@@ -1,0 +1,14 @@
+# Common table expressions (SQL-99). GlueSQL rejects the WITH clause, so this
+# file MUST land in the UNSUPPORTED bucket.
+
+statement ok
+CREATE TABLE c (id INTEGER PRIMARY KEY)
+
+statement ok
+INSERT INTO c VALUES (1), (2), (3), (4)
+
+query I
+WITH evens AS (SELECT id FROM c WHERE id % 2 = 0) SELECT id FROM evens ORDER BY id
+----
+2
+4
