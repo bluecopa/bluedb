@@ -1,0 +1,13 @@
+[package]
+name = "bluedb-rest"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+description = "PostgREST-style query DSL → SQL translation for bluedb (pure string translation; no SQL-engine dependency)."
+
+[dependencies]
+# Pure translation layer. We deliberately do NOT depend on `bluedb-sql` or
+# `gluesql-core`: this crate only renders SQL *strings*, and decoupling keeps
+# the build green while the SQL engine evolves independently.
+thiserror = { workspace = true }
+serde     = { workspace = true }

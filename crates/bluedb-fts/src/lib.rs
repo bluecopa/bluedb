@@ -43,5 +43,74 @@ pub mod manifest;
 /// Multi-split search — run a BM25 query across N splits and merge top-K.
 pub mod search;
 
+/// Logical deletes — the tombstone set over immutable splits.
+pub mod tombstones;
+
+/// Incremental indexing — append a new split to an existing index without
+/// rebuilding, and express updates as tombstone-then-append.
+pub mod writer;
+
+/// Merge / compaction — fold N splits into one, physically dropping tombstoned
+/// docs, to bound split count and query fan-out.
+pub mod merge;
+
 #[path = "../vendor/mod.rs"]
 pub mod vendor;
+
+use tantivy::schema::{Field, Value};
+use tantivy::TantivyDocument;
+
+/// Render an optional stored string/u64 value into the canonical doc-id string.
+///
+/// Doc-ids are always strings; a u64 primary key is canonicalized to its
+/// decimal rendering so the same value tombstones consistently whether the id
+/// field is a `STRING` or a `U64` (`FAST`/`INDEXED`) field. Prefers a string
+/// value if present, else a u64, else `None`.
+pub fn doc_id_string(as_str: Option<&str>, as_u64: Option<u64>) -> Option<String> {
+    if let Some(s) = as_str {
+        return Some(s.to_string());
+    }
+    as_u64.map(|n| n.to_string())
+}
+
+/// Canonical doc-id string for a u64 primary key. Use this to build the id you
+/// pass to [`tombstones::Tombstones::delete_doc_at`] when your id field is a u64.
+pub fn id_of_u64(id: u64) -> String {
+    id.to_string()
+}
+
+/// The designated **doc-id field**: a STORED field whose value uniquely
+/// identifies a document across the logical index.
+///
+/// Indexing/searching the lifecycle path needs to name a document independently
+/// of its physical `DocAddress` (which is per-split and unstable across
+/// rebuild/merge). The caller designates one stored field as the id and the
+/// engine reads its value at query/merge time. The field MUST be `STORED` and
+/// present (single-valued) on every document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdField(pub Field);
+
+impl IdField {
+    /// Wrap a tantivy [`Field`] as the doc-id field.
+    pub fn new(field: Field) -> Self {
+        Self(field)
+    }
+
+    /// The underlying tantivy field.
+    pub fn field(&self) -> Field {
+        self.0
+    }
+
+    /// Extract this document's id as the canonical string, or `None` if the
+    /// field has no stored string/u64 value on `doc`.
+    pub fn extract(&self, doc: &TantivyDocument) -> Option<String> {
+        let v = doc.get_first(self.0)?;
+        doc_id_string(v.as_str(), v.as_u64())
+    }
+}
+
+impl From<Field> for IdField {
+    fn from(f: Field) -> Self {
+        Self(f)
+    }
+}

@@ -225,12 +225,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "bluedb-rest"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "bluedb-sql"
 version = "0.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
+ "chrono",
  "futures",
  "gluesql-core",
  "serde",

@@ -52,6 +52,11 @@ impl Indexer {
         self
     }
 
+    /// The configured tantivy writer heap budget (bytes).
+    pub fn writer_heap_bytes(&self) -> usize {
+        self.writer_heap_bytes
+    }
+
     /// Build a tantivy index from `docs`, commit it, and return
     /// `(index, tempdir)`. The tempdir owns the on-disk files; keep it alive
     /// for as long as you read from `index`.
@@ -60,16 +65,30 @@ impl Indexer {
         schema: Schema,
         docs: impl IntoIterator<Item = TantivyDocument>,
     ) -> anyhow::Result<(Index, TempDir)> {
+        let (index, dir, _n) = self.build_index_counted(schema, docs)?;
+        Ok((index, dir))
+    }
+
+    /// Like [`Indexer::build_index`] but also returns the number of documents
+    /// committed. Used by the [`crate::writer::IndexWriter`] / [`crate::merge`]
+    /// coordinators, which record `num_docs` in the [`crate::manifest::SplitMeta`].
+    pub(crate) fn build_index_counted(
+        &self,
+        schema: Schema,
+        docs: impl IntoIterator<Item = TantivyDocument>,
+    ) -> anyhow::Result<(Index, TempDir, u64)> {
         let dir = tempfile::tempdir()?;
         let index = Index::create_in_dir(dir.path(), schema)?;
+        let mut num_docs: u64 = 0;
         {
             let mut writer = index.writer(self.writer_heap_bytes)?;
             for doc in docs {
                 writer.add_document(doc)?;
+                num_docs += 1;
             }
             writer.commit()?;
         } // writer dropped -> lock released, files flushed to disk
-        Ok((index, dir))
+        Ok((index, dir, num_docs))
     }
 
     /// Build an index from `docs` and pack it into a split with an **empty**

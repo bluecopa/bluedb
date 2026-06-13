@@ -12,12 +12,22 @@
 //!
 //! [`SlateDbStorage`] wraps an `Arc<slatedb::Db>` and implements GlueSQL's
 //! [`Store`](gluesql_core::store::Store) (read path) and
-//! [`StoreMut`](gluesql_core::store::StoreMut) (write path). The remaining
-//! traits in GlueSQL's `GStore`/`GStoreMut` bounds — `Index`, `IndexMut`,
-//! `Metadata`, `CustomFunction(Mut)`, `Transaction`, `AlterTable`, `Planner` —
-//! are satisfied by gluesql-core's default method implementations via empty
-//! marker `impl`s. Hand the storage to `gluesql_core::prelude::Glue::new` and
-//! run SQL strings through `Glue::execute`.
+//! [`StoreMut`](gluesql_core::store::StoreMut) (write path), plus real
+//! [`Transaction`](gluesql_core::store::Transaction) (overlay + atomic batch
+//! commit, snapshot isolation) and [`Index`](gluesql_core::store::Index)/
+//! [`IndexMut`](gluesql_core::store::IndexMut) (secondary indexes). The
+//! remaining `GStore`/`GStoreMut` traits — `Metadata`, `CustomFunction(Mut)`,
+//! `AlterTable`, `Planner` — are satisfied by gluesql-core's default method
+//! implementations via empty marker `impl`s. Hand the storage to
+//! `gluesql_core::prelude::Glue::new` and run SQL strings through
+//! `Glue::execute`.
+//!
+//! Every key is **tenant-namespaced**: many tenants can share one `Db` with no
+//! cross-tenant reads. See [`SlateDbStorage::new_for_tenant`].
+//!
+//! [`SchemaRegistry`] is a schema-as-data facade over the same storage: list,
+//! fetch, register/replace schemas without DDL, and validate a row against a
+//! registered schema.
 //!
 //! ```no_run
 //! use std::sync::Arc;
@@ -53,7 +63,10 @@
 
 mod error;
 mod keyspace;
+mod registry;
 mod storage;
 
 pub use error::SqlError;
+pub use keyspace::DEFAULT_TENANT;
+pub use registry::SchemaRegistry;
 pub use storage::SlateDbStorage;

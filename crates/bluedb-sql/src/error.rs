@@ -22,6 +22,17 @@ pub enum SqlError {
     /// Encoding a primary [`gluesql_core::data::Key`] to comparable bytes failed.
     #[error("key encode error: {0}")]
     KeyEncode(String),
+
+    /// Evaluating a secondary-index expression against a row failed, or its
+    /// result could not be turned into an indexable [`gluesql_core::data::Key`]
+    /// (e.g. the expression produced a map/list/point value).
+    #[error("index eval error: {0}")]
+    IndexEval(String),
+
+    /// A schema-registry write-time validation check failed (column count,
+    /// type, or NOT NULL mismatch). See [`crate::SchemaRegistry`].
+    #[error("schema validation error: {0}")]
+    SchemaValidation(String),
 }
 
 impl From<slatedb::Error> for SqlError {

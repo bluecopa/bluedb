@@ -93,6 +93,17 @@ impl Manifest {
         self.splits.iter().map(|s| s.num_docs).sum()
     }
 
+    /// The highest split `generation` currently in the catalog, or `0` if empty.
+    ///
+    /// Appends/compactions mint the next split at `max_generation() + 1`, so
+    /// this is the boundary used by generation-scoped deletes
+    /// ([`crate::tombstones`]): a delete recorded at `max_generation()` hides
+    /// every existing split's copy of an id while letting a fresh re-append (at
+    /// `max_generation() + 1`) survive.
+    pub fn max_generation(&self) -> u64 {
+        self.splits.iter().map(|s| s.generation).max().unwrap_or(0)
+    }
+
     /// Conventional blob key for this index's manifest:
     /// `indexes/<index_id>/manifest.json`.
     pub fn blob_key(&self) -> String {

@@ -1,38 +1,41 @@
 # bluedb — Production Readiness Roadmap
 
-Current state: **M1 FTS core + the M2 SQL pillar exist and pass tests** (`cargo test --workspace`, 45 tests; `cargo clippy --workspace --all-targets` clean). Working today:
+Current state: **M2 (SQL pillar) is complete; M1 FTS is feature-complete bar GC + query niceties** (`cargo test --workspace` ~117 tests; `cargo clippy --workspace --all-targets` clean). Working today:
 - ✅ `BlobStore` seam + `SlateDbBlobStore` (slatedb 0.13); durability proven across `Db` reopen; `BlobStoreMut` write seam; `ChunkedBlobStore` large-value layer.
 - ✅ Vendored Quickwit read path (Bundle/Storage/Hot/Caching directories) on the tantivy fork, bridged to `BlobStore`.
-- ✅ FTS: real indexer (docs→index→split), real hotcache + lazy range-fetch open, split manifest/catalog, multi-split BM25 search with merged ranking.
-- ✅ SQL: GlueSQL `Store`/`StoreMut` over SlateDB — order-preserving key encoding, CREATE/INSERT/SELECT-WHERE/UPDATE/DELETE/ORDER BY, schemaless tables.
+- ✅ FTS: real indexer, lazy hotcache open, split manifest, multi-split BM25 search; **logical deletes (generation-scoped tombstones), incremental append, same-id update, and merge/compaction** (re-index live docs, physically drop the dead).
+- ✅ SQL: GlueSQL `Store`/`StoreMut` + **real `Transaction` (overlay + `DbSnapshot` + atomic `WriteBatch`, snapshot isolation), secondary indexes (`Index`/`IndexMut`, order-preserving entry encoding), tenant-namespaced keyspace, and a schema-as-data registry**.
+- ✅ `bluedb-rest`: PostgREST-style DSL → SQL translation (input-table-v2 parity surface).
 - ✅ Apache-2.0 attribution/NOTICE for vendored code.
 
-Items below marked ✅ landed in the M1+M2 parallel build; unchecked items remain. Ordered by build-order milestone; cross-cutting tracks must advance alongside.
+Items below marked ✅ are done; unchecked items remain. Ordered by build-order milestone; cross-cutting tracks must advance alongside.
 
 ---
 
 ## M1 — FTS engine to usable
 
 - [x] Indexing pipeline: documents → tantivy index → split (`indexer` module — `Indexer` / `build_split{,_with_hotcache}`).
-- [ ] Schema/field mapping from a table's searchable columns; per-field analyzers / tokenizers / language config. *(schema is passed in; no per-field analyzer config layer yet.)*
-- [ ] Incremental indexing (add docs over time without full rebuild). *(each `build` is a fresh index.)*
+- [x] Incremental indexing (`writer::IndexWriter::append` — build a new split + append to the manifest, existing splits untouched; `generation` bumped per write).
 - [x] Split **manifest/catalog** (`manifest` module — `SplitMeta`/`Manifest`, load/store over the substrate).
 - [x] Multi-split search (`search` module — `multi_split_search`, merged descending-score ranking with deterministic tie-break).
-- [ ] Merge / compaction policy (bound split count and query fan-out).
-- [ ] Deletes & updates (tombstones + merge).
+- [x] Merge / compaction policy (`merge::Compactor` — re-index live docs from N splits into one, generation-scoped liveness, returns superseded keys for GC).
+- [x] Deletes & updates (`tombstones` — **generation-scoped** deletes so a same-id update is a true in-place replace: tombstone old at gen g, re-append at gen > g; `multi_split_search_filtered` applies the scope + last-write-wins dedup).
 - [x] **Lazy reads + hotcache** (`open::open_split_lazy` + `SplitBlobDirectory`: real hotcache via vendored `write_hotcache`, `HotDirectory`→`CachingDirectory`→`StorageDirectory`, range-fetch — never `get_all`).
-- [ ] GC of orphaned / superseded / expired splits (incl. the hot-window retention strategy).
+- [ ] Schema/field mapping from a table's searchable columns; per-field analyzers / tokenizers / language config. *(schema is passed in; no per-field analyzer config layer yet.)*
+- [ ] **GC executor** for the superseded/orphaned splits compaction reports (the policy + key list exist; wiring the actual deletes via `BlobStoreMut` + a hot-window retention strategy remains).
+- [ ] Compaction trigger policy / scheduler (when to compact — count/size/tombstone-ratio thresholds; today compaction is a manual call).
 - [ ] Query features: pagination, highlighting, FTS predicates combined with structured filters.
 
-## M2 — SQL pillar (GlueSQL over SlateDB)
+## M2 — SQL pillar (GlueSQL over SlateDB) — **complete**
 
-- [x] Implement GlueSQL `Store`/`StoreMut` over SlateDB (`bluedb-sql`: `fetch_schema`/`fetch_all_schemas`/`fetch_data`/`scan_data` + `insert_schema`/`delete_schema`/`append_data`/`insert_data`/`delete_data`). Order-preserving key encoding via `Key::to_cmp_be_bytes()`; schemaless tables supported. Pinned `gluesql-core =0.19.0`.
-- [ ] Secondary indexes (GlueSQL `Index` trait). *(stubbed — uses gluesql "not supported" defaults.)*
-- [ ] Transactions / isolation mapped onto SlateDB's single-writer model (the genuine hard design question). *(currently autocommit no-op; `BEGIN`/`COMMIT`/rollback not real.)*
-- [ ] Schema-as-data registry + write-time validation (keeps typed-schema UX without DDL).
-- [ ] PostgREST-DSL → SQL translation layer (input-table-v2 API parity).
-- [ ] Multi-tenant key prefixing for the SQL keyspace. *(key encoding has table+pk namespacing; tenant prefix not yet layered in.)*
+- [x] Implement GlueSQL `Store`/`StoreMut` over SlateDB (`bluedb-sql`). Order-preserving key encoding via `Key::to_cmp_be_bytes()`; schemaless tables supported. Pinned `gluesql-core =0.19.0`.
+- [x] Secondary indexes (`Index`/`IndexMut`): index entries in a `TAG_INDEX` keyspace with an **order-preserving, prefix-free** value segment (so string-column range/ORDER-BY scans sort by content, not encoded length); maintained through the txn overlay on every INSERT/UPDATE/DELETE; `CREATE INDEX` back-fills, `DROP INDEX` purges.
+- [x] Transactions / isolation on SlateDB's single-writer model: write-buffer **overlay** + point-in-time **`DbSnapshot`** reads + atomic **`WriteBatch`** commit. Snapshot isolation, read-your-own-writes, all-or-nothing commit, true ROLLBACK (incl. index entries). `begin(true)` returns `false` inside an open `BEGIN` so statements don't auto-commit.
+- [x] Schema-as-data registry + write-time validation (`SchemaRegistry`: list/get/register schemas without DDL; `validate_row` checks count/type/NOT-NULL; schemaless tables accept any row).
+- [x] PostgREST-DSL → SQL translation layer (`bluedb-rest`: filters/operators/order/limit/offset + INSERT/UPDATE/DELETE, identifier allow-listing + literal escaping; input-table-v2 parity surface).
+- [x] Multi-tenant key prefixing for the SQL keyspace (`Keyspace` length-prefixes a tenant namespace before every key; `SlateDbStorage::new_for_tenant`).
 - [ ] (Scope note: GlueSQL is OLTP/row-oriented — for the transactional facts store, **not** analytics. Heavy analytics stays in DuckDB/DuckLake.)
+- [ ] (Follow-ups, not blockers: wire `bluedb-rest` output into `bluedb-sql` execution; secondary-index *uniqueness* enforcement; cross-statement isolation under concurrent connections — today single-writer per `Db`.)
 
 ## M3 — Service & integration
 

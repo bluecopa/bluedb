@@ -21,6 +21,9 @@ bytes        = { workspace = true }
 # `RowIter` is a `futures::Stream`; we build it with `futures::stream::iter`.
 # Pinned to the same 0.3 line gluesql-core itself depends on.
 futures      = "0.3"
+# `SchemaIndex::created` is a `chrono::NaiveDateTime`; we stamp new indexes with
+# `Utc::now()`. Same 0.4 line gluesql-core resolves.
+chrono       = "0.4"
 
 [dev-dependencies]
 tokio = { workspace = true }
