@@ -5,11 +5,17 @@ edition.workspace = true
 license.workspace = true
 description = "Single-writer high-availability for bluedb: a lease/fencing-token abstraction + a self-fencing writer controller."
 
+[features]
+# Opt-in Postgres-backed lease arbiter (the HA shared lease store). Off by
+# default so the core crate stays dependency-light.
+postgres = ["dep:tokio-postgres"]
+
 [dependencies]
-tokio       = { workspace = true }
-async-trait = { workspace = true }
-anyhow      = { workspace = true }
-thiserror   = { workspace = true }
+tokio         = { workspace = true }
+async-trait   = { workspace = true }
+anyhow        = { workspace = true }
+thiserror     = { workspace = true }
+tokio-postgres = { version = "0.7", optional = true }
 
 [dev-dependencies]
 # (none beyond the above)

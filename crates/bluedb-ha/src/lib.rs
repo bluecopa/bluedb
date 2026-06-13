@@ -35,7 +35,11 @@
 mod clock;
 mod controller;
 mod lease;
+#[cfg(feature = "postgres")]
+mod postgres;
 
 pub use clock::{Clock, SystemClock, TestClock};
 pub use controller::{HaError, Role, Status, WriterController};
 pub use lease::{Lease, LeaseProvider, LocalLeaseProvider};
+#[cfg(feature = "postgres")]
+pub use postgres::{PostgresLeaseProvider, LEASE_TABLE_DDL};
