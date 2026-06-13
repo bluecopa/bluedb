@@ -1,12 +1,17 @@
 //! Cross-connection isolation tests for [`bluedb_sql::Database`].
 //!
 //! A `Database` vends multiple `Glue` connections over one SlateDB `Db` that
-//! share a write lease. These tests prove the two guarantees:
-//!   1. **Snapshot isolation** — one connection's uncommitted (and even
-//!      committed-after-BEGIN) writes are invisible to another connection's
-//!      in-flight transaction.
-//!   2. **Serializable write transactions** — two concurrent read-modify-write
-//!      transactions serialize on the lease, so neither update is lost.
+//! share a write lease. These tests prove the guarantees:
+//!   1. **Snapshot isolation** — a connection's in-flight transaction reads a
+//!      stable point-in-time view; another connection's uncommitted writes are
+//!      invisible to it.
+//!   2. **Serialized writers** — an explicit `BEGIN` holds the write lease for
+//!      its whole duration, so any other writer (autocommit included) blocks
+//!      until it commits. Two concurrent read-modify-write transactions thus
+//!      serialize and neither update is lost.
+//!
+//! Reads never take the lease: autocommit `SELECT`s run lock-free against an
+//! MVCC snapshot, so they neither block nor are blocked by writers.
 
 use std::sync::Arc;
 
@@ -62,7 +67,7 @@ async fn uncommitted_writes_are_invisible_to_other_connections() {
     assert_eq!(scalar_i64(&mut b, "SELECT v FROM t WHERE id = 1;").await, 99);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_transaction_reads_a_stable_snapshot() {
     let database = open_database("iso-snapshot").await;
     let mut a = Glue::new(database.connection());
@@ -70,21 +75,36 @@ async fn a_transaction_reads_a_stable_snapshot() {
     a.execute("CREATE TABLE t (id INTEGER PRIMARY KEY);").await.unwrap();
     a.execute("INSERT INTO t VALUES (1);").await.unwrap();
 
+    // A opens a transaction: it holds the write lease and a stable snapshot.
     a.execute("BEGIN;").await.unwrap();
     assert_eq!(row_count(&mut a, "SELECT id FROM t;").await, 1);
 
-    // Another connection inserts a row while A's transaction is open.
-    let mut b = Glue::new(database.connection());
-    b.execute("INSERT INTO t VALUES (2);").await.unwrap();
+    // Another connection tries to insert while A's transaction is open. Writers
+    // serialize on the lease, so B blocks until A commits — it cannot land a
+    // committed write inside A's lifetime. (Run on its own task; awaiting it
+    // here would wedge the test, which is the point — A holds the lease.)
+    let db2 = database.clone();
+    let writer = tokio::spawn(async move {
+        let mut b = Glue::new(db2.connection());
+        b.execute("INSERT INTO t VALUES (2);").await.unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    assert!(
+        !writer.is_finished(),
+        "B's write must block on the lease A holds, not commit during A's txn"
+    );
 
-    // A's snapshot is stable: it still sees only the row that existed at BEGIN.
+    // A's snapshot is stable regardless: still only the row that existed at BEGIN.
     assert_eq!(
         row_count(&mut a, "SELECT id FROM t;").await,
         1,
-        "A's snapshot must not see B's concurrently-committed insert"
+        "A's snapshot must not see a concurrent writer"
     );
 
+    // Committing releases the lease; B now proceeds.
     a.execute("COMMIT;").await.unwrap();
+    writer.await.expect("writer task");
+
     // A fresh read (new snapshot) now sees both rows.
     assert_eq!(row_count(&mut a, "SELECT id FROM t;").await, 2);
 }
