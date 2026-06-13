@@ -89,9 +89,16 @@ use gluesql_core::store::{
 use serde::{Deserialize, Serialize};
 use slatedb::config::ScanOptions;
 use slatedb::{Db, DbSnapshot, WriteBatch};
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::error::SqlError;
 use crate::keyspace::{prefix_upper_bound, Keyspace, DEFAULT_TENANT};
+
+/// A shared **write lease** — the async mutex that serializes write
+/// transactions across connections to one [`Db`]. Connections created from the
+/// same [`crate::Database`] share one of these; a standalone
+/// [`SlateDbStorage::new`] gets its own (it is the sole writer).
+pub(crate) type WriteLease = Arc<Mutex<()>>;
 
 /// The stored form of a data row: the primary key plus the row payload.
 #[derive(Serialize, Deserialize)]
@@ -105,9 +112,16 @@ struct TxnState {
     /// Buffered mutations keyed by encoded storage key: `Some` = put, `None` =
     /// delete (tombstone). Ordered so range merges over the base are cheap.
     overlay: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
-    /// Point-in-time read view of SlateDB captured at `begin`. Base reads
-    /// inside the txn go here, giving snapshot isolation.
+    /// Point-in-time read view of SlateDB captured at `begin` (after the write
+    /// lease is held), giving snapshot isolation.
     snapshot: Arc<DbSnapshot>,
+    /// Exclusive write lease held for the duration of this transaction. Held
+    /// from `begin` until `commit`/`rollback`, it serializes write transactions
+    /// across connections to the same `Db`: a second connection's `BEGIN`
+    /// blocks here until this one ends, so its snapshot sees this txn's commit
+    /// and no update is lost. Dropping it (on commit/rollback, or if the
+    /// connection is dropped mid-txn) releases the lease.
+    _lease: OwnedMutexGuard<()>,
 }
 
 /// GlueSQL custom storage over a SlateDB database.
@@ -118,24 +132,38 @@ struct TxnState {
 pub struct SlateDbStorage {
     db: Arc<Db>,
     keyspace: Keyspace,
+    /// Shared write lease serializing write transactions over this `Db`.
+    write_lease: WriteLease,
     /// `Some` while a `BEGIN ... COMMIT/ROLLBACK` block is open.
     txn: Option<TxnState>,
 }
 
 impl SlateDbStorage {
-    /// Wrap an already-open SlateDB database under the default tenant.
+    /// Wrap an already-open SlateDB database under the default tenant, as a
+    /// **standalone** connection (its own private write lease — it is the sole
+    /// writer). To run *several* coordinated connections over one `Db` (so their
+    /// write transactions serialize against each other), create them from a
+    /// shared [`crate::Database`] instead.
     pub fn new(db: Arc<Db>) -> Self {
         Self::new_for_tenant(db, DEFAULT_TENANT)
     }
 
-    /// Wrap an already-open SlateDB database scoped to `tenant`.
+    /// Wrap an already-open SlateDB database scoped to `tenant`, standalone.
     ///
     /// Every key this storage reads or writes is namespaced to `tenant`, so two
     /// storages over the same [`Db`] with different tenants share no data.
     pub fn new_for_tenant(db: Arc<Db>, tenant: &str) -> Self {
+        Self::with_lease(db, tenant, Arc::new(Mutex::new(())))
+    }
+
+    /// Construct a connection that shares `write_lease` with its siblings (used
+    /// by [`crate::Database`] so all connections over one `Db` serialize their
+    /// write transactions through the same lease).
+    pub(crate) fn with_lease(db: Arc<Db>, tenant: &str, write_lease: WriteLease) -> Self {
         Self {
             db,
             keyspace: Keyspace::new(tenant),
+            write_lease,
             txn: None,
         }
     }
@@ -569,11 +597,17 @@ impl Transaction for SlateDbStorage {
             // Plain statement, no explicit BEGIN: stay in write-through mode.
             return Ok(false);
         }
-        // Explicit BEGIN: open an overlay over a fresh snapshot.
+        // Explicit BEGIN: acquire the exclusive write lease FIRST, then take the
+        // snapshot. Taking the snapshot *after* the lease guarantees this txn
+        // sees every previously-committed write (a concurrent connection's
+        // `BEGIN` blocks on the lease until we commit, then snapshots our
+        // result) — so write transactions are serialized and no update is lost.
+        let lease = self.write_lease.clone().lock_owned().await;
         let snapshot = self.db.snapshot().await.map_err(SqlError::from)?;
         self.txn = Some(TxnState {
             overlay: BTreeMap::new(),
             snapshot,
+            _lease: lease,
         });
         Ok(true)
     }

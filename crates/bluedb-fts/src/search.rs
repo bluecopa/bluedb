@@ -11,12 +11,24 @@
 use std::cmp::Ordering;
 
 use tantivy::collector::TopDocs;
-use tantivy::query::QueryParser;
-use tantivy::schema::{Field, Value};
+use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, TermQuery};
+use tantivy::schema::{Field, IndexRecordOption, Term, Value};
 use tantivy::{DocAddress, Index, TantivyDocument};
 
 use crate::tombstones::Tombstones;
 use crate::{doc_id_string, IdField};
+
+/// Deterministic merged ordering for multi-split hits: descending score, then
+/// ascending `(split_ord, segment_ord, doc_id)` so results are stable across
+/// runs. Shared by every search variant.
+fn cmp_hits(a: &MultiSplitHit, b: &MultiSplitHit) -> Ordering {
+    b.score
+        .partial_cmp(&a.score)
+        .unwrap_or(Ordering::Equal)
+        .then_with(|| a.split_ord.cmp(&b.split_ord))
+        .then_with(|| a.doc_address.segment_ord.cmp(&b.doc_address.segment_ord))
+        .then_with(|| a.doc_address.doc_id.cmp(&b.doc_address.doc_id))
+}
 
 /// One hit from a multi-split search.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -123,14 +135,7 @@ pub fn multi_split_search(
     }
 
     // Merge: descending score, deterministic tie-break by (split_ord, doc).
-    all.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| a.split_ord.cmp(&b.split_ord))
-            .then_with(|| a.doc_address.segment_ord.cmp(&b.doc_address.segment_ord))
-            .then_with(|| a.doc_address.doc_id.cmp(&b.doc_address.doc_id))
-    });
+    all.sort_by(cmp_hits);
     all.truncate(limit);
     Ok(all)
 }
@@ -279,14 +284,7 @@ pub fn multi_split_search_filtered(
         .map(|(_, c)| c.hit)
         .collect();
 
-    merged.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| a.split_ord.cmp(&b.split_ord))
-            .then_with(|| a.doc_address.segment_ord.cmp(&b.doc_address.segment_ord))
-            .then_with(|| a.doc_address.doc_id.cmp(&b.doc_address.doc_id))
-    });
+    merged.sort_by(cmp_hits);
     merged.truncate(limit);
     Ok(merged)
 }
@@ -340,4 +338,167 @@ pub fn multi_split_count_filtered(
 pub fn stored_id(doc: &TantivyDocument, field: Field) -> Option<String> {
     let v = doc.get_first(field)?;
     doc_id_string(v.as_str(), v.as_u64())
+}
+
+// ----------------------------------------------------------------------------
+// Query niceties: pagination, highlighting, structured filters.
+// ----------------------------------------------------------------------------
+
+/// Paginated multi-split search: the merged hits for `query_str`, skipping the
+/// first `offset` and returning the next `limit`.
+///
+/// Correctness across merged splits is the whole point: scores are per-split, so
+/// we cannot ask each split for "page N" independently. Instead each split is
+/// over-fetched to `offset + limit` candidates, all candidates are merged into
+/// one globally-sorted list (same ordering as [`multi_split_search`]), and only
+/// then do we `skip(offset).take(limit)`. Over-fetching `offset + limit` per
+/// split guarantees the merged window is complete: the global top `offset +
+/// limit` can contain at most that many hits from any single split.
+pub fn multi_split_search_paginated(
+    splits: &[SplitHandle<'_>],
+    query_str: &str,
+    fields: &[Field],
+    offset: usize,
+    limit: usize,
+) -> anyhow::Result<Vec<MultiSplitHit>> {
+    let per_split = offset.saturating_add(limit);
+    if per_split == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut all: Vec<MultiSplitHit> = Vec::new();
+    for (split_ord, handle) in splits.iter().enumerate() {
+        let index = handle.index;
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let parser = QueryParser::for_index(index, fields.to_vec());
+        let query = parser
+            .parse_query(query_str)
+            .map_err(|err| anyhow::anyhow!("parse query for split {}: {err}", handle.split_id))?;
+
+        let hits = searcher.search(&query, &TopDocs::with_limit(per_split).order_by_score())?;
+        for (score, doc_address) in hits {
+            all.push(MultiSplitHit {
+                score,
+                split_ord,
+                doc_address,
+            });
+        }
+    }
+
+    all.sort_by(cmp_hits);
+    Ok(all.into_iter().skip(offset).take(limit).collect())
+}
+
+/// A structured filter to AND with a parsed full-text query.
+///
+/// Each variant becomes a tantivy sub-query that the document MUST match (an
+/// `Occur::Must` clause), so the result is the text-query hits *narrowed* to
+/// those also satisfying the filter. Use with [`multi_split_search_with_filter`].
+#[derive(Debug, Clone)]
+pub enum Filter {
+    /// Exact term match on a `STRING`/keyword `field` (a [`TermQuery`]).
+    Term { field: Field, value: String },
+    /// Inclusive `u64` range `[lo, hi]` on an indexed `field` (a
+    /// [`tantivy::query::RangeQuery`]). Bounds are inclusive on both ends.
+    U64Range { field: Field, lo: u64, hi: u64 },
+    /// Inclusive `i64` range `[lo, hi]` on an indexed `field` (e.g. an
+    /// epoch-millis timestamp).
+    I64Range { field: Field, lo: i64, hi: i64 },
+}
+
+impl Filter {
+    /// Build the tantivy [`Query`] for this filter.
+    fn to_query(&self) -> Box<dyn Query> {
+        use std::ops::Bound;
+        use tantivy::query::RangeQuery;
+        match self {
+            Filter::Term { field, value } => Box::new(TermQuery::new(
+                Term::from_field_text(*field, value),
+                IndexRecordOption::Basic,
+            )),
+            Filter::U64Range { field, lo, hi } => Box::new(RangeQuery::new(
+                Bound::Included(Term::from_field_u64(*field, *lo)),
+                Bound::Included(Term::from_field_u64(*field, *hi)),
+            )),
+            Filter::I64Range { field, lo, hi } => Box::new(RangeQuery::new(
+                Bound::Included(Term::from_field_i64(*field, *lo)),
+                Bound::Included(Term::from_field_i64(*field, *hi)),
+            )),
+        }
+    }
+}
+
+/// Full-text search ANDed with a structured `filter`.
+///
+/// Parses `query_str` over `fields` (as [`multi_split_search`] does), then wraps
+/// it and `filter` in a [`BooleanQuery`] where BOTH are `Occur::Must`, so only
+/// documents matching the text query *and* the filter are returned. Merged and
+/// truncated to `limit` with the standard ordering. The filter's fields must
+/// exist (and be indexed appropriately) in every split's schema.
+pub fn multi_split_search_with_filter(
+    splits: &[SplitHandle<'_>],
+    query_str: &str,
+    fields: &[Field],
+    filter: &Filter,
+    limit: usize,
+) -> anyhow::Result<Vec<MultiSplitHit>> {
+    let mut all: Vec<MultiSplitHit> = Vec::new();
+    for (split_ord, handle) in splits.iter().enumerate() {
+        let index = handle.index;
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let parser = QueryParser::for_index(index, fields.to_vec());
+        let text_query = parser
+            .parse_query(query_str)
+            .map_err(|err| anyhow::anyhow!("parse query for split {}: {err}", handle.split_id))?;
+
+        let combined: BooleanQuery = BooleanQuery::new(vec![
+            (Occur::Must, text_query),
+            (Occur::Must, filter.to_query()),
+        ]);
+
+        let hits = searcher.search(&combined, &TopDocs::with_limit(limit).order_by_score())?;
+        for (score, doc_address) in hits {
+            all.push(MultiSplitHit {
+                score,
+                split_ord,
+                doc_address,
+            });
+        }
+    }
+
+    all.sort_by(cmp_hits);
+    all.truncate(limit);
+    Ok(all)
+}
+
+/// Build a highlighted HTML snippet for one hit's `field`, with the query terms
+/// wrapped in `<b>...</b>` (tantivy's default snippet markup).
+///
+/// `index` is the split that produced the hit; `query_str` + `fields` are parsed
+/// exactly as the search did, so the snippet highlights the same terms that
+/// matched. `field` must be a `STORED` text field (the snippet generator reads
+/// its stored value). Returns the highlighted fragment; empty string if the
+/// field has no stored text on that document.
+pub fn highlight(
+    index: &Index,
+    query_str: &str,
+    fields: &[Field],
+    field: Field,
+    doc_address: DocAddress,
+) -> anyhow::Result<String> {
+    use tantivy::snippet::SnippetGenerator;
+
+    let reader = index.reader()?;
+    let searcher = reader.searcher();
+    let parser = QueryParser::for_index(index, fields.to_vec());
+    let query = parser
+        .parse_query(query_str)
+        .map_err(|err| anyhow::anyhow!("parse query for highlight: {err}"))?;
+
+    let generator = SnippetGenerator::create(&searcher, query.as_ref(), field)?;
+    let doc: TantivyDocument = searcher.doc(doc_address)?;
+    let snippet = generator.snippet_from_doc(&doc);
+    Ok(snippet.to_html())
 }

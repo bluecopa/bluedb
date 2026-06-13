@@ -7,8 +7,12 @@ description = "BM25 full-text search over object storage (tantivy + vendored qui
 
 [dependencies]
 bluedb-storage = { workspace = true }
-# Vendored quickwit-directories read path (crates/bluedb-fts/vendor/):
-tantivy     = { workspace = true }
+# Vendored quickwit-directories read path (crates/bluedb-fts/vendor/).
+# `stemmer` is additive on top of the workspace feature set: the per-field
+# `Analyzer::EnStem` mapping (src/mapping.rs) needs `tokenizer::{Stemmer, Language}`,
+# which the fork gates behind that feature. Cargo unifies features across the
+# workspace, so requesting it here doesn't change the pinned rev/source.
+tantivy     = { workspace = true, features = ["stemmer"] }
 async-trait = { workspace = true }
 anyhow      = { workspace = true }
 bytes       = { workspace = true }

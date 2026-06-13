@@ -1,6 +1,6 @@
 # bluedb — Production Readiness Roadmap
 
-Current state: **M2 (SQL pillar) is complete; M1 FTS is feature-complete bar GC + query niceties** (`cargo test --workspace` ~117 tests; `cargo clippy --workspace --all-targets` clean). Working today:
+Current state: **M1 (FTS) and M2 (SQL pillar) are both feature-complete** (`cargo test --workspace` 140 tests; `cargo clippy --workspace --all-targets` clean). The only remaining items are M1 ops-side niceties already covered by libraries (auto-compaction scheduling) and one M2 wiring follow-up (`bluedb-rest`→`bluedb-sql`). Working today:
 - ✅ `BlobStore` seam + `SlateDbBlobStore` (slatedb 0.13); durability proven across `Db` reopen; `BlobStoreMut` write seam; `ChunkedBlobStore` large-value layer.
 - ✅ Vendored Quickwit read path (Bundle/Storage/Hot/Caching directories) on the tantivy fork, bridged to `BlobStore`.
 - ✅ FTS: real indexer, lazy hotcache open, split manifest, multi-split BM25 search; **logical deletes (generation-scoped tombstones), incremental append, same-id update, and merge/compaction** (re-index live docs, physically drop the dead).
@@ -21,10 +21,10 @@ Items below marked ✅ are done; unchecked items remain. Ordered by build-order 
 - [x] Merge / compaction policy (`merge::Compactor` — re-index live docs from N splits into one, generation-scoped liveness, returns superseded keys for GC).
 - [x] Deletes & updates (`tombstones` — **generation-scoped** deletes so a same-id update is a true in-place replace: tombstone old at gen g, re-append at gen > g; `multi_split_search_filtered` applies the scope + last-write-wins dedup).
 - [x] **Lazy reads + hotcache** (`open::open_split_lazy` + `SplitBlobDirectory`: real hotcache via vendored `write_hotcache`, `HotDirectory`→`CachingDirectory`→`StorageDirectory`, range-fetch — never `get_all`).
-- [ ] Schema/field mapping from a table's searchable columns; per-field analyzers / tokenizers / language config. *(schema is passed in; no per-field analyzer config layer yet.)*
-- [ ] **GC executor** for the superseded/orphaned splits compaction reports (the policy + key list exist; wiring the actual deletes via `BlobStoreMut` + a hot-window retention strategy remains).
-- [ ] Compaction trigger policy / scheduler (when to compact — count/size/tombstone-ratio thresholds; today compaction is a manual call).
-- [ ] Query features: pagination, highlighting, FTS predicates combined with structured filters.
+- [x] Schema/field mapping + per-field analyzers (`mapping` module — `IndexMapping`/`FieldMapping`/`Analyzer{Raw,Default,EnStem,Whitespace}`: builds a tantivy `Schema` and registers the needed tokenizers on a lazily-opened split so stemming/keyword fields work at query time).
+- [x] **GC executor** (`gc` module — `gc_keys` deletes the compactor's `superseded_keys`; `gc_orphaned_splits` lists `splits/` via `BlobStoreMut::scan_prefix`, diffs the current manifest, deletes the unreferenced; pure retention policies `splits_below_generation`/`expired_by_time`).
+- [x] Compaction trigger policy (`policy::CompactionPolicy` — `should_compact`/`plan_compaction` over split-count + tombstone-ratio thresholds; v1 plan = full compaction). *(Wiring it to an automatic scheduler/loop is an ops concern for M3, not a library gap.)*
+- [x] Query features: pagination (`multi_split_search_paginated`), highlighting (`highlight` via `SnippetGenerator`), and FTS combined with structured filters (`multi_split_search_with_filter` + `Filter{Term,U64Range,I64Range}` AND-ed via a `BooleanQuery`).
 
 ## M2 — SQL pillar (GlueSQL over SlateDB) — **complete**
 
@@ -34,8 +34,10 @@ Items below marked ✅ are done; unchecked items remain. Ordered by build-order 
 - [x] Schema-as-data registry + write-time validation (`SchemaRegistry`: list/get/register schemas without DDL; `validate_row` checks count/type/NOT-NULL; schemaless tables accept any row).
 - [x] PostgREST-DSL → SQL translation layer (`bluedb-rest`: filters/operators/order/limit/offset + INSERT/UPDATE/DELETE, identifier allow-listing + literal escaping; input-table-v2 parity surface).
 - [x] Multi-tenant key prefixing for the SQL keyspace (`Keyspace` length-prefixes a tenant namespace before every key; `SlateDbStorage::new_for_tenant`).
+- [x] Uniqueness enforcement — verified: gluesql's executor enforces PRIMARY KEY (O(1) `fetch_data`) and `UNIQUE`-column (O(n) `scan_data`) constraints through our `Store`, correctly even inside a transaction (`tests/uniqueness.rs`). Note: gluesql has no `CREATE UNIQUE INDEX` and does not route uniqueness through secondary indexes — they accelerate query predicates only; the UNIQUE-column check is an O(n) table scan per write.
+- [x] Cross-statement isolation under concurrent connections (`Database` vends connections sharing one `Db` + a **write lease**; explicit transactions are serializable — `BEGIN` takes the lease and snapshots under it, so concurrent read-modify-write transactions cannot lose an update — while reads are snapshot-isolated and lock-free. `tests/isolation.rs`, incl. an 8-way concurrent-increment test).
 - [ ] (Scope note: GlueSQL is OLTP/row-oriented — for the transactional facts store, **not** analytics. Heavy analytics stays in DuckDB/DuckLake.)
-- [ ] (Follow-ups, not blockers: wire `bluedb-rest` output into `bluedb-sql` execution; secondary-index *uniqueness* enforcement; cross-statement isolation under concurrent connections — today single-writer per `Db`.)
+- [ ] (Remaining follow-up, not a blocker: wire `bluedb-rest`'s generated SQL into `bluedb-sql` execution end-to-end. Autocommit statements are atomic + snapshot-isolated but not serialized against each other — use an explicit `BEGIN..COMMIT` for atomic read-modify-write under concurrency.)
 
 ## M3 — Service & integration
 

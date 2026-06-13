@@ -61,11 +61,13 @@
 //! [`bluedb-storage`]: https://docs.rs/bluedb-storage
 //! [`bluedb-fts`]: https://docs.rs/bluedb-fts
 
+mod connection;
 mod error;
 mod keyspace;
 mod registry;
 mod storage;
 
+pub use connection::Database;
 pub use error::SqlError;
 pub use keyspace::DEFAULT_TENANT;
 pub use registry::SchemaRegistry;

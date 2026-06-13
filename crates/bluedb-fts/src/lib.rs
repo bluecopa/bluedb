@@ -54,6 +54,19 @@ pub mod writer;
 /// docs, to bound split count and query fan-out.
 pub mod merge;
 
+/// Garbage collection — physically delete superseded / orphaned / expired split
+/// blobs through the [`bluedb_storage::BlobStoreMut`] write seam.
+pub mod gc;
+
+/// Compaction policy — a pure decision layer (no I/O) over a manifest +
+/// tombstones that decides *whether* to compact and *which* splits to merge.
+pub mod policy;
+
+/// Field mapping — configure per-field analyzers/tokenizers and build the
+/// [`tantivy::schema::Schema`] + the tokenizer registrations a lazily-opened
+/// split needs.
+pub mod mapping;
+
 #[path = "../vendor/mod.rs"]
 pub mod vendor;
 

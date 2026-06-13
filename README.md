@@ -30,8 +30,8 @@ slice of that substrate.
 ## Crates
 
 - `bluedb-storage` — the object-store **seam**: a minimal read-only `BlobStore` trait (async read-byte-range) + the additive `BlobStoreMut` write seam (put/delete/ordered scan-prefix), `SlateDbBlobStore` (slatedb 0.13) with lifecycle helpers, and `ChunkedBlobStore` (large values split across ordered keys). The vendored Quickwit `Storage` adapter sits on top of `BlobStore`.
-- `bluedb-fts` — BM25 full-text search over object storage: `tantivy` + the vendored `quickwit-directories` read path, hosted on `bluedb-storage`. Indexer (docs→split), split manifest/catalog, multi-split merged search, lazy hotcache open (range-fetch, no whole-split load), and the full **index lifecycle**: incremental append, generation-scoped logical deletes (so a same-id update is a true in-place replace), and merge/compaction that physically drops dead docs.
-- `bluedb-sql` — SQL over the substrate: GlueSQL `Store`/`StoreMut` on SlateDB. Order-preserving key encoding (schema/data/index namespaces, `Key::to_cmp_be_bytes()` keys), schemaless tables, CREATE/INSERT/SELECT/UPDATE/DELETE/ORDER BY, **real transactions** (overlay + `DbSnapshot` + atomic `WriteBatch`, snapshot isolation, true ROLLBACK), **secondary indexes** (`CREATE/DROP INDEX`, index-backed scans), **tenant-namespaced** keyspace, and a **schema-as-data registry**.
+- `bluedb-fts` — BM25 full-text search over object storage: `tantivy` + the vendored `quickwit-directories` read path, hosted on `bluedb-storage`. Indexer (docs→split), split manifest/catalog, multi-split merged search, lazy hotcache open (range-fetch, no whole-split load), the full **index lifecycle** (incremental append, generation-scoped logical deletes so a same-id update is a true in-place replace, merge/compaction that physically drops dead docs), a **GC executor** (delete superseded/orphaned splits + retention policies), a **compaction policy** (count/tombstone-ratio thresholds), **per-field analyzers** (keyword / stemming / whitespace, registered on lazily-opened splits), and **query niceties** (pagination, highlighting, FTS combined with structured filters).
+- `bluedb-sql` — SQL over the substrate: GlueSQL `Store`/`StoreMut` on SlateDB. Order-preserving key encoding (schema/data/index namespaces, `Key::to_cmp_be_bytes()` keys), schemaless tables, CREATE/INSERT/SELECT/UPDATE/DELETE/ORDER BY, **real transactions** (overlay + `DbSnapshot` + atomic `WriteBatch`, snapshot isolation, true ROLLBACK), **secondary indexes** (`CREATE/DROP INDEX`, index-backed scans), enforced **uniqueness** (PK + `UNIQUE` columns), **tenant-namespaced** keyspace, a **schema-as-data registry**, and a **`Database`** handle vending write-serialized, snapshot-isolated **concurrent connections** (a shared write lease prevents lost updates).
 - `bluedb-rest` — PostgREST-style query DSL → SQL translation (filters/operators/order/limit/offset + INSERT/UPDATE/DELETE), with identifier allow-listing and literal escaping. The input-table-v2 API-parity surface; self-contained (no dependency on `bluedb-sql`).
 - _(planned)_ `bluedb-buffer` (ingest), `bluedb-server` (the Rust service), `bluedb-py` (PyO3 bindings for `fx_api`).
 
@@ -48,9 +48,9 @@ which is **Apache-2.0** (relicensed from AGPL after the Datadog acquisition).
 
 ## Status
 
-**The M2 SQL pillar is complete and M1 FTS is feature-complete** (bar GC + query
-niceties). `cargo test --workspace` is green — **~117 tests** — and `cargo clippy
---workspace --all-targets` is clean.
+**M1 (FTS) and M2 (SQL pillar) are both feature-complete.** `cargo test
+--workspace` is green — **140 tests** — and `cargo clippy --workspace
+--all-targets` is clean.
 
 - **FTS (`bluedb-fts`):** vendored read path on the tantivy fork (`6270552`),
   `impl<B: BlobStore> Storage for B` bridge; a real **indexer**; a real **hotcache** +
@@ -77,8 +77,8 @@ niceties). `cargo test --workspace` is green — **~117 tests** — and `cargo c
 
 See [ROADMAP.md](ROADMAP.md) for what's checked off and what remains.
 
-**Next (still open):** wire `bluedb-rest` output into `bluedb-sql` execution; a GC
-executor for compaction's superseded-split list + a compaction trigger policy;
-per-field FTS analyzers; query niceties (pagination/highlighting); then **M3** —
-the service binary and `fx_api` integration via PyO3 (`pyo3-async-runtimes`,
+**Next (still open):** wire `bluedb-rest`'s generated SQL into `bluedb-sql`
+execution end-to-end; an automatic compaction *scheduler* loop (the policy +
+GC executor exist — this is the ops glue that calls them); then **M3** — the
+service binary and `fx_api` integration via PyO3 (`pyo3-async-runtimes`,
 Tokio↔asyncio).
