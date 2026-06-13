@@ -89,6 +89,18 @@ impl Database {
         self.substrate.is_writer()
     }
 
+    /// Flush outstanding writes to object storage (writer only; a no-op on a
+    /// read replica). Use before a graceful step-down so a successor that opens
+    /// the database observes every acked write.
+    pub async fn flush(&self) -> anyhow::Result<()> {
+        if let Ok(db) = self.substrate.require_writer() {
+            db.flush()
+                .await
+                .map_err(|err| anyhow::anyhow!("flush: {err}"))?;
+        }
+        Ok(())
+    }
+
     /// A new connection under the default tenant.
     pub fn connection(&self) -> SlateDbStorage {
         self.connection_for_tenant(DEFAULT_TENANT)

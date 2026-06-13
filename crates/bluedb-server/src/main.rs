@@ -1,72 +1,120 @@
-//! `bluedb-server` binary — opens the database and serves the HTTP API.
+//! `bluedb-server` binary — builds the object store + lease controller and
+//! serves the HTTP API, running a background HA loop for bootstrap/failover.
 //!
 //! Config via env vars:
 //! - `BLUEDB_ADDR`     — listen address (default `0.0.0.0:8080`).
 //! - `BLUEDB_DB_PATH`  — SlateDB path/prefix inside the object store (default `bluedb`).
-//! - `BLUEDB_DATA_DIR` — local directory for the object store; if unset, an
-//!   **in-memory** (ephemeral) store is used. Set it to persist.
-//! - `BLUEDB_NODE_ID`  — this node's id for the writer lease (default `node-0`).
-//! - `BLUEDB_LEASE_TTL_SECS` / `BLUEDB_LEASE_MARGIN_SECS` — lease lifetime and
-//!   self-fence margin (defaults 15 / 5).
-//! - `BLUEDB_START_PASSIVE` — if set, start read-only and wait to be promoted via
-//!   `POST /admin/promote` (default: a standalone node auto-promotes).
-//!
-//! NOTE: the binary uses an in-process [`LocalLeaseProvider`], i.e. it is a
-//! single writer on its own. Real multi-node HA supplies a shared `LeaseProvider`
-//! (Postgres/K8s/NATS) and starts nodes passive; see `bluedb-ha`.
+//!   Also used as the lease `resource` key.
+//! - Object store (first match wins):
+//!   - `BLUEDB_S3_BUCKET` (+ `BLUEDB_S3_ENDPOINT` for MinIO, `BLUEDB_S3_REGION`,
+//!     `BLUEDB_S3_ACCESS_KEY_ID`, `BLUEDB_S3_SECRET_ACCESS_KEY`) — S3/MinIO. The
+//!     shared store for a real multi-node cluster.
+//!   - `BLUEDB_DATA_DIR` — local filesystem (single-node persistence).
+//!   - else — in-memory (ephemeral; single node only).
+//! - `BLUEDB_LEASE_PG_URL` — Postgres lease arbiter for multi-node election; if
+//!   unset, an in-process lease (single writer) is used.
+//! - `BLUEDB_NODE_ID` (default `node-0`), `BLUEDB_LEASE_TTL_SECS` (15),
+//!   `BLUEDB_LEASE_MARGIN_SECS` (5).
+//! - `BLUEDB_START_PASSIVE` — start as a read replica and wait for the HA loop
+//!   (or `POST /admin/promote`) to take the lease; default bootstraps to writer.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use bluedb_ha::{LocalLeaseProvider, SystemClock, WriterController};
+use bluedb_ha::{LeaseProvider, LocalLeaseProvider, PostgresLeaseProvider, SystemClock, WriterController};
 use bluedb_server::{build_app, AppState};
-use bluedb_sql::Database;
-use slatedb::object_store::{local::LocalFileSystem, memory::InMemory, ObjectStore};
-use slatedb::Db;
+use slatedb::object_store::aws::AmazonS3Builder;
+use slatedb::object_store::local::LocalFileSystem;
+use slatedb::object_store::memory::InMemory;
+use slatedb::object_store::ObjectStore;
 
 fn env_secs(key: &str, default: u64) -> Duration {
-    let secs = std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default);
-    Duration::from_secs(secs)
+    Duration::from_secs(std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default))
+}
+
+/// Build the object store from env (S3/MinIO, local FS, or in-memory).
+fn build_object_store() -> anyhow::Result<Arc<dyn ObjectStore>> {
+    if let Ok(bucket) = std::env::var("BLUEDB_S3_BUCKET") {
+        let mut builder = AmazonS3Builder::new()
+            .with_bucket_name(bucket)
+            .with_region(std::env::var("BLUEDB_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string()));
+        if let Ok(endpoint) = std::env::var("BLUEDB_S3_ENDPOINT") {
+            // MinIO / non-AWS: custom endpoint, allow plain HTTP.
+            builder = builder.with_endpoint(endpoint).with_allow_http(true);
+        }
+        if let Ok(key) = std::env::var("BLUEDB_S3_ACCESS_KEY_ID") {
+            builder = builder.with_access_key_id(key);
+        }
+        if let Ok(secret) = std::env::var("BLUEDB_S3_SECRET_ACCESS_KEY") {
+            builder = builder.with_secret_access_key(secret);
+        }
+        eprintln!("bluedb-server: object store = S3/MinIO");
+        Ok(Arc::new(builder.build()?))
+    } else if let Ok(dir) = std::env::var("BLUEDB_DATA_DIR") {
+        std::fs::create_dir_all(&dir)?;
+        eprintln!("bluedb-server: object store = local fs at {dir}");
+        Ok(Arc::new(LocalFileSystem::new_with_prefix(&dir)?))
+    } else {
+        eprintln!("bluedb-server: object store = in-memory (ephemeral, single-node)");
+        Ok(Arc::new(InMemory::new()))
+    }
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let db_path = std::env::var("BLUEDB_DB_PATH").unwrap_or_else(|_| "bluedb".to_string());
-    let object_store: Arc<dyn ObjectStore> = match std::env::var("BLUEDB_DATA_DIR") {
-        Ok(dir) => {
-            std::fs::create_dir_all(&dir)?;
-            Arc::new(LocalFileSystem::new_with_prefix(&dir)?)
+    let object_store = build_object_store()?;
+
+    // Lease arbiter: shared Postgres for real multi-node HA, else in-process.
+    let lease: Arc<dyn LeaseProvider> = match std::env::var("BLUEDB_LEASE_PG_URL") {
+        Ok(url) => {
+            eprintln!("bluedb-server: lease arbiter = postgres");
+            Arc::new(PostgresLeaseProvider::connect(&url, db_path.clone()).await?)
         }
         Err(_) => {
-            eprintln!(
-                "bluedb-server: BLUEDB_DATA_DIR not set — using an in-memory store (data is ephemeral)"
-            );
-            Arc::new(InMemory::new())
+            eprintln!("bluedb-server: lease arbiter = in-process (single writer)");
+            Arc::new(LocalLeaseProvider::new())
         }
     };
 
-    let db = Arc::new(Db::open(db_path, object_store).await?);
-
-    // Single-writer controller (in-process lease for the standalone binary).
     let node_id = std::env::var("BLUEDB_NODE_ID").unwrap_or_else(|_| "node-0".to_string());
+    let ttl = env_secs("BLUEDB_LEASE_TTL_SECS", 15);
     let writer = Arc::new(WriterController::new(
         node_id.clone(),
-        Arc::new(LocalLeaseProvider::new()),
+        lease,
         Arc::new(SystemClock),
-        env_secs("BLUEDB_LEASE_TTL_SECS", 15),
+        ttl,
         env_secs("BLUEDB_LEASE_MARGIN_SECS", 5),
     ));
+    let state = AppState::new(object_store, db_path, writer);
+
+    // Bootstrap: become writer unless asked to start as a replica.
     if std::env::var("BLUEDB_START_PASSIVE").is_err() {
-        writer.promote().await?;
-        eprintln!("bluedb-server: node '{node_id}' promoted to active writer");
+        match state.promote().await {
+            Ok(()) => eprintln!("bluedb-server: node '{node_id}' promoted to writer"),
+            Err(_) => {
+                eprintln!("bluedb-server: node '{node_id}' could not promote (another writer holds the lease) — starting as replica");
+                state.attach_reader().await;
+            }
+        }
     } else {
-        eprintln!("bluedb-server: node '{node_id}' started passive (POST /admin/promote to activate)");
+        eprintln!("bluedb-server: node '{node_id}' starting passive");
+        state.attach_reader().await;
     }
-    writer.clone().spawn_renewal();
 
-    let state = AppState::new(Database::new(db), writer);
+    // Background HA loop: renew while writer, take over on failover, self-fence.
+    let ha_state = state.clone();
+    let tick = std::cmp::max(ttl / 3, Duration::from_secs(1));
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(tick);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            ha_state.ha_tick().await;
+        }
+    });
+
     let app = build_app(state);
-
     let addr = std::env::var("BLUEDB_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     eprintln!("bluedb-server: listening on http://{addr}");

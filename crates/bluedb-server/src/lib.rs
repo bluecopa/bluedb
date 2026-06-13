@@ -3,15 +3,25 @@
 //! A PostgREST-style API: tables are addressed at `/tables/{table}` with
 //! `GET`/`POST`/`PATCH`/`DELETE`, filters/order/limit live in the query string
 //! (parsed by [`bluedb_rest`]), and bodies are JSON. A raw `/sql` endpoint runs
-//! arbitrary SQL (DDL + queries) for setup/admin, and `/health` is a liveness
-//! probe.
+//! arbitrary SQL (DDL + queries) for setup/admin, `/health` is a liveness probe,
+//! and `/admin/{status,promote,demote}` drive the single-writer role.
 //!
-//! Each request borrows a fresh connection from a shared [`Database`], so
-//! requests are isolated and their write transactions serialize on the engine's
-//! write lease (see `bluedb_sql`'s isolation model).
+//! ## Role-aware storage
 //!
-//! The router is built by [`build_app`] from an [`AppState`]; `main` only opens
-//! the database and serves it. Tests drive [`build_app`] directly via
+//! A node binds to the SlateDB database dynamically by **role** (see
+//! [`bluedb_ha`]):
+//! - **promote** → acquire the writer lease, then open a writer `Db` (which
+//!   bumps SlateDB's `writer_epoch`, fencing any dead writer); reads + writes.
+//! - **demote** → release the lease, then open a read-only `DbReader` that
+//!   follows the (new) writer's manifest; reads only.
+//!
+//! So the live [`Database`] handle is swapped under an `RwLock` as the role
+//! changes. Writes require the active writer (`503` otherwise); reads are served
+//! by whatever handle is bound (writer or replica), `503` only if the node has
+//! no database yet (fresh cluster, not promoted).
+//!
+//! The router is built by [`build_app`] from an [`AppState`]; `main` builds the
+//! object store + lease controller and serves. Tests drive [`build_app`] via
 //! `tower::ServiceExt::oneshot` — no socket required.
 
 use std::collections::BTreeMap;
@@ -23,41 +33,147 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Map, Value};
+use tokio::sync::RwLock;
 
 use bluedb_engine::{rest_sql, EngineError};
 use bluedb_ha::{HaError, Status, WriterController};
 use bluedb_rest::{parse_filters, DeleteRequest, InsertRequest, UpdateRequest};
 use bluedb_sql::{Database, SlateDbStorage};
 use gluesql_core::prelude::{Glue, Payload, Value as SqlValue};
+use slatedb::object_store::ObjectStore;
+use slatedb::{Db, DbReader};
 
-/// Shared service state: the database connections are drawn from, plus the
-/// single-writer [`WriterController`] that gates mutations.
+/// Shared service state. Cheap to clone (an `Arc` to the inner state).
 #[derive(Clone)]
 pub struct AppState {
-    db: Database,
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    /// Object store + SlateDB path the writer/reader open against.
+    object_store: Arc<dyn ObjectStore>,
+    db_path: String,
+    /// Single-writer lease controller (HA election + self-fencing).
     writer: Arc<WriterController>,
+    /// The live SQL handle, swapped by role: a writer `Database` when active, a
+    /// read-replica `Database` when passive, `None` before the cluster's first
+    /// writer has created the database.
+    db: RwLock<Option<Database>>,
 }
 
 impl AppState {
-    /// Wrap a [`Database`] and the node's [`WriterController`] for serving.
-    pub fn new(db: Database, writer: Arc<WriterController>) -> Self {
-        Self { db, writer }
+    /// Build state over an object store + SlateDB path + lease controller. The
+    /// node starts with **no** bound database; call [`AppState::promote`] (to
+    /// open a writer) or [`AppState::attach_reader`] (to follow an existing
+    /// writer) — `main` does this at startup.
+    pub fn new(
+        object_store: Arc<dyn ObjectStore>,
+        db_path: impl Into<String>,
+        writer: Arc<WriterController>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                object_store,
+                db_path: db_path.into(),
+                writer,
+                db: RwLock::new(None),
+            }),
+        }
     }
 
-    fn glue(&self) -> Glue<SlateDbStorage> {
-        Glue::new(self.db.connection())
+    /// The lease controller (for the HA background loop in `main`).
+    pub fn writer(&self) -> &Arc<WriterController> {
+        &self.inner.writer
     }
 
-    /// Reject a mutating request unless this node is the active writer. Reads
-    /// never call this — standby (Passive) nodes serve reads, only the elected
-    /// writer mutates (single-writer safety; see [`bluedb_ha`]).
+    /// Acquire the writer lease and open a writer `Db` (creating it if absent).
+    /// Opening the writer bumps SlateDB's `writer_epoch`, fencing a dead writer.
+    pub async fn promote(&self) -> Result<(), AppError> {
+        self.inner.writer.promote().await.map_err(AppError::from_ha)?;
+        let db = Db::open(self.inner.db_path.clone(), self.inner.object_store.clone())
+            .await
+            .map_err(|err| AppError::internal(format!("open writer db: {err}")))?;
+        *self.inner.db.write().await = Some(Database::new(Arc::new(db)));
+        Ok(())
+    }
+
+    /// Release the writer lease and rebind as a read replica (or `None` if the
+    /// database doesn't exist yet). Flushes the writer first so a successor sees
+    /// every acked write (graceful step-down).
+    pub async fn demote(&self) -> Result<(), AppError> {
+        if let Some(db) = self.inner.db.read().await.as_ref() {
+            let _ = db.flush().await; // best-effort durability before handoff
+        }
+        self.inner
+            .writer
+            .demote()
+            .await
+            .map_err(|err| AppError::internal(format!("demote: {err}")))?;
+        self.attach_reader().await;
+        Ok(())
+    }
+
+    /// Bind as a read replica only if currently unbound (avoids reopening a
+    /// reader every HA tick).
+    async fn attach_reader_if_unbound(&self) {
+        if self.inner.db.read().await.is_none() {
+            self.attach_reader().await;
+        }
+    }
+
+    /// One iteration of the background HA control loop, driving automatic
+    /// bootstrap, failover, and self-fencing:
+    /// - **active** → renew the lease; if it was lost, flip to a read replica;
+    /// - **passive** → try to take the lease (first-node bootstrap, or failover
+    ///   after the previous writer's lease expired); if denied, ensure we are at
+    ///   least serving reads as a replica.
+    pub async fn ha_tick(&self) {
+        if self.inner.writer.is_active() {
+            match self.inner.writer.renew_once().await {
+                Ok(true) => {}
+                _ => self.attach_reader().await, // lost the lease → become a replica
+            }
+        } else {
+            match self.promote().await {
+                Ok(()) => {} // took over (bootstrap or failover)
+                Err(_) => self.attach_reader_if_unbound().await,
+            }
+        }
+    }
+
+    /// Bind (or rebind) this node as a read replica following the writer's
+    /// manifest. If the database doesn't exist yet, leaves the node unbound.
+    pub async fn attach_reader(&self) {
+        let bound = DbReader::builder(self.inner.db_path.clone(), self.inner.object_store.clone())
+            .build()
+            .await
+            .ok()
+            .map(|reader| Database::reader(Arc::new(reader)));
+        *self.inner.db.write().await = bound;
+    }
+
+    /// A connection to the currently-bound database, or `503` if unbound.
+    async fn connection(&self) -> Result<SlateDbStorage, AppError> {
+        match self.inner.db.read().await.as_ref() {
+            Some(db) => Ok(db.connection()),
+            None => Err(AppError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                message: "node has no database yet (no writer has been promoted)".to_string(),
+            }),
+        }
+    }
+
+    /// Reject a mutating request unless this node is the active writer.
     fn require_active(&self) -> Result<(), AppError> {
-        if self.writer.is_active() {
+        if self.inner.writer.is_active() {
             Ok(())
         } else {
             Err(AppError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
-                message: format!("node '{}' is passive (not the active writer)", self.writer.node_id()),
+                message: format!(
+                    "node '{}' is passive (not the active writer)",
+                    self.inner.writer.node_id()
+                ),
             })
         }
     }
@@ -84,27 +200,26 @@ async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
 }
 
-/// `POST /sql` — run raw SQL (DDL + queries). Body is the SQL text. Gated to the
-/// active writer (it can mutate; SELECT-only callers should use `GET /tables`).
+/// `POST /sql` — run raw SQL (DDL + queries). Gated to the active writer.
 async fn exec_sql(State(state): State<AppState>, body: String) -> Result<Json<Value>, AppError> {
     state.require_active()?;
-    let payloads = state.glue().execute(&body).await.map_err(EngineError::from)?;
+    let mut glue = Glue::new(state.connection().await?);
+    let payloads = glue.execute(&body).await.map_err(EngineError::from)?;
     Ok(Json(payloads_to_json(payloads)))
 }
 
-/// `GET /tables/{table}?<filters>` — PostgREST SELECT.
+/// `GET /tables/{table}?<filters>` — PostgREST SELECT (served by writer or replica).
 async fn select(
     State(state): State<AppState>,
     Path(table): Path<String>,
     RawQuery(query): RawQuery,
 ) -> Result<Json<Value>, AppError> {
-    let mut glue = state.glue();
+    let mut glue = Glue::new(state.connection().await?);
     let payloads = rest_sql::execute_query_str(&mut glue, &table, query.as_deref().unwrap_or("")).await?;
     Ok(Json(payloads_to_json(payloads)))
 }
 
-/// `POST /tables/{table}` — INSERT. Body is a JSON object or an array of
-/// objects; each object's keys are the columns.
+/// `POST /tables/{table}` — INSERT (JSON object or array of objects).
 async fn insert(
     State(state): State<AppState>,
     Path(table): Path<String>,
@@ -112,13 +227,12 @@ async fn insert(
 ) -> Result<Json<Value>, AppError> {
     state.require_active()?;
     let req = build_insert(table, body)?;
-    let mut glue = state.glue();
+    let mut glue = Glue::new(state.connection().await?);
     let payloads = rest_sql::execute_insert(&mut glue, &req).await?;
     Ok(Json(payloads_to_json(payloads)))
 }
 
-/// `PATCH /tables/{table}?<filters>` — UPDATE. Body is a JSON object of
-/// `column: value` assignments.
+/// `PATCH /tables/{table}?<filters>` — UPDATE (JSON assignments body).
 async fn update(
     State(state): State<AppState>,
     Path(table): Path<String>,
@@ -132,7 +246,7 @@ async fn update(
         .map(|(col, value)| Ok((col, json_scalar_to_dsl(&value)?)))
         .collect::<Result<Vec<_>, AppError>>()?;
     let req = UpdateRequest { table, assignments, filters };
-    let mut glue = state.glue();
+    let mut glue = Glue::new(state.connection().await?);
     let payloads = rest_sql::execute_update(&mut glue, &req).await?;
     Ok(Json(payloads_to_json(payloads)))
 }
@@ -146,42 +260,28 @@ async fn delete_rows(
     state.require_active()?;
     let filters = parse_filters(query.as_deref().unwrap_or("")).map_err(EngineError::from)?;
     let req = DeleteRequest { table, filters };
-    let mut glue = state.glue();
+    let mut glue = Glue::new(state.connection().await?);
     let payloads = rest_sql::execute_delete(&mut glue, &req).await?;
     Ok(Json(payloads_to_json(payloads)))
 }
 
 // --- admin / high-availability control --------------------------------------
 
-/// `GET /admin/status` — this node's writer role (`active`/`passive`), fencing
-/// epoch, and lease expiry.
+/// `GET /admin/status` — this node's writer role, fencing epoch, lease expiry.
 async fn admin_status(State(state): State<AppState>) -> Json<Value> {
-    Json(status_json(&state.writer.status()))
+    Json(status_json(&state.inner.writer.status()))
 }
 
-/// `POST /admin/promote` — try to become the active writer (acquire the lease).
-/// `409 Conflict` if another node holds it.
+/// `POST /admin/promote` — acquire the lease + open the writer database.
 async fn admin_promote(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    match state.writer.promote().await {
-        Ok(_) => Ok(Json(status_json(&state.writer.status()))),
-        Err(HaError::LeaseHeldByAnother) => Err(AppError {
-            status: StatusCode::CONFLICT,
-            message: "cannot promote: the lease is held by another node".to_string(),
-        }),
-        Err(HaError::Provider(err)) => Err(AppError {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: err.to_string(),
-        }),
-    }
+    state.promote().await?;
+    Ok(Json(status_json(&state.inner.writer.status())))
 }
 
-/// `POST /admin/demote` — step down to passive (release the lease).
+/// `POST /admin/demote` — release the lease + rebind as a read replica.
 async fn admin_demote(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    state.writer.demote().await.map_err(|err| AppError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        message: err.to_string(),
-    })?;
-    Ok(Json(status_json(&state.writer.status())))
+    state.demote().await?;
+    Ok(Json(status_json(&state.inner.writer.status())))
 }
 
 fn status_json(status: &Status) -> Value {
@@ -243,7 +343,7 @@ fn build_insert(table: String, body: Value) -> Result<InsertRequest, AppError> {
 /// Render a JSON scalar into the DSL string form `bluedb-rest` expects. (Like
 /// PostgREST, values are stringly-typed: `render_value` re-types them — numeric
 /// text → numeric literal, `true`/`false` → bool, `null` → NULL, else a quoted
-/// string. So a JSON string that *looks* numeric is treated as numeric.)
+/// string.)
 fn json_scalar_to_dsl(value: &Value) -> Result<String, AppError> {
     match value {
         Value::String(s) => Ok(s.clone()),
@@ -302,8 +402,7 @@ fn payload_to_json(payload: Payload) -> Value {
 }
 
 /// Map a GlueSQL scalar to clean JSON. Common scalars map directly; exotic types
-/// (decimal/date/uuid/list/map/...) fall back to their debug rendering as a
-/// string rather than GlueSQL's tagged serde form.
+/// fall back to a debug string rather than GlueSQL's tagged serde form.
 fn sql_value_to_json(value: &SqlValue) -> Value {
     match value {
         SqlValue::Null => Value::Null,
@@ -326,6 +425,7 @@ fn sql_value_to_json(value: &SqlValue) -> Value {
 // --- errors -----------------------------------------------------------------
 
 /// An HTTP error: a status plus a message rendered as `{"error": ...}`.
+#[derive(Debug)]
 pub struct AppError {
     status: StatusCode,
     message: String,
@@ -338,14 +438,30 @@ impl AppError {
             message: message.into(),
         }
     }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: message.into(),
+        }
+    }
+
+    /// Map a lease error: another node holds it → `409 Conflict`; otherwise `500`.
+    fn from_ha(err: HaError) -> Self {
+        match err {
+            HaError::LeaseHeldByAnother => Self {
+                status: StatusCode::CONFLICT,
+                message: "cannot promote: the lease is held by another node".to_string(),
+            },
+            HaError::Provider(err) => Self::internal(err.to_string()),
+        }
+    }
 }
 
 impl From<EngineError> for AppError {
     fn from(err: EngineError) -> Self {
         let status = match err {
-            // Client errors: a malformed DSL request or a rejected SQL statement.
             EngineError::Rest(_) | EngineError::Sql(_) => StatusCode::BAD_REQUEST,
-            // Infrastructure (blob I/O, etc.).
             EngineError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         Self {
