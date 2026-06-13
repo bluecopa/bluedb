@@ -800,4 +800,25 @@ impl Metadata for SlateDbStorage {}
 impl CustomFunction for SlateDbStorage {}
 impl CustomFunctionMut for SlateDbStorage {}
 impl AlterTable for SlateDbStorage {}
-impl Planner for SlateDbStorage {}
+// Override the default planner to add equi-join predicate pushdown before
+// gluesql's `plan_join` runs: the comma-join shim leaves join keys in the
+// `WHERE` as `... JOIN b ON TRUE`, and pushing them into the `ON` lets
+// `plan_join` build hash joins instead of nested-loop cartesian products.
+// All passes below are gluesql's own public plan helpers; this is the same
+// pipeline as the default `plan()` with our pass inserted.
+#[async_trait]
+impl Planner for SlateDbStorage {
+    async fn plan(
+        &self,
+        statement: gluesql_core::ast::Statement,
+    ) -> GlueResult<gluesql_core::ast::Statement> {
+        use gluesql_core::plan::{fetch_schema_map, plan_join, plan_primary_key, validate};
+
+        let schema_map = fetch_schema_map(self, &statement).await?;
+        validate(&schema_map, &statement)?;
+        let statement = crate::pushdown::pushdown_equijoins(&schema_map, statement);
+        let statement = plan_primary_key(&schema_map, statement);
+        let statement = plan_join(&schema_map, statement);
+        Ok(statement)
+    }
+}

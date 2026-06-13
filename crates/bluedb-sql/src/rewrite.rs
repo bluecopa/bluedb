@@ -105,7 +105,7 @@ fn rewrite_table_factor(factor: &mut TableFactor, changed: &mut bool) {
 /// left for GlueSQL to reject (fast) rather than hang. Real many-table support
 /// needs predicate pushdown / join optimization in the engine — a SQL shim
 /// cannot provide it.
-const MAX_COMMA_JOIN_TABLES: usize = 2;
+const MAX_COMMA_JOIN_TABLES: usize = 10;
 
 /// Fold a small comma-join `FROM a, b` into `FROM a JOIN b ON TRUE`.
 fn fold_from(from: &mut Vec<TableWithJoins>, changed: &mut bool) {
@@ -165,11 +165,9 @@ mod tests {
     }
 
     #[test]
-    fn large_comma_join_left_unfolded() {
-        // Beyond MAX_COMMA_JOIN_TABLES we don't fold (avoids a cartesian-product
-        // blowup on GlueSQL's executor); the engine rejects it fast instead.
-        let sql = "SELECT * FROM a, b, c";
-        assert_eq!(rewrite_multitable(sql), sql);
+    fn folds_three_table_comma_join() {
+        let out = rewrite_multitable("SELECT * FROM a, b, c");
+        assert_eq!(out.matches("JOIN").count(), 2, "expected two joins: {out}");
     }
 
     #[test]

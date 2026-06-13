@@ -64,6 +64,7 @@
 mod connection;
 mod error;
 mod keyspace;
+mod pushdown;
 mod registry;
 mod rewrite;
 mod storage;
