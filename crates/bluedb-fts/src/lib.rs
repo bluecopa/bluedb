@@ -29,5 +29,19 @@
 /// [`vendor::BundleDirectory`] can open.
 pub mod split;
 
+/// Indexing pipeline — build a tantivy index from documents, pack it into a
+/// split (with or without a real hotcache).
+pub mod indexer;
+
+/// Lazy split open — range-fetch only the footer + hotcache, then serve reads
+/// on demand against the split blob (no `get_all`).
+pub mod open;
+
+/// Split **manifest** — the serde-serializable catalog of an index's splits.
+pub mod manifest;
+
+/// Multi-split search — run a BM25 query across N splits and merge top-K.
+pub mod search;
+
 #[path = "../vendor/mod.rs"]
 pub mod vendor;

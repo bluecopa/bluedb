@@ -1,36 +1,37 @@
 # bluedb — Production Readiness Roadmap
 
-Current state: a **validated spike**. Working today (`cargo test -p bluedb-fts`, 21 tests):
-- ✅ `BlobStore` seam + `SlateDbBlobStore` (slatedb 0.13).
+Current state: **M1 FTS core + the M2 SQL pillar exist and pass tests** (`cargo test --workspace`, 45 tests; `cargo clippy --workspace --all-targets` clean). Working today:
+- ✅ `BlobStore` seam + `SlateDbBlobStore` (slatedb 0.13); durability proven across `Db` reopen; `BlobStoreMut` write seam; `ChunkedBlobStore` large-value layer.
 - ✅ Vendored Quickwit read path (Bundle/Storage/Hot/Caching directories) on the tantivy fork, bridged to `BlobStore`.
-- ✅ `split::pack_split` (split writer) and an end-to-end BM25 query over a split stored in SlateDB.
+- ✅ FTS: real indexer (docs→index→split), real hotcache + lazy range-fetch open, split manifest/catalog, multi-split BM25 search with merged ranking.
+- ✅ SQL: GlueSQL `Store`/`StoreMut` over SlateDB — order-preserving key encoding, CREATE/INSERT/SELECT-WHERE/UPDATE/DELETE/ORDER BY, schemaless tables.
 - ✅ Apache-2.0 attribution/NOTICE for vendored code.
 
-Everything below is **not done**. Ordered by build-order milestone; cross-cutting tracks must advance alongside.
+Items below marked ✅ landed in the M1+M2 parallel build; unchecked items remain. Ordered by build-order milestone; cross-cutting tracks must advance alongside.
 
 ---
 
 ## M1 — FTS engine to usable
 
-- [ ] Indexing pipeline: documents → tantivy index → split (not just `pack_split`).
-- [ ] Schema/field mapping from a table's searchable columns; per-field analyzers / tokenizers / language config.
-- [ ] Incremental indexing (add docs over time without full rebuild).
-- [ ] Split **manifest/catalog**: which splits exist per tenant/index, with byte ranges, generation, doc count, time window.
-- [ ] Multi-split search (open + query across a tenant's splits; merge ranked results).
+- [x] Indexing pipeline: documents → tantivy index → split (`indexer` module — `Indexer` / `build_split{,_with_hotcache}`).
+- [ ] Schema/field mapping from a table's searchable columns; per-field analyzers / tokenizers / language config. *(schema is passed in; no per-field analyzer config layer yet.)*
+- [ ] Incremental indexing (add docs over time without full rebuild). *(each `build` is a fresh index.)*
+- [x] Split **manifest/catalog** (`manifest` module — `SplitMeta`/`Manifest`, load/store over the substrate).
+- [x] Multi-split search (`search` module — `multi_split_search`, merged descending-score ranking with deterministic tie-break).
 - [ ] Merge / compaction policy (bound split count and query fan-out).
 - [ ] Deletes & updates (tombstones + merge).
-- [ ] **Lazy reads + hotcache**: write a real hotcache (`write_hotcache`), open via `HotDirectory` over `StorageDirectory`, range-fetch footer+hotcache instead of reading the whole split into memory.
+- [x] **Lazy reads + hotcache** (`open::open_split_lazy` + `SplitBlobDirectory`: real hotcache via vendored `write_hotcache`, `HotDirectory`→`CachingDirectory`→`StorageDirectory`, range-fetch — never `get_all`).
 - [ ] GC of orphaned / superseded / expired splits (incl. the hot-window retention strategy).
 - [ ] Query features: pagination, highlighting, FTS predicates combined with structured filters.
 
-## M2 — SQL pillar (GlueSQL over SlateDB) — *not started*
+## M2 — SQL pillar (GlueSQL over SlateDB)
 
-- [ ] Implement GlueSQL `Store`/`StoreMut` over SlateDB (`get`/`put`/`delete`/ordered `scan`); key encoding (table + pk → key), values, schemaless tables.
-- [ ] Secondary indexes (GlueSQL `Index` trait).
-- [ ] Transactions / isolation mapped onto SlateDB's single-writer model (the genuine hard design question).
+- [x] Implement GlueSQL `Store`/`StoreMut` over SlateDB (`bluedb-sql`: `fetch_schema`/`fetch_all_schemas`/`fetch_data`/`scan_data` + `insert_schema`/`delete_schema`/`append_data`/`insert_data`/`delete_data`). Order-preserving key encoding via `Key::to_cmp_be_bytes()`; schemaless tables supported. Pinned `gluesql-core =0.19.0`.
+- [ ] Secondary indexes (GlueSQL `Index` trait). *(stubbed — uses gluesql "not supported" defaults.)*
+- [ ] Transactions / isolation mapped onto SlateDB's single-writer model (the genuine hard design question). *(currently autocommit no-op; `BEGIN`/`COMMIT`/rollback not real.)*
 - [ ] Schema-as-data registry + write-time validation (keeps typed-schema UX without DDL).
 - [ ] PostgREST-DSL → SQL translation layer (input-table-v2 API parity).
-- [ ] Multi-tenant key prefixing for the SQL keyspace.
+- [ ] Multi-tenant key prefixing for the SQL keyspace. *(key encoding has table+pk namespacing; tenant prefix not yet layered in.)*
 - [ ] (Scope note: GlueSQL is OLTP/row-oriented — for the transactional facts store, **not** analytics. Heavy analytics stays in DuckDB/DuckLake.)
 
 ## M3 — Service & integration
@@ -54,10 +55,10 @@ Everything below is **not done**. Ordered by build-order milestone; cross-cuttin
 ## Cross-cutting (advance alongside every milestone)
 
 ### Storage / SlateDB
-- [ ] Durability round-trip proven: reopen the `Db` and read after restart (current tests put+get in one instance — memtable only).
-- [ ] `Db` lifecycle management (open/close, background flush/compaction, graceful shutdown).
+- [x] Durability round-trip proven: reopen the `Db` and read after restart (`durability_survives_reopen` over `LocalFileSystem`). Note: WAL is on by default (no `wal_disable` feature); a bare put-then-drop is **not** guaranteed durable — an explicit `flush()`/`close()` is required for determinism.
+- [x] `Db` lifecycle management (`SlateDbBlobStore::open`/`open_local`/`open_in_memory`/`flush`/`shutdown`).
 - [ ] SlateDB settings tuned per workload (block cache / Foyer, flush interval, L0 SST size).
-- [ ] Fix the `get_range` KV caveat (chunk large values across keys, or footer-range fetch).
+- [x] Fix the `get_range` KV caveat — `ChunkedBlobStore` splits large values across ordered keys + manifest; range reads fetch only overlapping chunks. *(opt-in layer; not yet wired under the FTS/SQL read paths.)*
 
 ### Robustness
 - [ ] Typed error taxonomy at lib boundaries (replace stringly `anyhow`/`unwrap`/`expect`).

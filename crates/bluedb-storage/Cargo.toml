@@ -12,4 +12,5 @@ bytes       = { workspace = true }
 slatedb     = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+tokio    = { workspace = true }
+tempfile = { workspace = true }

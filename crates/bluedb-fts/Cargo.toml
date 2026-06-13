@@ -18,8 +18,9 @@ postcard    = { workspace = true }
 thiserror   = { workspace = true }
 time        = { workspace = true }
 tracing     = { workspace = true }
+# The indexer builds tantivy indexes in a tempdir before packing them.
+tempfile    = { workspace = true }
 
 [dev-dependencies]
 tokio    = { workspace = true }
 slatedb  = { workspace = true }
-tempfile = { workspace = true }
