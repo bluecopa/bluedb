@@ -817,6 +817,7 @@ impl Planner for SlateDbStorage {
         let schema_map = fetch_schema_map(self, &statement).await?;
         validate(&schema_map, &statement)?;
         let statement = crate::pushdown::pushdown_equijoins(&schema_map, statement);
+        crate::pushdown::reject_cross_products(&statement)?;
         let statement = plan_primary_key(&schema_map, statement);
         let statement = plan_join(&schema_map, statement);
         Ok(statement)

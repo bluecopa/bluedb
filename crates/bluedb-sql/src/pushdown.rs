@@ -22,7 +22,8 @@ use gluesql_core::ast::{
     BinaryOperator, Expr, Join, JoinConstraint, JoinOperator, Query, Select, SetExpr, Statement,
     TableFactor,
 };
-use gluesql_core::data::Schema;
+use gluesql_core::data::{Schema, Value};
+use gluesql_core::error::{Error, Result as GlueResult};
 
 type SchemaMap = HashMap<String, Schema>;
 
@@ -32,6 +33,39 @@ pub fn pushdown_equijoins(schema_map: &SchemaMap, statement: Statement) -> State
     match statement {
         Statement::Query(query) => Statement::Query(rewrite_query(schema_map, query)),
         other => other,
+    }
+}
+
+/// Fast-fail any inner join left without a join key after pushdown — `ON TRUE`
+/// over multiple tables would materialize a full cartesian product on GlueSQL's
+/// nested-loop executor. Rejecting at plan time means it fails instantly,
+/// before a single row is built.
+pub fn reject_cross_products(statement: &Statement) -> GlueResult<()> {
+    let Statement::Query(query) = statement else {
+        return Ok(());
+    };
+    let SetExpr::Select(select) = &query.body else {
+        return Ok(());
+    };
+    for join in &select.from.joins {
+        if let JoinOperator::Inner(JoinConstraint::On(on)) = &join.join_operator {
+            if is_trivially_true(on) {
+                return Err(Error::StorageMsg(
+                    "unsupported: multi-table query without an equi-join key \
+                     (would materialize a cartesian product)"
+                        .to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_trivially_true(expr: &Expr) -> bool {
+    match expr {
+        Expr::Value(Value::Bool(true)) => true,
+        Expr::Nested(inner) => is_trivially_true(inner),
+        _ => false,
     }
 }
 
