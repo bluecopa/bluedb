@@ -22,7 +22,7 @@ use anyhow::{anyhow, Result};
 use slatedb::object_store::local::LocalFileSystem;
 use slatedb::object_store::memory::InMemory;
 use slatedb::object_store::ObjectStore;
-use slatedb::Db;
+use slatedb::{Db, DbReader};
 
 use crate::SlateDbBlobStore;
 
@@ -65,26 +65,43 @@ impl SlateDbBlobStore {
         Self::open("bluedb", Arc::new(InMemory::new())).await
     }
 
+    /// Open a **read-only** [`SlateDbBlobStore`] replica at `db_path` over
+    /// `object_store`. It follows the writer's manifest and serves reads; writes
+    /// ([`BlobStoreMut`](crate::BlobStoreMut)) error. The database must already
+    /// exist (a writer must have created it), exactly as in the HA model where a
+    /// standby reads the active node's database.
+    pub async fn open_reader(
+        db_path: impl Into<String>,
+        object_store: Arc<dyn ObjectStore>,
+    ) -> Result<Self> {
+        let path = db_path.into();
+        let reader = DbReader::builder(path.clone(), object_store)
+            .build()
+            .await
+            .map_err(|err| anyhow!("slatedb reader open failed for {path}: {err}"))?;
+        Ok(Self::from_reader(Arc::new(reader)))
+    }
+
     /// Flush outstanding writes to object storage, keeping the handle open.
     ///
     /// After this returns `Ok`, every prior `put`/`delete` is durable: a fresh
-    /// `Db` opened at the same path will observe them.
+    /// `Db` opened at the same path will observe them. Errors on a read replica
+    /// (there is nothing to flush).
     pub async fn flush(&self) -> Result<()> {
-        self.db()
+        self.substrate()
+            .require_writer()?
             .flush()
             .await
             .map_err(|err| anyhow!("slatedb flush failed: {err}"))
     }
 
-    /// Gracefully shut down: flush memtables to L0 and close the `Db`.
+    /// Gracefully shut down: close the underlying handle (a writer flushes
+    /// memtables to L0; a reader just releases its checkpoint).
     ///
-    /// Consumes the wrapper. If other clones of the underlying `Arc<Db>` are
-    /// still alive this still issues the close on the shared handle; callers who
-    /// need a hard guarantee should hold the sole reference.
+    /// Consumes the wrapper. If other clones of the underlying handle are still
+    /// alive this still issues the close on the shared handle; callers who need a
+    /// hard guarantee should hold the sole reference.
     pub async fn shutdown(self) -> Result<()> {
-        self.db()
-            .close()
-            .await
-            .map_err(|err| anyhow!("slatedb close failed: {err}"))
+        self.substrate().close().await
     }
 }

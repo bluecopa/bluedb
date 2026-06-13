@@ -52,6 +52,9 @@ pub trait BlobStoreMut: BlobStore {
     async fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Bytes)>>;
 }
 
+mod substrate;
+pub use substrate::Substrate;
+
 mod slatedb_backend;
 pub use slatedb_backend::SlateDbBlobStore;
 
