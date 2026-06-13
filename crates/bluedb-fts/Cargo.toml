@@ -1,0 +1,25 @@
+[package]
+name = "bluedb-fts"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+description = "BM25 full-text search over object storage (tantivy + vendored quickwit-directories read path)."
+
+[dependencies]
+bluedb-storage = { workspace = true }
+# Vendored quickwit-directories read path (crates/bluedb-fts/vendor/):
+tantivy     = { workspace = true }
+async-trait = { workspace = true }
+anyhow      = { workspace = true }
+bytes       = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+postcard    = { workspace = true }
+thiserror   = { workspace = true }
+time        = { workspace = true }
+tracing     = { workspace = true }
+
+[dev-dependencies]
+tokio    = { workspace = true }
+slatedb  = { workspace = true }
+tempfile = { workspace = true }

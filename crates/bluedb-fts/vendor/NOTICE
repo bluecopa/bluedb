@@ -1,0 +1,26 @@
+bluedb-fts/vendor
+==================
+
+This directory contains source files copied (and minimally adapted) from:
+
+    Quickwit — https://github.com/quickwit-oss/quickwit
+    Copyright 2021-Present Datadog, Inc.
+    Licensed under the Apache License, Version 2.0.
+
+Specifically, a minimal subset of the `quickwit-directories` crate (the
+object-storage tantivy `Directory` read path) plus a thin slice of type
+definitions from `quickwit-storage` and `quickwit-common`.
+
+Each copied file retains its original Apache-2.0 license header verbatim, as
+required by the license. The full Apache-2.0 text is in `LICENSE-APACHE` at the
+repository root (TODO: add it).
+
+NOT used / NOT copied:
+  - The crates.io `quickwit-*` packages (v0.3.0, 2022) are AGPL-3.0 and stale;
+    they are deliberately avoided. All copies are taken from `quickwit@main`,
+    which is Apache-2.0.
+
+Adaptations from upstream:
+  - `quickwit_storage::Storage` is replaced/adapted onto `bluedb_storage::BlobStore`.
+  - `CacheMetrics` is replaced with a local no-dependency stub.
+  - The write path (split building, AWS SDK) is excluded.

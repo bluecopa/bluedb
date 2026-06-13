@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0" # bluedb's own code; vendored Quickwit files keep their own Apache-2.0 headers
+rust-version = "1.80"
+
+[workspace.dependencies]
+# --- internal crates ---
+bluedb-storage = { path = "crates/bluedb-storage" }
+
+# --- external ---
+# tantivy MUST match the exact rev quickwit-oss/quickwit@main pins — the
+# vendored quickwit-directories files are written against that Directory API.
+# Mirrors quickwit/Cargo.toml:405.
+tantivy = { git = "https://github.com/quickwit-oss/tantivy", rev = "6270552", default-features = false, features = ["lz4-compression", "mmap", "quickwit", "zstd-compression", "columnar-zstd-compression"] }
+slatedb      = "0.13"   # KV on object storage; re-exports its backend as slatedb::object_store
+# The following mirror the exact version+features from quickwit/Cargo.toml so the
+# vendored read-path code (crates/bluedb-fts/vendor/) compiles unchanged.
+tokio        = { version = "1.52", features = ["full"] }
+async-trait  = "0.1"
+anyhow       = "1"
+thiserror    = "2"
+serde        = { version = "1.0.228", features = ["derive", "rc"] }
+serde_json   = "1.0"
+postcard     = { version = "1.1", features = ["use-std"], default-features = false }
+bytes        = { version = "1", features = ["serde"] }
+time         = { version = "0.3", features = ["std", "formatting", "macros"] }
+tracing      = "0.1"
+tempfile     = "3"
