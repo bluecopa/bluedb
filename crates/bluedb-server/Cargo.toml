@@ -13,6 +13,7 @@ path = "src/main.rs"
 bluedb-engine = { workspace = true }
 bluedb-sql    = { workspace = true }
 bluedb-rest   = { workspace = true }
+bluedb-ha     = { workspace = true }
 gluesql-core  = "=0.19.0"
 slatedb       = { workspace = true }
 axum          = "0.8"

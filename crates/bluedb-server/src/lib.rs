@@ -15,6 +15,7 @@
 //! `tower::ServiceExt::oneshot` — no socket required.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use axum::extract::{Path, RawQuery, State};
 use axum::http::StatusCode;
@@ -24,24 +25,41 @@ use axum::{Json, Router};
 use serde_json::{json, Map, Value};
 
 use bluedb_engine::{rest_sql, EngineError};
+use bluedb_ha::{HaError, Status, WriterController};
 use bluedb_rest::{parse_filters, DeleteRequest, InsertRequest, UpdateRequest};
 use bluedb_sql::{Database, SlateDbStorage};
 use gluesql_core::prelude::{Glue, Payload, Value as SqlValue};
 
-/// Shared service state: the database handle connections are drawn from.
+/// Shared service state: the database connections are drawn from, plus the
+/// single-writer [`WriterController`] that gates mutations.
 #[derive(Clone)]
 pub struct AppState {
     db: Database,
+    writer: Arc<WriterController>,
 }
 
 impl AppState {
-    /// Wrap a [`Database`] for serving.
-    pub fn new(db: Database) -> Self {
-        Self { db }
+    /// Wrap a [`Database`] and the node's [`WriterController`] for serving.
+    pub fn new(db: Database, writer: Arc<WriterController>) -> Self {
+        Self { db, writer }
     }
 
     fn glue(&self) -> Glue<SlateDbStorage> {
         Glue::new(self.db.connection())
+    }
+
+    /// Reject a mutating request unless this node is the active writer. Reads
+    /// never call this — standby (Passive) nodes serve reads, only the elected
+    /// writer mutates (single-writer safety; see [`bluedb_ha`]).
+    fn require_active(&self) -> Result<(), AppError> {
+        if self.writer.is_active() {
+            Ok(())
+        } else {
+            Err(AppError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                message: format!("node '{}' is passive (not the active writer)", self.writer.node_id()),
+            })
+        }
     }
 }
 
@@ -54,6 +72,9 @@ pub fn build_app(state: AppState) -> Router {
             "/tables/{table}",
             get(select).post(insert).patch(update).delete(delete_rows),
         )
+        .route("/admin/status", get(admin_status))
+        .route("/admin/promote", post(admin_promote))
+        .route("/admin/demote", post(admin_demote))
         .with_state(state)
 }
 
@@ -63,8 +84,10 @@ async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
 }
 
-/// `POST /sql` — run raw SQL (DDL + queries). Body is the SQL text.
+/// `POST /sql` — run raw SQL (DDL + queries). Body is the SQL text. Gated to the
+/// active writer (it can mutate; SELECT-only callers should use `GET /tables`).
 async fn exec_sql(State(state): State<AppState>, body: String) -> Result<Json<Value>, AppError> {
+    state.require_active()?;
     let payloads = state.glue().execute(&body).await.map_err(EngineError::from)?;
     Ok(Json(payloads_to_json(payloads)))
 }
@@ -87,6 +110,7 @@ async fn insert(
     Path(table): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, AppError> {
+    state.require_active()?;
     let req = build_insert(table, body)?;
     let mut glue = state.glue();
     let payloads = rest_sql::execute_insert(&mut glue, &req).await?;
@@ -101,6 +125,7 @@ async fn update(
     RawQuery(query): RawQuery,
     Json(assignments): Json<Map<String, Value>>,
 ) -> Result<Json<Value>, AppError> {
+    state.require_active()?;
     let filters = parse_filters(query.as_deref().unwrap_or("")).map_err(EngineError::from)?;
     let assignments = assignments
         .into_iter()
@@ -118,11 +143,54 @@ async fn delete_rows(
     Path(table): Path<String>,
     RawQuery(query): RawQuery,
 ) -> Result<Json<Value>, AppError> {
+    state.require_active()?;
     let filters = parse_filters(query.as_deref().unwrap_or("")).map_err(EngineError::from)?;
     let req = DeleteRequest { table, filters };
     let mut glue = state.glue();
     let payloads = rest_sql::execute_delete(&mut glue, &req).await?;
     Ok(Json(payloads_to_json(payloads)))
+}
+
+// --- admin / high-availability control --------------------------------------
+
+/// `GET /admin/status` — this node's writer role (`active`/`passive`), fencing
+/// epoch, and lease expiry.
+async fn admin_status(State(state): State<AppState>) -> Json<Value> {
+    Json(status_json(&state.writer.status()))
+}
+
+/// `POST /admin/promote` — try to become the active writer (acquire the lease).
+/// `409 Conflict` if another node holds it.
+async fn admin_promote(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    match state.writer.promote().await {
+        Ok(_) => Ok(Json(status_json(&state.writer.status()))),
+        Err(HaError::LeaseHeldByAnother) => Err(AppError {
+            status: StatusCode::CONFLICT,
+            message: "cannot promote: the lease is held by another node".to_string(),
+        }),
+        Err(HaError::Provider(err)) => Err(AppError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: err.to_string(),
+        }),
+    }
+}
+
+/// `POST /admin/demote` — step down to passive (release the lease).
+async fn admin_demote(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    state.writer.demote().await.map_err(|err| AppError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: err.to_string(),
+    })?;
+    Ok(Json(status_json(&state.writer.status())))
+}
+
+fn status_json(status: &Status) -> Value {
+    json!({
+        "node_id": status.node_id,
+        "role": status.role.as_str(),
+        "epoch": status.epoch,
+        "lease_expires_at_millis": status.lease_expires_at_millis,
+    })
 }
 
 // --- request/response mapping ----------------------------------------------

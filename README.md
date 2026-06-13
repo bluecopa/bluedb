@@ -34,8 +34,9 @@ slice of that substrate.
 - `bluedb-sql` — SQL over the substrate: GlueSQL `Store`/`StoreMut` on SlateDB. Order-preserving key encoding (schema/data/index namespaces, `Key::to_cmp_be_bytes()` keys), schemaless tables, CREATE/INSERT/SELECT/UPDATE/DELETE/ORDER BY, **real transactions** (overlay + `DbSnapshot` + atomic `WriteBatch`, snapshot isolation, true ROLLBACK), **secondary indexes** (`CREATE/DROP INDEX`, index-backed scans), enforced **uniqueness** (PK + `UNIQUE` columns), **tenant-namespaced** keyspace, a **schema-as-data registry**, and a **`Database`** handle vending write-serialized, snapshot-isolated **concurrent connections** (a shared write lease prevents lost updates).
 - `bluedb-rest` — PostgREST-style query DSL → SQL translation (filters/operators/order/limit/offset + INSERT/UPDATE/DELETE), with identifier allow-listing and literal escaping. The input-table-v2 API-parity surface; self-contained (no dependency on `bluedb-sql`).
 - `bluedb-engine` — the **facade** that composes the pillars (M3): `rest_sql` runs a `bluedb-rest` DSL request end-to-end against `bluedb-sql`; `FtsIndex` is a full-text engine over one index (append / update / delete / search) with a policy-driven compaction coordinator + background scheduler (manifest → `CompactionPolicy` → `Compactor` → persist → GC). The service wraps this.
-- `bluedb-server` — the **HTTP/REST service** (axum) over `bluedb-engine`: PostgREST-style CRUD at `/tables/{table}` (filters/order/limit in the query string, JSON bodies), a raw `/sql` admin endpoint, and `/health`. The integration surface — consumers talk to it over HTTP.
-- _(planned)_ `bluedb-buffer` (ingest); M4 high-availability (single-writer election, multi-region).
+- `bluedb-server` — the **HTTP/REST service** (axum) over `bluedb-engine`: PostgREST-style CRUD at `/tables/{table}` (filters/order/limit in the query string, JSON bodies), a raw `/sql` admin endpoint, `/health`, and `/admin/{status,promote,demote}`. Writes are gated to the active writer; reads always served. The integration surface — consumers talk to it over HTTP.
+- `bluedb-ha` — **single-writer high availability**: a `LeaseProvider` seam (in-memory impl built; Postgres/K8s/NATS plug in) + a `WriterController` (promote/demote, background renewal, self-fencing within a safety margin, monotonic fencing-token `epoch` that composes with SlateDB's `writer_epoch`). Deterministically tested with an injectable clock.
+- _(planned / deployment layer)_ a concrete shared `LeaseProvider`; cross-region replication + failover orchestration; `bluedb-buffer` (ingest).
 
 ## Provenance & licensing
 
@@ -50,11 +51,14 @@ which is **Apache-2.0** (relicensed from AGPL after the Datadog acquisition).
 
 ## Status
 
-**M1 (FTS), M2 (SQL pillar), and M3 (engine + HTTP service) are complete** — the
-`bluedb-engine` facade composes the pillars and `bluedb-server` exposes them over
-HTTP. (Python/PyO3 embedding was dropped; the HTTP service is the integration
-surface.) `cargo test --workspace` is green — **151 tests** — and `cargo clippy
---workspace --all-targets` is clean. Remaining: **M4 (high availability)**.
+**M1 (FTS), M2 (SQL), M3 (engine + HTTP service), and the M4 single-writer core
+are complete.** The `bluedb-engine` facade composes the pillars, `bluedb-server`
+exposes them over HTTP, and `bluedb-ha` provides single-writer election +
+self-fencing with the service gating writes to the active node. (Python/PyO3
+embedding was dropped; the HTTP service is the integration surface.) `cargo test
+--workspace` is green — **158 tests** — and `cargo clippy --workspace
+--all-targets` is clean. Remaining is the M4 **deployment layer** (a concrete
+shared lease store + cross-region replication/orchestration).
 
 - **FTS (`bluedb-fts`):** vendored read path on the tantivy fork (`6270552`),
   `impl<B: BlobStore> Storage for B` bridge; a real **indexer**; a real **hotcache** +
@@ -81,8 +85,11 @@ surface.) `cargo test --workspace` is green — **151 tests** — and `cargo cli
 
 See [ROADMAP.md](ROADMAP.md) for what's checked off and what remains.
 
-**Next (M4 — high availability):** single-writer election (K8s Lease / NATS) +
-SlateDB `writer_epoch` fencing for intra-region RPO 0; active-passive
-multi-region with gated promotion (Temporal saga) and an HA arbiter; failback.
-The stateless readers need no coordination — only the writer (and the FTS
-indexer/compactor) is the coordinated single writer the HA layer fences.
+**Next (M4 deployment layer):** the single-writer machinery + service gating are
+done; what remains needs external systems — a concrete `LeaseProvider` (a
+Postgres lease row / Kubernetes `Lease` / NATS KV) for real multi-node election,
+object-store cross-region replication, and an operator/controller that drives
+`/admin/promote`+`/admin/demote` for gated cross-region failover (+ a SlateDB
+checkpoint recovery hook on promotion). Stateless readers need no coordination —
+only the writer (and the FTS indexer/compactor) is the single writer the lease
+fences.

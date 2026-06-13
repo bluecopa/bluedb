@@ -1,0 +1,15 @@
+[package]
+name = "bluedb-ha"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+description = "Single-writer high-availability for bluedb: a lease/fencing-token abstraction + a self-fencing writer controller."
+
+[dependencies]
+tokio       = { workspace = true }
+async-trait = { workspace = true }
+anyhow      = { workspace = true }
+thiserror   = { workspace = true }
+
+[dev-dependencies]
+# (none beyond the above)

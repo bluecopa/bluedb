@@ -47,14 +47,20 @@ Items below marked ✅ are done; unchecked items remain. Ordered by build-order 
 - [x] The Rust service binary (`bluedb-server`): an **HTTP/REST API** over `bluedb-engine` (axum) — PostgREST-style CRUD (`GET`/`POST`/`PATCH`/`DELETE` over `/tables/{table}`, filters/order/limit in the query string, JSON bodies), a raw `/sql` admin endpoint (DDL + arbitrary queries), and `/health`. Each request draws a fresh isolated connection from a shared `Database`; `EngineError` maps to HTTP status (REST/SQL → 400, infra → 500). `build_app(state) -> Router` is testable via `oneshot` (no socket); `main` opens the `Db` (local FS or in-memory via env) and serves.
 - ~~PyO3 bindings / `fx_api` embedding / maturin~~ — **dropped** (2026-06-14): no Python embedding; the HTTP service is the integration surface.
 
-## M4 — High availability (design → implementation)
+## M4 — High availability
 
-- [ ] Single-writer election (K8s Lease or NATS) + SlateDB `writer_epoch` fencing (intra-region, RPO 0).
-- [ ] Self-fencing writer (halt on lease loss before TTL).
-- [ ] External arbiter (HA multi-AZ Postgres lease row) for cross-region.
-- [ ] Active-passive multi-region: bucket cross-region replication, gated promotion, consistency-aware recovery (SlateDB checkpoints), Temporal failover saga in `fx_worker`.
-- [ ] Failback procedure (reverse replication, re-promote).
-- [ ] Confirm FTS search needs no coordination/replication (stateless readers); only the indexer is a coordinated writer.
+The single-writer **machinery** (election, self-fencing, fencing tokens) and the
+service-level **gating + control API** are built in `bluedb-ha` + `bluedb-server`;
+the parts that need external systems (a concrete shared lease store, object-store
+cross-region replication, the failover orchestrator) are scoped as the
+deployment layer behind the `LeaseProvider` seam.
+
+- [x] Single-writer **election** + self-fencing (`bluedb-ha`): `WriterController` `promote`/`demote`, a background renewal loop, and an `is_active` gate that self-fences within `safety_margin` of lease expiry (and immediately on a lost renew). A monotonic `epoch` fencing token rides on every handover and composes with SlateDB's own `writer_epoch` CAS fencing (the storage backstop). Deterministically tested via `TestClock`.
+- [x] Service wiring (`bluedb-server`): writes (`POST/PATCH/DELETE /tables`, `POST /sql`) are gated to the active writer (→ `503` when passive); reads are always served (standby = read-only). `GET /admin/status`, `POST /admin/promote` (→ `409` if held elsewhere), `POST /admin/demote`. Standalone binary auto-promotes; `BLUEDB_START_PASSIVE` starts read-only.
+- [x] FTS search needs no coordination/replication — confirmed: reads are ungated (stateless); only the writer (and the FTS indexer/compactor) is the coordinated single writer the lease fences.
+- [ ] **Concrete `LeaseProvider`** for real multi-node HA — a Postgres lease row (the HA arbiter), a Kubernetes `Lease`, or a NATS KV bucket. The trait + an in-memory impl exist; these need the external store (+ its client deps) and a cluster to test. *(deployment layer.)*
+- [ ] **Active-passive multi-region** (RPO > 0): object-store cross-region replication (bucket config), gated promotion after "waiting out" the old lease to avoid cross-bucket split-brain, and consistency-aware recovery via SlateDB checkpoints on promotion. Orchestrated by an external operator/controller driving `/admin/promote`+`/admin/demote` (no Python/Temporal-in-fx_worker — that path was dropped). *(deployment layer + a checkpoint-recovery hook to add.)*
+- [ ] **Failback** — reverse replication + re-promote, via the same `/admin` control surface. *(runbook/ops.)*
 
 ---
 
