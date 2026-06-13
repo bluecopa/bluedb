@@ -205,6 +205,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "bluedb-engine"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "bluedb-fts",
+ "bluedb-rest",
+ "bluedb-sql",
+ "bluedb-storage",
+ "bytes",
+ "gluesql-core",
+ "slatedb",
+ "tantivy",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "bluedb-fts"
 version = "0.0.0"
 dependencies = [

@@ -1,0 +1,23 @@
+[package]
+name = "bluedb-engine"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+description = "bluedb engine facade: unifies the SQL (bluedb-sql + bluedb-rest) and FTS (bluedb-fts) pillars over the SlateDB substrate, with a policy-driven compaction coordinator."
+
+[dependencies]
+bluedb-storage = { workspace = true }
+bluedb-fts     = { workspace = true }
+bluedb-sql     = { workspace = true }
+bluedb-rest    = { workspace = true }
+# Matches bluedb-sql's pin so cargo resolves a single gluesql-core.
+gluesql-core   = "=0.19.0"
+slatedb        = { workspace = true }
+tantivy        = { workspace = true }
+tokio          = { workspace = true }
+anyhow         = { workspace = true }
+thiserror      = { workspace = true }
+bytes          = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

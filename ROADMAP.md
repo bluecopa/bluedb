@@ -39,9 +39,12 @@ Items below marked ✅ are done; unchecked items remain. Ordered by build-order 
 - [ ] (Scope note: GlueSQL is OLTP/row-oriented — for the transactional facts store, **not** analytics. Heavy analytics stays in DuckDB/DuckLake.)
 - [ ] (Remaining follow-up, not a blocker: wire `bluedb-rest`'s generated SQL into `bluedb-sql` execution end-to-end. Autocommit statements are atomic + snapshot-isolated but not serialized against each other — use an explicit `BEGIN..COMMIT` for atomic read-modify-write under concurrency.)
 
-## M3 — Service & integration
+## M3 — Engine, service & integration
 
-- [ ] The Rust service binary: gRPC/HTTP data + control API (ingest, query, `promote`/`demote`/`health`).
+- [x] **`bluedb-engine`** crate — unifies the pillars behind one facade so the service/PyO3 layers wrap a single API:
+  - REST→SQL execution (`rest_sql`): a `bluedb-rest` DSL request → SQL → `bluedb-sql` `Glue::execute` → rows; `RestError` vs SQL error kept distinct in `EngineError`. *(carried from M2 follow-ups — done.)*
+  - `FtsIndex` facade — ingest (`append`), in-place `update`, generation-scoped `delete`, `search`, and a policy-driven `maybe_compact` (load manifest+tombstones → `CompactionPolicy` → `Compactor` → persist → `gc_keys`) + `spawn_compaction_scheduler` background loop. Manifest read-modify-write serialized by an in-process write lock. *(carried from M1 follow-ups — done.)*
+- [ ] The Rust service binary (`bluedb-server`): gRPC/HTTP data + control API (ingest, query, compact, `promote`/`demote`/`health`) over `bluedb-engine`.
 - [ ] PyO3 bindings (`bluedb-py`) with `pyo3-async-runtimes` (Tokio↔asyncio) so `fx_api`'s async endpoints don't block the event loop.
 - [ ] `fx_api` integration: v2-compatible endpoints, Pusher change-event parity, multi-tenant routing.
 - [ ] maturin build wired into the uv/hatchling workspace; CI wheel artifacts.
