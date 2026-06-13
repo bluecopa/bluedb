@@ -45,29 +45,48 @@
 
 use std::sync::Arc;
 
-use slatedb::Db;
+use bluedb_storage::Substrate;
+use slatedb::{Db, DbReader};
 use tokio::sync::Mutex;
 
 use crate::keyspace::DEFAULT_TENANT;
 use crate::storage::{SlateDbStorage, WriteLease};
 
-/// A handle to one SlateDB [`Db`] that vends isolated, write-serialized
-/// [`SlateDbStorage`] connections.
+/// A handle to one SlateDB database that vends isolated [`SlateDbStorage`]
+/// connections — either a **writer** handle (connections can read + write,
+/// write transactions serialized by a shared lease) or a **read-replica**
+/// handle (connections are read-only; writes/`BEGIN` error).
 #[derive(Clone)]
 pub struct Database {
-    db: Arc<Db>,
+    substrate: Substrate,
     write_lease: WriteLease,
 }
 
 impl Database {
-    /// Wrap an already-open `Db`. All connections vended from this handle share
-    /// one write lease, so their write transactions serialize against each
+    /// Wrap an already-open writer `Db`. All connections vended from this handle
+    /// share one write lease, so their write transactions serialize against each
     /// other.
     pub fn new(db: Arc<Db>) -> Self {
+        Self::over(Substrate::writer(db))
+    }
+
+    /// Wrap a read-only [`DbReader`] replica. Connections vended from this handle
+    /// serve reads (following the writer's manifest) and refuse writes — the
+    /// standby role in the HA model.
+    pub fn reader(reader: Arc<DbReader>) -> Self {
+        Self::over(Substrate::reader(reader))
+    }
+
+    fn over(substrate: Substrate) -> Self {
         Self {
-            db,
+            substrate,
             write_lease: Arc::new(Mutex::new(())),
         }
+    }
+
+    /// Is this a writer handle (vs. a read replica)?
+    pub fn is_writer(&self) -> bool {
+        self.substrate.is_writer()
     }
 
     /// A new connection under the default tenant.
@@ -78,13 +97,8 @@ impl Database {
     /// A new connection scoped to `tenant` (its keyspace is namespaced; see
     /// [`SlateDbStorage::new_for_tenant`]). It still shares this `Database`'s
     /// write lease, so write transactions across tenants serialize on the one
-    /// underlying single-writer `Db`.
+    /// underlying single-writer database.
     pub fn connection_for_tenant(&self, tenant: &str) -> SlateDbStorage {
-        SlateDbStorage::with_lease(self.db.clone(), tenant, self.write_lease.clone())
-    }
-
-    /// Borrow the underlying `Db`.
-    pub fn db(&self) -> &Arc<Db> {
-        &self.db
+        SlateDbStorage::with_substrate(self.substrate.clone(), tenant, self.write_lease.clone())
     }
 }

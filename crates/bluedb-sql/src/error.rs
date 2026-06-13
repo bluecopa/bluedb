@@ -41,6 +41,14 @@ impl From<slatedb::Error> for SqlError {
     }
 }
 
+impl From<anyhow::Error> for SqlError {
+    // Substrate read/lifecycle ops (and the "this node is a read-only replica"
+    // guard) surface as `anyhow`; carry the message through.
+    fn from(err: anyhow::Error) -> Self {
+        SqlError::SlateDb(err.to_string())
+    }
+}
+
 impl From<serde_json::Error> for SqlError {
     fn from(err: serde_json::Error) -> Self {
         SqlError::Serde(err.to_string())

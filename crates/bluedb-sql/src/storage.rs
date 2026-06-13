@@ -91,6 +91,8 @@ use slatedb::config::ScanOptions;
 use slatedb::{Db, DbSnapshot, WriteBatch};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
+use bluedb_storage::Substrate;
+
 use crate::error::SqlError;
 use crate::keyspace::{prefix_upper_bound, Keyspace, DEFAULT_TENANT};
 
@@ -130,7 +132,10 @@ struct TxnState {
 /// [`SlateDbStorage::new_for_tenant`] from an already-open [`Db`], then hand it
 /// to `gluesql_core::prelude::Glue::new`.
 pub struct SlateDbStorage {
-    db: Arc<Db>,
+    /// The SlateDB handle this connection reads/writes through: a writer `Db`
+    /// (active node) or a read-only `DbReader` (replica). Writes and `BEGIN`
+    /// require the writer.
+    substrate: Substrate,
     keyspace: Keyspace,
     /// Shared write lease serializing write transactions over this `Db`.
     write_lease: WriteLease,
@@ -153,24 +158,24 @@ impl SlateDbStorage {
     /// Every key this storage reads or writes is namespaced to `tenant`, so two
     /// storages over the same [`Db`] with different tenants share no data.
     pub fn new_for_tenant(db: Arc<Db>, tenant: &str) -> Self {
-        Self::with_lease(db, tenant, Arc::new(Mutex::new(())))
+        Self::with_substrate(Substrate::writer(db), tenant, Arc::new(Mutex::new(())))
     }
 
-    /// Construct a connection that shares `write_lease` with its siblings (used
-    /// by [`crate::Database`] so all connections over one `Db` serialize their
-    /// write transactions through the same lease).
-    pub(crate) fn with_lease(db: Arc<Db>, tenant: &str, write_lease: WriteLease) -> Self {
+    /// Construct over any [`Substrate`] (writer or read replica), sharing
+    /// `write_lease`. A reader substrate yields a **read-only** connection:
+    /// reads work, but writes and `BEGIN` error (`require_writer`).
+    pub(crate) fn with_substrate(substrate: Substrate, tenant: &str, write_lease: WriteLease) -> Self {
         Self {
-            db,
+            substrate,
             keyspace: Keyspace::new(tenant),
             write_lease,
             txn: None,
         }
     }
 
-    /// Borrow the underlying SlateDB handle.
-    pub fn db(&self) -> &Arc<Db> {
-        &self.db
+    /// The writer handle, or a read-only error if this connection is a replica.
+    fn writer(&self) -> Result<&Arc<Db>, SqlError> {
+        Ok(self.substrate.require_writer()?)
     }
 
     // --- Unified read/write through the optional transaction overlay. -------
@@ -184,7 +189,7 @@ impl SlateDbStorage {
                 Ok(())
             }
             None => {
-                self.db.put(&key, &value).await?;
+                self.writer()?.put(&key, &value).await?;
                 Ok(())
             }
         }
@@ -199,7 +204,7 @@ impl SlateDbStorage {
                 Ok(())
             }
             None => {
-                self.db.delete(&key).await?;
+                self.writer()?.delete(&key).await?;
                 Ok(())
             }
         }
@@ -215,7 +220,7 @@ impl SlateDbStorage {
                 Some(None) => Ok(None),
                 None => Ok(txn.snapshot.get(key).await?.map(|b| b.to_vec())),
             },
-            None => Ok(self.db.get(key).await?.map(|b| b.to_vec())),
+            None => Ok(self.substrate.get(key).await?.map(|b| b.to_vec())),
         }
     }
 
@@ -278,18 +283,8 @@ impl SlateDbStorage {
                 }
             }
             None => {
-                let mut iter = match end {
-                    Some(end) => {
-                        self.db
-                            .scan_with_options(start.to_vec()..end.to_vec(), &ScanOptions::default())
-                            .await?
-                    }
-                    None => {
-                        self.db
-                            .scan_with_options(start.to_vec().., &ScanOptions::default())
-                            .await?
-                    }
-                };
+                // Live read through the substrate (writer Db or read replica).
+                let mut iter = self.substrate.scan_range(start, end).await?;
                 while let Some(kv) = iter.next().await? {
                     out.push((kv.key.to_vec(), kv.value.to_vec()));
                 }
@@ -603,7 +598,7 @@ impl Transaction for SlateDbStorage {
         // `BEGIN` blocks on the lease until we commit, then snapshots our
         // result) — so write transactions are serialized and no update is lost.
         let lease = self.write_lease.clone().lock_owned().await;
-        let snapshot = self.db.snapshot().await.map_err(SqlError::from)?;
+        let snapshot = self.writer()?.snapshot().await.map_err(SqlError::from)?;
         self.txn = Some(TxnState {
             overlay: BTreeMap::new(),
             snapshot,
@@ -628,7 +623,7 @@ impl Transaction for SlateDbStorage {
                         None => batch.delete(&key),
                     }
                 }
-                self.db.write(batch).await.map_err(SqlError::from)?;
+                self.writer()?.write(batch).await.map_err(SqlError::from)?;
             }
         }
         Ok(())

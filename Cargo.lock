@@ -347,6 +347,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bluedb-storage",
  "bytes",
  "chrono",
  "futures",

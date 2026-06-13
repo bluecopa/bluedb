@@ -9,8 +9,9 @@ description = "SQL engine for bluedb: GlueSQL custom storage over SlateDB (schem
 # GlueSQL execution layer + pluggable Store/StoreMut traits. Pinned exact: the
 # custom-storage trait surface shifts between minor versions, so we lock the
 # version whose trait signatures this crate is written against.
-gluesql-core = "=0.19.0"
-slatedb      = { workspace = true }
+gluesql-core   = "=0.19.0"
+bluedb-storage = { workspace = true }
+slatedb        = { workspace = true }
 tokio        = { workspace = true }
 async-trait  = { workspace = true }
 anyhow       = { workspace = true }
