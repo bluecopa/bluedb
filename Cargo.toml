@@ -13,6 +13,7 @@ bluedb-storage = { path = "crates/bluedb-storage" }
 bluedb-fts     = { path = "crates/bluedb-fts" }
 bluedb-sql     = { path = "crates/bluedb-sql" }
 bluedb-rest    = { path = "crates/bluedb-rest" }
+bluedb-engine  = { path = "crates/bluedb-engine" }
 
 # --- external ---
 # tantivy MUST match the exact rev quickwit-oss/quickwit@main pins — the

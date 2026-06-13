@@ -1,0 +1,26 @@
+[package]
+name = "bluedb-server"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+description = "bluedb HTTP/REST service: a PostgREST-style data API over bluedb-engine."
+
+[[bin]]
+name = "bluedb-server"
+path = "src/main.rs"
+
+[dependencies]
+bluedb-engine = { workspace = true }
+bluedb-sql    = { workspace = true }
+bluedb-rest   = { workspace = true }
+gluesql-core  = "=0.19.0"
+slatedb       = { workspace = true }
+axum          = "0.8"
+tokio         = { workspace = true }
+serde         = { workspace = true }
+serde_json    = { workspace = true }
+anyhow        = { workspace = true }
+
+[dev-dependencies]
+tower          = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

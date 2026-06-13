@@ -33,8 +33,9 @@ slice of that substrate.
 - `bluedb-fts` — BM25 full-text search over object storage: `tantivy` + the vendored `quickwit-directories` read path, hosted on `bluedb-storage`. Indexer (docs→split), split manifest/catalog, multi-split merged search, lazy hotcache open (range-fetch, no whole-split load), the full **index lifecycle** (incremental append, generation-scoped logical deletes so a same-id update is a true in-place replace, merge/compaction that physically drops dead docs), a **GC executor** (delete superseded/orphaned splits + retention policies), a **compaction policy** (count/tombstone-ratio thresholds), **per-field analyzers** (keyword / stemming / whitespace, registered on lazily-opened splits), and **query niceties** (pagination, highlighting, FTS combined with structured filters).
 - `bluedb-sql` — SQL over the substrate: GlueSQL `Store`/`StoreMut` on SlateDB. Order-preserving key encoding (schema/data/index namespaces, `Key::to_cmp_be_bytes()` keys), schemaless tables, CREATE/INSERT/SELECT/UPDATE/DELETE/ORDER BY, **real transactions** (overlay + `DbSnapshot` + atomic `WriteBatch`, snapshot isolation, true ROLLBACK), **secondary indexes** (`CREATE/DROP INDEX`, index-backed scans), enforced **uniqueness** (PK + `UNIQUE` columns), **tenant-namespaced** keyspace, a **schema-as-data registry**, and a **`Database`** handle vending write-serialized, snapshot-isolated **concurrent connections** (a shared write lease prevents lost updates).
 - `bluedb-rest` — PostgREST-style query DSL → SQL translation (filters/operators/order/limit/offset + INSERT/UPDATE/DELETE), with identifier allow-listing and literal escaping. The input-table-v2 API-parity surface; self-contained (no dependency on `bluedb-sql`).
-- `bluedb-engine` — the **facade** that composes the pillars (M3): `rest_sql` runs a `bluedb-rest` DSL request end-to-end against `bluedb-sql`; `FtsIndex` is a full-text engine over one index (append / update / delete / search) with a policy-driven compaction coordinator + background scheduler (manifest → `CompactionPolicy` → `Compactor` → persist → GC). The service binary and PyO3 bindings wrap this.
-- _(planned)_ `bluedb-buffer` (ingest), `bluedb-server` (the Rust service), `bluedb-py` (PyO3 bindings for `fx_api`).
+- `bluedb-engine` — the **facade** that composes the pillars (M3): `rest_sql` runs a `bluedb-rest` DSL request end-to-end against `bluedb-sql`; `FtsIndex` is a full-text engine over one index (append / update / delete / search) with a policy-driven compaction coordinator + background scheduler (manifest → `CompactionPolicy` → `Compactor` → persist → GC). The service wraps this.
+- `bluedb-server` — the **HTTP/REST service** (axum) over `bluedb-engine`: PostgREST-style CRUD at `/tables/{table}` (filters/order/limit in the query string, JSON bodies), a raw `/sql` admin endpoint, and `/health`. The integration surface — consumers talk to it over HTTP.
+- _(planned)_ `bluedb-buffer` (ingest); M4 high-availability (single-writer election, multi-region).
 
 ## Provenance & licensing
 
@@ -49,9 +50,11 @@ which is **Apache-2.0** (relicensed from AGPL after the Datadog acquisition).
 
 ## Status
 
-**M1 (FTS) and M2 (SQL pillar) are feature-complete; M3 (integration) has begun
-— the `bluedb-engine` facade composes the pillars.** `cargo test --workspace` is
-green — **147 tests** — and `cargo clippy --workspace --all-targets` is clean.
+**M1 (FTS), M2 (SQL pillar), and M3 (engine + HTTP service) are complete** — the
+`bluedb-engine` facade composes the pillars and `bluedb-server` exposes them over
+HTTP. (Python/PyO3 embedding was dropped; the HTTP service is the integration
+surface.) `cargo test --workspace` is green — **151 tests** — and `cargo clippy
+--workspace --all-targets` is clean. Remaining: **M4 (high availability)**.
 
 - **FTS (`bluedb-fts`):** vendored read path on the tantivy fork (`6270552`),
   `impl<B: BlobStore> Storage for B` bridge; a real **indexer**; a real **hotcache** +
@@ -78,8 +81,8 @@ green — **147 tests** — and `cargo clippy --workspace --all-targets` is clea
 
 See [ROADMAP.md](ROADMAP.md) for what's checked off and what remains.
 
-**Next (M3, in progress):** the `bluedb-engine` facade landed (REST→SQL
-execution + the FTS compaction coordinator/scheduler). Remaining M3: the
-`bluedb-server` service binary (gRPC/HTTP) over the engine; PyO3 bindings
-(`bluedb-py`, `pyo3-async-runtimes`, Tokio↔asyncio); and `fx_api` integration
-(v2-compatible endpoints, maturin/CI).
+**Next (M4 — high availability):** single-writer election (K8s Lease / NATS) +
+SlateDB `writer_epoch` fencing for intra-region RPO 0; active-passive
+multi-region with gated promotion (Temporal saga) and an HA arbiter; failback.
+The stateless readers need no coordination — only the writer (and the FTS
+indexer/compactor) is the coordinated single writer the HA layer fences.
