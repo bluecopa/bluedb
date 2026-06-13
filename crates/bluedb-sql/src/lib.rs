@@ -65,10 +65,12 @@ mod connection;
 mod error;
 mod keyspace;
 mod registry;
+mod rewrite;
 mod storage;
 
 pub use connection::Database;
 pub use error::SqlError;
 pub use keyspace::DEFAULT_TENANT;
 pub use registry::SchemaRegistry;
+pub use rewrite::rewrite_multitable;
 pub use storage::SlateDbStorage;

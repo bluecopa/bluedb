@@ -1,0 +1,53 @@
+# Verify the rewrite TARGET: GlueSQL rejects comma-join and CROSS JOIN, but does
+# it execute INNER JOIN ON TRUE / ON 1=1 (the semantic equivalent of a comma
+# join)? And does a chained 3-way inner join work? If yes, the multi-table fix
+# is: rewrite `FROM a, b, ...` -> `FROM a JOIN b ON TRUE JOIN ... ON TRUE`.
+
+statement ok
+CREATE TABLE a (id INTEGER PRIMARY KEY, x INTEGER)
+
+statement ok
+CREATE TABLE b (id INTEGER PRIMARY KEY, y INTEGER)
+
+statement ok
+CREATE TABLE c (id INTEGER PRIMARY KEY, z INTEGER)
+
+statement ok
+INSERT INTO a VALUES (1, 10), (2, 20)
+
+statement ok
+INSERT INTO b VALUES (1, 100), (2, 200)
+
+statement ok
+INSERT INTO c VALUES (1, 1000), (2, 2000)
+
+# (1) INNER JOIN ON TRUE — the rewrite target
+query I
+SELECT a.x FROM a JOIN b ON TRUE ORDER BY a.x
+----
+10
+10
+20
+20
+
+# (2) INNER JOIN ON 1=1 — fallback target
+query I
+SELECT a.x FROM a JOIN b ON 1 = 1 ORDER BY a.x
+----
+10
+10
+20
+20
+
+# (3) chained 3-way inner join (FROM a, b, c -> a JOIN b ON TRUE JOIN c ON TRUE)
+query I
+SELECT a.x FROM a JOIN b ON TRUE JOIN c ON TRUE ORDER BY a.x
+----
+10
+10
+10
+10
+20
+20
+20
+20
