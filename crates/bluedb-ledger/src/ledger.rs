@@ -2714,19 +2714,57 @@ mod tests {
         let ts_after = l2.lookup_account(2).await.unwrap().unwrap().timestamp;
         assert!(ts_after > ts_before, "watermark survived reopen → still monotonic");
     }
+
+    #[tokio::test]
+    async fn acked_transfers_are_durable_across_reopen() {
+        use std::sync::Arc;
+
+        use slatedb::object_store::memory::InMemory;
+        use slatedb::Db;
+
+        // Durable-before-ack for the group-commit path: every transfer that
+        // returned `Created` flushed before returning, so all of them must
+        // survive a restart even though we drop the Db WITHOUT a clean
+        // close/flush (a simulated crash — no explicit durability on shutdown).
+        let store = Arc::new(InMemory::new());
+        {
+            let db = Arc::new(Db::open("ledger-durab", store.clone()).await.unwrap());
+            let database = Database::new(db);
+            let l = Ledger::new(&database);
+            l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
+            for i in 0..20u128 {
+                assert_eq!(
+                    l.create_transfers(&[xfer(100 + i, 1, 2, 5)]).await.unwrap(),
+                    vec![CreateTransferResult::Created]
+                );
+            }
+            // Drop WITHOUT an explicit flush/close — only the per-call durability
+            // of create_transfers should have made these writes survive.
+        }
+        let db2 = Arc::new(Db::open("ledger-durab", store.clone()).await.unwrap());
+        let database2 = Database::new(db2);
+        let l2 = Ledger::new(&database2);
+        // All 20 acked transfers survived and balances are conserved.
+        assert_eq!(l2.lookup_account(1).await.unwrap().unwrap().debits_posted, 100);
+        assert_eq!(l2.lookup_account(2).await.unwrap().unwrap().credits_posted, 100);
+        for i in 0..20u128 {
+            assert!(l2.lookup_transfer(100 + i).await.unwrap().is_some(), "transfer {i} durable across reopen");
+        }
+    }
 }
 
 /// Write-throughput benchmarks (run with `--release --ignored --nocapture`).
 ///
 /// These run against an in-memory object store, so they isolate the engine +
 /// the SlateDB WAL **flush_interval timer** (a real object store adds the PUT
-/// round-trip on top of each flush). They demonstrate the two things that set
+/// round-trip on top of each flush). They demonstrate the levers that set
 /// ledger write speed:
-///   * a single transfer per call is bounded by `flush_interval` (each
-///     `create_transfers` holds the write lease across its durable flush, so
-///     applies serialize — concurrency does not help, exactly like TB);
 ///   * **batching** (many transfers per call) amortizes the one flush and
-///     climbs toward the engine's CPU ceiling — the same lever as TB's batches.
+///     climbs toward the engine's CPU ceiling — the same lever as TB's batches;
+///   * **concurrency** — since the group-commit path releases the write lease
+///     before the durable flush, many clients' writes coalesce into shared WAL
+///     flushes, so aggregate throughput scales with in-flight clients (see
+///     `bench_concurrent_single_transfer`) instead of being flush-bound.
 ///
 /// Run: `cargo test -p bluedb-ledger --release --ignored --nocapture bench_`
 #[cfg(test)]
