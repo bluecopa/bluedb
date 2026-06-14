@@ -33,6 +33,13 @@ pub enum SqlError {
     /// type, or NOT NULL mismatch). See [`crate::SchemaRegistry`].
     #[error("schema validation error: {0}")]
     SchemaValidation(String),
+
+    /// A concurrent connection committed a row with the same primary key after
+    /// this transaction checked it was free — detected at commit while holding
+    /// the write lease (first committer wins; the loser aborts). See
+    /// [`crate::storage::SlateDbStorage`]'s commit-time uniqueness validation.
+    #[error("unique constraint violation: a row with key {0} already exists")]
+    UniqueViolation(String),
 }
 
 impl From<slatedb::Error> for SqlError {

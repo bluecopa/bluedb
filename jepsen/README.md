@@ -1,0 +1,115 @@
+# bluedb Jepsen test
+
+A real [Jepsen](https://jepsen.io) consistency test for the bluedb cluster:
+randomized concurrent operations + injected faults + a formal checker over the
+recorded history.
+
+## What it checks
+
+Four workloads, pick with `--workload`:
+
+**`set` (default) — grow-only set.** Clients append unique integers through the
+active writer; a final-read phase reads the whole set back. The `set-full`
+checker proves two things across failover:
+
+- **no lost writes** — every *acknowledged* add (HTTP 200) is present in the
+  final read, and
+- **no fabrication** — no element appears that was never added.
+
+Best for durability / no-lost-update under failover.
+
+**`list-append` — Elle list-append.** Each Jepsen transaction is a `BEGIN; …;
+COMMIT;` of appends + reads over several keys, sent as one `POST /sql` so it runs
+as one explicit transaction on the active writer. Elle reconstructs the
+transaction dependency graph from the observed reads and flags any
+serializability anomaly (G0/G1/G2, write skew, lost update). Checked against
+`--consistency serializable` (default) or `strict-serializable` (also adds
+real-time order). Exercises the explicit-transaction path under concurrency.
+
+**`counter` — lost-update probe.** Concurrent autocommit `UPDATE cnt SET n=n+1`
+(a single-statement read-modify-write), checked with `jepsen.checker/counter`:
+any read below the count of acknowledged increments is a lost update.
+
+**`unique` — same-primary-key race.** Many clients race to `INSERT` the same
+fresh primary key; the checker flags any id acknowledged (HTTP 200) more than
+once. Uses a tiny id space + no stagger to maximize the narrow insert TOCTOU.
+
+In the set/list-append/counter cases the cluster is driven as a single logical writer whose identity
+moves on failover (bluedb's guarantee: one serial writer + async read replicas).
+The client discovers the active writer via `/admin/status` and re-discovers on a
+`503` (its node became a replica) — i.e. it follows the leader across promotions.
+
+## Faults (nemesis)
+
+Injected via the `docker` CLI against the compose stack — the natural
+fault-injection seam for a containerized deployment (no SSH; `:ssh {:dummy?
+true}`):
+
+| `--nemesis` | fault | tests |
+|---|---|---|
+| `kill` | `docker kill` the active writer (crash) | durability of acked writes through SlateDB's WAL window; a standby promotes |
+| `partition` | `docker network disconnect` the writer from Postgres + MinIO + peers | clean failover, no split-brain (the isolated writer loses its lease and storage at once) |
+| `partition-half` | isolate the writer **+ one peer** (a 2-node minority) from the network | a lone node + infra must take/keep leadership; the arbiter-less minority steps down |
+| `skew` | shift the writer's wall clock 8 s **backward** (via libfaketime) | the writer over-estimates its lease validity, so a standby can acquire concurrently — checks the SlateDB `writer_epoch` fence still blocks divergent writes |
+| `pause` | `docker pause` the writer (SIGSTOP, no crash) | the frozen writer stops renewing; a standby promotes; on resume it wakes to an expired lease + bumped epoch and must step down |
+| `arbiter` | `docker pause` Postgres (the lease arbiter) | writer can't renew → self-fences; standbys can't acquire → cluster goes writer-less (no split-brain) → recovers on thaw |
+| `arbiter-hard` | `docker stop`/`start` Postgres (kills the connection) | like `arbiter`, but tests `PostgresLeaseProvider` reconnect — a node re-acquires once Postgres is back |
+| `storage` | `docker pause` MinIO (the object store) | writer keeps its lease but can't durably write → writes don't ack → recovers on thaw |
+| `disk-full` | fill MinIO's bounded `/data` tmpfs → ENOSPC | durable writes fail until space is freed |
+| `mix` | kill + partition, alternating | combined |
+| `chaos` | kill + pause + skew + partition-half | everything |
+| `none` | — | baseline (no faults) |
+
+The `arbiter`/`storage`/`disk-full` faults verify bluedb stays **consistent**
+(no split-brain, no lost acked writes) while losing availability when a
+dependency fails — CP, not AP. All three are `:valid? true` / `lost-count 0`.
+
+Fault windows straddle the 10 s lease TTL so failover completes inside each
+window. The clock-skew nemesis needs the image's libfaketime entrypoint
+(`docker-entrypoint.sh`); it writes the offset into each node's
+`/faketime/offset` via `docker exec`.
+
+## Running
+
+Prereqs: the cluster must be **up** (`docker compose up -d` from the repo root)
+and **Java 21+** on `$PATH` (a transitive dep needs `java.util.SequencedCollection`;
+JDK 17 fails to load it). Leiningen is vendored at `bin/lein`.
+
+```bash
+cd jepsen
+export LEIN_HOME="$PWD/.lein"
+# point at a JDK 21+ if your default `java` is older, e.g. on macOS:
+# export JAVA_HOME=$(/usr/libexec/java_home -v 24); export PATH="$JAVA_HOME/bin:$PATH"
+
+NODES="--node node1 --node node2 --node node3"
+
+# set workload (durability / no-lost-update), each fault mode
+./bin/lein run test --workload set --nemesis none      --time-limit 60  --concurrency 10 $NODES
+./bin/lein run test --workload set --nemesis kill      --time-limit 120 --concurrency 10 $NODES
+./bin/lein run test --workload set --nemesis partition --time-limit 120 --concurrency 10 $NODES
+./bin/lein run test --workload set --nemesis mix       --time-limit 180 --concurrency 10 $NODES
+
+# list-append workload (serializability) — baseline and through failover
+./bin/lein run test --workload list-append --nemesis none --time-limit 60  --concurrency 10 $NODES
+./bin/lein run test --workload list-append --nemesis mix  --time-limit 120 --concurrency 10 $NODES
+# stronger: strict-serializable (adds real-time order)
+./bin/lein run test --workload list-append --consistency strict-serializable --nemesis chaos --time-limit 150 --concurrency 10 $NODES
+
+# counter (lost-update) and unique (same-PK) — use high concurrency
+./bin/lein run test --workload counter --nemesis kill --time-limit 90 --concurrency 10 $NODES
+./bin/lein run test --workload unique  --nemesis none --time-limit 15 --concurrency 40 $NODES
+```
+
+Results land in `store/`; `store/latest/results.edn` holds the verdict and
+`store/latest/timeline.html` a per-process timeline. `:valid? true` means the
+checker found no anomalies.
+
+## Layout
+
+- `src/bluedb/jepsen/http.clj` — REST/`/admin` HTTP layer + leader discovery
+- `src/bluedb/jepsen/client.clj` — leader-aware set client (add / read)
+- `src/bluedb/jepsen/list_append.clj` — Elle list-append client (txn → `/sql`)
+- `src/bluedb/jepsen/counter.clj` — counter client (autocommit RMW increments)
+- `src/bluedb/jepsen/unique.clj` — same-PK insert client + soundness checker
+- `src/bluedb/jepsen/nemesis.clj` — docker-driven kill / partition / pause / skew
+- `src/bluedb/jepsen/core.clj` — workloads, generator, checker, CLI

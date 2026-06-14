@@ -1,12 +1,17 @@
 //! Cross-connection isolation tests for [`bluedb_sql::Database`].
 //!
-//! A `Database` vends multiple `Glue` connections over one SlateDB `Db` that
-//! share a write lease. These tests prove the two guarantees:
-//!   1. **Snapshot isolation** — one connection's uncommitted (and even
-//!      committed-after-BEGIN) writes are invisible to another connection's
-//!      in-flight transaction.
-//!   2. **Serializable write transactions** — two concurrent read-modify-write
-//!      transactions serialize on the lease, so neither update is lost.
+//! A `Database` vends multiple `Glue` connections over one SlateDB `Db`. These
+//! tests prove the guarantees:
+//!   1. **Snapshot isolation** — a connection's in-flight transaction reads a
+//!      stable point-in-time view; another connection's writes (uncommitted, or
+//!      even committed after BEGIN) are invisible to it.
+//!   2. **Serializable explicit write transactions** — two concurrent
+//!      read-modify-write `BEGIN..COMMIT` blocks serialize on the shared write
+//!      lease, so neither update is lost.
+//!
+//! Autocommit statements never take the lease: reads run lock-free against an
+//! MVCC snapshot, and writes commit concurrently (auto-increment keys stay
+//! collision-free via a shared counter).
 
 use std::sync::Arc;
 
@@ -73,7 +78,8 @@ async fn a_transaction_reads_a_stable_snapshot() {
     a.execute("BEGIN;").await.unwrap();
     assert_eq!(row_count(&mut a, "SELECT id FROM t;").await, 1);
 
-    // Another connection inserts a row while A's transaction is open.
+    // Another connection commits an insert while A's transaction is open.
+    // Autocommit writes don't take A's lease, so this commits immediately.
     let mut b = Glue::new(database.connection());
     b.execute("INSERT INTO t VALUES (2);").await.unwrap();
 

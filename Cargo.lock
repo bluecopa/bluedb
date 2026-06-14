@@ -365,6 +365,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "bluedb-ledger"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "bluedb-sql",
+ "bluedb-storage",
+ "postcard",
+ "serde",
+ "slatedb",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "bluedb-rest"
 version = "0.0.0"
 dependencies = [

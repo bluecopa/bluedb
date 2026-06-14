@@ -6,31 +6,32 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;
-use bluedb_ha::{LocalLeaseProvider, SystemClock, WriterController};
+use bluedb_ha::{LeaseProvider, LocalLeaseProvider, SystemClock, WriterController};
 use bluedb_server::{build_app, AppState};
-use bluedb_sql::Database;
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
-use slatedb::object_store::memory::InMemory;
-use slatedb::Db;
+use slatedb::object_store::{memory::InMemory, ObjectStore};
 use tower::ServiceExt;
 
-/// Build an app; `promote` decides whether the node starts as the active writer.
+const TTL: Duration = Duration::from_secs(30);
+const MARGIN: Duration = Duration::from_secs(5);
+
+/// An [`AppState`] over a fresh in-memory store with its own (or a shared)
+/// lease provider.
+fn node(node_id: &str, store: Arc<dyn ObjectStore>, lease: Arc<dyn LeaseProvider>) -> AppState {
+    let writer = Arc::new(WriterController::new(node_id, lease, Arc::new(SystemClock), TTL, MARGIN));
+    AppState::new(store, "bluedb", writer)
+}
+
+/// Build an app; `promote` decides whether the node starts as the active writer
+/// (and thus has a bound database). A non-promoted node is unbound (`503`).
 async fn make_app(promote: bool) -> Router {
-    let db = Db::open("bluedb-server-test", Arc::new(InMemory::new()))
-        .await
-        .expect("open slatedb");
-    let writer = Arc::new(WriterController::new(
-        "test-node",
-        Arc::new(LocalLeaseProvider::new()),
-        Arc::new(SystemClock),
-        Duration::from_secs(30),
-        Duration::from_secs(5),
-    ));
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let state = node("test-node", store, Arc::new(LocalLeaseProvider::new()));
     if promote {
-        writer.promote().await.expect("promote");
+        state.promote().await.expect("promote");
     }
-    build_app(AppState::new(Database::new(Arc::new(db)), writer))
+    build_app(state)
 }
 
 /// The common case: an active (writable) node.
@@ -162,22 +163,67 @@ async fn unknown_table_select_is_a_400() {
 }
 
 #[tokio::test]
-async fn passive_node_refuses_writes_but_serves_reads_and_status() {
-    let app = make_app(false).await; // passive: never promoted
+async fn unbound_passive_node_refuses_writes_and_answers_status() {
+    let app = make_app(false).await; // passive, never promoted → no bound database
 
-    // Writes are refused with 503.
+    // Writes are refused with 503 (not the active writer).
     let (status, _) = sql(&app, "CREATE TABLE t (id INTEGER PRIMARY KEY);").await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     let (status, _) = call(&app, "POST", "/tables/t", Some(json!({ "id": 1 }))).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 
-    // Liveness and status still answer.
+    // Liveness and status always answer.
     let (status, _) = call(&app, "GET", "/health", None).await;
     assert_eq!(status, StatusCode::OK);
     let (status, body) = call(&app, "GET", "/admin/status", None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["role"], json!("passive"));
     assert_eq!(body["epoch"], json!(null));
+}
+
+#[tokio::test]
+async fn failover_new_writer_sees_prior_data_and_can_write() {
+    // Two nodes over ONE shared object store + ONE shared lease — an in-process
+    // stand-in for a cluster, exercising the role-swap + SlateDB epoch fencing.
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let lease: Arc<dyn LeaseProvider> = Arc::new(LocalLeaseProvider::new());
+    let a = node("a", store.clone(), lease.clone());
+    let b = node("b", store.clone(), lease.clone());
+
+    // a is the writer: create a table + a row.
+    a.promote().await.expect("a promotes");
+    let app_a = build_app(a.clone());
+    assert_eq!(
+        sql(&app_a, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);").await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(&app_a, "POST", "/tables/t", Some(json!({ "id": 1, "v": 10 }))).await.1,
+        json!({ "inserted": 1 })
+    );
+
+    // a steps down (flushing for a clean handoff); b's HA tick takes the freed
+    // lease and opens the writer database (bumping the epoch).
+    a.demote().await.expect("a demotes");
+    b.ha_tick().await;
+    let app_b = build_app(b.clone());
+
+    // The NEW writer sees a's committed data...
+    let (status, body) = call(&app_b, "GET", "/tables/t?order=id.asc", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!([{ "id": 1, "v": 10 }]), "new writer inherited the data");
+
+    // ...and can write.
+    assert_eq!(
+        call(&app_b, "POST", "/tables/t", Some(json!({ "id": 2, "v": 20 }))).await.1,
+        json!({ "inserted": 1 })
+    );
+
+    // The demoted node is now a read replica: writes are refused.
+    assert_eq!(
+        call(&app_a, "POST", "/tables/t", Some(json!({ "id": 3, "v": 30 }))).await.0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
 }
 
 #[tokio::test]

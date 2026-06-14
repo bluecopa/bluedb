@@ -1,0 +1,7 @@
+# Leiningen's self-installed standalone jar + resolved deps (re-downloaded by
+# `bin/lein` on first run).
+.lein/
+# Jepsen run artifacts (histories, logs, results.edn, timeline.html per run).
+store/
+# Compiled classes / uberjars.
+target/

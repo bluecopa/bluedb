@@ -12,6 +12,7 @@ rust-version = "1.80"
 bluedb-storage = { path = "crates/bluedb-storage" }
 bluedb-fts     = { path = "crates/bluedb-fts" }
 bluedb-sql     = { path = "crates/bluedb-sql" }
+bluedb-ledger  = { path = "crates/bluedb-ledger" }
 bluedb-rest    = { path = "crates/bluedb-rest" }
 bluedb-engine  = { path = "crates/bluedb-engine" }
 bluedb-ha      = { path = "crates/bluedb-ha" }
