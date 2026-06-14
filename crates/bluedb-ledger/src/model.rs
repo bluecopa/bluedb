@@ -236,6 +236,8 @@ impl Transfer {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CreateAccountResult {
     Created,
+    LinkedEventFailed,
+    LinkedEventChainOpen,
     TimestampMustBeZero,
     ReservedField,
     ReservedFlag,
@@ -267,6 +269,8 @@ pub enum CreateAccountResult {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CreateTransferResult {
     Created,
+    LinkedEventFailed,
+    LinkedEventChainOpen,
     TimestampMustBeZero,
     ReservedFlag,
     IdMustNotBeZero,
@@ -350,11 +354,12 @@ pub(crate) enum TransferOp {
     Gated,
 }
 
-/// Classify a transfer that has already passed input validation.
+/// Classify a transfer that has already passed input validation. `LINKED` is
+/// orthogonal to the op (handled by the chain driver), so it does not affect the
+/// classification.
 pub(crate) fn classify(t: &Transfer) -> TransferOp {
     use TransferFlags as F;
-    if t.flags.contains(F::LINKED)
-        || t.flags.contains(F::BALANCING_DEBIT)
+    if t.flags.contains(F::BALANCING_DEBIT)
         || t.flags.contains(F::BALANCING_CREDIT)
         || t.flags.contains(F::CLOSING_DEBIT)
         || t.flags.contains(F::CLOSING_CREDIT)
@@ -372,6 +377,41 @@ pub(crate) fn classify(t: &Transfer) -> TransferOp {
         return TransferOp::PendingReserve; // timeout handled in Phase C
     }
     TransferOp::Regular
+}
+
+/// A contiguous run of batch events forming one linked chain (or one independent
+/// event). `start..=end` inclusive; `open` is true iff the run's last event still
+/// has `linked` set — i.e. the batch ended mid-chain (no terminator).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Chain {
+    pub start: usize,
+    pub end: usize,
+    pub open: bool,
+}
+
+/// Group a batch into chains from each event's `linked` flag. A maximal run of
+/// `linked == true` events plus its terminator (`linked == false`) is one chain;
+/// a lone `linked == false` event is an independent chain; a trailing run of
+/// `linked == true` with no terminator is an `open` chain.
+pub(crate) fn chains(linked: &[bool]) -> Vec<Chain> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < linked.len() {
+        let mut j = i;
+        while j < linked.len() && linked[j] {
+            j += 1;
+        }
+        if j < linked.len() {
+            // linked[j] == false → terminator; chain is i..=j.
+            out.push(Chain { start: i, end: j, open: false });
+            i = j + 1;
+        } else {
+            // ran off the end while still linked → open chain i..=len-1.
+            out.push(Chain { start: i, end: j - 1, open: true });
+            i = j;
+        }
+    }
+    out
 }
 
 // ---- Account input validators (mirror TB create_accounts order) ----
@@ -451,9 +491,10 @@ pub(crate) fn account_exists_result(incoming: &Account, existing: &Account) -> C
     R::Exists
 }
 
-/// LINKED (Phase D) and IMPORTED (Phase G) account creation are gated for now.
+/// IMPORTED (Phase G) account creation is gated for now. (LINKED is handled by
+/// the chain driver, not gated.)
 pub(crate) fn account_is_gated(a: &Account) -> bool {
-    a.flags.contains(AccountFlags::LINKED) || a.flags.contains(AccountFlags::IMPORTED)
+    a.flags.contains(AccountFlags::IMPORTED)
 }
 
 // ---- Transfer input validators (mirror TB create_transfers order) ----
@@ -691,9 +732,25 @@ mod tests {
         assert_eq!(classify(&t(F::PENDING, 30)), TransferOp::PendingReserve); // pending+timeout handled in C
         assert_eq!(classify(&t(F::POST_PENDING_TRANSFER, 0)), TransferOp::Post);
         assert_eq!(classify(&t(F::VOID_PENDING_TRANSFER, 0)), TransferOp::Void);
-        assert_eq!(classify(&t(F::LINKED, 0)), TransferOp::Gated);
+        assert_eq!(classify(&t(F::LINKED, 0)), TransferOp::Regular); // LINKED is orthogonal
+        assert_eq!(classify(&t(F::LINKED | F::PENDING, 0)), TransferOp::PendingReserve);
         assert_eq!(classify(&t(F::BALANCING_DEBIT, 0)), TransferOp::Gated);
         assert_eq!(classify(&t(F::PENDING | F::CLOSING_DEBIT, 0)), TransferOp::Gated); // closing → Phase F
+    }
+
+    #[test]
+    fn chains_grouping() {
+        let c = |s, e, o| Chain { start: s, end: e, open: o };
+        assert_eq!(chains(&[]), vec![]);
+        assert_eq!(chains(&[false]), vec![c(0, 0, false)]);
+        assert_eq!(chains(&[true]), vec![c(0, 0, true)]); // lone open
+        assert_eq!(chains(&[true, false]), vec![c(0, 1, false)]);
+        assert_eq!(chains(&[true, true, false, false]), vec![c(0, 2, false), c(3, 3, false)]);
+        assert_eq!(chains(&[false, true, true]), vec![c(0, 0, false), c(1, 2, true)]);
+        assert_eq!(
+            chains(&[true, false, true, false]),
+            vec![c(0, 1, false), c(2, 3, false)]
+        );
     }
 
     #[test]

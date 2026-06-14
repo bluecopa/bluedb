@@ -20,7 +20,7 @@ use slatedb::WriteBatch;
 
 use crate::keyspace::LedgerKeyspace;
 use crate::model::{
-    account_exists_result, account_is_gated, classify, transfer_exists_result,
+    account_exists_result, account_is_gated, chains, classify, transfer_exists_result,
     validate_account_post_existence, validate_account_pre_existence,
     validate_transfer_post_existence, validate_transfer_pre_existence, Account, AccountFlags,
     CreateAccountResult, CreateTransferResult, PendingStatus, Transfer, TransferFlags, TransferOp,
@@ -109,10 +109,10 @@ impl Ledger {
     /// Create accounts (batch). Each item is validated against TigerBeetle's
     /// `create_accounts` check ordering; the first failing check determines the
     /// returned code. An id that already exists (committed or staged earlier in
-    /// this batch) yields [`CreateAccountResult::Exists`] or
-    /// `ExistsWith*` (field comparison). Accepted accounts are assigned an
-    /// engine timestamp and committed in one atomic batch. Requires the active
-    /// writer.
+    /// this batch) yields [`CreateAccountResult::Exists`] or `ExistsWith*` (field
+    /// comparison). `flags.linked` chains members all-or-nothing. Accepted
+    /// accounts are assigned an engine timestamp and committed in one atomic
+    /// batch. Requires the active writer.
     pub async fn create_accounts(&self, specs: &[Account]) -> Result<Vec<CreateAccountResult>> {
         use CreateAccountResult as R;
         let _lease = self.write_lease.lock().await; // exclusive: we are the sole mutator
@@ -120,46 +120,100 @@ impl Ledger {
 
         let now = self.clock.now_ns();
         let mut ts = TimestampSource::new(get_watermark(&self.substrate, &self.keyspace).await?);
-        let mut batch = WriteBatch::new();
-        let mut results = Vec::with_capacity(specs.len());
-        // Accounts staged in THIS batch, for in-batch existence comparison.
         let mut staged: HashMap<u128, Account> = HashMap::new();
+        let mut accepted: Vec<Account> = Vec::new();
+        let mut results = Vec::with_capacity(specs.len());
 
-        for spec in specs {
-            if let Some(code) = validate_account_pre_existence(spec) {
-                results.push(code);
+        let linked: Vec<bool> = specs.iter().map(|a| a.flags.contains(AccountFlags::LINKED)).collect();
+        for chain in chains(&linked) {
+            // Fast path: an independent (single, non-linked) account.
+            if chain.start == chain.end && !chain.open {
+                let r = self.stage_account(&specs[chain.start], now, &mut ts, &mut staged, &mut accepted).await?;
+                results.push(r);
                 continue;
             }
-            // Existence (TB 13–19): committed first, then staged this batch.
-            if let Some(existing) = get_account(&self.substrate, &self.keyspace, spec.id).await? {
-                results.push(account_exists_result(spec, &existing));
-                continue;
+            // Linked chain (or open): tentatively apply, roll back on any failure.
+            let staged_snap = staged.clone();
+            let accepted_len = accepted.len();
+            let ts_snap = ts.last;
+            let mut chain_results = Vec::new();
+            let mut offender = None;
+            if !chain.open {
+                for (pos, spec) in specs[chain.start..=chain.end].iter().enumerate() {
+                    let r = self.stage_account(spec, now, &mut ts, &mut staged, &mut accepted).await?;
+                    let ok = matches!(r, R::Created | R::Exists);
+                    chain_results.push(r);
+                    if !ok {
+                        offender = Some(pos);
+                        break;
+                    }
+                }
             }
-            if let Some(existing) = staged.get(&spec.id) {
-                results.push(account_exists_result(spec, existing));
-                continue;
+            if chain.open || offender.is_some() {
+                staged = staged_snap;
+                accepted.truncate(accepted_len);
+                ts.last = ts_snap;
+                for k in chain.start..=chain.end {
+                    let pos = k - chain.start;
+                    results.push(if chain.open {
+                        if k == chain.end { R::LinkedEventChainOpen } else { R::LinkedEventFailed }
+                    } else if Some(pos) == offender {
+                        chain_results[pos]
+                    } else {
+                        R::LinkedEventFailed
+                    });
+                }
+            } else {
+                results.extend(chain_results);
             }
-            if let Some(code) = validate_account_post_existence(spec) {
-                results.push(code);
-                continue;
-            }
-            if account_is_gated(spec) {
-                results.push(R::NotImplementedYet);
-                continue;
-            }
-
-            let mut acct = *spec;
-            acct.timestamp = ts.next(now);
-            batch.put(self.keyspace.account_key(acct.id), &encode(&acct)?);
-            staged.insert(acct.id, acct);
-            results.push(R::Created);
         }
 
-        if !staged.is_empty() {
+        let mut batch = WriteBatch::new();
+        for a in &accepted {
+            batch.put(self.keyspace.account_key(a.id), &encode(a)?);
+        }
+        if !accepted.is_empty() {
             batch.put(self.keyspace.watermark_key(), ts.last.to_be_bytes());
+        }
+        if !batch.is_empty() {
             writer.write(batch).await?;
         }
         Ok(results)
+    }
+
+    /// Validate + (on success) stage one account into `staged`/`accepted`,
+    /// assigning a timestamp. Returns the per-item result; mutates nothing on a
+    /// failure/exists result.
+    async fn stage_account(
+        &self,
+        spec: &Account,
+        now: u64,
+        ts: &mut TimestampSource,
+        staged: &mut HashMap<u128, Account>,
+        accepted: &mut Vec<Account>,
+    ) -> Result<CreateAccountResult> {
+        use CreateAccountResult as R;
+        if let Some(code) = validate_account_pre_existence(spec) {
+            return Ok(code);
+        }
+        // Existence (TB 13–19): committed first, then staged this batch.
+        if let Some(existing) = get_account(&self.substrate, &self.keyspace, spec.id).await? {
+            return Ok(account_exists_result(spec, &existing));
+        }
+        if let Some(existing) = staged.get(&spec.id) {
+            return Ok(account_exists_result(spec, existing));
+        }
+        if let Some(code) = validate_account_post_existence(spec) {
+            return Ok(code);
+        }
+        if account_is_gated(spec) {
+            return Ok(R::NotImplementedYet);
+        }
+        let mut acct = *spec;
+        acct.timestamp = ts.next(now);
+        staged.insert(acct.id, acct);
+        accepted.push(acct);
+        Ok(R::Created)
     }
 
     /// Apply transfers (batch). Begins by sweeping expired pendings, then
@@ -189,58 +243,53 @@ impl Ledger {
         let mut accepted: Vec<Transfer> = Vec::new();
         let mut results = Vec::with_capacity(transfers.len());
 
-        for t in transfers {
-            if let Some(code) = validate_transfer_pre_existence(t) {
-                results.push(code);
+        let linked: Vec<bool> = transfers.iter().map(|t| t.flags.contains(TransferFlags::LINKED)).collect();
+        for chain in chains(&linked) {
+            // Fast path: an independent (single, non-linked) transfer.
+            if chain.start == chain.end && !chain.open {
+                let r = self
+                    .process_transfer(&transfers[chain.start], now, &mut ts, &mut state, &mut staged, &mut accepted)
+                    .await?;
+                results.push(r);
                 continue;
             }
-            // Existence (TB 12–23): committed first, then staged this batch.
-            if let Some(existing) = get_transfer(&self.substrate, &self.keyspace, t.id).await? {
-                results.push(transfer_exists_result(t, &existing));
-                continue;
-            }
-            if let Some(existing) = staged.get(&t.id) {
-                results.push(transfer_exists_result(t, existing));
-                continue;
-            }
-            if let Some(code) = validate_transfer_post_existence(t) {
-                results.push(code);
-                continue;
-            }
-
-            // Classify and apply. Each arm yields the record to persist (raw for
-            // regular/pending; materialized for post/void) or a rejection code.
-            let op = classify(t);
-            let staged_record: StageRecord = match op {
-                TransferOp::Regular => self.stage_regular(t, &mut state).await?.map(|()| *t),
-                TransferOp::PendingReserve => {
-                    // The timestamp this item will get on accept (for the
-                    // timeout-overflow check); equals `ts.next(now)` since no
-                    // accept happens between this peek and the accept below.
-                    let prospective_ts = ts.peek(now);
-                    self.stage_pending(t, prospective_ts, &mut state).await?.map(|()| *t)
+            // Linked chain (or open): tentatively apply, roll back on any failure.
+            let state_snap = state.clone();
+            let staged_snap = staged.clone();
+            let accepted_len = accepted.len();
+            let ts_snap = ts.last;
+            let mut chain_results = Vec::new();
+            let mut offender = None;
+            if !chain.open {
+                for (pos, t) in transfers[chain.start..=chain.end].iter().enumerate() {
+                    let r = self
+                        .process_transfer(t, now, &mut ts, &mut state, &mut staged, &mut accepted)
+                        .await?;
+                    let ok = matches!(r, R::Created | R::Exists);
+                    chain_results.push(r);
+                    if !ok {
+                        offender = Some(pos);
+                        break;
+                    }
                 }
-                TransferOp::Post | TransferOp::Void => {
-                    let post = matches!(op, TransferOp::Post);
-                    // The referenced pending may be committed or staged this batch.
-                    let pending = match get_transfer(&self.substrate, &self.keyspace, t.pending_id).await? {
-                        Some(p) => Some(p),
-                        None => staged.get(&t.pending_id).copied(),
-                    };
-                    self.stage_resolution(t, pending, post, now, &mut state).await?
+            }
+            if chain.open || offender.is_some() {
+                state = state_snap;
+                staged = staged_snap;
+                accepted.truncate(accepted_len);
+                ts.last = ts_snap;
+                for k in chain.start..=chain.end {
+                    let pos = k - chain.start;
+                    results.push(if chain.open {
+                        if k == chain.end { R::LinkedEventChainOpen } else { R::LinkedEventFailed }
+                    } else if Some(pos) == offender {
+                        chain_results[pos]
+                    } else {
+                        R::LinkedEventFailed
+                    });
                 }
-                TransferOp::Gated => Err(R::NotImplementedYet),
-            };
-
-            match staged_record {
-                Ok(record) => {
-                    // Timestamp assigned only on accept (failed items don't advance it).
-                    let applied = Transfer { timestamp: ts.next(now), ..record };
-                    staged.insert(applied.id, applied);
-                    accepted.push(applied);
-                    results.push(R::Created);
-                }
-                Err(code) => results.push(code),
+            } else {
+                results.extend(chain_results);
             }
         }
 
@@ -274,6 +323,70 @@ impl Ledger {
             writer.write(batch).await?;
         }
         Ok(results)
+    }
+
+    /// Validate, classify, and (on success) apply one transfer into `state`,
+    /// `staged`, and `accepted`, assigning a timestamp on accept. Returns the
+    /// per-item result; mutates nothing on a failure/exists result.
+    #[allow(clippy::too_many_arguments)]
+    async fn process_transfer(
+        &self,
+        t: &Transfer,
+        now: u64,
+        ts: &mut TimestampSource,
+        state: &mut ApplyState,
+        staged: &mut HashMap<u128, Transfer>,
+        accepted: &mut Vec<Transfer>,
+    ) -> Result<CreateTransferResult> {
+        use CreateTransferResult as R;
+        if let Some(code) = validate_transfer_pre_existence(t) {
+            return Ok(code);
+        }
+        // Existence (TB 12–23): committed first, then staged this batch.
+        if let Some(existing) = get_transfer(&self.substrate, &self.keyspace, t.id).await? {
+            return Ok(transfer_exists_result(t, &existing));
+        }
+        if let Some(existing) = staged.get(&t.id) {
+            return Ok(transfer_exists_result(t, existing));
+        }
+        if let Some(code) = validate_transfer_post_existence(t) {
+            return Ok(code);
+        }
+
+        // Classify and apply. Each arm yields the record to persist (raw for
+        // regular/pending; materialized for post/void) or a rejection code.
+        let op = classify(t);
+        let staged_record: StageRecord = match op {
+            TransferOp::Regular => self.stage_regular(t, state).await?.map(|()| *t),
+            TransferOp::PendingReserve => {
+                // The timestamp this item will get on accept (for the
+                // timeout-overflow check); equals `ts.next(now)` since no accept
+                // happens between this peek and the accept below.
+                let prospective_ts = ts.peek(now);
+                self.stage_pending(t, prospective_ts, state).await?.map(|()| *t)
+            }
+            TransferOp::Post | TransferOp::Void => {
+                let post = matches!(op, TransferOp::Post);
+                // The referenced pending may be committed or staged this batch.
+                let pending = match get_transfer(&self.substrate, &self.keyspace, t.pending_id).await? {
+                    Some(p) => Some(p),
+                    None => staged.get(&t.pending_id).copied(),
+                };
+                self.stage_resolution(t, pending, post, now, state).await?
+            }
+            TransferOp::Gated => Err(R::NotImplementedYet),
+        };
+
+        match staged_record {
+            Ok(record) => {
+                // Timestamp assigned only on accept (failed items don't advance it).
+                let applied = Transfer { timestamp: ts.next(now), ..record };
+                staged.insert(applied.id, applied);
+                accepted.push(applied);
+                Ok(R::Created)
+            }
+            Err(code) => Ok(code),
+        }
     }
 
     /// Auto-void every timed pending whose `expires_at <= now`: release the
@@ -665,7 +778,7 @@ type StageRecord = std::result::Result<Transfer, CreateTransferResult>;
 /// these are written back), and the pending transfers resolved this batch (each
 /// gets a pending-state record, and a second resolution in the same batch is
 /// rejected).
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct ApplyState {
     working: HashMap<u128, Account>,
     dirty: HashSet<u128>,
@@ -848,10 +961,13 @@ mod tests {
         let db = writer_database().await;
         let l = Ledger::new(&db);
         setup_two_accounts(&l).await;
-        // Later-phase flags still gate (linked D, balancing E, closing F, imported G).
-        for f in [TransferFlags::LINKED, TransferFlags::BALANCING_DEBIT, TransferFlags::IMPORTED] {
+        // Later-phase flags still gate (balancing E, imported G; closing F via pending).
+        for f in [TransferFlags::BALANCING_DEBIT, TransferFlags::BALANCING_CREDIT, TransferFlags::IMPORTED] {
             assert_eq!(l.create_transfers(&[xfer(1, 1, 2, 5).with_flags(f)]).await.unwrap(), vec![R::NotImplementedYet]);
         }
+        // A closing transfer (requires pending) is gated to Phase F.
+        let closing = xfer(1, 1, 2, 5).with_flags(TransferFlags::PENDING | TransferFlags::CLOSING_DEBIT);
+        assert_eq!(l.create_transfers(&[closing]).await.unwrap(), vec![R::NotImplementedYet]);
         // Nothing persisted by a gated item.
         assert!(l.lookup_transfer(1).await.unwrap().is_none());
         assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_posted, 0);
@@ -1227,6 +1343,153 @@ mod tests {
         assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_pending, 100, "untimed pending outstanding");
         // And it can still be posted.
         assert_eq!(l.create_transfers(&[post(501, 500, AMOUNT_MAX)]).await.unwrap(), vec![CreateTransferResult::Created]);
+    }
+
+    // ---- Phase D: linked chains ----
+
+    fn linked_xfer(id: u128, d: u128, c: u128, amt: u128) -> Transfer {
+        xfer(id, d, c, amt).with_flags(TransferFlags::LINKED)
+    }
+
+    #[tokio::test]
+    async fn linked_accounts_all_succeed() {
+        use CreateAccountResult as R;
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        let a = acct(1, 7).with_flags(AccountFlags::LINKED);
+        let res = l.create_accounts(&[a, acct(2, 7)]).await.unwrap();
+        assert_eq!(res, vec![R::Created, R::Created]);
+        assert!(l.lookup_account(1).await.unwrap().is_some());
+        assert!(l.lookup_account(2).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn linked_accounts_one_fails_rolls_back_chain() {
+        use CreateAccountResult as R;
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        // a1 (linked) ok, a2 has ledger 0 (LedgerMustNotBeZero) → whole chain fails.
+        let a1 = acct(1, 7).with_flags(AccountFlags::LINKED);
+        let a2 = Account::input(2, 0).with_code(1);
+        let res = l.create_accounts(&[a1, a2]).await.unwrap();
+        assert_eq!(res, vec![R::LinkedEventFailed, R::LedgerMustNotBeZero]);
+        // Neither persisted (a1 rolled back).
+        assert!(l.lookup_account(1).await.unwrap().is_none());
+        assert!(l.lookup_account(2).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn open_chain_is_rejected() {
+        use CreateAccountResult as R;
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        // A lone linked account (last batch event linked) → chain open.
+        let res = l.create_accounts(&[acct(1, 7).with_flags(AccountFlags::LINKED)]).await.unwrap();
+        assert_eq!(res, vec![R::LinkedEventChainOpen]);
+        assert!(l.lookup_account(1).await.unwrap().is_none());
+        // Two linked with no terminator → first LinkedEventFailed, last ChainOpen.
+        let res = l
+            .create_accounts(&[acct(2, 7).with_flags(AccountFlags::LINKED), acct(3, 7).with_flags(AccountFlags::LINKED)])
+            .await
+            .unwrap();
+        assert_eq!(res, vec![R::LinkedEventFailed, R::LinkedEventChainOpen]);
+        assert!(l.lookup_account(2).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn linked_transfers_all_succeed() {
+        use CreateTransferResult as R;
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        l.create_accounts(&[acct(1, 7), acct(2, 7), acct(3, 7)]).await.unwrap();
+        // 1→2 (linked) then 2→3 (terminator): both apply.
+        let res = l.create_transfers(&[linked_xfer(10, 1, 2, 100), xfer(11, 2, 3, 40)]).await.unwrap();
+        assert_eq!(res, vec![R::Created, R::Created]);
+        assert_eq!(l.lookup_account(2).await.unwrap().unwrap().debits_posted, 40);
+        assert_eq!(l.lookup_account(2).await.unwrap().unwrap().credits_posted, 100);
+    }
+
+    #[tokio::test]
+    async fn linked_transfers_failure_rolls_back_whole_chain() {
+        use CreateTransferResult as R;
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
+        // t1 ok (1→2), t2 references a missing account → chain fails, t1 rolled back.
+        let res = l.create_transfers(&[linked_xfer(10, 1, 2, 100), xfer(11, 1, 99, 5)]).await.unwrap();
+        assert_eq!(res, vec![R::LinkedEventFailed, R::CreditAccountNotFound]);
+        // t1's movement rolled back; nothing persisted.
+        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_posted, 0);
+        assert_eq!(l.lookup_account(2).await.unwrap().unwrap().credits_posted, 0);
+        assert!(l.lookup_transfer(10).await.unwrap().is_none());
+        assert!(l.lookup_transfer(11).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn failure_mid_chain_marks_all_others_linked_failed() {
+        use CreateTransferResult as R;
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
+        // t1 ok, t2 bad (missing acct 3), t3 terminator — t2 is the offender.
+        let res = l
+            .create_transfers(&[linked_xfer(10, 1, 2, 50), linked_xfer(11, 2, 3, 10), xfer(12, 2, 1, 5)])
+            .await
+            .unwrap();
+        assert_eq!(res, vec![R::LinkedEventFailed, R::CreditAccountNotFound, R::LinkedEventFailed]);
+        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_posted, 0);
+        assert_eq!(l.lookup_account(2).await.unwrap().unwrap().debits_posted, 0);
+    }
+
+    #[tokio::test]
+    async fn independent_events_commit_around_a_failed_chain() {
+        use CreateTransferResult as R;
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
+        // indep ok | [t2(linked) ok, t3(bad)] chain fails | indep ok
+        let batch = [
+            xfer(10, 1, 2, 10),                // independent → Created
+            linked_xfer(11, 1, 2, 20),         // chain start
+            xfer(12, 1, 99, 5),                // terminator, bad → CreditAccountNotFound
+            xfer(13, 2, 1, 7),                 // independent → Created
+        ];
+        let res = l.create_transfers(&batch).await.unwrap();
+        assert_eq!(res, vec![R::Created, R::LinkedEventFailed, R::CreditAccountNotFound, R::Created]);
+        // Only the two independents applied: 1 debits 10 (+0 from chain), credits 7; 2 credits 10, debits 7.
+        let a1 = l.lookup_account(1).await.unwrap().unwrap();
+        let a2 = l.lookup_account(2).await.unwrap().unwrap();
+        assert_eq!((a1.debits_posted, a1.credits_posted), (10, 7));
+        assert_eq!((a2.credits_posted, a2.debits_posted), (10, 7));
+    }
+
+    #[tokio::test]
+    async fn linked_two_phase_chain() {
+        use CreateTransferResult as R;
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
+        // reserve(linked) + post(terminator) committed atomically.
+        let mut reserve = xfer(10, 1, 2, 100).with_flags(TransferFlags::PENDING | TransferFlags::LINKED);
+        reserve.timeout = 0;
+        let res = l.create_transfers(&[reserve, post(11, 10, AMOUNT_MAX)]).await.unwrap();
+        assert_eq!(res, vec![R::Created, R::Created]);
+        let d = l.lookup_account(1).await.unwrap().unwrap();
+        assert_eq!((d.debits_pending, d.debits_posted), (0, 100));
+    }
+
+    #[tokio::test]
+    async fn idempotent_linked_chain_retry() {
+        use CreateTransferResult as R;
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        l.create_accounts(&[acct(1, 7), acct(2, 7), acct(3, 7)]).await.unwrap();
+        let batch = [linked_xfer(10, 1, 2, 100), xfer(11, 2, 3, 40)];
+        assert_eq!(l.create_transfers(&batch).await.unwrap(), vec![R::Created, R::Created]);
+        // Resubmit identical → both Exists; chain commits (no LinkedEventFailed).
+        assert_eq!(l.create_transfers(&batch).await.unwrap(), vec![R::Exists, R::Exists]);
+        // Balances unchanged (applied exactly once).
+        assert_eq!(l.lookup_account(2).await.unwrap().unwrap().credits_posted, 100);
     }
 
     #[tokio::test]
