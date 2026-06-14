@@ -22,6 +22,13 @@ PostgreSQL/DuckDB.
 >
 > Reproduce: run `fetch_corpus.sh`, then
 > `cargo run -p bluedb-sqltest --bin conformance -- <corpus-dir>`.
+>
+> **Storage-contract conformance.** Separately, GlueSQL's own custom-storage
+> test suite runs against `SlateDbStorage` (`crates/bluedb-sql/tests/gluesql_suite.rs`):
+> **205/205** pass across store / alter-table / index / transaction / metadata.
+> This validates the trait impls *we* wrote (CRUD, snapshot-isolation rollback,
+> secondary-index scans, `GLUE_OBJECTS`) — the axis the SQL corpus doesn't cover.
+> Run: `cargo test -p bluedb-sql --test gluesql_suite`.
 
 ## How a query is processed
 
@@ -52,7 +59,8 @@ between a numeric operand and a numeric string literal compares *numerically*
 - `CREATE TABLE` (typed *and* schemaless), `DROP TABLE`
 - `INSERT` (single-row), `UPDATE`, `DELETE`
 - `SELECT` — projection, `WHERE`, `ORDER BY`, `GROUP BY`, `HAVING`, `LIMIT`/`OFFSET`, `DISTINCT`
-- `CREATE INDEX` / `DROP INDEX` (single-column)
+- `CREATE INDEX` / `DROP INDEX` (single-column) — and secondary indexes are actually *used* by the planner (`plan_index`), not just built.
+- Metadata/introspection tables — `GLUE_OBJECTS` (tables + indexes, with a real per-table `CREATED`), `GLUE_TABLES`, `GLUE_TABLE_COLUMNS`, `GLUE_INDEXES`.
 - `CREATE VIEW` / `DROP VIEW` — no engine view support; the definition is captured and inlined as a derived table on reference (one level; non-recursive).
 - `SET` / `PRAGMA` — `default_null_order` is honored; other engine-config knobs are accepted as no-ops rather than rejected.
 - Transactions — `BEGIN` / `COMMIT` / `ROLLBACK` (snapshot isolation; write transactions serialized — single writer)
