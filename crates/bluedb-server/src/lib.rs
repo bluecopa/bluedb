@@ -26,6 +26,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{Path, RawQuery, State};
 use axum::http::StatusCode;
@@ -41,7 +42,30 @@ use bluedb_rest::{parse_filters, DeleteRequest, InsertRequest, UpdateRequest};
 use bluedb_sql::{Database, SlateDbStorage};
 use gluesql_core::prelude::{Glue, Payload, Value as SqlValue};
 use slatedb::object_store::ObjectStore;
-use slatedb::{Db, DbReader};
+use slatedb::{Db, DbReader, Settings};
+
+/// bluedb's default WAL flush interval (overrides SlateDB's 100 ms) — chosen for
+/// the latency-sensitive HTTP profile. Override with `BLUEDB_FLUSH_INTERVAL_MS`.
+const DEFAULT_FLUSH_INTERVAL_MS: u64 = 25;
+
+/// Parse a `BLUEDB_FLUSH_INTERVAL_MS` value into a `Duration`. `None`, empty, or
+/// unparseable → the 25 ms default (total + non-panicking).
+fn parse_flush_interval_ms(raw: Option<&str>) -> Duration {
+    let ms = raw
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_FLUSH_INTERVAL_MS);
+    Duration::from_millis(ms)
+}
+
+/// SlateDB `Settings` for the writer `Db`: bluedb's `flush_interval` default,
+/// env-overridable, everything else at SlateDB defaults.
+fn writer_settings() -> Settings {
+    let mut settings = Settings::default();
+    settings.flush_interval = Some(parse_flush_interval_ms(
+        std::env::var("BLUEDB_FLUSH_INTERVAL_MS").ok().as_deref(),
+    ));
+    settings
+}
 
 /// Shared service state. Cheap to clone (an `Arc` to the inner state).
 #[derive(Clone)]
@@ -90,7 +114,9 @@ impl AppState {
     /// Opening the writer bumps SlateDB's `writer_epoch`, fencing a dead writer.
     pub async fn promote(&self) -> Result<(), AppError> {
         self.inner.writer.promote().await.map_err(AppError::from_ha)?;
-        let db = Db::open(self.inner.db_path.clone(), self.inner.object_store.clone())
+        let db = Db::builder(self.inner.db_path.clone(), self.inner.object_store.clone())
+            .with_settings(writer_settings())
+            .build()
             .await
             .map_err(|err| AppError::internal(format!("open writer db: {err}")))?;
         *self.inner.db.write().await = Some(Database::new(Arc::new(db)));
@@ -456,6 +482,22 @@ fn sql_value_to_json(value: &SqlValue) -> Value {
 }
 
 // --- tests ------------------------------------------------------------------
+
+#[cfg(test)]
+mod flush_interval_cfg {
+    use super::parse_flush_interval_ms;
+    use std::time::Duration;
+
+    #[test]
+    fn defaults_to_25ms_and_parses_override() {
+        assert_eq!(parse_flush_interval_ms(None), Duration::from_millis(25));
+        assert_eq!(parse_flush_interval_ms(Some("50")), Duration::from_millis(50));
+        assert_eq!(parse_flush_interval_ms(Some("100")), Duration::from_millis(100));
+        assert_eq!(parse_flush_interval_ms(Some("abc")), Duration::from_millis(25));
+        assert_eq!(parse_flush_interval_ms(Some("")), Duration::from_millis(25));
+        assert_eq!(parse_flush_interval_ms(Some("0")), Duration::from_millis(0));
+    }
+}
 
 #[cfg(test)]
 mod insert_routing {

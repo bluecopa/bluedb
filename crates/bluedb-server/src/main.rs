@@ -17,6 +17,8 @@
 //!   `BLUEDB_LEASE_MARGIN_SECS` (5).
 //! - `BLUEDB_START_PASSIVE` — start as a read replica and wait for the HA loop
 //!   (or `POST /admin/promote`) to take the lease; default bootstraps to writer.
+//! - `BLUEDB_FLUSH_INTERVAL_MS` — WAL flush interval in ms (default 25). Set at
+//!   writer open; lower = lower write latency + more object-store PUTs under load.
 
 use std::sync::Arc;
 use std::time::Duration;
