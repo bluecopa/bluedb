@@ -6,19 +6,30 @@ recorded history.
 
 ## What it checks
 
-**Workload — grow-only set.** Clients append unique integers through the active
-writer; a final-read phase reads the whole set back. The `set-full` checker
-proves two things across failover:
+Two workloads, pick with `--workload`:
+
+**`set` (default) — grow-only set.** Clients append unique integers through the
+active writer; a final-read phase reads the whole set back. The `set-full`
+checker proves two things across failover:
 
 - **no lost writes** — every *acknowledged* add (HTTP 200) is present in the
   final read, and
 - **no fabrication** — no element appears that was never added.
 
-The cluster is driven as a single logical linearizable writer whose identity
-moves on failover (bluedb's actual guarantee: one linearizable writer + async
-read replicas). The client discovers the active writer via `/admin/status` and
-re-discovers when it gets a `503` (its node is now a replica) — i.e. it follows
-the leader across promotions.
+Best for durability / no-lost-update under failover.
+
+**`list-append` — Elle list-append.** Each Jepsen transaction is a `BEGIN; …;
+COMMIT;` of appends + reads over several keys, sent as one `POST /sql` so it runs
+as one explicit transaction on the active writer. Elle reconstructs the
+transaction dependency graph from the observed reads and flags any
+serializability anomaly (G0/G1/G2, write skew, lost update). This exercises the
+explicit-transaction path under concurrency — the stronger guarantee that
+`set-full` doesn't cover.
+
+In both cases the cluster is driven as a single logical writer whose identity
+moves on failover (bluedb's guarantee: one serial writer + async read replicas).
+The client discovers the active writer via `/admin/status` and re-discovers on a
+`503` (its node became a replica) — i.e. it follows the leader across promotions.
 
 ## Faults (nemesis)
 
@@ -39,21 +50,26 @@ window.
 ## Running
 
 Prereqs: the cluster must be **up** (`docker compose up -d` from the repo root)
-and Java 17+ on `$PATH`. Leiningen is vendored at `bin/lein`.
+and **Java 21+** on `$PATH` (a transitive dep needs `java.util.SequencedCollection`;
+JDK 17 fails to load it). Leiningen is vendored at `bin/lein`.
 
 ```bash
 cd jepsen
 export LEIN_HOME="$PWD/.lein"
+# point at a JDK 21+ if your default `java` is older, e.g. on macOS:
+# export JAVA_HOME=$(/usr/libexec/java_home -v 24); export PATH="$JAVA_HOME/bin:$PATH"
 
-# baseline, then each fault mode
-./bin/lein run test --nemesis none      --time-limit 60  --concurrency 10 \
-  --node node1 --node node2 --node node3
-./bin/lein run test --nemesis kill      --time-limit 120 --concurrency 10 \
-  --node node1 --node node2 --node node3
-./bin/lein run test --nemesis partition --time-limit 120 --concurrency 10 \
-  --node node1 --node node2 --node node3
-./bin/lein run test --nemesis mix       --time-limit 180 --concurrency 10 \
-  --node node1 --node node2 --node node3
+NODES="--node node1 --node node2 --node node3"
+
+# set workload (durability / no-lost-update), each fault mode
+./bin/lein run test --workload set --nemesis none      --time-limit 60  --concurrency 10 $NODES
+./bin/lein run test --workload set --nemesis kill      --time-limit 120 --concurrency 10 $NODES
+./bin/lein run test --workload set --nemesis partition --time-limit 120 --concurrency 10 $NODES
+./bin/lein run test --workload set --nemesis mix       --time-limit 180 --concurrency 10 $NODES
+
+# list-append workload (serializability) — baseline and through failover
+./bin/lein run test --workload list-append --nemesis none --time-limit 60  --concurrency 10 $NODES
+./bin/lein run test --workload list-append --nemesis mix  --time-limit 120 --concurrency 10 $NODES
 ```
 
 Results land in `store/`; `store/latest/results.edn` holds the verdict and
@@ -64,5 +80,6 @@ checker found no anomalies.
 
 - `src/bluedb/jepsen/http.clj` — REST/`/admin` HTTP layer + leader discovery
 - `src/bluedb/jepsen/client.clj` — leader-aware set client (add / read)
+- `src/bluedb/jepsen/list_append.clj` — Elle list-append client (txn → `/sql`)
 - `src/bluedb/jepsen/nemesis.clj` — docker-driven kill / partition / heal
-- `src/bluedb/jepsen/core.clj` — workload, generator, checker, CLI
+- `src/bluedb/jepsen/core.clj` — workloads, generator, checker, CLI

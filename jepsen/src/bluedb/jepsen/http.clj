@@ -34,6 +34,25 @@
   []
   (some (fn [n] (when (= "active" (:role (status n))) n)) (keys ports)))
 
+;; --- leader-aware routing (shared by the workload clients) -----------------
+
+(defn make-leader
+  "A fresh shared cell holding the believed-active node name."
+  []
+  (atom nil))
+
+(defn refresh-leader!
+  "Re-discover the active writer and cache it; returns the node name or nil."
+  [leader]
+  (let [a (active-node)]
+    (reset! leader a)
+    a))
+
+(defn target
+  "The cached active node, discovering one if the cell is empty."
+  [leader]
+  (or @leader (refresh-leader! leader)))
+
 (defn add!
   "POST /tables/jset {v}. Returns the ring response (status code), or throws on
   connection/timeout errors."
