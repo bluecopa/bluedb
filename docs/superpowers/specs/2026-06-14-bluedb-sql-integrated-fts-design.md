@@ -114,13 +114,19 @@ LIMIT 20;
 ```
 
 **Parser feasibility (verified).** sqlparser 0.52 **tokenizes `@@`** (`Token::AtAt` →
-`BinaryOperator::AtAt`), and `to_tsvector` / `to_tsquery` / `plainto_tsquery` /
-`websearch_to_tsquery` / `ts_rank` parse as ordinary function calls — so the surface is
-syntactically accepted. gluesql's *translate/executor* does **not** understand `@@` or the
-`tsvector`/`tsquery` types, so we intercept these constructs in our pre-execution shim
-(the same place we rewrite set-ops, comma-joins, and coercions) and the `Planner::plan`
-pass, rewriting them into the tantivy plan. The query string is a bound `$N` param
-(injection-proof per Spec A).
+`BinaryOperator::AtAt`) and parses `to_tsvector` / `to_tsquery` / `plainto_tsquery` /
+`websearch_to_tsquery` / `ts_rank` as ordinary function calls. But gluesql's `translate`
+(which runs **before** our `Planner::plan` hook in the parse→translate→plan pipeline)
+**rejects `@@`**: `translate_binary_operator` (operator.rs:44) has a catch-all
+`_ => Err(UnsupportedBinaryOperator)`, and `AtAt` is not in its list (likewise the unknown
+`ts*` functions error in translate). **So the rewrite cannot live in the Planner hook —
+it must be a pre-parse pass.**
+
+We do it with **sqlparser directly** (already a pinned dependency, used the same way for
+the comma-join / set-op rewrites): parse the SQL with sqlparser → detect the FTS
+constructs → run the tantivy search → rewrite the sqlparser AST (`@@` → `pk IN (…)`,
+`ts_rank(…)` → score expr) → re-emit SQL → hand the now-FTS-free SQL to gluesql. The query
+string is a bound `$N` param (injection-proof per Spec A).
 
 The rewrite:
 1. Detects `to_tsvector(cfg, col) @@ <tsquery-fn>(q)` and `ts_rank(to_tsvector(cfg,col), …)`.
@@ -199,9 +205,10 @@ interval.
   Split`. Independently testable in-memory.
 - **New: commit tap** — a hook in `bluedb-sql`'s `StoreMut` commit emitting indexed-column
   changes for FTS-indexed tables.
-- **New: SQL↔FTS bridge** — a shim/`Planner::plan` pass detecting the `@@` predicate +
+- **New: SQL↔FTS bridge** — a **pre-parse sqlparser pass** detecting the `@@` predicate +
   `to_tsvector`/`*_tsquery`/`ts_rank` constructs and rewriting via an injected
-  `FtsSearcher` (which fans the search over splits ∪ live).
+  `FtsSearcher` (which fans the search over splits ∪ live), re-emitting FTS-free SQL for
+  gluesql. (Not the `Planner::plan` hook — gluesql `translate` rejects `@@` first.)
 - `bluedb-engine` — wires the `LiveSegment` + `FtsSearcher` into the SQL connection and
   drives the background seal scheduler (it already has the `FtsIndex` compaction scheduler
   pattern to follow).
@@ -222,12 +229,11 @@ interval.
 
 ## 9. Open questions
 
-- **Predicate syntax — resolved to the Postgres surface** (`@@` + `to_tsvector` /
-  `*_tsquery` / `ts_rank`); sqlparser 0.52 parses all of it. **Remaining sub-question:**
-  whether gluesql's `translate` *errors* on `BinaryOperator::AtAt`/unknown functions (→ we
-  must rewrite at the **pre-parse string** level, before gluesql parses) or tolerates them
-  far enough to reach our `Planner::plan` hook (→ rewrite on the typed AST). Determines
-  which shim stage does the rewrite; verify against gluesql 0.19 `translate`.
+- **Predicate syntax & rewrite stage — RESOLVED.** Postgres surface (`@@` + `to_tsvector` /
+  `*_tsquery` / `ts_rank`); sqlparser 0.52 parses all of it. gluesql `translate` rejects
+  `@@` (`UnsupportedBinaryOperator`, operator.rs:44) *before* the Planner hook, so the
+  rewrite is a **pre-parse sqlparser pass** (parse → detect → search → rewrite AST →
+  re-emit SQL → gluesql), per §4.3. Confirmed against gluesql-core 0.19.
 - **Score threading mechanism.** How the per-pk score reaches `ts_rank`/`ORDER BY` after
   the `pk IN (…)` rewrite — candidates: a derived `VALUES (pk, score)` join, an injected
   `CASE pk WHEN … THEN score` expression, or a scalar-subquery. Pick by what GlueSQL plans

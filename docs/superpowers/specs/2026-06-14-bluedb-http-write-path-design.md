@@ -73,7 +73,7 @@ serialized, release):
 3. Give clients a **batching primitive without a driver**: `POST /tables/{t}` with an
    array becomes one `BEGIN; <param-bound INSERTs>; COMMIT;` → one durable flush.
 4. Expose **`flush_interval`** as a per-DB PRAGMA to trade per-request latency vs
-   object-store PUT cost; add an opt-in **relaxed-durability** mode.
+   object-store PUT cost (the *only* throughput knob — durability stays strong).
 5. Enable **HTTP/2** so one connection can multiplex many in-flight writes.
 6. Add an **authz scope** seam (`data:read` → `data:query` → `schema:admin` →
    `superuser`) composing with the existing `require_active()` HA gate.
@@ -89,6 +89,11 @@ serialized, release):
   round-trips is an availability hazard.)
 - Fixing the upstream sqlparser multi-row-VALUES bug. We **sidestep** it via
   `BEGIN…COMMIT` of single-row inserts.
+- **Relaxed durability** (`await_durable=false`). Explicitly rejected: an acked write
+  is always durable in object storage before the ack (Jepsen `lost-count 0`). Throughput
+  comes from concurrency + group commit + the `flush_interval` knob, never from weakening
+  the durability contract. The `flush_interval` PRAGMA is the only latency/throughput
+  lever.
 - An identity provider. We design the authz **seam**; the principal source
   (bearer/JWT/API-key/mTLS) is pluggable and out of scope.
 - Cross-region concerns (Spec for HA covers those).
@@ -197,21 +202,19 @@ the Admin surface.
   only for break-glass.
 - The only surface where SQL injection is even possible — by design, locked down.
 
-### 4.5 Write-path knobs
+### 4.5 Write-path knob — `flush_interval` PRAGMA
 
-**`flush_interval` PRAGMA.** `PRAGMA flush_interval = '25ms'` (per-DB). Plumbed to the
-SlateDB open path: replace `Db::open` with `Db::builder(path, store).with_settings(s)`
-where `s.flush_interval = Some(d)` (`slatedb::Settings`, default `Some(100ms)`). Trade:
-lower interval → lower per-request latency, more object-store PUTs (SlateDB docs:
-~$130/mo per the 100 ms tier on S3 standard; 25 ms ≈ 4×). Default unchanged (100 ms).
+`PRAGMA flush_interval = '25ms'` (per-DB). Plumbed to the SlateDB open path: replace
+`Db::open` with `Db::builder(path, store).with_settings(s)` where
+`s.flush_interval = Some(d)` (`slatedb::Settings`, default `Some(100ms)`). Trade: lower
+interval → lower per-request latency and higher throughput, more object-store PUTs
+(SlateDB docs: ~$130/mo per the 100 ms tier on S3 standard; 25 ms ≈ 4×). Default unchanged
+(100 ms).
 
-**Relaxed-durability mode.** Opt-in per-DB (or per-request header) `await_durable=false`
-via `write_with_options` — ack lands in WAL/memtable and returns immediately (~µs+network
-instead of ~flush_interval). **Loss-window contract** must be documented: an acked write
-is durable only at the next flush; on crash/failover before a flush, recently-acked
-writes can be lost. Flush points: the periodic `flush_interval` and graceful step-down
-(`Database::flush()`). Interacts with HA — verify failover cannot ack-then-lose beyond
-the documented window. **Default = strong durability** (`await_durable=true`).
+**Durability stays strong** (`await_durable=true`) — an acked write is durable in object
+storage before the ack, always. `flush_interval` is the *only* latency/throughput lever;
+we never relax durability. Higher aggregate throughput comes from concurrency + group
+commit (and a shorter interval), per §5.
 
 ### 4.6 HTTP/2
 
@@ -253,7 +256,7 @@ static-token impl for dev/tests.
 - `bluedb-engine`: `rest_sql` switches to `execute_with_params`; new structured-DDL
   compiler module; new bulk-insert builder (BEGIN..COMMIT param batch).
 - `bluedb-sql`: `flush_interval` plumbed through the `Database`/open path; PRAGMA
-  intercept; relaxed-durability write option threaded to the autocommit/commit calls.
+  intercept. (Durability stays strong; no write-option change.)
 - `bluedb-server`: route split (DML/SQL/DDL/Admin), authz middleware, `{sql, params}`
   decoding, audit log for Admin, HTTP/2/TLS config, admin-enable flag.
 
@@ -272,8 +275,8 @@ maps JSON→AST; the authz layer is a middleware unit; the throughput is the exi
 - **DDL API:** create/drop table+index round-trips through the schema registry;
   introspection reflects it.
 - **flush_interval PRAGMA:** setting it changes the measured per-request latency.
-- **Relaxed durability:** acked-then-crash-before-flush loses only the documented
-  window; the transaction/isolation regression tests stay green.
+- **Durability unchanged:** an acked write survives crash/reopen (the transaction/
+  isolation + durability regression tests stay green).
 - **Throughput:** `throughput_bench` (moved into this branch) as a non-CI `#[ignore]`
   bench; numbers tracked in the docs.
 
@@ -293,4 +296,3 @@ maps JSON→AST; the authz layer is a middleware unit; the throughput is the exi
   AST (forcing all values to `$N`). Leaning **no** (kills legitimate constants like
   `LIMIT 10`, `WHERE active = TRUE`); the single-statement/no-DDL restriction + param
   binding is sufficient.
-- Per-request vs per-connection toggle for relaxed durability (a header vs a PRAGMA).
