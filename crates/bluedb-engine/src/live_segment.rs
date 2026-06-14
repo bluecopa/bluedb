@@ -47,6 +47,10 @@ pub struct LiveSegment {
     writer: Mutex<IndexWriter>,
     reader: IndexReader,
     tombstones: Mutex<HashSet<i64>>,
+    /// Every pk this live segment has indexed or tombstoned since construction
+    /// (or the last [`Self::drain_for_seal`]). The union searcher uses it to mask
+    /// any durable-split hit whose pk the live tier already covers (live wins).
+    covered: Mutex<HashSet<i64>>,
     dirty: AtomicBool,
 }
 
@@ -108,6 +112,7 @@ impl LiveSegment {
             writer: Mutex::new(writer),
             reader,
             tombstones: Mutex::new(HashSet::new()),
+            covered: Mutex::new(HashSet::new()),
             dirty: AtomicBool::new(false),
         })
     }
@@ -121,6 +126,11 @@ impl LiveSegment {
         w.delete_term(Term::from_field_i64(self.pk_field, pk));
         w.add_document(doc!(self.pk_field => pk, self.body_field => text.to_string()))
             .map_err(|e| EngineError::Other(e.into()))?;
+        drop(w);
+        self.covered
+            .lock()
+            .expect("covered mutex poisoned")
+            .insert(pk);
         self.dirty.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -135,6 +145,10 @@ impl LiveSegment {
         self.tombstones
             .lock()
             .expect("tombstones mutex poisoned")
+            .insert(pk);
+        self.covered
+            .lock()
+            .expect("covered mutex poisoned")
             .insert(pk);
         self.dirty.store(true, Ordering::SeqCst);
         Ok(())
@@ -208,6 +222,94 @@ impl LiveSegment {
         }
         hits.truncate(limit);
         Ok(hits)
+    }
+
+    /// Every pk this segment has indexed or tombstoned since construction (or the
+    /// last [`Self::drain_for_seal`]). The union searcher masks any durable hit
+    /// whose pk is in this set — the live tier holds the authoritative (latest or
+    /// deleted) version of those pks, so a stale durable copy must not surface.
+    pub fn covered(&self) -> HashSet<i64> {
+        self.covered
+            .lock()
+            .expect("covered mutex poisoned")
+            .clone()
+    }
+
+    /// Drain the live segment for a seal: return `(live docs as (pk, body),
+    /// tombstone set)`, then **reset** the segment (clear its index, tombstones,
+    /// and covered set) so subsequent writes start fresh.
+    ///
+    /// The caller (the engine's `seal`) folds the returned docs/tombstones into
+    /// the durable tier (re-add the live docs, superseding any prior durable copy;
+    /// tombstone the deleted pks). After this returns, a `search` yields nothing
+    /// and `covered()` is empty until new writes land.
+    pub fn drain_for_seal(&self) -> Result<(Vec<(i64, String)>, HashSet<i64>)> {
+        use tantivy::collector::DocSetCollector;
+        use tantivy::query::AllQuery;
+
+        self.ensure_fresh()?;
+
+        let tombs = self
+            .tombstones
+            .lock()
+            .expect("tombstones mutex poisoned")
+            .clone();
+
+        // Read every live doc (all addresses, not just a top-K window).
+        let searcher = self.reader.searcher();
+        let addrs = searcher
+            .search(&AllQuery, &DocSetCollector)
+            .map_err(|e| EngineError::Other(e.into()))?;
+
+        let mut docs: Vec<(i64, String)> = Vec::with_capacity(addrs.len());
+        for addr in addrs {
+            let d: TantivyDocument = searcher
+                .doc(addr)
+                .map_err(|e| EngineError::Other(e.into()))?;
+            let pk = d
+                .get_first(self.pk_field)
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| {
+                    EngineError::Other(anyhow::anyhow!(
+                        "live segment doc at {addr:?} missing stored i64 pk"
+                    ))
+                })?;
+            // Defensive: a tombstoned pk should already be gone from the index
+            // (its term was deleted), but skip it explicitly so it never leaks
+            // into the docs vec — it belongs in the tombstone set.
+            if tombs.contains(&pk) {
+                continue;
+            }
+            let body = d
+                .get_first(self.body_field)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            docs.push((pk, body));
+        }
+
+        // Reset: clear the index (delete all docs + commit + reload), then the
+        // tombstone and covered sets.
+        {
+            let mut w = self.writer.lock().expect("writer mutex poisoned");
+            w.delete_all_documents()
+                .map_err(|e| EngineError::Other(e.into()))?;
+            w.commit().map_err(|e| EngineError::Other(e.into()))?;
+        }
+        self.reader
+            .reload()
+            .map_err(|e| EngineError::Other(e.into()))?;
+        self.tombstones
+            .lock()
+            .expect("tombstones mutex poisoned")
+            .clear();
+        self.covered
+            .lock()
+            .expect("covered mutex poisoned")
+            .clear();
+        self.dirty.store(false, Ordering::SeqCst);
+
+        Ok((docs, tombs))
     }
 }
 
@@ -505,6 +607,53 @@ mod tests {
             .collect();
         assert!(after.contains(&1));
         assert!(!after.contains(&3), "tombstoned pk must not appear immediately");
+    }
+
+    // --- Task 3: seal-support — covered set + drain_for_seal ---
+
+    #[tokio::test]
+    async fn covered_tracks_every_indexed_and_tombstoned_pk() {
+        let seg = LiveSegment::new("english").unwrap();
+        seg.index(1, "alpha").unwrap();
+        seg.index(2, "beta").unwrap();
+        seg.tombstone(3).unwrap();
+        // Re-indexing an existing pk doesn't duplicate it in covered.
+        seg.index(1, "alpha updated").unwrap();
+
+        let mut covered: Vec<i64> = seg.covered().into_iter().collect();
+        covered.sort_unstable();
+        assert_eq!(covered, vec![1, 2, 3], "covered = every pk index/tombstone touched");
+    }
+
+    #[tokio::test]
+    async fn drain_for_seal_returns_live_docs_plus_tombstones_then_resets() {
+        let seg = LiveSegment::new("english").unwrap();
+        seg.index(1, "first version").unwrap();
+        seg.index(2, "second doc").unwrap();
+        seg.index(1, "first updated").unwrap(); // update pk 1's text
+        seg.tombstone(2).unwrap(); // delete pk 2
+
+        let (docs, tombs) = seg.drain_for_seal().unwrap();
+
+        // Live docs: only pk 1, carrying its LATEST text. pk 2 is tombstoned, so
+        // it's in the tombstone set, NOT the docs vec.
+        assert_eq!(docs.len(), 1, "only the single live doc (pk 1)");
+        assert_eq!(docs[0].0, 1, "the live pk");
+        assert_eq!(docs[0].1, "first updated", "latest text per pk (post-update)");
+        assert!(tombs.contains(&2), "tombstoned pk 2 is in the tombstone set");
+        assert!(!docs.iter().any(|(pk, _)| *pk == 2), "tombstoned pk not in docs vec");
+
+        // Reset: a subsequent search returns nothing, covered() is empty,
+        // tombstones cleared.
+        let after = seg.search("first", TsQueryKind::Plain, 10).unwrap();
+        assert!(after.is_empty(), "drained segment has no searchable docs");
+        assert!(seg.covered().is_empty(), "covered cleared after drain");
+
+        // Indexing fresh after a drain works and is the only thing covered now.
+        seg.index(9, "ninth").unwrap();
+        let again = seg.search("ninth", TsQueryKind::Plain, 10).unwrap();
+        assert_eq!(again.iter().map(|h| h.pk).collect::<Vec<_>>(), vec![9]);
+        assert_eq!(seg.covered().into_iter().collect::<Vec<_>>(), vec![9]);
     }
 
     #[tokio::test]
