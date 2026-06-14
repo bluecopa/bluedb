@@ -216,10 +216,86 @@ impl LiveSegment {
     }
 }
 
+/// Strip a Postgres tsquery lexeme weight/prefix marker (`:*`, `:A`, `:AB`,
+/// `:*A`, ...) from the end of a token, leaving the bare lexeme.
+fn strip_weight(token: &str) -> &str {
+    match token.split_once(':') {
+        Some((lexeme, _marker)) => lexeme,
+        None => token,
+    }
+}
+
 /// Translate a `query` string into a tantivy [`QueryParser`] query string per
-/// the tsquery `kind`. (Implemented in Task 2; a passthrough for now.)
-fn translate_query(query: &str, _kind: TsQueryKind) -> String {
-    query.to_string()
+/// the tsquery `kind`.
+///
+/// - `Plain` (`plainto_tsquery`): the input is a bag of literal terms. Strip any
+///   tantivy/Postgres metacharacters, lowercase, and return the space-separated
+///   terms — conjunction-by-default (set on the parser in [`LiveSegment::search`])
+///   ANDs them, matching `plainto_tsquery`'s all-terms-required semantics.
+/// - `ToTsQuery` (`to_tsquery`): translate Postgres boolean operators —
+///   `&`→`AND`, `|`→`OR` — and negation `!X` to tantivy's `-X` (a `MustNot`
+///   prefix). (Tantivy's `NOT` keyword wraps the negated leaf in an all-negative
+///   inner boolean that matches nothing under `Must`, so the `-` prefix is the
+///   correct mapping.) `:*`/`:A`-style lexeme weight markers are dropped.
+/// - `Websearch` (`websearch_to_tsquery`): pass through largely as-is — tantivy's
+///   `QueryParser` already handles `"phrase"`, `-term`, and `OR`; only normalize a
+///   bare `or` to the `OR` operator.
+fn translate_query(query: &str, kind: TsQueryKind) -> String {
+    match kind {
+        TsQueryKind::Plain => {
+            // Replace tantivy/Postgres metacharacters with spaces, lowercase,
+            // and collapse whitespace into space-separated literal terms.
+            let cleaned: String = query
+                .chars()
+                .map(|c| match c {
+                    '&' | '|' | '!' | '(' | ')' | ':' | '*' | '"' | '+' | '-' | '^' | '~' => ' ',
+                    other => other,
+                })
+                .collect();
+            cleaned
+                .split_whitespace()
+                .map(|t| t.to_lowercase())
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+        TsQueryKind::ToTsQuery => {
+            // Token-wise: map `&`/`|` to AND/OR, fold `!` into a `-` prefix on
+            // the following lexeme (tantivy MustNot), strip weight markers.
+            // Pad `&`/`|` so they tokenize independently; keep `!` glued so it
+            // attaches to its operand.
+            let spaced = query.replace('&', " & ").replace('|', " | ");
+            let mut out: Vec<String> = Vec::new();
+            for tok in spaced.split_whitespace() {
+                match tok {
+                    "&" => out.push("AND".into()),
+                    "|" => out.push("OR".into()),
+                    other => {
+                        // `!lexeme` (one or more leading `!`) → `-lexeme`.
+                        let trimmed = other.trim_start_matches('!');
+                        let negated = trimmed.len() != other.len();
+                        let lexeme = strip_weight(trimmed);
+                        if lexeme.is_empty() {
+                            continue;
+                        }
+                        if negated {
+                            out.push(format!("-{lexeme}"));
+                        } else {
+                            out.push(lexeme.to_string());
+                        }
+                    }
+                }
+            }
+            out.join(" ")
+        }
+        TsQueryKind::Websearch => {
+            // tantivy handles quotes / `-term` / OR; just normalize a bare `or`.
+            query
+                .split_whitespace()
+                .map(|t| if t.eq_ignore_ascii_case("or") { "OR" } else { t })
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -243,5 +319,107 @@ mod tests {
         // BM25: doc 3 (both terms, shorter) should rank at or above doc 1
         assert_eq!(hits[0].pk, 3);
         assert!(hits[0].score > 0.0);
+    }
+
+    // --- Task 2: tsquery-kind → tantivy query translation ---
+
+    #[test]
+    fn translate_to_tsquery_operators() {
+        assert_eq!(translate_query("invoice & overdue", TsQueryKind::ToTsQuery), "invoice AND overdue");
+        assert_eq!(translate_query("invoice | report", TsQueryKind::ToTsQuery), "invoice OR report");
+        // `!X` → tantivy's `-X` MustNot prefix (the `NOT` keyword nests into an
+        // all-negative inner boolean that matches nothing; see translate_query docs).
+        assert_eq!(translate_query("invoice & !weather", TsQueryKind::ToTsQuery), "invoice AND -weather");
+        // `:*` prefix / weight markers are stripped.
+        assert_eq!(translate_query("invoic:* & overdue:A", TsQueryKind::ToTsQuery), "invoic AND overdue");
+    }
+
+    #[test]
+    fn translate_plain_strips_operators() {
+        // Plain treats the input as literal terms — Postgres operators are not
+        // honored; metacharacters are removed and the terms left to AND.
+        assert_eq!(translate_query("invoice & overdue", TsQueryKind::Plain), "invoice overdue");
+        assert_eq!(translate_query("INVOICE Overdue", TsQueryKind::Plain), "invoice overdue");
+    }
+
+    #[test]
+    fn translate_websearch_normalizes_or() {
+        // tantivy already handles "phrase", -term; a bare `or` becomes the OR operator.
+        assert_eq!(translate_query("foo or bar", TsQueryKind::Websearch), "foo OR bar");
+        assert_eq!(translate_query("\"quarterly invoice\"", TsQueryKind::Websearch), "\"quarterly invoice\"");
+        assert_eq!(translate_query("foo -bar", TsQueryKind::Websearch), "foo -bar");
+    }
+
+    #[test]
+    fn plain_terms_conjoin_excluding_single_term_rows() {
+        let seg = LiveSegment::new("english").unwrap();
+        seg.index(1, "invoice overdue payment").unwrap();
+        seg.index(2, "invoice only here").unwrap();
+        let hits = seg.search("invoice overdue", TsQueryKind::Plain, 10).unwrap();
+        let pks: Vec<i64> = hits.iter().map(|h| h.pk).collect();
+        assert_eq!(pks, vec![1], "Plain conjoins terms: row with only 'invoice' is excluded");
+    }
+
+    #[test]
+    fn to_tsquery_and_or_not() {
+        let seg = LiveSegment::new("english").unwrap();
+        seg.index(1, "invoice overdue").unwrap();
+        seg.index(2, "weather report").unwrap();
+        seg.index(3, "invoice weather").unwrap();
+
+        // invoice & overdue → AND
+        let a: Vec<i64> = seg
+            .search("invoice & overdue", TsQueryKind::ToTsQuery, 10)
+            .unwrap()
+            .iter()
+            .map(|h| h.pk)
+            .collect();
+        assert_eq!(a, vec![1]);
+
+        // invoice | report → OR
+        let mut o: Vec<i64> = seg
+            .search("invoice | report", TsQueryKind::ToTsQuery, 10)
+            .unwrap()
+            .iter()
+            .map(|h| h.pk)
+            .collect();
+        o.sort();
+        assert_eq!(o, vec![1, 2, 3]);
+
+        // invoice & !weather → invoice AND NOT weather
+        let n: Vec<i64> = seg
+            .search("invoice & !weather", TsQueryKind::ToTsQuery, 10)
+            .unwrap()
+            .iter()
+            .map(|h| h.pk)
+            .collect();
+        assert_eq!(n, vec![1]);
+    }
+
+    #[test]
+    fn websearch_phrase_and_negation() {
+        let seg = LiveSegment::new("english").unwrap();
+        seg.index(1, "the quarterly invoice arrived").unwrap();
+        seg.index(2, "invoice quarterly mismatch order").unwrap();
+        seg.index(3, "weather report only").unwrap();
+
+        // Phrase: only doc 1 has the adjacent "quarterly invoice".
+        let p: Vec<i64> = seg
+            .search("\"quarterly invoice\"", TsQueryKind::Websearch, 10)
+            .unwrap()
+            .iter()
+            .map(|h| h.pk)
+            .collect();
+        assert_eq!(p, vec![1]);
+
+        // `or` becomes OR.
+        let mut o: Vec<i64> = seg
+            .search("invoice or weather", TsQueryKind::Websearch, 10)
+            .unwrap()
+            .iter()
+            .map(|h| h.pk)
+            .collect();
+        o.sort();
+        assert_eq!(o, vec![1, 2, 3]);
     }
 }
