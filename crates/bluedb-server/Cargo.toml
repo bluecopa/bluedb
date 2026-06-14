@@ -18,7 +18,7 @@ bluedb-rest   = { workspace = true }
 bluedb-ha     = { workspace = true, features = ["postgres"] }
 gluesql-core  = "=0.19.0"
 slatedb       = { workspace = true }
-axum          = "0.8"
+axum          = { version = "0.8", features = ["http2"] }
 tokio         = { workspace = true }
 serde         = { workspace = true }
 serde_json    = { workspace = true }
@@ -27,3 +27,4 @@ anyhow        = { workspace = true }
 [dev-dependencies]
 tower          = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+reqwest        = { version = "0.12", default-features = false, features = ["http2"] }

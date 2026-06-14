@@ -1,6 +1,10 @@
 //! `bluedb-server` binary — builds the object store + lease controller and
 //! serves the HTTP API, running a background HA loop for bootstrap/failover.
 //!
+//! The server speaks HTTP/1.1 and HTTP/2 (h2c, prior-knowledge) on the plaintext
+//! listener — an h2 client can multiplex many concurrent in-flight writes over one
+//! connection. HTTP/2 over TLS (ALPN) is a deployment-layer concern.
+//!
 //! Config via env vars:
 //! - `BLUEDB_ADDR`     — listen address (default `0.0.0.0:8080`).
 //! - `BLUEDB_DB_PATH`  — SlateDB path/prefix inside the object store (default `bluedb`).
