@@ -240,7 +240,8 @@ impl Transfer {
 /// Per-item result of `create_accounts`. Variant ordering mirrors TigerBeetle's
 /// create_accounts result codes. `Created` is success; `Exists` / `ExistsWith*`
 /// are idempotent (not failures).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CreateAccountResult {
     Created,
     LinkedEventFailed,
@@ -273,7 +274,8 @@ pub enum CreateAccountResult {
 
 /// Per-item result of `create_transfers`. Variant ordering mirrors TigerBeetle's
 /// create_transfers result codes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CreateTransferResult {
     Created,
     LinkedEventFailed,

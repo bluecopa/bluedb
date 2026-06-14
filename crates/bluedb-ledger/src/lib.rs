@@ -9,9 +9,11 @@
 mod keyspace;
 mod ledger;
 mod model;
+mod projection;
 mod store;
 
 pub use ledger::{Clock, Ledger};
 pub use model::{
     Account, AccountFlags, CreateAccountResult, CreateTransferResult, Transfer, TransferFlags,
 };
+pub use projection::ensure_schema;

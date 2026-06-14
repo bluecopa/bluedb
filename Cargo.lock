@@ -321,6 +321,7 @@ dependencies = [
  "anyhow",
  "bluedb-sql",
  "bluedb-storage",
+ "gluesql-core",
  "postcard",
  "serde",
  "slatedb",

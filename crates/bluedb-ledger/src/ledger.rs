@@ -194,8 +194,13 @@ impl Ledger {
         }
 
         let mut batch = WriteBatch::new();
+        let sql_ks = bluedb_sql::Keyspace::new(DEFAULT_TENANT);
+        let accounts_tbl = crate::projection::accounts_table();
         for a in &accepted {
             batch.put(self.keyspace.account_key(a.id), &encode(a)?);
+            // Atomic SQL projection: mirror the account row in the same batch.
+            let (k, v) = accounts_tbl.encode_row(&sql_ks, &crate::projection::project_account(a))?;
+            batch.put(k, &v);
         }
         if !accepted.is_empty() {
             batch.put(self.keyspace.watermark_key(), ts.last.to_be_bytes());
@@ -356,13 +361,22 @@ impl Ledger {
         // records (incl. swept `Expired`) + expiry-index churn + burned ids + the
         // watermark.
         let mut batch = WriteBatch::new();
+        let sql_ks = bluedb_sql::Keyspace::new(DEFAULT_TENANT);
+        let accounts_tbl = crate::projection::accounts_table();
+        let transfers_tbl = crate::projection::transfers_table();
         for id in &state.dirty {
             if let Some(account) = state.working.get(id) {
                 batch.put(self.keyspace.account_key(*id), &encode(account)?);
+                // Atomic SQL projection: re-mirror the post-mutation account.
+                let (k, v) = accounts_tbl.encode_row(&sql_ks, &crate::projection::project_account(account))?;
+                batch.put(k, &v);
             }
         }
         for t in &accepted {
             batch.put(self.keyspace.transfer_key(t.id), &encode(t)?);
+            // Atomic SQL projection: mirror the transfer row in the same batch.
+            let (k, v) = transfers_tbl.encode_row(&sql_ks, &crate::projection::project_transfer(t))?;
+            batch.put(k, &v);
             // A new timed pending gets an expiry-index entry for the sweep.
             if t.flags.contains(TransferFlags::PENDING) && t.timeout != 0 {
                 let expires_at = expiry_of(t.timestamp, t.timeout);
@@ -1003,6 +1017,89 @@ mod tests {
     async fn setup_two_accounts(ledger: &Ledger) {
         let r = ledger.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
         assert_eq!(r, vec![CreateAccountResult::Created, CreateAccountResult::Created]);
+    }
+
+    #[tokio::test]
+    async fn sql_projection_mirrors_native_state_and_conserves() {
+        use gluesql_core::prelude::{Glue, Payload, Value as SqlValue};
+
+        let database = writer_database().await;
+        crate::projection::ensure_schema(&database).await.unwrap();
+        let ledger = Ledger::new(&database);
+
+        setup_two_accounts(&ledger).await;
+        let r = ledger.create_transfers(&[xfer(10, 1, 2, 100)]).await.unwrap();
+        assert_eq!(r, vec![CreateTransferResult::Created]);
+
+        // Read the projection back through a real GlueSQL connection on the
+        // same database — it must agree with the canonical lookups.
+        let mut glue = Glue::new(database.connection());
+
+        let native = ledger.lookup_account(1).await.unwrap().unwrap();
+        assert_eq!(native.debits_posted, 100);
+        let out = glue
+            .execute("SELECT debits_posted, credits_posted FROM ledger_accounts WHERE id = 1")
+            .await
+            .unwrap();
+        let Payload::Select { rows, .. } = &out[0] else { panic!("expected select") };
+        assert_eq!(rows[0][0], SqlValue::U128(100));
+        assert_eq!(rows[0][1], SqlValue::U128(0));
+
+        // Conservation: total debits == total credits across the projection.
+        let out = glue
+            .execute("SELECT SUM(debits_posted), SUM(credits_posted) FROM ledger_accounts")
+            .await
+            .unwrap();
+        let Payload::Select { rows, .. } = &out[0] else { panic!() };
+        assert_eq!(rows[0][0], SqlValue::U128(100));
+        assert_eq!(rows[0][0], rows[0][1]);
+
+        // The transfer is visible in the transfers projection.
+        let out = glue
+            .execute("SELECT amount, debit_account_id, credit_account_id FROM ledger_transfers WHERE id = 10")
+            .await
+            .unwrap();
+        let Payload::Select { rows, .. } = &out[0] else { panic!() };
+        assert_eq!(rows[0][0], SqlValue::U128(100));
+        assert_eq!(rows[0][1], SqlValue::U128(1));
+        assert_eq!(rows[0][2], SqlValue::U128(2));
+    }
+
+    #[tokio::test]
+    async fn sql_projection_reflects_pending_then_post() {
+        use gluesql_core::prelude::{Glue, Payload, Value as SqlValue};
+
+        let database = writer_database().await;
+        crate::projection::ensure_schema(&database).await.unwrap();
+        let ledger = Ledger::new(&database);
+        setup_two_accounts(&ledger).await;
+
+        // Pending reserve of 40, then post it.
+        let pending = Transfer::new(20, 1, 2, 40, 7).with_code(1).with_flags(TransferFlags::PENDING);
+        assert_eq!(ledger.create_transfers(&[pending]).await.unwrap(), vec![CreateTransferResult::Created]);
+
+        let mut glue = Glue::new(database.connection());
+        let out = glue
+            .execute("SELECT debits_pending, debits_posted FROM ledger_accounts WHERE id = 1")
+            .await
+            .unwrap();
+        let Payload::Select { rows, .. } = &out[0] else { panic!() };
+        assert_eq!(rows[0][0], SqlValue::U128(40), "pending reserved");
+        assert_eq!(rows[0][1], SqlValue::U128(0));
+
+        let post = Transfer::new(21, 0, 0, AMOUNT_MAX, 7)
+            .with_code(1)
+            .with_flags(TransferFlags::POST_PENDING_TRANSFER)
+            .with_pending_id(20);
+        assert_eq!(ledger.create_transfers(&[post]).await.unwrap(), vec![CreateTransferResult::Created]);
+
+        let out = glue
+            .execute("SELECT debits_pending, debits_posted FROM ledger_accounts WHERE id = 1")
+            .await
+            .unwrap();
+        let Payload::Select { rows, .. } = &out[0] else { panic!() };
+        assert_eq!(rows[0][0], SqlValue::U128(0), "pending released on post");
+        assert_eq!(rows[0][1], SqlValue::U128(40), "posted");
     }
 
     #[tokio::test]
