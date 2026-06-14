@@ -86,26 +86,43 @@ fn setexpr_to_sql(body: &SetExpr, counter: &mut u32) -> Option<String> {
             *counter += 1;
             let lsql = setexpr_to_sql(left, counter)?;
             let rsql = setexpr_to_sql(right, counter)?;
-            let lcol = single_column(left)?;
             let keep_all = matches!(set_quantifier, SetQuantifier::All | SetQuantifier::AllByName);
             let distinct = if keep_all { "" } else { "DISTINCT " };
             // Unique aliases for this node so nested set ops don't collide.
             let (l, r, d, u) = (format!("_l{id}"), format!("_r{id}"), format!("_d{id}"), format!("_u{id}"));
 
             let sql = match op {
+                // INTERSECT/EXCEPT use an IN/NOT IN subquery, which GlueSQL only
+                // supports for a single column; multi-column would need
+                // NULL-aware row matching, so it stays unsupported.
                 SetOperator::Intersect => {
+                    let lcol = single_column(left)?;
                     format!("SELECT {distinct}{l}.{lcol} FROM ({lsql}) AS {l} WHERE {l}.{lcol} IN ({rsql})")
                 }
                 SetOperator::Except => {
+                    let lcol = single_column(left)?;
                     format!(
                         "SELECT {distinct}{l}.{lcol} FROM ({lsql}) AS {l} WHERE {l}.{lcol} NOT IN ({rsql})"
                     )
                 }
+                // UNION concatenates, so it generalizes to N columns: a 2-row
+                // driver + gated LEFT JOINs, with one CASE per output column.
                 SetOperator::Union => {
-                    let rcol = single_column(right)?;
-                    // Concatenate with a 2-row driver + gated LEFT JOINs.
+                    let lcols = columns(left)?;
+                    let rcols = columns(right)?;
+                    if lcols.len() != rcols.len() {
+                        return None;
+                    }
+                    let projection = lcols
+                        .iter()
+                        .zip(&rcols)
+                        .map(|(lc, rc)| {
+                            format!("CASE WHEN {d}.N = 1 THEN {l}.{lc} ELSE {r}.{rc} END AS {lc}")
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     let union_all = format!(
-                        "SELECT CASE WHEN {d}.N = 1 THEN {l}.{lcol} ELSE {r}.{rcol} END AS {lcol} \
+                        "SELECT {projection} \
                          FROM SERIES(2) AS {d} \
                          LEFT JOIN ({lsql}) AS {l} ON {d}.N = 1 \
                          LEFT JOIN ({rsql}) AS {r} ON {d}.N = 2"
@@ -113,7 +130,12 @@ fn setexpr_to_sql(body: &SetExpr, counter: &mut u32) -> Option<String> {
                     if keep_all {
                         union_all
                     } else {
-                        format!("SELECT DISTINCT {u}.{lcol} FROM ({union_all}) AS {u}")
+                        let ucols = lcols
+                            .iter()
+                            .map(|c| format!("{u}.{c}"))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("SELECT DISTINCT {ucols} FROM ({union_all}) AS {u}")
                     }
                 }
             };
@@ -145,6 +167,33 @@ fn single_column(body: &SetExpr) -> Option<String> {
     }
 }
 
+/// Output column names of a branch (descending nested set ops via the left
+/// branch). `None` if any projection item isn't a simply-named column or alias
+/// (e.g. a wildcard), since then we can't name the columns to build the CASEs.
+fn columns(body: &SetExpr) -> Option<Vec<String>> {
+    match body {
+        SetExpr::Select(select) => {
+            if select.projection.is_empty() {
+                return None;
+            }
+            select
+                .projection
+                .iter()
+                .map(|item| match item {
+                    SelectItem::UnnamedExpr(Expr::Identifier(id)) => Some(id.value.clone()),
+                    SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) => {
+                        parts.last().map(|ident| ident.value.clone())
+                    }
+                    SelectItem::ExprWithAlias { alias, .. } => Some(alias.value.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+        SetExpr::SetOperation { left, .. } => columns(left),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::rewrite_set_ops;
@@ -172,6 +221,30 @@ mod tests {
     }
 
     #[test]
+    fn multi_column_union_builds_case_per_column() {
+        let out = rewrite_set_ops("SELECT a, b FROM x UNION ALL SELECT c, d FROM y");
+        assert!(!out.to_uppercase().contains("UNION"), "got: {out}");
+        assert!(out.contains("SERIES(2)"), "got: {out}");
+        // One CASE per output column.
+        assert_eq!(out.to_uppercase().matches("CASE WHEN").count(), 2, "got: {out}");
+    }
+
+    #[test]
+    fn multi_column_union_distinct_wraps() {
+        let out = rewrite_set_ops("SELECT a, b FROM x UNION SELECT c, d FROM y");
+        assert!(out.to_uppercase().contains("DISTINCT"), "got: {out}");
+        assert!(!out.to_uppercase().contains("UNION"), "got: {out}");
+    }
+
+    #[test]
+    fn multi_column_intersect_stays_unsupported() {
+        // Multi-column INTERSECT can't be rewritten (single-column only); left
+        // intact for GlueSQL to reject.
+        let out = rewrite_set_ops("SELECT a, b FROM x INTERSECT SELECT c, d FROM y");
+        assert!(out.to_uppercase().contains("INTERSECT"), "got: {out}");
+    }
+
+    #[test]
     fn union_distinct_wraps_with_distinct() {
         let out = rewrite_set_ops("SELECT a FROM x UNION SELECT b FROM y");
         assert!(out.to_uppercase().contains("DISTINCT"), "got: {out}");
@@ -185,8 +258,18 @@ mod tests {
     }
 
     #[test]
-    fn multi_column_branch_left_unchanged() {
-        let sql = "SELECT a, b FROM x UNION SELECT a, b FROM y";
+    fn multi_column_union_is_now_rewritten() {
+        // Multi-column UNION used to be left unchanged; it is now rewritten via
+        // the driver-join (one CASE per column).
+        let out = rewrite_set_ops("SELECT a, b FROM x UNION SELECT a, b FROM y");
+        assert!(!out.to_uppercase().contains("UNION"), "got: {out}");
+        assert!(out.contains("SERIES(2)"), "got: {out}");
+    }
+
+    #[test]
+    fn wildcard_branch_left_unchanged() {
+        // `SELECT *` has no nameable columns, so we can't build the CASEs — bail.
+        let sql = "SELECT * FROM x UNION SELECT * FROM y";
         assert_eq!(rewrite_set_ops(sql), sql);
     }
 }
