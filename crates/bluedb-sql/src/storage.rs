@@ -153,6 +153,13 @@ struct TxnState {
     /// durable commits run concurrently for group commit). Held until
     /// `commit`/`rollback`; dropping it releases the lease.
     _lease: Option<OwnedMutexGuard<()>>,
+    /// Storage keys this txn inserted that were **absent at its snapshot** (fresh
+    /// keyed inserts — e.g. `INSERT` into a table with a primary key; not
+    /// updates, not auto-increment appends). At commit they are re-checked
+    /// against live committed state under the write lease, so two concurrent
+    /// inserts of the same primary key can't both succeed (the loser aborts with
+    /// [`SqlError::UniqueViolation`]).
+    unique_checks: Vec<Vec<u8>>,
 }
 
 /// GlueSQL custom storage over a SlateDB database.
@@ -168,6 +175,11 @@ pub struct SlateDbStorage {
     keyspace: Keyspace,
     /// Shared write lease serializing explicit write transactions over this `Db`.
     write_lease: WriteLease,
+    /// Shared lock held *briefly* at commit while a fresh keyed insert
+    /// re-validates uniqueness and writes — separate from `write_lease` so an
+    /// autocommit insert doesn't block on a long-held explicit-transaction lease
+    /// (it serializes only against other inserters). See `commit`.
+    insert_lock: WriteLease,
     /// Shared per-table auto-increment counters (see [`SeqAllocator`]).
     seq: SeqAllocator,
     /// When set, autocommit statements on this connection also take the write
@@ -200,24 +212,27 @@ impl SlateDbStorage {
             Substrate::writer(db),
             tenant,
             Arc::new(Mutex::new(())),
+            Arc::new(Mutex::new(())),
             Arc::new(Mutex::new(HashMap::new())),
         )
     }
 
     /// Construct over any [`Substrate`] (writer or read replica), sharing the
-    /// `write_lease` and `seq` allocator. A reader substrate yields a
-    /// **read-only** connection: reads work, but writes and `BEGIN` error
-    /// (`require_writer`).
+    /// `write_lease`, `insert_lock` and `seq` allocator. A reader substrate
+    /// yields a **read-only** connection: reads work, but writes and `BEGIN`
+    /// error (`require_writer`).
     pub(crate) fn with_substrate(
         substrate: Substrate,
         tenant: &str,
         write_lease: WriteLease,
+        insert_lock: WriteLease,
         seq: SeqAllocator,
     ) -> Self {
         Self {
             substrate,
             keyspace: Keyspace::new(tenant),
             write_lease,
+            insert_lock,
             seq,
             serialize_writes: false,
             txn: None,
@@ -640,6 +655,10 @@ impl StoreMut for SlateDbStorage {
                 let old: StoredRow = decode(&bytes)?;
                 self.apply_index_entries(table_name, &key, &old.row, false)
                     .await?;
+            } else if let Some(txn) = self.txn.as_mut() {
+                // Fresh keyed insert (absent at our snapshot): remember it so
+                // commit can re-validate uniqueness against live committed state.
+                txn.unique_checks.push(storage_key.clone());
             }
             self.apply_index_entries(table_name, &key, &row, true)
                 .await?;
@@ -712,6 +731,7 @@ impl Transaction for SlateDbStorage {
             overlay: BTreeMap::new(),
             snapshot,
             _lease: lease,
+            unique_checks: Vec::new(),
         });
         // Return `autocommit` so GlueSQL commits after a plain statement; the
         // value is ignored for the explicit `StartTransaction` statement.
@@ -727,6 +747,33 @@ impl Transaction for SlateDbStorage {
     async fn commit(&mut self) -> GlueResult<()> {
         if let Some(txn) = self.txn.take() {
             if !txn.overlay.is_empty() {
+                // If this txn made fresh keyed inserts, validate uniqueness while
+                // holding `insert_lock` across the re-check AND the batch write,
+                // so the check is atomic against other inserters. This is a
+                // distinct, briefly-held lock — NOT `write_lease` — so an
+                // autocommit insert doesn't stall behind a long-held explicit
+                // transaction (and a read-only explicit txn never blocks it).
+                // Pure appends/updates have no checks and stay lock-free (group
+                // commit). Acquired regardless of whether `write_lease` is already
+                // held, so explicit-transaction inserts serialize here too.
+                let _ilock = if txn.unique_checks.is_empty() {
+                    None
+                } else {
+                    Some(self.insert_lock.clone().lock_owned().await)
+                };
+                for key in &txn.unique_checks {
+                    if self
+                        .substrate
+                        .get(key)
+                        .await
+                        .map_err(SqlError::from)?
+                        .is_some()
+                    {
+                        // Another connection inserted this primary key since our
+                        // snapshot — first committer wins, we abort.
+                        return Err(SqlError::UniqueViolation(format!("{key:?}")).into());
+                    }
+                }
                 let mut batch = WriteBatch::new();
                 for (key, op) in txn.overlay {
                     match op {

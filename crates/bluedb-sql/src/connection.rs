@@ -63,6 +63,7 @@ use crate::storage::{SeqAllocator, SlateDbStorage, WriteLease};
 pub struct Database {
     substrate: Substrate,
     write_lease: WriteLease,
+    insert_lock: WriteLease,
     seq: SeqAllocator,
 }
 
@@ -85,6 +86,7 @@ impl Database {
         Self {
             substrate,
             write_lease: Arc::new(Mutex::new(())),
+            insert_lock: Arc::new(Mutex::new(())),
             seq: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -129,6 +131,7 @@ impl Database {
             self.substrate.clone(),
             tenant,
             self.write_lease.clone(),
+            self.insert_lock.clone(),
             self.seq.clone(),
         )
     }
