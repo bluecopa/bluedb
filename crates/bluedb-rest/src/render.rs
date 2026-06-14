@@ -159,6 +159,45 @@ impl InsertRequest {
             tuples.join(", ")
         ))
     }
+
+    /// Render one **single-row** `INSERT` statement per row (no terminating `;`),
+    /// with placeholders numbered **globally** across all rows so the statements
+    /// can share one params slice (gluesql binds `$N` against a single shared
+    /// vector). Avoids multi-row `VALUES (..),(..)`, which sqlparser rejects past
+    /// ~50 tuples. The caller wraps the statements in `BEGIN; … ; COMMIT;`.
+    pub fn row_statements_with_params(&self) -> Result<(Vec<String>, Vec<Param>), RestError> {
+        let table = validate_ident(&self.table)?;
+        if self.columns.is_empty() {
+            return Err(RestError::BadColumnSet("INSERT has no columns".to_string()));
+        }
+        if self.rows.is_empty() {
+            return Err(RestError::BadColumnSet("INSERT has no rows".to_string()));
+        }
+        let cols: Vec<&str> = self
+            .columns
+            .iter()
+            .map(|c| validate_ident(c))
+            .collect::<Result<_, _>>()?;
+        let col_list = cols.join(", ");
+
+        let mut params = Vec::new();
+        let mut stmts = Vec::with_capacity(self.rows.len());
+        for row in &self.rows {
+            if row.len() != self.columns.len() {
+                return Err(RestError::BadColumnSet(format!(
+                    "row has {} values but there are {} columns",
+                    row.len(),
+                    self.columns.len()
+                )));
+            }
+            let placeholders: Vec<String> = row.iter().map(|v| bind(v, &mut params)).collect();
+            stmts.push(format!(
+                "INSERT INTO {table} ({col_list}) VALUES ({})",
+                placeholders.join(", ")
+            ));
+        }
+        Ok((stmts, params))
+    }
 }
 
 impl UpdateRequest {
@@ -260,7 +299,7 @@ fn direction_sql(direction: crate::model::Direction) -> &'static str {
 
 #[cfg(test)]
 mod params_render {
-    use crate::model::{Filter, Operator, OrderKey, Direction, Param, RestQuery, UpdateRequest, DeleteRequest};
+    use crate::model::{Filter, InsertRequest, Operator, OrderKey, Direction, Param, RestQuery, UpdateRequest, DeleteRequest};
 
     #[test]
     fn select_binds_filters_keeps_structure_literal() {
@@ -301,6 +340,30 @@ mod params_render {
         let (sql, params) = d.to_sql_with_params().unwrap();
         assert_eq!(sql, "DELETE FROM t WHERE id = $1;");
         assert_eq!(params, vec![Param::Int(42)]);
+    }
+
+    #[test]
+    fn insert_emits_one_statement_per_row_with_global_indices() {
+        let req = InsertRequest {
+            table: "docs".into(),
+            columns: vec!["id".into(), "body".into()],
+            rows: vec![
+                vec!["1".into(), "hi".into()],
+                vec!["2".into(), "yo".into()],
+            ],
+        };
+        let (stmts, params) = req.row_statements_with_params().unwrap();
+        assert_eq!(
+            stmts,
+            vec![
+                "INSERT INTO docs (id, body) VALUES ($1, $2)".to_string(),
+                "INSERT INTO docs (id, body) VALUES ($3, $4)".to_string(),
+            ]
+        );
+        assert_eq!(
+            params,
+            vec![Param::Int(1), Param::Str("hi".into()), Param::Int(2), Param::Str("yo".into())]
+        );
     }
 
     #[test]
