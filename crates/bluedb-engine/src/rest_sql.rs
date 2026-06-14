@@ -64,8 +64,10 @@ pub async fn execute_query_str(
     execute_query(glue, &query).await
 }
 
-/// Execute a single-row [`InsertRequest`] as one autocommit statement (the
-/// group-commit fast path — caller supplies the group-commit connection).
+/// Execute each row of `req` as an independent autocommit statement (no
+/// transaction). A multi-row `req` is therefore **not atomic**. The server
+/// uses this only for single-object POSTs (one row); array bodies go through
+/// [`execute_insert_batch`] for atomicity.
 pub async fn execute_insert(glue: &mut Glue<SlateDbStorage>, req: &InsertRequest) -> Result<Vec<Payload>> {
     let (stmts, params) = req.row_statements_with_params()?;
     let sql = format!("{};", stmts.join("; "));

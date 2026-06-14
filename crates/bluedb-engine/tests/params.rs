@@ -67,5 +67,26 @@ async fn delete_with_param() {
     rest_sql::execute_delete(&mut g, &d).await.unwrap();
     let q = RestQuery { table: "docs".into(), ..Default::default() };
     let out = rest_sql::execute_query(&mut g, &q).await.unwrap();
-    assert_eq!(rows(out.into_iter().next().unwrap()).len(), 1);
+    let r = rows(out.into_iter().next().unwrap());
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0][0], Value::I64(2)); // the surviving row is id=2, not id=1
+}
+
+#[tokio::test]
+async fn injection_payload_via_single_insert_is_data_not_executed() {
+    let mut g = glue().await;
+    let payload = "'); DROP TABLE docs; --";
+    let req = InsertRequest {
+        table: "docs".into(),
+        columns: vec!["id".into(), "body".into()],
+        rows: vec![vec!["1".into(), payload.into()]],
+    };
+    // Single-row autocommit path (what the server uses for a single-object POST).
+    rest_sql::execute_insert(&mut g, &req).await.unwrap();
+
+    let q = RestQuery { table: "docs".into(), ..Default::default() };
+    let out = rest_sql::execute_query(&mut g, &q).await.unwrap();
+    let r = rows(out.into_iter().next().unwrap());
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0][1], Value::Str(payload.into())); // table survived; value is data
 }
