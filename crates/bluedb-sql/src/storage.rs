@@ -71,14 +71,23 @@
 //!
 //! `StoreMut`/`Transaction` methods take `&mut self`, so GlueSQL guarantees
 //! exclusivity *within one connection*. But many connections (one per request)
-//! share a single [`Db`], and `&mut self` says nothing across them. To serialize
-//! writers, every writing statement holds the shared [`WriteLease`] from `begin`
-//! until commit (snapshotting under it), so concurrent connections cannot
-//! interleave a read-modify-write — this is what stops two autocommit `INSERT`s
-//! from allocating the same row key and clobbering each other. Read replicas
-//! take no lease (their writes are rejected anyway).
+//! share a single [`Db`], and `&mut self` says nothing across them. Two seams
+//! coordinate them:
+//!
+//! * **Auto-increment keys** ([`SeqAllocator`]). `append_data` assigns row keys
+//!   from a shared in-memory per-table counter (atomically, under a brief map
+//!   lock), *not* by scanning for the current max. So two concurrent autocommit
+//!   `INSERT`s always get distinct keys and can't clobber each other — without
+//!   any global lock on the write path. The counter lazily initializes from the
+//!   live committed max (once per table per writer; re-derived after failover).
+//! * **Write lease** ([`WriteLease`]). An explicit `BEGIN` holds it for the whole
+//!   block, snapshotting under it, so its read-modify-write (e.g. an `UPDATE`'s
+//!   row scan) is serialized against other explicit transactions. Autocommit
+//!   statements do *not* take it — their durable commits run concurrently so
+//!   SlateDB's WAL coalesces them into one object-store flush (group commit),
+//!   which is the throughput path. Read replicas take no lease either.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
 use std::sync::Arc;
 
@@ -102,11 +111,20 @@ use bluedb_storage::Substrate;
 use crate::error::SqlError;
 use crate::keyspace::{prefix_upper_bound, Keyspace, DEFAULT_TENANT};
 
-/// A shared **write lease** — the async mutex that serializes write
+/// A shared **write lease** — the async mutex that serializes *explicit* write
 /// transactions across connections to one [`Db`]. Connections created from the
 /// same [`crate::Database`] share one of these; a standalone
 /// [`SlateDbStorage::new`] gets its own (it is the sole writer).
 pub(crate) type WriteLease = Arc<Mutex<()>>;
+
+/// Shared per-table auto-increment row-key counters (keyed by the table's data
+/// keyspace prefix, so tenants don't collide). Holds the *next* key already
+/// handed out; `append_data` bumps it under the map lock. Lazily seeded from the
+/// live committed max the first time a table is appended to on a given writer,
+/// so it stays correct across failover (a freshly promoted writer re-derives it
+/// from object storage). In-memory only — gaps from rolled-back/failed appends
+/// are fine, exactly like a SQL sequence.
+pub(crate) type SeqAllocator = Arc<Mutex<HashMap<Vec<u8>, i64>>>;
 
 /// The stored form of a data row: the primary key plus the row payload.
 #[derive(Serialize, Deserialize)]
@@ -124,17 +142,17 @@ struct TxnState {
     /// delete (tombstone). Ordered so range merges over the base are cheap.
     overlay: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     /// Point-in-time read view of SlateDB captured at `begin`, giving snapshot
-    /// isolation. For autocommit statements this is taken *without* the lease so
-    /// read-only statements never block writers; a write then reads live
-    /// committed state under the lease (see [`SlateDbStorage::append_data`]).
+    /// isolation. Autocommit statements snapshot *without* the lease, so they
+    /// never block (or are blocked by) writers.
     snapshot: Arc<DbSnapshot>,
-    /// Exclusive write lease serializing writers over one `Db`. Acquired
-    /// **eagerly** at `begin` for an explicit `BEGIN` (so the txn's own reads —
-    /// e.g. an `UPDATE`'s row scan — are serialized too), or **lazily** on the
-    /// first mutation of an autocommit statement (so read-only statements stay
-    /// lock-free and don't block writers). Held until `commit`/`rollback`, when
-    /// dropping it releases the lease. `None` until acquired.
-    lease: Option<OwnedMutexGuard<()>>,
+    /// Exclusive write lease, held only for an **explicit** `BEGIN` (acquired
+    /// eagerly at `begin`, before the snapshot, so the transaction's own reads —
+    /// e.g. an `UPDATE`'s row scan — are serialized against other explicit
+    /// transactions). `None` for autocommit statements, which don't serialize on
+    /// it (key allocation is collision-free via the [`SeqAllocator`], and their
+    /// durable commits run concurrently for group commit). Held until
+    /// `commit`/`rollback`; dropping it releases the lease.
+    _lease: Option<OwnedMutexGuard<()>>,
 }
 
 /// GlueSQL custom storage over a SlateDB database.
@@ -148,8 +166,10 @@ pub struct SlateDbStorage {
     /// require the writer.
     substrate: Substrate,
     keyspace: Keyspace,
-    /// Shared write lease serializing write transactions over this `Db`.
+    /// Shared write lease serializing explicit write transactions over this `Db`.
     write_lease: WriteLease,
+    /// Shared per-table auto-increment counters (see [`SeqAllocator`]).
+    seq: SeqAllocator,
     /// `Some` while a `BEGIN ... COMMIT/ROLLBACK` block is open.
     txn: Option<TxnState>,
 }
@@ -169,17 +189,29 @@ impl SlateDbStorage {
     /// Every key this storage reads or writes is namespaced to `tenant`, so two
     /// storages over the same [`Db`] with different tenants share no data.
     pub fn new_for_tenant(db: Arc<Db>, tenant: &str) -> Self {
-        Self::with_substrate(Substrate::writer(db), tenant, Arc::new(Mutex::new(())))
+        Self::with_substrate(
+            Substrate::writer(db),
+            tenant,
+            Arc::new(Mutex::new(())),
+            Arc::new(Mutex::new(HashMap::new())),
+        )
     }
 
-    /// Construct over any [`Substrate`] (writer or read replica), sharing
-    /// `write_lease`. A reader substrate yields a **read-only** connection:
-    /// reads work, but writes and `BEGIN` error (`require_writer`).
-    pub(crate) fn with_substrate(substrate: Substrate, tenant: &str, write_lease: WriteLease) -> Self {
+    /// Construct over any [`Substrate`] (writer or read replica), sharing the
+    /// `write_lease` and `seq` allocator. A reader substrate yields a
+    /// **read-only** connection: reads work, but writes and `BEGIN` error
+    /// (`require_writer`).
+    pub(crate) fn with_substrate(
+        substrate: Substrate,
+        tenant: &str,
+        write_lease: WriteLease,
+        seq: SeqAllocator,
+    ) -> Self {
         Self {
             substrate,
             keyspace: Keyspace::new(tenant),
             write_lease,
+            seq,
             txn: None,
         }
     }
@@ -189,59 +221,38 @@ impl SlateDbStorage {
         Ok(self.substrate.require_writer()?)
     }
 
-    /// Ensure the open txn holds the exclusive write lease, acquiring it now if
-    /// it doesn't. Called at the top of every mutating `StoreMut`/`IndexMut`
-    /// method: an explicit `BEGIN` already holds it (no-op here), while an
-    /// autocommit statement acquires it lazily on its first write so read-only
-    /// statements never take the lease. The lease drops when the txn ends.
-    async fn ensure_write_lease(&mut self) -> Result<(), SqlError> {
-        let needs = matches!(&self.txn, Some(txn) if txn.lease.is_none());
-        if !needs {
-            return Ok(());
-        }
-        // Acquire without holding a borrow on `self.txn` across the await.
-        let guard = self.write_lease.clone().lock_owned().await;
-        if let Some(txn) = self.txn.as_mut() {
-            txn.lease = Some(guard);
-        }
-        Ok(())
+    /// Reserve `count` consecutive auto-increment row keys for `table_name`,
+    /// returning the first. Atomic across connections: the shared [`SeqAllocator`]
+    /// hands out monotonically increasing keys under a brief map lock, so
+    /// concurrent autocommit `INSERT`s never collide — no global write lease and
+    /// no max-scan on the hot path. The counter seeds lazily from the live
+    /// committed max the first time a table is touched on this writer (re-derived
+    /// after a failover, since it's in-memory).
+    async fn allocate_keys(&self, table_name: &str, count: usize) -> Result<i64, SqlError> {
+        let prefix = self.keyspace.data_prefix(table_name);
+        let seq = self.seq.clone();
+        let mut map = seq.lock().await;
+        let current = match map.get(&prefix).copied() {
+            Some(n) => n,
+            // First append to this table on this writer: seed from object storage.
+            None => self.live_max_i64_key(&prefix).await?,
+        };
+        let start = current + 1;
+        map.insert(prefix, current + count as i64);
+        Ok(start)
     }
 
-    /// Highest `I64` row key currently in use for `table_name`, considering both
-    /// **live committed** rows (read straight from the writer `Db`, not the txn
-    /// snapshot) and this txn's own buffered rows. Must be called with the write
-    /// lease held: the live read is only stable against concurrent writers while
-    /// the lease serializes them, which is what makes auto-incremented append
-    /// keys collision-free. Returns 0 for an empty table.
-    async fn append_high_water(&self, table_name: &str) -> Result<i64, SqlError> {
-        let prefix = self.keyspace.data_prefix(table_name);
-        let end = prefix_upper_bound(&prefix);
+    /// Highest `I64` row key among the **live committed** rows under `prefix`
+    /// (read straight from the writer `Db`, not a snapshot). Used only to seed the
+    /// auto-increment counter. Returns 0 for an empty table.
+    async fn live_max_i64_key(&self, prefix: &[u8]) -> Result<i64, SqlError> {
+        let end = prefix_upper_bound(prefix);
         let mut max = 0i64;
-
-        // Live committed rows (other connections' commits land here once their
-        // `WriteBatch` is durable; our own uncommitted rows are in the overlay).
-        let mut iter = self.substrate.scan_range(&prefix, end.as_deref()).await?;
+        let mut iter = self.substrate.scan_range(prefix, end.as_deref()).await?;
         while let Some(kv) = iter.next().await? {
             let stored: StoredRow = decode(&kv.value)?;
             if let Key::I64(n) = stored.key {
                 max = max.max(n);
-            }
-        }
-
-        // This txn's own buffered appends (matters for multi-INSERT explicit
-        // txns, where earlier rows aren't committed yet).
-        if let Some(txn) = self.txn.as_ref() {
-            let upper = match &end {
-                Some(end) => Bound::Excluded(end.clone()),
-                None => Bound::Unbounded,
-            };
-            for (_, op) in txn.overlay.range((Bound::Included(prefix.clone()), upper)) {
-                if let Some(bytes) = op {
-                    let stored: StoredRow = decode(bytes)?;
-                    if let Key::I64(n) = stored.key {
-                        max = max.max(n);
-                    }
-                }
             }
         }
         Ok(max)
@@ -556,7 +567,6 @@ impl Store for SlateDbStorage {
 #[async_trait]
 impl StoreMut for SlateDbStorage {
     async fn insert_schema(&mut self, schema: &Schema) -> GlueResult<()> {
-        self.ensure_write_lease().await?;
         let key = self.keyspace.schema_key(&schema.table_name);
         self.write_key(key, encode(schema)?).await?;
         Ok(())
@@ -565,7 +575,6 @@ impl StoreMut for SlateDbStorage {
     async fn delete_schema(&mut self, table_name: &str) -> GlueResult<()> {
         // Drop every index entry, every row, then the schema record (which
         // carries the index *definitions*) itself.
-        self.ensure_write_lease().await?;
         let rows = self.collect_rows(table_name).await?;
         for (key, row) in &rows {
             self.apply_index_entries(table_name, key, row, false).await?;
@@ -579,18 +588,19 @@ impl StoreMut for SlateDbStorage {
     }
 
     async fn append_data(&mut self, table_name: &str, rows: Vec<DataRow>) -> GlueResult<()> {
-        // `append_data` feeds schemaless / auto-incremented tables: assign each
-        // row a fresh monotonically increasing I64 key. Take the write lease
-        // FIRST, then read the high-water mark from live committed state under
-        // it — this serializes the whole read-modify-write so two concurrent
-        // autocommit `INSERT`s can't both pick the same key and clobber each
-        // other (the bug a plain write-through path had).
-        self.ensure_write_lease().await?;
-        let mut next = self.append_high_water(table_name).await?;
+        // `append_data` feeds schemaless / auto-incremented tables. Reserve a
+        // contiguous run of keys from the shared counter (atomic across
+        // connections), so concurrent autocommit `INSERT`s never collide — no
+        // global write lease, no max-scan on the hot path, so their durable
+        // commits run concurrently and SlateDB's WAL group-commits them.
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut next = self.allocate_keys(table_name, rows.len()).await?;
 
         for row in rows {
-            next += 1;
             let key = Key::I64(next);
+            next += 1;
             let storage_key = self.keyspace.row_key(table_name, &key)?;
             self.apply_index_entries(table_name, &key, &row, true)
                 .await?;
@@ -605,7 +615,6 @@ impl StoreMut for SlateDbStorage {
 
     async fn insert_data(&mut self, table_name: &str, rows: Vec<(Key, DataRow)>) -> GlueResult<()> {
         // Used for keyed inserts and updates (UPDATE re-inserts the same key).
-        self.ensure_write_lease().await?;
         for (key, row) in rows {
             // For UPDATE, the old row's index entries must be removed first.
             let storage_key = self.keyspace.row_key(table_name, &key)?;
@@ -626,7 +635,6 @@ impl StoreMut for SlateDbStorage {
     }
 
     async fn delete_data(&mut self, table_name: &str, keys: Vec<Key>) -> GlueResult<()> {
-        self.ensure_write_lease().await?;
         for key in keys {
             let storage_key = self.keyspace.row_key(table_name, &key)?;
             if let Some(bytes) = self.read_key(&storage_key).await? {
@@ -667,33 +675,32 @@ impl Transaction for SlateDbStorage {
             return Ok(false);
         }
         if autocommit {
-            // Plain statement: snapshot now WITHOUT the lease so a read-only
-            // statement never blocks (and is never blocked by) a writer. If the
-            // statement turns out to write, the first mutation acquires the
-            // lease and reads live committed state under it (see `append_data`),
-            // which is what serializes the read-modify-write and stops two
-            // concurrent autocommit `INSERT`s from allocating the same row key.
-            // Return `true` so GlueSQL commits (flushes the overlay) afterwards.
+            // Plain statement: snapshot now WITHOUT the lease so it never blocks
+            // (and is never blocked by) a writer. Auto-increment keys come from
+            // the collision-free shared counter (see `append_data`), so no lease
+            // is needed even for writes — and concurrent commits batch at the
+            // SlateDB WAL (group commit). Return `true` so GlueSQL commits
+            // (flushes the overlay) afterwards.
             let snapshot = self.writer()?.snapshot().await.map_err(SqlError::from)?;
             self.txn = Some(TxnState {
                 overlay: BTreeMap::new(),
                 snapshot,
-                lease: None,
+                _lease: None,
             });
             Ok(true)
         } else {
             // Explicit BEGIN: acquire the exclusive write lease FIRST, then take
             // the snapshot. Holding the lease for the whole block serializes the
             // txn's *reads* too (so an `UPDATE`'s row scan can't lose against a
-            // concurrent writer), and the snapshot taken after it sees every
-            // previously-committed write. The return value is ignored for the
-            // `StartTransaction` statement; the user drives COMMIT/ROLLBACK.
+            // concurrent explicit transaction), and the snapshot taken after it
+            // sees every previously-committed write. The return value is ignored
+            // for the `StartTransaction` statement; the user drives COMMIT/ROLLBACK.
             let lease = self.write_lease.clone().lock_owned().await;
             let snapshot = self.writer()?.snapshot().await.map_err(SqlError::from)?;
             self.txn = Some(TxnState {
                 overlay: BTreeMap::new(),
                 snapshot,
-                lease: Some(lease),
+                _lease: Some(lease),
             });
             Ok(false)
         }
@@ -800,7 +807,6 @@ impl IndexMut for SlateDbStorage {
         index_name: &str,
         column: &OrderByExpr,
     ) -> GlueResult<()> {
-        self.ensure_write_lease().await?;
         let mut schema = self
             .read_schema(table_name)
             .await?
@@ -849,7 +855,6 @@ impl IndexMut for SlateDbStorage {
     }
 
     async fn drop_index(&mut self, table_name: &str, index_name: &str) -> GlueResult<()> {
-        self.ensure_write_lease().await?;
         let mut schema = self
             .read_schema(table_name)
             .await?

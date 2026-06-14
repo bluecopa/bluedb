@@ -13,16 +13,18 @@
 //! - **Reads** are lock-free and **snapshot-isolated**: each transaction reads
 //!   a point-in-time [`DbSnapshot`](slatedb::DbSnapshot) captured at `BEGIN`, so
 //!   it never observes another connection's writes committed after it began.
-//! - **Write transactions are serializable**: a connection's explicit
+//! - **Explicit write transactions are serializable**: a connection's explicit
 //!   transaction takes the exclusive write lease at `BEGIN` (and snapshots
 //!   *under* it), so a second connection's `BEGIN` blocks until the first
 //!   commits — then snapshots the first's result. Concurrent read-modify-write
-//!   transactions therefore cannot lose an update. (SlateDB is single-writer;
-//!   this lease is exactly that single writer, surfaced as a queue.)
-//! - **Autocommit statements** (no explicit `BEGIN`) are individually atomic and
-//!   physically safe on the shared `Db`, but are NOT serialized against other
-//!   statements. For an atomic read-modify-write under concurrency, wrap it in a
-//!   `BEGIN ... COMMIT` block.
+//!   transactions therefore cannot lose an update.
+//! - **Autocommit statements** (no explicit `BEGIN`) do NOT take the lease, so
+//!   they run concurrently and their durable commits batch at SlateDB's WAL
+//!   (group commit — the throughput path). Auto-increment `INSERT`s are still
+//!   collision-free: row keys come from a shared atomic counter, not a racy
+//!   max-scan. An autocommit read-modify-write across *existing* keys (e.g.
+//!   `UPDATE x = x + 1`) is not serialized against a concurrent writer, though —
+//!   wrap those in a `BEGIN ... COMMIT` block.
 //!
 //! ```no_run
 //! # use std::sync::Arc;
@@ -43,6 +45,7 @@
 //! # }
 //! ```
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use bluedb_storage::Substrate;
@@ -50,7 +53,7 @@ use slatedb::{Db, DbReader};
 use tokio::sync::Mutex;
 
 use crate::keyspace::DEFAULT_TENANT;
-use crate::storage::{SlateDbStorage, WriteLease};
+use crate::storage::{SeqAllocator, SlateDbStorage, WriteLease};
 
 /// A handle to one SlateDB database that vends isolated [`SlateDbStorage`]
 /// connections — either a **writer** handle (connections can read + write,
@@ -60,6 +63,7 @@ use crate::storage::{SlateDbStorage, WriteLease};
 pub struct Database {
     substrate: Substrate,
     write_lease: WriteLease,
+    seq: SeqAllocator,
 }
 
 impl Database {
@@ -81,6 +85,7 @@ impl Database {
         Self {
             substrate,
             write_lease: Arc::new(Mutex::new(())),
+            seq: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -111,6 +116,11 @@ impl Database {
     /// write lease, so write transactions across tenants serialize on the one
     /// underlying single-writer database.
     pub fn connection_for_tenant(&self, tenant: &str) -> SlateDbStorage {
-        SlateDbStorage::with_substrate(self.substrate.clone(), tenant, self.write_lease.clone())
+        SlateDbStorage::with_substrate(
+            self.substrate.clone(),
+            tenant,
+            self.write_lease.clone(),
+            self.seq.clone(),
+        )
     }
 }
