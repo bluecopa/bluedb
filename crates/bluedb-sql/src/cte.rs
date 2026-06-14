@@ -12,12 +12,89 @@
 use std::collections::HashMap;
 
 use sqlparser::ast::{
-    Expr, Ident, Query, Select, SelectItem, SetExpr, Statement, TableAlias, TableFactor,
+    Expr, Ident, ObjectName, ObjectType, Query, Select, SelectItem, SetExpr, Statement, TableAlias,
+    TableFactor,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 type Scope = HashMap<String, Box<Query>>;
+
+fn last_name(name: &ObjectName) -> String {
+    name.0.last().map(|i| i.value.clone()).unwrap_or_default()
+}
+
+/// If `sql` is `CREATE [OR REPLACE] VIEW name AS <query>`, return
+/// `(name, query-SQL)`. GlueSQL has no views, so the harness stores the
+/// definition and inlines references (see [`inline_views`]).
+pub fn parse_create_view(sql: &str) -> Option<(String, String)> {
+    let dialect = GenericDialect {};
+    let stmts = Parser::parse_sql(&dialect, sql).ok()?;
+    match stmts.into_iter().next()? {
+        Statement::CreateView { name, query, .. } => Some((last_name(&name), query.to_string())),
+        _ => None,
+    }
+}
+
+/// If `sql` is `DROP VIEW …`, return the view names dropped.
+pub fn parse_drop_view(sql: &str) -> Option<Vec<String>> {
+    let dialect = GenericDialect {};
+    let stmts = Parser::parse_sql(&dialect, sql).ok()?;
+    match stmts.into_iter().next()? {
+        Statement::Drop {
+            object_type: ObjectType::View,
+            names,
+            ..
+        } => Some(names.iter().map(last_name).collect()),
+        _ => None,
+    }
+}
+
+/// Inline references to stored views (name → view-body SQL) as derived tables,
+/// reusing the CTE substitution. View bodies should already be CTE-inlined when
+/// stored. One level of reference is resolved (a view referencing another view
+/// is not recursively expanded).
+pub fn inline_views(sql: &str, views: &HashMap<String, String>) -> String {
+    if views.is_empty() {
+        return sql.to_string();
+    }
+    let dialect = GenericDialect {};
+    let mut scope = Scope::new();
+    for (name, body) in views {
+        if let Ok(stmts) = Parser::parse_sql(&dialect, body) {
+            if let Some(Statement::Query(query)) = stmts.into_iter().next() {
+                scope.insert(name.clone(), query);
+            }
+        }
+    }
+    if scope.is_empty() {
+        return sql.to_string();
+    }
+    let Ok(mut statements) = Parser::parse_sql(&dialect, sql) else {
+        return sql.to_string();
+    };
+    let mut changed = false;
+    for stmt in &mut statements {
+        let inner = match stmt {
+            Statement::Query(query) => Some(query.as_mut()),
+            Statement::CreateTable(create) => create.query.as_deref_mut(),
+            Statement::Insert(insert) => insert.source.as_deref_mut(),
+            _ => None,
+        };
+        if let Some(query) = inner {
+            inline_query(query, &scope, &mut changed);
+        }
+    }
+    if changed {
+        statements
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ")
+    } else {
+        sql.to_string()
+    }
+}
 
 /// Inline non-recursive CTEs. Returns the original SQL unchanged if it can't be
 /// parsed or has no inlinable `WITH`.
@@ -29,7 +106,15 @@ pub fn inline_ctes(sql: &str) -> String {
     let mut changed = false;
     let empty = Scope::new();
     for stmt in &mut statements {
-        if let Statement::Query(query) = stmt {
+        // `WITH` can head a bare query, a `CREATE TABLE … AS <query>`, or an
+        // `INSERT … <query>`; inline it in all three.
+        let inner = match stmt {
+            Statement::Query(query) => Some(query.as_mut()),
+            Statement::CreateTable(create) => create.query.as_deref_mut(),
+            Statement::Insert(insert) => insert.source.as_deref_mut(),
+            _ => None,
+        };
+        if let Some(query) = inner {
             inline_query(query, &empty, &mut changed);
         }
     }
@@ -154,6 +239,18 @@ mod tests {
         let out = inline_ctes("WITH a AS (SELECT x FROM t1), b AS (SELECT y FROM t2) SELECT x FROM a, b");
         assert!(!out.to_uppercase().contains("WITH "), "got: {out}");
         assert_eq!(out.matches("SELECT").count() >= 3, true, "both CTEs inlined: {out}");
+    }
+
+    #[test]
+    fn inlines_cte_in_create_table_as() {
+        let out = inline_ctes("CREATE TABLE u AS WITH c AS (SELECT a FROM t) SELECT a FROM c");
+        assert!(!out.to_uppercase().contains("WITH "), "WITH should be gone: {out}");
+    }
+
+    #[test]
+    fn inlines_cte_in_insert() {
+        let out = inline_ctes("INSERT INTO u WITH c AS (SELECT a FROM t) SELECT a FROM c");
+        assert!(!out.to_uppercase().contains("WITH "), "WITH should be gone: {out}");
     }
 
     #[test]

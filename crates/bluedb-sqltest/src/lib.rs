@@ -34,6 +34,9 @@ pub struct GlueTester {
     /// `Some(true)` = NULLS FIRST, `Some(false)` = NULLS LAST. Set by
     /// `SET default_null_order = …` and applied to every subsequent `ORDER BY`.
     nulls_first: Option<bool>,
+    /// View definitions (name → CTE-inlined body SQL) captured from
+    /// `CREATE VIEW`, inlined into later queries (GlueSQL has no views).
+    views: std::collections::HashMap<String, String>,
 }
 
 impl GlueTester {
@@ -56,6 +59,7 @@ impl GlueTester {
         Ok(Self {
             glue: Glue::new(SlateDbStorage::new(Arc::new(db))),
             nulls_first: None,
+            views: std::collections::HashMap::new(),
         })
     }
 }
@@ -80,6 +84,18 @@ impl AsyncDB for GlueTester {
         if is_ignorable_setting(sql) {
             return Ok(DBOutput::StatementComplete(0));
         }
+        // GlueSQL has no views: capture `CREATE VIEW` definitions (CTE-inlined)
+        // and inline references in later queries; swallow `DROP VIEW`.
+        if let Some((name, body)) = bluedb_sql::parse_create_view(sql) {
+            self.views.insert(name, bluedb_sql::inline_ctes(&body));
+            return Ok(DBOutput::StatementComplete(0));
+        }
+        if let Some(names) = bluedb_sql::parse_drop_view(sql) {
+            for name in names {
+                self.views.remove(&name);
+            }
+            return Ok(DBOutput::StatementComplete(0));
+        }
 
         // Reject SQL GlueSQL would silently mis-execute (window functions) with
         // a clear error rather than returning wrong rows.
@@ -89,9 +105,11 @@ impl AsyncDB for GlueTester {
 
         // Apply bluedb's SQL-compat rewrites, matching how bluedb-sql would
         // preprocess SQL in production: CTE inlining first (WITH -> derived
-        // tables), then set ops (UNION/INTERSECT/EXCEPT -> joins/subqueries),
-        // then comma-join folding + data-type normalization.
+        // tables), view-reference inlining, then set ops
+        // (UNION/INTERSECT/EXCEPT -> joins/subqueries), then comma-join folding +
+        // data-type normalization.
         let sql = bluedb_sql::inline_ctes(sql);
+        let sql = bluedb_sql::inline_views(&sql, &self.views);
         let sql = bluedb_sql::rewrite_set_ops(&sql);
         let sql = bluedb_sql::rewrite_multitable(&sql);
         // Normalize NULL placement: strip explicit `NULLS FIRST/LAST` (GlueSQL

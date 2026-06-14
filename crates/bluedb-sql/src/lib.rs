@@ -75,7 +75,7 @@ mod setops;
 mod storage;
 
 pub use connection::Database;
-pub use cte::inline_ctes;
+pub use cte::{inline_ctes, inline_views, parse_create_view, parse_drop_view};
 pub use error::SqlError;
 pub use keyspace::DEFAULT_TENANT;
 pub use nullorder::{parse_default_null_order, rewrite_null_order};
