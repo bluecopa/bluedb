@@ -20,7 +20,7 @@
 
 use sqlparser::ast::{
     CreateTable, Cte, DataType, ExactNumberInfo, Expr, Join, JoinConstraint, JoinOperator, Query,
-    Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, Value, With,
+    Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, TimezoneInfo, Value, With,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -136,6 +136,29 @@ fn fold_expr_subqueries(expr: &mut Expr, changed: &mut bool) {
                 fold_expr_subqueries(item, changed);
             }
         }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            fold_expr_subqueries(expr, changed);
+            fold_expr_subqueries(low, changed);
+            fold_expr_subqueries(high, changed);
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => {
+            if let Some(op) = operand {
+                fold_expr_subqueries(op, changed);
+            }
+            for e in conditions.iter_mut().chain(results.iter_mut()) {
+                fold_expr_subqueries(e, changed);
+            }
+            if let Some(e) = else_result {
+                fold_expr_subqueries(e, changed);
+            }
+        }
         _ => {}
     }
 }
@@ -198,13 +221,27 @@ fn normalize_data_type(data_type: &mut DataType) -> bool {
         "VARCHAR" | "CHAR" | "CHARACTER" | "NVARCHAR" | "NCHAR" | "CLOB" | "STRING" => {
             Some(DataType::Text)
         }
-        "DECIMAL" | "NUMERIC" | "DEC" | "BIGDECIMAL" | "BIGNUMERIC" => {
+        "DECIMAL" | "NUMERIC" | "DEC" | "BIGDECIMAL" | "BIGNUMERIC" | "BIGNUM" => {
             Some(DataType::Decimal(ExactNumberInfo::None))
         }
-        "BIGINT" | "SMALLINT" | "TINYINT" | "MEDIUMINT" | "INT2" | "INT4" | "INT8" | "HUGEINT" => {
-            Some(DataType::Integer(None))
+        // Floating point: GlueSQL has a single `FLOAT` (f64). Map the whole
+        // family (and strip any precision) onto it.
+        "DOUBLE" | "REAL" | "FLOAT" | "FLOAT4" | "FLOAT8" | "BINARY_FLOAT" | "BINARY_DOUBLE" => {
+            Some(DataType::Float(None))
         }
+        // Integer family, including unsigned and wide variants (widened to i64;
+        // lossy for out-of-range values but lets the DDL/query run).
+        "BIGINT" | "SMALLINT" | "TINYINT" | "MEDIUMINT" | "INT2" | "INT4" | "INT8" | "INT16"
+        | "INT32" | "INT64" | "INT128" | "INT256" | "HUGEINT" | "UHUGEINT" | "UBIGINT" | "UINT"
+        | "UINTEGER" | "USMALLINT" | "UTINYINT" | "UMEDIUMINT" | "UINT8" | "UINT16" | "UINT32"
+        | "UINT64" | "UINT128" => Some(DataType::Integer(None)),
         "INT" | "INTEGER" if has_param => Some(DataType::Integer(None)),
+        // Temporal: strip sub-second precision / timezone GlueSQL doesn't model
+        // (bare forms map to themselves and are skipped by the `!=` guard below).
+        "TIMESTAMP" | "TIMESTAMPTZ" | "DATETIME" => {
+            Some(DataType::Timestamp(None, TimezoneInfo::None))
+        }
+        "TIME" | "TIMETZ" => Some(DataType::Time(None, TimezoneInfo::None)),
         _ => None,
     };
 
@@ -258,6 +295,46 @@ mod tests {
         let out = rewrite_multitable("CREATE TABLE t (a INTEGER, x VARCHAR(30))");
         assert!(out.to_uppercase().contains("TEXT"), "got: {out}");
         assert!(!out.to_uppercase().contains("VARCHAR"), "got: {out}");
+    }
+
+    #[test]
+    fn float_family_becomes_float() {
+        for ddl in [
+            "CREATE TABLE t (x DOUBLE)",
+            "CREATE TABLE t (x REAL)",
+            "CREATE TABLE t (x DOUBLE PRECISION)",
+            "CREATE TABLE t (x FLOAT(10))",
+        ] {
+            let out = rewrite_multitable(ddl).to_uppercase();
+            assert!(out.contains("FLOAT"), "{ddl} -> {out}");
+            assert!(!out.contains("DOUBLE") && !out.contains("REAL"), "{ddl} -> {out}");
+        }
+    }
+
+    #[test]
+    fn wide_and_unsigned_ints_become_integer() {
+        for ddl in ["CREATE TABLE t (x UHUGEINT)", "CREATE TABLE t (x UBIGINT)"] {
+            let out = rewrite_multitable(ddl).to_uppercase();
+            assert!(out.contains("INT"), "{ddl} -> {out}");
+            assert!(!out.contains("HUGE") && !out.contains("UBIG"), "{ddl} -> {out}");
+        }
+    }
+
+    #[test]
+    fn timestamp_precision_is_stripped() {
+        let out = rewrite_multitable("CREATE TABLE t (x TIMESTAMP(6))").to_uppercase();
+        assert!(out.contains("TIMESTAMP"), "got: {out}");
+        assert!(!out.contains("TIMESTAMP(6)") && !out.contains("(6)"), "got: {out}");
+    }
+
+    #[test]
+    fn cast_type_normalized_inside_case() {
+        let out = rewrite_multitable(
+            "SELECT CASE WHEN x THEN CAST(y AS DOUBLE) ELSE NULL END FROM t",
+        )
+        .to_uppercase();
+        assert!(out.contains("FLOAT"), "got: {out}");
+        assert!(!out.contains("DOUBLE"), "got: {out}");
     }
 
     #[test]
