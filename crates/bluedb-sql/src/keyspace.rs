@@ -274,7 +274,7 @@ impl Keyspace {
     /// A key in an **external** namespace: `<tenant> <tag> <suffix>`. The caller
     /// owns the `suffix` encoding (e.g. a `u128` big-endian id). `tag` must be
     /// `>= TAG_EXTERNAL_BASE` so it cannot collide with bluedb-sql's own
-    /// namespaces; this is debug-asserted.
+    /// namespaces; this is asserted.
     pub fn external_key(&self, tag: u8, suffix: &[u8]) -> Vec<u8> {
         assert!(tag >= TAG_EXTERNAL_BASE, "external tag must be >= TAG_EXTERNAL_BASE");
         let mut key = self.tagged(tag, suffix.len());

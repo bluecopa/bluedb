@@ -9,7 +9,7 @@ use bluedb_storage::Substrate;
 use slatedb::WriteBatch;
 
 use crate::keyspace::LedgerKeyspace;
-use crate::model::{Account, AccountFlags, CreateResult, LedgerError, NewAccount, Transfer};
+use crate::model::{Account, AccountFlags, CreateResult, LedgerError, NewAccount, Transfer, TransferFlags};
 use crate::store::{encode, get_account, get_transfer};
 
 /// A double-entry ledger over one bluedb database.
@@ -92,12 +92,21 @@ impl Ledger {
         // Ids of accounts an accepted transfer actually mutated — only these are
         // written back (accounts merely read by a rejected transfer are skipped).
         let mut dirty: HashSet<u128> = HashSet::new();
+        // Transfer ids accepted in THIS batch, so a duplicate id within one call
+        // is treated as Exists (the committed-state check in stage_transfer can't
+        // see uncommitted siblings) and cannot double-apply balances.
+        let mut staged: HashSet<u128> = HashSet::new();
         let mut accepted: Vec<Transfer> = Vec::new();
         let mut results = Vec::with_capacity(transfers.len());
 
         for t in transfers {
+            if staged.contains(&t.id) {
+                results.push(CreateResult::Exists);
+                continue;
+            }
             match self.stage_transfer(t, timestamp, &mut working).await? {
                 StageOutcome::Applied(applied) => {
+                    staged.insert(applied.id);
                     dirty.insert(applied.debit_account_id);
                     dirty.insert(applied.credit_account_id);
                     accepted.push(applied);
@@ -135,6 +144,12 @@ impl Ledger {
     ) -> Result<StageOutcome> {
         if t.debit_account_id == t.credit_account_id {
             return Ok(StageOutcome::Rejected(LedgerError::AccountsMustDiffer));
+        }
+        // Posted transfers only: reject any flag whose semantics aren't
+        // implemented yet (linked / two-phase / balancing) so a flagged transfer
+        // is never silently persisted as a plain posted one.
+        if t.flags != TransferFlags::NONE {
+            return Ok(StageOutcome::Rejected(LedgerError::UnsupportedFlag));
         }
         // Idempotency: committed transfer with this id already exists.
         if get_transfer(&self.substrate, &self.keyspace, t.id).await?.is_some() {
@@ -501,5 +516,38 @@ mod tests {
         assert_eq!(total_debits, moved);
         assert_eq!(total_credits, moved);
         assert_eq!(total_debits, total_credits);
+    }
+
+    #[tokio::test]
+    async fn duplicate_transfer_id_within_one_batch_applies_once() {
+        use crate::model::{CreateResult, Transfer};
+        let database = writer_database().await;
+        let ledger = Ledger::new(&database);
+        setup_two_accounts(&ledger).await;
+
+        // The same id twice in ONE batch: the first applies, the second is a
+        // no-op Exists — balances must move exactly once (no double-apply).
+        let t = Transfer::new(7, 1, 2, 100, 7);
+        let res = ledger.create_transfers(&[t, t], 1).await.unwrap();
+        assert_eq!(res, vec![CreateResult::Ok, CreateResult::Exists]);
+        assert_eq!(ledger.lookup_account(1).await.unwrap().unwrap().debits_posted, 100);
+        assert_eq!(ledger.lookup_account(2).await.unwrap().unwrap().credits_posted, 100);
+    }
+
+    #[tokio::test]
+    async fn unsupported_transfer_flag_is_rejected() {
+        use crate::model::{CreateResult, LedgerError, Transfer, TransferFlags};
+        let database = writer_database().await;
+        let ledger = Ledger::new(&database);
+        setup_two_accounts(&ledger).await;
+
+        // A flag whose semantics aren't implemented yet is rejected, not
+        // silently applied as a plain posted transfer.
+        let mut t = Transfer::new(1, 1, 2, 100, 7);
+        t.flags = TransferFlags::PENDING;
+        let res = ledger.create_transfers(&[t], 1).await.unwrap();
+        assert_eq!(res, vec![CreateResult::Failed(LedgerError::UnsupportedFlag)]);
+        assert_eq!(ledger.lookup_account(1).await.unwrap().unwrap().debits_posted, 0);
+        assert!(ledger.lookup_transfer(1).await.unwrap().is_none());
     }
 }

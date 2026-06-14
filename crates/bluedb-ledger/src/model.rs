@@ -184,6 +184,8 @@ pub enum LedgerError {
     ExceedsDebits,
     #[error("balance arithmetic overflowed u128")]
     Overflow,
+    #[error("transfer flag is not supported yet (this engine implements posted transfers only)")]
+    UnsupportedFlag,
 }
 
 #[cfg(test)]
