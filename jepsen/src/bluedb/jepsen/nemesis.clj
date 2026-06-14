@@ -124,6 +124,12 @@
                                (info "nemesis paused Postgres (lease arbiter)")
                                (assoc op :value :postgres-paused))
           :resume-postgres (do (docker "unpause" pg-container) (assoc op :value :postgres-resumed))
+          ;; Hard restart (vs pause): kills the TCP connection, so recovery
+          ;; depends on PostgresLeaseProvider reconnecting.
+          :stop-postgres   (do (docker "stop" pg-container)
+                               (info "nemesis STOPPED Postgres (connection loss)")
+                               (assoc op :value :postgres-stopped))
+          :start-postgres  (do (docker "start" pg-container) (assoc op :value :postgres-started))
           :pause-minio     (do (docker "pause" minio-container)
                                (info "nemesis paused MinIO (object store)")
                                (assoc op :value :minio-paused))
@@ -145,5 +151,6 @@
           (docker "network" "connect" net c)
           (docker "exec" c "sh" "-c" "echo '+0' > /faketime/offset"))
         (docker "unpause" pg-container)
+        (docker "start" pg-container)
         (docker "unpause" minio-container)
         (docker "exec" minio-container "sh" "-c" (str "rm -f " filler "; true"))))))

@@ -53,6 +53,7 @@ true}`):
 | `skew` | shift the writer's wall clock 8 s **backward** (via libfaketime) | the writer over-estimates its lease validity, so a standby can acquire concurrently — checks the SlateDB `writer_epoch` fence still blocks divergent writes |
 | `pause` | `docker pause` the writer (SIGSTOP, no crash) | the frozen writer stops renewing; a standby promotes; on resume it wakes to an expired lease + bumped epoch and must step down |
 | `arbiter` | `docker pause` Postgres (the lease arbiter) | writer can't renew → self-fences; standbys can't acquire → cluster goes writer-less (no split-brain) → recovers on thaw |
+| `arbiter-hard` | `docker stop`/`start` Postgres (kills the connection) | like `arbiter`, but tests `PostgresLeaseProvider` reconnect — a node re-acquires once Postgres is back |
 | `storage` | `docker pause` MinIO (the object store) | writer keeps its lease but can't durably write → writes don't ack → recovers on thaw |
 | `disk-full` | fill MinIO's bounded `/data` tmpfs → ENOSPC | durable writes fail until space is freed |
 | `mix` | kill + partition, alternating | combined |

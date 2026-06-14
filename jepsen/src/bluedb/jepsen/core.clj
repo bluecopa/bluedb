@@ -129,6 +129,8 @@
                      (gen/sleep 14) {:type :info :f :heal}]
    "arbiter"   [(gen/sleep 6)  {:type :info :f :pause-postgres}
                 (gen/sleep 16) {:type :info :f :resume-postgres}]
+   "arbiter-hard" [(gen/sleep 6)  {:type :info :f :stop-postgres}
+                   (gen/sleep 18) {:type :info :f :start-postgres}]
    "storage"   [(gen/sleep 6)  {:type :info :f :pause-minio}
                 (gen/sleep 16) {:type :info :f :resume-minio}]
    "disk-full" [(gen/sleep 6)  {:type :info :f :fill-disk}
@@ -175,6 +177,7 @@
              (gen/nemesis (gen/once {:type :info :f :start-all}))
              (gen/nemesis (gen/once {:type :info :f :resume}))
              (gen/nemesis (gen/once {:type :info :f :resume-postgres}))
+             (gen/nemesis (gen/once {:type :info :f :start-postgres}))
              (gen/nemesis (gen/once {:type :info :f :resume-minio}))
              (gen/nemesis (gen/once {:type :info :f :free-disk}))
              (gen/sleep 25)
@@ -192,7 +195,7 @@
     "Faults: kill|partition|partition-half|skew|pause|arbiter|storage|disk-full|mix|chaos|none"
     :default "mix"
     :validate [#{"kill" "partition" "partition-half" "skew" "pause"
-                 "arbiter" "storage" "disk-full" "mix" "chaos" "none"}
+                 "arbiter" "arbiter-hard" "storage" "disk-full" "mix" "chaos" "none"}
                "unknown nemesis"]]
    [nil "--workload NAME" "Workload: set | list-append | counter | unique"
     :default "set"
