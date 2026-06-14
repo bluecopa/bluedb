@@ -1,7 +1,8 @@
 (ns bluedb.jepsen.core
   "Jepsen test entry point for bluedb.
 
-  Two workloads (pick with --workload):
+  Workloads (pick with --workload): set (default) | list-append | counter |
+  unique | ledger. Highlights:
 
   * `set` (default) — a grow-only set. Clients append unique ints through the
     active writer; a final read reads the whole set back. `set-full` proves every
@@ -12,6 +13,10 @@
     appends + reads over several keys; Elle reconstructs the dependency graph and
     flags serializability anomalies (G0/G1/G2, write skew, lost update). Exercises
     the explicit-transaction path under concurrency.
+
+  * `ledger` — double-entry transfers over the `/ledger/*` API; checks that
+    debits and credits stay conserved and that observed totals match the
+    acknowledged-applied set (no double-apply / no lost transfer) under faults.
 
   Faults (--nemesis): none | kill | partition | partition-half | skew | pause |
   arbiter | storage | disk-full | mix | chaos, injected via the docker CLI (skew
@@ -26,6 +31,7 @@
   (:require [bluedb.jepsen.client :as bc]
             [bluedb.jepsen.counter :as bcnt]
             [bluedb.jepsen.http :as h]
+            [bluedb.jepsen.ledger :as bl]
             [bluedb.jepsen.list-append :as la]
             [bluedb.jepsen.nemesis :as bn]
             [bluedb.jepsen.unique :as bu]
@@ -145,6 +151,29 @@
                 (gen/sleep 14) {:type :info :f :heal}]
    "none"      []})
 
+(defn- ledger-workload
+  "Random posted transfers among a fixed set of accounts, plus reads. Checks
+  double-entry conservation (Σ debits = Σ credits) and that the observed posted
+  total stays within the acknowledged-applied band (no double-apply, no lost
+  transfer) across faults. Account/transfer ids are namespaced per run, so the
+  workload needs no schema reset (the server bootstraps the projection tables)."
+  [_opts]
+  (let [n 8
+        transfer (fn []
+                   (let [a (inc (rand-int n))
+                         b (inc (rand-int n))
+                         b (if (= a b) (inc (mod b n)) b)]
+                     {:type :invoke :f :transfer
+                      :value {:from a :to b :amount (inc (rand-int 1000))}}))
+        read (fn [] {:type :invoke :f :read})]
+    {:client          (bl/client)
+     ;; Bias toward transfers; interleave occasional reads to exercise the read
+     ;; path under fault. Conservation is judged at the final read.
+     :generator       (gen/mix [(repeatedly transfer) (repeatedly transfer)
+                                (repeatedly transfer) (repeatedly read)])
+     :final-generator (gen/once {:type :invoke :f :read})
+     :checker         (bl/checker)}))
+
 (defn bluedb-test
   [opts]
   (let [kind      (:nemesis opts "mix")
@@ -154,6 +183,7 @@
                      "list-append" list-append-workload
                      "counter"     counter-workload
                      "unique"      unique-workload
+                     "ledger"      ledger-workload
                      set-workload)
                    opts)]
     (merge tests/noop-test
@@ -197,10 +227,10 @@
     :validate [#{"kill" "partition" "partition-half" "skew" "pause"
                  "arbiter" "arbiter-hard" "storage" "disk-full" "mix" "chaos" "none"}
                "unknown nemesis"]]
-   [nil "--workload NAME" "Workload: set | list-append | counter | unique"
+   [nil "--workload NAME" "Workload: set | list-append | counter | unique | ledger"
     :default "set"
-    :validate [#{"set" "list-append" "counter" "unique"}
-               "must be set, list-append, counter, or unique"]]
+    :validate [#{"set" "list-append" "counter" "unique" "ledger"}
+               "must be set, list-append, counter, unique, or ledger"]]
    [nil "--consistency MODEL" "list-append model: serializable | strict-serializable"
     :default "serializable"
     :validate [#{"serializable" "strict-serializable"}
