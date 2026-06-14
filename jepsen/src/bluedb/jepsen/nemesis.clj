@@ -17,7 +17,16 @@
                        believes its lease is valid longer than Postgres records,
                        so a standby can acquire concurrently — tests that the
                        SlateDB writer_epoch fence still prevents divergent writes.
-    :reset-clock       restore every node's clock."
+    :reset-clock       restore every node's clock.
+    :pause-writer      SIGSTOP the active writer's container (docker pause): it
+                       stops renewing without crashing. A standby promotes; on
+                       :resume the frozen writer wakes to an expired lease and a
+                       bumped epoch, so it must step down (fenced).
+    :resume            unpause every container.
+    :isolate-half      asymmetric partition: cut the active writer AND one peer
+                       off the network (a 2-node minority that loses the Postgres
+                       arbiter + MinIO), leaving a lone node + infra to lead.
+                       Healed by :heal."
   (:require [bluedb.jepsen.http :as h]
             [jepsen.nemesis :as nemesis]
             [clojure.java.shell :as shell]
@@ -75,10 +84,33 @@
           :reset-clock
           (do (doseq [c (containers)]
                 (docker "exec" c "sh" "-c" "echo '+0' > /faketime/offset"))
-              (assoc op :value :clock-reset))))
+              (assoc op :value :clock-reset))
+
+          :pause-writer
+          (let [w (h/active-node)]
+            (when w (docker "pause" (h/node->container w)))
+            (info "nemesis paused writer" w)
+            (assoc op :value (str "paused " w)))
+
+          :resume
+          (do (doseq [c (containers)] (docker "unpause" c))
+              (assoc op :value :resumed))
+
+          :isolate-half
+          (let [w       (h/active-node)
+                buddy   (first (sort (remove #{w} (keys h/ports))))
+                victims (filter some? [w buddy])]
+            (doseq [n victims]
+              (docker "network" "disconnect" net (h/node->container n)))
+            (reset! partitioned victims)
+            (info "nemesis isolated minority" victims)
+            (assoc op :value (str "isolated " (vec victims))))))
 
       (teardown! [_this _test]
-        ;; best-effort: bring everything back so the cluster is usable after the run
+        ;; best-effort: bring everything back so the cluster is usable after the
+        ;; run — unpause first (a paused container can't exec), then reconnect and
+        ;; reset clocks.
+        (doseq [c (containers)] (docker "unpause" c))
         (doseq [c (containers)]
           (docker "start" c)
           (docker "network" "connect" net c)

@@ -13,8 +13,9 @@
     flags serializability anomalies (G0/G1/G2, write skew, lost update). Exercises
     the explicit-transaction path under concurrency.
 
-  Faults (--nemesis): none | kill | partition | skew | mix | chaos, injected via
-  the docker CLI (skew = wall-clock skew via libfaketime).
+  Faults (--nemesis): none | kill | partition | partition-half | skew | pause |
+  mix | chaos, injected via the docker CLI (skew = wall-clock skew via
+  libfaketime; pause = docker pause; partition-half = isolate a 2-node minority).
 
   Run against the up docker-compose cluster, e.g.:
 
@@ -101,11 +102,17 @@
                 (gen/sleep 14) {:type :info :f :heal}]
    "skew"      [(gen/sleep 6)  {:type :info :f :skew-clock}
                 (gen/sleep 14) {:type :info :f :reset-clock}]
+   "pause"     [(gen/sleep 6)  {:type :info :f :pause-writer}
+                (gen/sleep 14) {:type :info :f :resume}]
+   "partition-half" [(gen/sleep 6)  {:type :info :f :isolate-half}
+                     (gen/sleep 14) {:type :info :f :heal}]
    "chaos"     [(gen/sleep 6)  {:type :info :f :kill-writer}
                 (gen/sleep 14) {:type :info :f :start-all}
+                (gen/sleep 5)  {:type :info :f :pause-writer}
+                (gen/sleep 14) {:type :info :f :resume}
                 (gen/sleep 5)  {:type :info :f :skew-clock}
                 (gen/sleep 14) {:type :info :f :reset-clock}
-                (gen/sleep 5)  {:type :info :f :partition-writer}
+                (gen/sleep 5)  {:type :info :f :isolate-half}
                 (gen/sleep 14) {:type :info :f :heal}]
    "none"      []})
 
@@ -147,10 +154,11 @@
 
 (def cli-opts
   "Extra command-line options beyond Jepsen's defaults."
-  [[nil "--nemesis NAME" "Fault schedule: kill | partition | skew | mix | chaos | none"
+  [[nil "--nemesis NAME"
+    "Faults: kill | partition | partition-half | skew | pause | mix | chaos | none"
     :default "mix"
-    :validate [#{"kill" "partition" "skew" "mix" "chaos" "none"}
-               "must be kill, partition, skew, mix, chaos, or none"]]
+    :validate [#{"kill" "partition" "partition-half" "skew" "pause" "mix" "chaos" "none"}
+               "must be kill, partition, partition-half, skew, pause, mix, chaos, or none"]]
    [nil "--workload NAME" "Workload: set | list-append | counter"
     :default "set"
     :validate [#{"set" "list-append" "counter"} "must be set, list-append, or counter"]]])
