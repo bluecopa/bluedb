@@ -206,10 +206,25 @@ the Admin surface.
 
 `PRAGMA flush_interval = '25ms'` (per-DB). Plumbed to the SlateDB open path: replace
 `Db::open` with `Db::builder(path, store).with_settings(s)` where
-`s.flush_interval = Some(d)` (`slatedb::Settings`, default `Some(100ms)`). Trade: lower
-interval → lower per-request latency and higher throughput, more object-store PUTs
-(SlateDB docs: ~$130/mo per the 100 ms tier on S3 standard; 25 ms ≈ 4×). Default unchanged
-(100 ms).
+`s.flush_interval = Some(d)`. **bluedb default = 25 ms** (overriding SlateDB's 100 ms),
+chosen for the latency-sensitive HTTP profile (no client pipelining, so the flush wait is
+per-request latency).
+
+**Cost scales with write activity, not the raw interval.** The interval is a *maximum*
+staleness bound on pending writes, not a heartbeat: when the WAL is empty the periodic tick
+is a no-op (`freeze_current_wal`/`do_flush` return early — **idle ticks issue no PUT**, so
+they're free). PUT cost is therefore proportional to how much you actually write:
+- *Idle / bursty* (e.g. input-table-v2): ~free regardless of interval; an arriving write is
+  flushed within the interval.
+- *Sustained high write load*: up to `1/interval` data-carrying flushes/sec. Here a shorter
+  interval is the real cost — ~4× the WAL-object/PUT rate and L0/compaction churn at 25 ms
+  vs 100 ms (SlateDB cites ~$130/mo for the continuous-write 100 ms tier on S3). Such a
+  deployment raises the PRAGMA. Group commit still coalesces all in-flight writes into one
+  flush per tick, so extra cost only accrues when writes outpace a single flush.
+
+On real object storage the PUT round-trip (~tens of ms) is the effective floor: 25 ms is
+"flush about as fast as the store durably accepts," and lower intervals give diminishing
+returns (the sequential flush loop + `maybe_apply_backpressure` bound any pileup).
 
 **Durability stays strong** (`await_durable=true`) — an acked write is durable in object
 storage before the ack, always. `flush_interval` is the *only* latency/throughput lever;
@@ -238,7 +253,8 @@ static-token impl for dev/tests.
 
 ## 5. Throughput & durability contract (to document for users)
 
-- **Single sequential client:** latency ≈ `flush_interval` (≈10/s @ 100 ms, ≈40/s @ 25 ms).
+- **Single sequential client:** latency ≈ `flush_interval` — ≈40/s at the **25 ms default**
+  (was ≈10/s @ 100 ms); on real object storage the PUT round-trip is the floor.
 - **Concurrency:** linear — **1000/s ≈ ~100 concurrent** `POST /tables/{t}` (or fewer
   via the bulk endpoint). Achieve concurrency with a client connection pool or HTTP/2.
 - **Bulk:** one request → one flush → N rows.
@@ -285,8 +301,9 @@ maps JSON→AST; the authz layer is a middleware unit; the throughput is the exi
 - `POST /sql` **changes meaning**: it becomes the parameterized, single-statement,
   non-DDL surface. Arbitrary SQL moves to `POST /admin/sql`. Document the migration.
 - Authz becomes required; ship a dev default (static token) so local/test flows work.
-- Default `flush_interval` and durability are unchanged — no silent behavior change for
-  existing throughput/durability.
+- **Default `flush_interval` lowered 100 ms → 25 ms** (latency-sensitive HTTP profile). Idle
+  cost is unchanged (empty ticks are free); sustained-write-heavy deployments that care
+  about PUT cost / compaction churn raise the PRAGMA. Durability is unchanged (strong).
 
 ## 9. Open questions
 
