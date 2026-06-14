@@ -86,12 +86,10 @@ impl AsyncDB for GlueTester {
         let sql = bluedb_sql::inline_ctes(sql);
         let sql = bluedb_sql::rewrite_set_ops(&sql);
         let sql = bluedb_sql::rewrite_multitable(&sql);
-        // Honor an active `default_null_order` by injecting `(key IS NULL)` sort
-        // keys (GlueSQL has no NULLS FIRST/LAST).
-        let sql = match self.nulls_first {
-            Some(nulls_first) => bluedb_sql::rewrite_null_order(&sql, nulls_first),
-            None => sql,
-        };
+        // Normalize NULL placement: strip explicit `NULLS FIRST/LAST` (GlueSQL
+        // rejects it) and apply any active `default_null_order`, both via
+        // injected `(key IS NULL)` sort keys.
+        let sql = bluedb_sql::rewrite_null_order(&sql, self.nulls_first);
         let mut payloads = self
             .glue
             .execute(&sql)

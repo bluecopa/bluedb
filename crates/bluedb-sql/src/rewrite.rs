@@ -19,8 +19,9 @@
 //! never makes a query worse than it was.
 
 use sqlparser::ast::{
-    CreateTable, Cte, DataType, ExactNumberInfo, Expr, Join, JoinConstraint, JoinOperator, Query,
-    Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, TimezoneInfo, Value, With,
+    BinaryOperator, CastKind, CreateTable, Cte, DataType, ExactNumberInfo, Expr, Ident, Join,
+    JoinConstraint, JoinOperator, ObjectName, Query, Select, SelectItem, SetExpr, Statement,
+    TableFactor, TableWithJoins, TimezoneInfo, Value, With,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -83,9 +84,11 @@ fn rewrite_set_expr(set_expr: &mut SetExpr, changed: &mut bool) {
 
 fn rewrite_select(select: &mut Select, changed: &mut bool) {
     fold_from(&mut select.from, changed);
-    // Recurse into derived tables (subqueries that appear in FROM).
+    // Recurse into derived tables (subqueries that appear in FROM), and turn any
+    // `JOIN … USING (cols)` into the equivalent `ON` (GlueSQL lacks USING).
     for twj in &mut select.from {
         rewrite_table_factor(&mut twj.relation, changed);
+        rewrite_using_joins(twj, changed);
         for join in &mut twj.joins {
             rewrite_table_factor(&mut join.relation, changed);
         }
@@ -112,6 +115,89 @@ fn rewrite_table_factor(factor: &mut TableFactor, changed: &mut bool) {
     }
 }
 
+/// Turn `left JOIN right USING (c1, c2)` into `… ON left.c1 = right.c1 AND …`.
+/// GlueSQL has no `USING`; the `ON` form is equivalent for an equi-join. The
+/// left side of each join is the table introduced immediately before it (the
+/// base relation for the first join), which covers the common chained case.
+fn rewrite_using_joins(twj: &mut TableWithJoins, changed: &mut bool) {
+    let mut left = table_ident(&twj.relation);
+    for join in &mut twj.joins {
+        let right = table_ident(&join.relation);
+        if let (Some(l), Some(r)) = (left.as_ref(), right.as_ref()) {
+            if let Some(on) = using_to_on(&join.join_operator, l, r) {
+                set_join_on(&mut join.join_operator, on);
+                *changed = true;
+            }
+        }
+        if right.is_some() {
+            left = right;
+        }
+    }
+}
+
+/// The name a column reference would qualify with: the alias if present, else the
+/// (last segment of the) table name. `None` for derived/other factors we can't
+/// name simply.
+fn table_ident(factor: &TableFactor) -> Option<Ident> {
+    match factor {
+        TableFactor::Table { name, alias, .. } => Some(
+            alias
+                .as_ref()
+                .map(|a| a.name.clone())
+                .unwrap_or_else(|| last_segment(name)),
+        ),
+        TableFactor::Derived { alias, .. } => alias.as_ref().map(|a| a.name.clone()),
+        _ => None,
+    }
+}
+
+fn last_segment(name: &ObjectName) -> Ident {
+    name.0
+        .last()
+        .cloned()
+        .unwrap_or_else(|| Ident::new(name.to_string()))
+}
+
+/// If this join carries a `USING (cols)` constraint, build the equivalent `ON`.
+fn using_to_on(op: &JoinOperator, left: &Ident, right: &Ident) -> Option<Expr> {
+    let constraint = match op {
+        JoinOperator::Inner(c)
+        | JoinOperator::LeftOuter(c)
+        | JoinOperator::RightOuter(c)
+        | JoinOperator::FullOuter(c) => c,
+        _ => return None,
+    };
+    let JoinConstraint::Using(cols) = constraint else {
+        return None;
+    };
+    let mut conjuncts = cols.iter().map(|col| Expr::BinaryOp {
+        left: Box::new(qualified(left, col)),
+        op: BinaryOperator::Eq,
+        right: Box::new(qualified(right, col)),
+    });
+    let first = conjuncts.next()?;
+    Some(conjuncts.fold(first, |acc, eq| Expr::BinaryOp {
+        left: Box::new(acc),
+        op: BinaryOperator::And,
+        right: Box::new(eq),
+    }))
+}
+
+fn qualified(table: &Ident, col: &Ident) -> Expr {
+    Expr::CompoundIdentifier(vec![table.clone(), col.clone()])
+}
+
+fn set_join_on(op: &mut JoinOperator, on: Expr) {
+    let constraint = JoinConstraint::On(on);
+    match op {
+        JoinOperator::Inner(c)
+        | JoinOperator::LeftOuter(c)
+        | JoinOperator::RightOuter(c)
+        | JoinOperator::FullOuter(c) => *c = constraint,
+        _ => {}
+    }
+}
+
 /// Walk an expression and fold comma-joins inside any subquery it contains
 /// (`IN (SELECT ...)`, `EXISTS (...)`, scalar `(SELECT ...)`).
 fn fold_expr_subqueries(expr: &mut Expr, changed: &mut bool) {
@@ -119,7 +205,18 @@ fn fold_expr_subqueries(expr: &mut Expr, changed: &mut bool) {
         Expr::Subquery(query)
         | Expr::InSubquery { subquery: query, .. }
         | Expr::Exists { subquery: query, .. } => rewrite_query(query, changed),
-        Expr::Cast { expr, data_type, .. } => {
+        Expr::Cast {
+            kind,
+            expr,
+            data_type,
+            ..
+        } => {
+            // GlueSQL has no TRY_CAST/SAFE_CAST; fall back to plain CAST. (Differs
+            // only when the cast would fail — TRY_CAST yields NULL, CAST errors.)
+            if matches!(kind, CastKind::TryCast | CastKind::SafeCast) {
+                *kind = CastKind::Cast;
+                *changed = true;
+            }
             if normalize_data_type(data_type) {
                 *changed = true;
             }
@@ -325,6 +422,28 @@ mod tests {
         let out = rewrite_multitable("CREATE TABLE t (x TIMESTAMP(6))").to_uppercase();
         assert!(out.contains("TIMESTAMP"), "got: {out}");
         assert!(!out.contains("TIMESTAMP(6)") && !out.contains("(6)"), "got: {out}");
+    }
+
+    #[test]
+    fn join_using_becomes_on() {
+        let out = rewrite_multitable("SELECT * FROM a JOIN b USING (id)").to_uppercase();
+        assert!(!out.contains("USING"), "USING should be gone: {out}");
+        assert!(out.contains("A.ID") && out.contains("B.ID"), "got: {out}");
+    }
+
+    #[test]
+    fn join_using_multiple_columns() {
+        let out = rewrite_multitable("SELECT * FROM a JOIN b USING (x, y)");
+        let up = out.to_uppercase();
+        assert!(!up.contains("USING"), "got: {out}");
+        assert!(up.contains("AND"), "expected conjunction: {out}");
+    }
+
+    #[test]
+    fn try_cast_becomes_cast() {
+        let out = rewrite_multitable("SELECT TRY_CAST(x AS INTEGER) FROM t").to_uppercase();
+        assert!(!out.contains("TRY_CAST"), "TRY_CAST should be gone: {out}");
+        assert!(out.contains("CAST"), "got: {out}");
     }
 
     #[test]
