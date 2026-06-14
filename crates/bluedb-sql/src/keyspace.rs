@@ -26,6 +26,7 @@
 //! index entry:   <tenant> [TAG_INDEX]     <len(table)::u32-be> <table_utf8>
 //!                          <len(index)::u32-be> <index_utf8>
 //!                          <value_cmp_be escaped + 0x00 0x00> <pk_cmp_be>
+//! external key:  <tenant> [tag >= TAG_EXTERNAL_BASE] <caller-encoded suffix>
 //! ```
 //!
 //! The indexed `<value>` is wrapped in an order-preserving, self-terminating
@@ -44,6 +45,9 @@
 //!   different tenants can never produce overlapping key ranges.
 //! * `TAG_SCHEMA` < `TAG_DATA` < `TAG_INDEX` so the three namespaces never
 //!   interleave and a prefix scan in one can never run into a key from another.
+//! * Tags `>= TAG_EXTERNAL_BASE` (0x10) are reserved for layers above
+//!   bluedb-sql (e.g. bluedb-ledger) and never collide with the SQL namespaces
+//!   because they sort after `TAG_INDEX`.
 //! * Table (and index) names are **length-prefixed** with a big-endian `u32`.
 //!   Without the length prefix a table named `t` and a table named `t2` would
 //!   share an ambiguous prefix; the explicit length makes each table's range a
@@ -106,6 +110,12 @@ const TAG_SCHEMA: u8 = 0x01;
 const TAG_DATA: u8 = 0x02;
 /// Tag byte for secondary-index *entries* (one per indexed row).
 const TAG_INDEX: u8 = 0x03;
+
+/// Tag floor for namespaces owned by layers *above* bluedb-sql (e.g.
+/// `bluedb-ledger`). bluedb-sql's own tags (`TAG_SCHEMA`/`TAG_DATA`/`TAG_INDEX`)
+/// stay below this, so an external namespace can never collide with a SQL one
+/// inside a shared tenant keyspace.
+pub const TAG_EXTERNAL_BASE: u8 = 0x10;
 
 /// The default tenant used by [`SlateDbStorage::new`](crate::SlateDbStorage::new).
 ///
@@ -259,6 +269,24 @@ impl Keyspace {
         let mut key = self.index_prefix(table_name, index_name);
         Self::push_order_preserving(&mut key, &value_bytes);
         Ok(key)
+    }
+
+    /// A key in an **external** namespace: `<tenant> <tag> <suffix>`. The caller
+    /// owns the `suffix` encoding (e.g. a `u128` big-endian id). `tag` must be
+    /// `>= TAG_EXTERNAL_BASE` so it cannot collide with bluedb-sql's own
+    /// namespaces; this is debug-asserted.
+    pub fn external_key(&self, tag: u8, suffix: &[u8]) -> Vec<u8> {
+        assert!(tag >= TAG_EXTERNAL_BASE, "external tag must be >= TAG_EXTERNAL_BASE");
+        let mut key = self.tagged(tag, suffix.len());
+        key.extend_from_slice(suffix);
+        key
+    }
+
+    /// The shared prefix of every key in external namespace `tag`
+    /// (`<tenant> <tag>`), for range scans. `tag` must be `>= TAG_EXTERNAL_BASE`.
+    pub fn external_prefix(&self, tag: u8) -> Vec<u8> {
+        assert!(tag >= TAG_EXTERNAL_BASE, "external tag must be >= TAG_EXTERNAL_BASE");
+        self.tagged(tag, 0)
     }
 }
 
@@ -450,5 +478,30 @@ mod tests {
         assert_eq!(prefix_upper_bound(&[0x01, 0xFF]), Some(vec![0x02]));
         assert_eq!(prefix_upper_bound(&[0xFF, 0xFF]), None);
         assert_eq!(prefix_upper_bound(&[]), None);
+    }
+
+    #[test]
+    fn external_namespace_is_disjoint_and_ordered() {
+        let ks = ks();
+        // External tags (>= 0x10) sort after sql's own namespaces and don't
+        // collide with each other.
+        let acct = ks.external_key(TAG_EXTERNAL_BASE, &7u128.to_be_bytes());
+        let xfer = ks.external_key(TAG_EXTERNAL_BASE + 1, &7u128.to_be_bytes());
+        let data = ks.data_prefix("t");
+        assert!(data < acct, "sql data namespace sorts before external tags");
+        assert!(acct < xfer, "external tag 0x10 sorts before 0x11");
+        // Every account key starts with the account prefix; no transfer key does.
+        let acct_prefix = ks.external_prefix(TAG_EXTERNAL_BASE);
+        assert!(acct.starts_with(&acct_prefix));
+        assert!(!xfer.starts_with(&acct_prefix));
+    }
+
+    #[test]
+    fn external_keys_sort_by_u128_suffix() {
+        let ks = ks();
+        let a = ks.external_key(TAG_EXTERNAL_BASE, &1u128.to_be_bytes());
+        let b = ks.external_key(TAG_EXTERNAL_BASE, &2u128.to_be_bytes());
+        let big = ks.external_key(TAG_EXTERNAL_BASE, &u128::MAX.to_be_bytes());
+        assert!(a < b && b < big, "big-endian u128 suffixes sort numerically");
     }
 }
