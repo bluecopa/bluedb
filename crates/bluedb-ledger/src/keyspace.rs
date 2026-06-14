@@ -9,6 +9,8 @@ const TAG_ACCOUNT: u8 = TAG_EXTERNAL_BASE; // 0x10
 const TAG_TRANSFER: u8 = TAG_EXTERNAL_BASE + 1; // 0x11
 /// Tag for the "pending transfer resolved" marker (present ⇒ posted/voided).
 const TAG_PENDING_RESOLVED: u8 = TAG_EXTERNAL_BASE + 2; // 0x12
+/// Tag for the per-tenant monotonic timestamp watermark (a single key).
+const TAG_TS_WATERMARK: u8 = TAG_EXTERNAL_BASE + 5; // 0x15
 
 /// Builds the storage keys for ledger records within one tenant. Account and
 /// transfer ids are encoded big-endian so a range scan yields them in id order.
@@ -29,8 +31,14 @@ impl LedgerKeyspace {
         self.ks.external_key(TAG_TRANSFER, &id.to_be_bytes())
     }
 
+    #[allow(dead_code)] // reinstated in Phase B (pending-state record)
     pub(crate) fn pending_resolved_key(&self, pending_id: u128) -> Vec<u8> {
         self.ks.external_key(TAG_PENDING_RESOLVED, &pending_id.to_be_bytes())
+    }
+
+    /// The single per-tenant key holding the monotonic timestamp watermark.
+    pub(crate) fn watermark_key(&self) -> Vec<u8> {
+        self.ks.external_key(TAG_TS_WATERMARK, b"ts")
     }
 
     #[allow(dead_code)] // used by range scans in later plans (lookup-all / sweeps)
@@ -78,5 +86,16 @@ mod tests {
         assert!(ks.transfer_key(5) < r);
         // Ordered by id within the namespace.
         assert!(ks.pending_resolved_key(1) < ks.pending_resolved_key(2));
+    }
+
+    #[test]
+    fn watermark_key_is_constant_and_distinct() {
+        let ks = LedgerKeyspace::new("_");
+        let w = ks.watermark_key();
+        assert_eq!(w, ks.watermark_key(), "watermark is a single fixed key");
+        assert_ne!(w, ks.account_key(0));
+        assert_ne!(w, ks.transfer_key(0));
+        // tag 0x15 sorts after account (0x10) / transfer (0x11).
+        assert!(ks.transfer_key(u128::MAX) < w);
     }
 }
