@@ -2723,6 +2723,52 @@ mod throughput_bench {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "benchmark; run explicitly with --release --ignored --nocapture"]
+    async fn bench_concurrent_single_transfer() {
+        // Many clients, each issuing single (un-batched) transfers concurrently.
+        // They all share one writer's `write_lease`, which the ledger holds
+        // across its durable flush — so applies SERIALIZE and concurrency does
+        // NOT coalesce into a flush (unlike the SQL autocommit group-commit
+        // path). Expectation: aggregate throughput stays ~1/flush_interval,
+        // flat in the client count.
+        println!("\n--- concurrent clients: 1 transfer/call each, flush_interval=25ms ---");
+        for clients in [1usize, 8, 32, 64] {
+            let (database, ledger0) = open_ledger(25).await;
+            setup(&ledger0).await;
+            let per = (80 / clients).max(1);
+            let start = Instant::now();
+            let mut handles = Vec::new();
+            for t in 0..clients {
+                let db = database.clone();
+                handles.push(tokio::spawn(async move {
+                    let ledger = Ledger::new(&db);
+                    let mut next = 1_000_000u128 * (t as u128 + 1);
+                    for _ in 0..per {
+                        let id = next;
+                        next += 1;
+                        let d = (id % N_ACCTS) + 1;
+                        let c = (d % N_ACCTS) + 1;
+                        ledger
+                            .create_transfers(&[Transfer::new(id, d, c, 1, 7).with_code(1)])
+                            .await
+                            .unwrap();
+                    }
+                }));
+            }
+            for h in handles {
+                h.await.unwrap();
+            }
+            let elapsed = start.elapsed();
+            let done = clients * per;
+            let tps = done as f64 / elapsed.as_secs_f64();
+            println!(
+                "  clients={clients:>3} : {done:>4} transfers in {:>6.2?}  =>  {tps:>7.0} transfers/sec (aggregate)",
+                elapsed
+            );
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "benchmark; run explicitly with --release --ignored --nocapture"]
     async fn bench_batched_transfers() {
