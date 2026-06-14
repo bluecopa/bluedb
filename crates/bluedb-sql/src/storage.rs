@@ -127,10 +127,14 @@ pub type WriteLease = Arc<Mutex<()>>;
 pub(crate) type SeqAllocator = Arc<Mutex<HashMap<Vec<u8>, i64>>>;
 
 /// The stored form of a data row: the primary key plus the row payload.
+///
+/// `pub(crate)` so [`crate::projection`] can build the exact same on-disk row
+/// form that GlueSQL's own store writes, letting a layer above bluedb-sql
+/// hand-encode rows into its own atomic batch.
 #[derive(Serialize, Deserialize)]
-struct StoredRow {
-    key: Key,
-    row: DataRow,
+pub(crate) struct StoredRow {
+    pub(crate) key: Key,
+    pub(crate) row: DataRow,
 }
 
 /// State for an in-flight transaction. Every statement on the writer runs
@@ -501,13 +505,14 @@ impl SlateDbStorage {
     }
 }
 
-/// Serialize a value to bytes (JSON).
-fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, SqlError> {
+/// Serialize a value to bytes (JSON). `pub(crate)` so [`crate::projection`]
+/// reuses the exact row encoding GlueSQL's store reads back.
+pub(crate) fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, SqlError> {
     Ok(serde_json::to_vec(value)?)
 }
 
 /// Deserialize bytes (JSON) back into a value.
-fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, SqlError> {
+pub(crate) fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, SqlError> {
     Ok(serde_json::from_slice(bytes)?)
 }
 
