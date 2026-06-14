@@ -278,6 +278,8 @@ dependencies = [
  "bluedb-storage",
  "bytes",
  "gluesql-core",
+ "serde",
+ "serde_json",
  "slatedb",
  "tantivy",
  "tempfile",

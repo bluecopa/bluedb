@@ -17,6 +17,8 @@ tantivy        = { workspace = true }
 tokio          = { workspace = true }
 anyhow         = { workspace = true }
 async-trait    = { workspace = true }
+serde          = { workspace = true }
+serde_json     = { workspace = true }
 bigdecimal     = { version = "0.4", features = ["serde", "string-only"] }
 thiserror      = { workspace = true }
 bytes          = { workspace = true }

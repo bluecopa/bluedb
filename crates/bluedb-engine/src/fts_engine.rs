@@ -36,7 +36,9 @@ use bluedb_fts::policy::CompactionPolicy;
 use bluedb_fts::IdField;
 use bluedb_rest::Param;
 use bluedb_sql::{CommitObserver, RowChange, SlateDbStorage};
-use bluedb_storage::{SlateDbBlobStore, Substrate};
+use bluedb_storage::{BlobStore, BlobStoreMut, SlateDbBlobStore, Substrate};
+use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 use gluesql_core::data::{Key, Value as GValue};
 use gluesql_core::prelude::{Glue, Payload};
 use gluesql_core::store::{DataRow, Store};
@@ -53,6 +55,23 @@ use crate::rest_sql;
 /// `DEFAULT_LIMIT`; the over-fetch window sizing per Spec B §9 is refined later).
 const UNION_LIMIT: usize = 100;
 
+/// Fixed blob key for the durable FTS registry — one JSON document holding the
+/// full `Vec<PersistedDef>` of declared indexes. Read on [`FtsEngine::reopen`],
+/// rewritten on every `create_fulltext_index` (durable mode only).
+const FTS_REGISTRY_KEY: &str = "fts/_registry";
+
+/// The persistable shape of one fulltext-index declaration. Persisting the
+/// `column_ordinal` (stable for a table's lifetime) means [`FtsEngine::reopen`]
+/// rebuilds the in-memory [`IndexDef`] with NO schema fetch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedDef {
+    table: String,
+    column: String,
+    column_ordinal: usize,
+    pk_column: String,
+    analyzer: String,
+}
+
 /// One declared fulltext index: the indexed text column, the table's integer
 /// primary-key column, the text column's ordinal in the schema'd row, the live
 /// segment that holds its terms, and (when the engine has a durable backing) the
@@ -61,6 +80,10 @@ struct IndexDef {
     column: String,
     pk_column: String,
     column_ordinal: usize,
+    /// The `to_tsvector` config string this index was declared with. Stored so
+    /// the def can round-trip through the durable registry (reopen rebuilds the
+    /// live segment + durable mapping from it without a schema fetch).
+    analyzer: String,
     segment: Arc<LiveSegment>,
     /// The durable tier (object-storage splits). `None` for an in-memory-only
     /// engine ([`FtsEngine::new`]); then the union searcher is live-only.
@@ -110,6 +133,82 @@ impl FtsEngine {
         })
     }
 
+    /// Reopen a durable engine over `substrate`, rebuilding its in-memory index
+    /// defs from the durable registry. For each persisted def the live segment is
+    /// allocated fresh (empty until new writes / a replay) and the durable
+    /// [`FtsIndex`] tier reconnects to its existing splits via the stable
+    /// `fts/{table}/{column}` index_id — so a `@@` query served by the reopened
+    /// engine finds the sealed data (Spec B B4-3, restart durability).
+    ///
+    /// The un-sealed live window (writes since the last seal) is NOT replayed
+    /// here — SQL is the source of truth and rebuilding that tail on failover is
+    /// the deferred HA-M4 concern.
+    pub async fn reopen(substrate: Substrate) -> Result<Arc<Self>> {
+        let blob = Arc::new(SlateDbBlobStore::from_substrate(substrate));
+        let persisted = Self::load_registry(&blob).await?;
+
+        let engine = Arc::new(Self {
+            indexes: RwLock::new(HashMap::new()),
+            blob: Some(blob),
+        });
+
+        for pd in persisted {
+            // No schema fetch: the persisted ordinal/pk are authoritative.
+            let def = engine.build_index_def(
+                &pd.table,
+                &pd.column,
+                &pd.pk_column,
+                pd.column_ordinal,
+                &pd.analyzer,
+            )?;
+            let mut idx = engine.indexes.write().unwrap();
+            let defs = idx.entry(pd.table.clone()).or_default();
+            defs.retain(|d| d.column != pd.column);
+            defs.push(def);
+        }
+
+        Ok(engine)
+    }
+
+    /// Load the durable registry: `get_all` the registry blob and deserialize the
+    /// `Vec<PersistedDef>`. An absent blob (a never-yet-persisted engine) is an
+    /// empty registry — mirrors [`FtsIndex::load_manifest`]'s present/absent
+    /// handling (a parse error IS propagated; only absence resets to empty).
+    async fn load_registry(blob: &SlateDbBlobStore) -> Result<Vec<PersistedDef>> {
+        match blob.get_all(FTS_REGISTRY_KEY).await {
+            Ok(bytes) => serde_json::from_slice::<Vec<PersistedDef>>(&bytes)
+                .map_err(|e| EngineError::Other(e.into())),
+            Err(_) => Ok(Vec::new()),
+        }
+    }
+
+    /// Rewrite the durable registry blob from the current in-memory def map.
+    /// Durable mode only — a no-op without a blob ([`FtsEngine::new`]). The map is
+    /// keyed by table → its defs, so the persisted list is inherently deduped by
+    /// (table, column).
+    async fn persist_registry(&self) -> Result<()> {
+        let Some(blob) = &self.blob else {
+            return Ok(());
+        };
+        let defs: Vec<PersistedDef> = {
+            let idx = self.indexes.read().unwrap();
+            idx.iter()
+                .flat_map(|(table, defs)| {
+                    defs.iter().map(move |d| PersistedDef {
+                        table: table.clone(),
+                        column: d.column.clone(),
+                        column_ordinal: d.column_ordinal,
+                        pk_column: d.pk_column.clone(),
+                        analyzer: d.analyzer.clone(),
+                    })
+                })
+                .collect()
+        };
+        let bytes = serde_json::to_vec(&defs).map_err(|e| EngineError::Other(e.into()))?;
+        blob.put(FTS_REGISTRY_KEY, Bytes::from(bytes)).await?;
+        Ok(())
+    }
+
     /// Declare a fulltext index on `table.text_column`, with `pk_column` the
     /// table's integer primary key and `analyzer` a `to_tsvector` config string.
     /// Resolves the text column's ordinal from the live schema.
@@ -136,6 +235,36 @@ impl FtsEngine {
             .ok_or_else(|| {
                 EngineError::Rejected(format!("no column {text_column} on {table}"))
             })?;
+
+        let def = self.build_index_def(table, text_column, pk_column, ordinal, analyzer)?;
+        // Replace any prior def for this (table, column) — a re-create supersedes
+        // rather than duplicating, keeping the in-memory map (and thus the durable
+        // registry derived from it) deduped.
+        {
+            let mut idx = self.indexes.write().unwrap();
+            let defs = idx.entry(table.to_string()).or_default();
+            defs.retain(|d| d.column != text_column);
+            defs.push(def);
+        }
+        // Durable mode only: rewrite the registry blob so the def survives a
+        // restart. A no-op without a blob (`FtsEngine::new`).
+        self.persist_registry().await?;
+        Ok(())
+    }
+
+    /// Build an [`IndexDef`] for `table.text_column` (pk `pk_column`, text-column
+    /// `ordinal`, `analyzer` config). Allocates a fresh live segment and, in
+    /// durable mode, the durable [`FtsIndex`] tier over the stable
+    /// `fts/{table}/{column}` index_id — the SAME builder both `create_*` and
+    /// [`Self::reopen`] use, so a reopened def reconnects to existing splits.
+    fn build_index_def(
+        &self,
+        table: &str,
+        text_column: &str,
+        pk_column: &str,
+        ordinal: usize,
+        analyzer: &str,
+    ) -> Result<IndexDef> {
         let segment = Arc::new(LiveSegment::new(analyzer)?);
 
         // When the engine is durable, build the durable tier: a STORED keyword
@@ -166,21 +295,15 @@ impl FtsEngine {
             (None, None)
         };
 
-        let def = IndexDef {
+        Ok(IndexDef {
             column: text_column.to_string(),
             pk_column: pk_column.to_string(),
             column_ordinal: ordinal,
+            analyzer: analyzer.to_string(),
             segment,
             durable,
             durable_body_field,
-        };
-        self.indexes
-            .write()
-            .unwrap()
-            .entry(table.to_string())
-            .or_default()
-            .push(def);
-        Ok(())
+        })
     }
 
     /// Like [`Self::create_fulltext_index`] but resolves the table's primary-key
