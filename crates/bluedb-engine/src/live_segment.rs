@@ -54,7 +54,7 @@ pub struct LiveSegment {
 ///
 /// Unknown configs fall back to [`Analyzer::Default`] — a permissive default so
 /// an unrecognized config still tokenizes sensibly rather than erroring.
-fn analyzer_for_config(config: &str) -> Analyzer {
+pub(crate) fn analyzer_for_config(config: &str) -> Analyzer {
     match config.to_lowercase().as_str() {
         "english" | "en" | "english_stem" => Analyzer::EnStem,
         "simple" | "default" => Analyzer::Default,
@@ -171,12 +171,11 @@ impl LiveSegment {
         let searcher = self.reader.searcher();
         let query_str = translate_query(query, kind);
 
-        let mut parser = QueryParser::for_index(&self.index, vec![self.body_field]);
-        // Plain/to_tsquery space-separated terms AND together (PG semantics);
-        // websearch leaves tantivy's default OR.
-        if matches!(kind, TsQueryKind::Plain | TsQueryKind::ToTsQuery) {
-            parser.set_conjunction_by_default();
-        }
+        // `translate_query` emits explicit AND/OR operators for every kind, so
+        // the parser's default conjunction is irrelevant — no
+        // `set_conjunction_by_default` needed (and the durable tier, which can't
+        // set it, parses the same string identically).
+        let parser = QueryParser::for_index(&self.index, vec![self.body_field]);
 
         let parsed = parser
             .parse_query(&query_str)
@@ -241,9 +240,12 @@ fn strip_weight(token: &str) -> &str {
 /// the tsquery `kind`.
 ///
 /// - `Plain` (`plainto_tsquery`): the input is a bag of literal terms. Strip any
-///   tantivy/Postgres metacharacters, lowercase, and return the space-separated
-///   terms — conjunction-by-default (set on the parser in [`LiveSegment::search`])
-///   ANDs them, matching `plainto_tsquery`'s all-terms-required semantics.
+///   tantivy/Postgres metacharacters, lowercase, and join the terms with an
+///   explicit `AND` — matching `plainto_tsquery`'s all-terms-required semantics.
+///   Emitting an explicit operator (rather than relying on a parser's
+///   default-conjunction setting) lets BOTH FTS tiers — the live segment and the
+///   durable [`bluedb_fts::FtsIndex`] splits — parse the same translated string
+///   identically (the durable search path can't call `set_conjunction_by_default`).
 /// - `ToTsQuery` (`to_tsquery`): translate Postgres boolean operators —
 ///   `&`→`AND`, `|`→`OR` — and negation `!X` to tantivy's `-X` (a `MustNot`
 ///   prefix). (Tantivy's `NOT` keyword wraps the negated leaf in an all-negative
@@ -252,7 +254,7 @@ fn strip_weight(token: &str) -> &str {
 /// - `Websearch` (`websearch_to_tsquery`): pass through largely as-is — tantivy's
 ///   `QueryParser` already handles `"phrase"`, `-term`, and `OR`; only normalize a
 ///   bare `or` to the `OR` operator.
-fn translate_query(query: &str, kind: TsQueryKind) -> String {
+pub(crate) fn translate_query(query: &str, kind: TsQueryKind) -> String {
     match kind {
         TsQueryKind::Plain => {
             // Replace tantivy/Postgres metacharacters with spaces, lowercase,
@@ -268,7 +270,7 @@ fn translate_query(query: &str, kind: TsQueryKind) -> String {
                 .split_whitespace()
                 .map(|t| t.to_lowercase())
                 .collect::<Vec<_>>()
-                .join(" ")
+                .join(" AND ")
         }
         TsQueryKind::ToTsQuery => {
             // Token-wise: map `&`/`|` to AND/OR, fold `!` into a `-` prefix on
@@ -349,9 +351,11 @@ mod tests {
     #[test]
     fn translate_plain_strips_operators() {
         // Plain treats the input as literal terms — Postgres operators are not
-        // honored; metacharacters are removed and the terms left to AND.
-        assert_eq!(translate_query("invoice & overdue", TsQueryKind::Plain), "invoice overdue");
-        assert_eq!(translate_query("INVOICE Overdue", TsQueryKind::Plain), "invoice overdue");
+        // honored; metacharacters are removed and the bare terms joined with an
+        // explicit `AND` (so both FTS tiers parse identically regardless of any
+        // per-parser default-conjunction setting).
+        assert_eq!(translate_query("invoice & overdue", TsQueryKind::Plain), "invoice AND overdue");
+        assert_eq!(translate_query("INVOICE Overdue", TsQueryKind::Plain), "invoice AND overdue");
     }
 
     #[test]
