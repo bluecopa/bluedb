@@ -4,7 +4,9 @@ name: docs
 # to dev that touches the docs (or the site config).
 on:
   push:
-    branches: [dev]
+    # `dev` is the trunk; `sql-conformance-harness` is included so the site can
+    # be previewed from the PR before it merges (remove after merge if desired).
+    branches: [dev, sql-conformance-harness]
     paths:
       - "docs/**"
       - "mkdocs.yml"
