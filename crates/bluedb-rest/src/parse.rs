@@ -14,7 +14,7 @@
 //! to hand it already-decoded parameter text (the same assumption a router
 //! makes after extracting query params). Identifier validation still happens
 //! at render time via [`crate::model::validate_ident`], so a malicious column
-//! name surfaces as a [`RestError`] from `to_sql`.
+//! name surfaces as a [`RestError`] from `to_sql_with_params`.
 
 use crate::error::RestError;
 use crate::model::{Direction, Filter, Operator, OrderKey, RestQuery};
