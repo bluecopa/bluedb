@@ -39,6 +39,11 @@ impl AccountFlags {
         self.contains(Self::DEBITS_MUST_NOT_EXCEED_CREDITS)
             && self.contains(Self::CREDITS_MUST_NOT_EXCEED_DEBITS)
     }
+
+    /// This flag set with `other`'s bits cleared (e.g. reopen: clear `CLOSED`).
+    pub fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
 }
 
 impl std::ops::BitOr for AccountFlags {
@@ -354,12 +359,14 @@ pub(crate) enum TransferOp {
     Gated,
 }
 
-/// Classify a transfer that has already passed input validation. `LINKED` and
-/// the `BALANCING_*` flags are orthogonal to the op (handled by the chain driver
-/// and the apply paths respectively), so they do not affect the classification.
+/// Classify a transfer that has already passed input validation. `LINKED`, the
+/// `BALANCING_*` flags, and the `CLOSING_*` flags are orthogonal to the op
+/// (handled by the chain driver / apply paths), so they do not affect the
+/// classification — a closing transfer always has `PENDING` set (validated), so
+/// it classifies as `PendingReserve`.
 pub(crate) fn classify(t: &Transfer) -> TransferOp {
     use TransferFlags as F;
-    if t.flags.contains(F::CLOSING_DEBIT) || t.flags.contains(F::CLOSING_CREDIT) || t.flags.contains(F::IMPORTED) {
+    if t.flags.contains(F::IMPORTED) {
         return TransferOp::Gated;
     }
     if t.flags.contains(F::POST_PENDING_TRANSFER) {
@@ -732,7 +739,7 @@ mod tests {
         assert_eq!(classify(&t(F::BALANCING_DEBIT, 0)), TransferOp::Regular); // balancing is orthogonal
         assert_eq!(classify(&t(F::BALANCING_CREDIT | F::PENDING, 0)), TransferOp::PendingReserve);
         assert_eq!(classify(&t(F::IMPORTED, 0)), TransferOp::Gated); // imported → Phase G
-        assert_eq!(classify(&t(F::PENDING | F::CLOSING_DEBIT, 0)), TransferOp::Gated); // closing → Phase F
+        assert_eq!(classify(&t(F::PENDING | F::CLOSING_DEBIT, 0)), TransferOp::PendingReserve); // closing is a pending
     }
 
     #[test]

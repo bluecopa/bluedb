@@ -447,6 +447,13 @@ impl Ledger {
                 .credits_pending
                 .checked_sub(pending.amount)
                 .ok_or_else(|| anyhow::anyhow!("ledger invariant: credits_pending underflow on expiry"))?;
+            // An expired closing pending reopens the account(s) it closed.
+            if pending.flags.contains(TransferFlags::CLOSING_DEBIT) {
+                debit.flags = debit.flags.without(AccountFlags::CLOSED);
+            }
+            if pending.flags.contains(TransferFlags::CLOSING_CREDIT) {
+                credit.flags = credit.flags.without(AccountFlags::CLOSED);
+            }
             state.working.insert(debit.id, debit);
             state.dirty.insert(debit.id);
             state.working.insert(credit.id, credit);
@@ -481,6 +488,13 @@ impl Ledger {
         }
         if t.ledger != debit.ledger {
             return Ok(Err(R::TransferMustHaveTheSameLedgerAsAccounts));
+        }
+        // 58 / 59: a closed account rejects new movements.
+        if debit.flags.contains(AccountFlags::CLOSED) {
+            return Ok(Err(R::DebitAccountAlreadyClosed));
+        }
+        if credit.flags.contains(AccountFlags::CLOSED) {
+            return Ok(Err(R::CreditAccountAlreadyClosed));
         }
 
         // Balancing: reduce the amount to the headroom on each balancing side.
@@ -560,6 +574,14 @@ impl Ledger {
         if t.ledger != debit.ledger {
             return Ok(Err(R::TransferMustHaveTheSameLedgerAsAccounts));
         }
+        // 58 / 59: a closed account rejects new movements. (A closing pending's own
+        // accounts are not yet closed here, so it passes and closes them below.)
+        if debit.flags.contains(AccountFlags::CLOSED) {
+            return Ok(Err(R::DebitAccountAlreadyClosed));
+        }
+        if credit.flags.contains(AccountFlags::CLOSED) {
+            return Ok(Err(R::CreditAccountAlreadyClosed));
+        }
 
         // Balancing: reduce the reserved amount to the headroom on each balancing side.
         let amount = balancing_amount(t, &debit, &credit);
@@ -605,6 +627,15 @@ impl Ledger {
             && credit.credits_posted + credit.credits_pending > credit.debits_posted
         {
             return Ok(Err(R::ExceedsDebits));
+        }
+
+        // A closing pending closes the named account(s) on creation; voiding or
+        // expiring it reopens them (see stage_resolution / sweep_expired).
+        if t.flags.contains(TransferFlags::CLOSING_DEBIT) {
+            debit.flags = debit.flags | AccountFlags::CLOSED;
+        }
+        if t.flags.contains(TransferFlags::CLOSING_CREDIT) {
+            credit.flags = credit.flags | AccountFlags::CLOSED;
         }
 
         state.working.insert(debit.id, debit);
@@ -720,6 +751,15 @@ impl Ledger {
                 Some(v) => v,
                 None => return Ok(Err(R::OverflowsCreditsPosted)),
             };
+        } else {
+            // Voiding a closing pending reopens the account(s) it closed; posting
+            // keeps the closure permanent.
+            if pending.flags.contains(TransferFlags::CLOSING_DEBIT) {
+                debit.flags = debit.flags.without(AccountFlags::CLOSED);
+            }
+            if pending.flags.contains(TransferFlags::CLOSING_CREDIT) {
+                credit.flags = credit.flags.without(AccountFlags::CLOSED);
+            }
         }
 
         state.working.insert(debit.id, debit);
@@ -994,11 +1034,8 @@ mod tests {
         let db = writer_database().await;
         let l = Ledger::new(&db);
         setup_two_accounts(&l).await;
-        // Later-phase flags still gate (imported G; closing F via pending).
+        // Imported (Phase G) is still gated.
         assert_eq!(l.create_transfers(&[xfer(1, 1, 2, 5).with_flags(TransferFlags::IMPORTED)]).await.unwrap(), vec![R::NotImplementedYet]);
-        // A closing transfer (requires pending) is gated to Phase F.
-        let closing = xfer(1, 1, 2, 5).with_flags(TransferFlags::PENDING | TransferFlags::CLOSING_DEBIT);
-        assert_eq!(l.create_transfers(&[closing]).await.unwrap(), vec![R::NotImplementedYet]);
         // Nothing persisted by a gated item.
         assert!(l.lookup_transfer(1).await.unwrap().is_none());
         assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_posted, 0);
@@ -1546,6 +1583,147 @@ mod tests {
         assert_eq!(l.create_transfers(&batch).await.unwrap(), vec![R::Exists, R::Exists]);
         // Balances unchanged (applied exactly once).
         assert_eq!(l.lookup_account(2).await.unwrap().unwrap().credits_posted, 100);
+    }
+
+    // ---- Phase F: closing transfers + closed accounts ----
+
+    fn closing_pending(id: u128, debit: u128, credit: u128, amount: u128, flags: TransferFlags) -> Transfer {
+        xfer(id, debit, credit, amount).with_flags(TransferFlags::PENDING | flags)
+    }
+
+    #[tokio::test]
+    async fn closing_debit_closes_account_and_rejects_movements() {
+        use CreateTransferResult as R;
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        l.create_accounts(&[acct(1, 7), acct(2, 7), acct(3, 7)]).await.unwrap();
+        // pending | closing_debit 1→2: reserves and closes account 1.
+        let c = closing_pending(10, 1, 2, 50, TransferFlags::CLOSING_DEBIT);
+        assert_eq!(l.create_transfers(&[c]).await.unwrap(), vec![R::Created]);
+        assert!(l.lookup_account(1).await.unwrap().unwrap().flags.contains(AccountFlags::CLOSED));
+        // New movements debiting OR crediting account 1 are rejected.
+        assert_eq!(l.create_transfers(&[xfer(11, 1, 3, 5)]).await.unwrap(), vec![R::DebitAccountAlreadyClosed]);
+        assert_eq!(l.create_transfers(&[xfer(12, 3, 1, 5)]).await.unwrap(), vec![R::CreditAccountAlreadyClosed]);
+    }
+
+    #[tokio::test]
+    async fn closing_credit_closes_credit_account() {
+        use CreateTransferResult as R;
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        l.create_accounts(&[acct(1, 7), acct(2, 7), acct(3, 7)]).await.unwrap();
+        l.create_transfers(&[closing_pending(10, 1, 2, 50, TransferFlags::CLOSING_CREDIT)]).await.unwrap();
+        assert!(l.lookup_account(2).await.unwrap().unwrap().flags.contains(AccountFlags::CLOSED));
+        assert_eq!(l.create_transfers(&[xfer(11, 3, 2, 5)]).await.unwrap(), vec![R::CreditAccountAlreadyClosed]);
+    }
+
+    #[tokio::test]
+    async fn post_keeps_account_closed_permanently() {
+        use CreateTransferResult as R;
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        l.create_accounts(&[acct(1, 7), acct(2, 7), acct(3, 7)]).await.unwrap();
+        l.create_transfers(&[closing_pending(10, 1, 2, 50, TransferFlags::CLOSING_DEBIT)]).await.unwrap();
+        // Post the closing pending → stays closed.
+        assert_eq!(l.create_transfers(&[post(11, 10, AMOUNT_MAX)]).await.unwrap(), vec![R::Created]);
+        assert!(l.lookup_account(1).await.unwrap().unwrap().flags.contains(AccountFlags::CLOSED));
+        assert_eq!(l.create_transfers(&[xfer(12, 1, 3, 5)]).await.unwrap(), vec![R::DebitAccountAlreadyClosed]);
+    }
+
+    #[tokio::test]
+    async fn void_reopens_account() {
+        use CreateTransferResult as R;
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
+        l.create_transfers(&[closing_pending(10, 1, 2, 50, TransferFlags::CLOSING_DEBIT)]).await.unwrap();
+        assert!(l.lookup_account(1).await.unwrap().unwrap().flags.contains(AccountFlags::CLOSED));
+        // Void the closing pending → account reopened.
+        assert_eq!(l.create_transfers(&[void(11, 10, 0)]).await.unwrap(), vec![R::Created]);
+        assert!(!l.lookup_account(1).await.unwrap().unwrap().flags.contains(AccountFlags::CLOSED));
+        // A regular transfer on account 1 now succeeds.
+        assert_eq!(l.create_transfers(&[xfer(12, 1, 2, 5)]).await.unwrap(), vec![R::Created]);
+    }
+
+    #[tokio::test]
+    async fn expiry_reopens_closed_account() {
+        let db = writer_database().await;
+        let t0 = 1_000_000_000_000;
+        let (l, clk) = manual_ledger(&db, t0);
+        l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
+        // Timed closing pending closes account 1.
+        let mut c = closing_pending(10, 1, 2, 50, TransferFlags::CLOSING_DEBIT);
+        c.timeout = 10;
+        l.create_transfers(&[c]).await.unwrap();
+        assert!(l.lookup_account(1).await.unwrap().unwrap().flags.contains(AccountFlags::CLOSED));
+        // Advance past expiry; sweep auto-voids → reopened.
+        clk.store(t0 + 11_000_000_000, Ordering::SeqCst);
+        l.create_transfers(&[]).await.unwrap();
+        assert!(!l.lookup_account(1).await.unwrap().unwrap().flags.contains(AccountFlags::CLOSED));
+        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_pending, 0);
+    }
+
+    #[tokio::test]
+    async fn resolution_exempt_from_closed_check() {
+        use CreateTransferResult as R;
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
+        // Reserve p1 (1→2) BEFORE closing.
+        l.create_transfers(&[xfer(10, 1, 2, 30).with_flags(TransferFlags::PENDING)]).await.unwrap();
+        // Now close account 1 with a separate closing pending.
+        l.create_transfers(&[closing_pending(11, 1, 2, 5, TransferFlags::CLOSING_DEBIT)]).await.unwrap();
+        assert!(l.lookup_account(1).await.unwrap().unwrap().flags.contains(AccountFlags::CLOSED));
+        // Posting p1 (touching the now-closed account 1) is still allowed.
+        assert_eq!(l.create_transfers(&[post(12, 10, AMOUNT_MAX)]).await.unwrap(), vec![R::Created]);
+        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_posted, 30);
+    }
+
+    #[tokio::test]
+    async fn closing_both_accounts() {
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
+        let c = closing_pending(10, 1, 2, 50, TransferFlags::CLOSING_DEBIT | TransferFlags::CLOSING_CREDIT);
+        l.create_transfers(&[c]).await.unwrap();
+        assert!(l.lookup_account(1).await.unwrap().unwrap().flags.contains(AccountFlags::CLOSED));
+        assert!(l.lookup_account(2).await.unwrap().unwrap().flags.contains(AccountFlags::CLOSED));
+    }
+
+    #[tokio::test]
+    async fn close_then_debit_in_one_batch() {
+        use CreateTransferResult as R;
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
+        let res = l
+            .create_transfers(&[closing_pending(10, 1, 2, 50, TransferFlags::CLOSING_DEBIT), xfer(11, 1, 2, 5)])
+            .await
+            .unwrap();
+        assert_eq!(res, vec![R::Created, R::DebitAccountAlreadyClosed]);
+    }
+
+    #[tokio::test]
+    async fn closing_in_linked_chain_rolls_back() {
+        use CreateTransferResult as R;
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
+        // [closing(linked), bad terminator] → chain fails, account 1 NOT closed.
+        let mut c = closing_pending(10, 1, 2, 50, TransferFlags::CLOSING_DEBIT);
+        c.flags = c.flags | TransferFlags::LINKED;
+        let res = l.create_transfers(&[c, xfer(11, 1, 99, 5)]).await.unwrap();
+        assert_eq!(res, vec![R::LinkedEventFailed, R::CreditAccountNotFound]);
+        assert!(!l.lookup_account(1).await.unwrap().unwrap().flags.contains(AccountFlags::CLOSED), "rolled back");
+    }
+
+    #[tokio::test]
+    async fn account_created_closed_rejects_movements() {
+        use CreateTransferResult as R;
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        l.create_accounts(&[acct(1, 7).with_flags(AccountFlags::CLOSED), acct(2, 7)]).await.unwrap();
+        assert_eq!(l.create_transfers(&[xfer(10, 1, 2, 5)]).await.unwrap(), vec![R::DebitAccountAlreadyClosed]);
     }
 
     // ---- Phase E: balancing transfers ----
