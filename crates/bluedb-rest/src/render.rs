@@ -7,14 +7,12 @@
 
 use crate::error::RestError;
 use crate::model::{
-    bind, validate_ident, DeleteRequest, InsertRequest, Param, RestQuery, UpdateRequest,
+    bind, validate_ident, DeleteRequest, Direction, Filter, InsertRequest, Param, RestQuery,
+    UpdateRequest,
 };
 
 /// Param-aware `WHERE …` builder: appends each filter's binds to `params`.
-fn render_where_params(
-    filters: &[crate::model::Filter],
-    params: &mut Vec<Param>,
-) -> Result<String, RestError> {
+fn render_where_params(filters: &[Filter], params: &mut Vec<Param>) -> Result<String, RestError> {
     if filters.is_empty() {
         return Ok(String::new());
     }
@@ -115,7 +113,9 @@ impl UpdateRequest {
     pub fn to_sql_with_params(&self) -> Result<(String, Vec<Param>), RestError> {
         let table = validate_ident(&self.table)?;
         if self.assignments.is_empty() {
-            return Err(RestError::BadColumnSet("UPDATE has no assignments".to_string()));
+            return Err(RestError::BadColumnSet(
+                "UPDATE has no assignments".to_string(),
+            ));
         }
         if self.filters.is_empty() {
             return Err(RestError::UnfilteredMutation("UPDATE"));
@@ -130,7 +130,10 @@ impl UpdateRequest {
             })
             .collect::<Result<_, RestError>>()?;
         let where_clause = render_where_params(&self.filters, &mut params)?;
-        Ok((format!("UPDATE {table} SET {}{};", sets.join(", "), where_clause), params))
+        Ok((
+            format!("UPDATE {table} SET {}{};", sets.join(", "), where_clause),
+            params,
+        ))
     }
 }
 
@@ -152,16 +155,19 @@ impl DeleteRequest {
 
 /// `Direction` SQL keyword. Kept here so the public `Direction` enum need not
 /// expose its rendering.
-fn direction_sql(direction: crate::model::Direction) -> &'static str {
+fn direction_sql(direction: Direction) -> &'static str {
     match direction {
-        crate::model::Direction::Asc => "ASC",
-        crate::model::Direction::Desc => "DESC",
+        Direction::Asc => "ASC",
+        Direction::Desc => "DESC",
     }
 }
 
 #[cfg(test)]
 mod params_render {
-    use crate::model::{Filter, InsertRequest, Operator, OrderKey, Direction, Param, RestQuery, UpdateRequest, DeleteRequest};
+    use crate::model::{
+        DeleteRequest, Direction, Filter, InsertRequest, Operator, OrderKey, Param, RestQuery,
+        UpdateRequest,
+    };
 
     #[test]
     fn select_binds_filters_keeps_structure_literal() {
@@ -169,7 +175,10 @@ mod params_render {
             table: "users".into(),
             select: vec!["id".into(), "name".into()],
             filters: vec![Filter::new("age", Operator::Gt, "20")],
-            order: vec![OrderKey { column: "name".into(), direction: Direction::Asc }],
+            order: vec![OrderKey {
+                column: "name".into(),
+                direction: Direction::Asc,
+            }],
             limit: Some(10),
             offset: Some(5),
         };
@@ -190,7 +199,10 @@ mod params_render {
         };
         let (sql, params) = u.to_sql_with_params().unwrap();
         assert_eq!(sql, "UPDATE t SET name = $1, age = $2 WHERE id = $3;");
-        assert_eq!(params, vec![Param::Str("amy".into()), Param::Int(9), Param::Int(1)]);
+        assert_eq!(
+            params,
+            vec![Param::Str("amy".into()), Param::Int(9), Param::Int(1)]
+        );
     }
 
     #[test]
@@ -209,10 +221,7 @@ mod params_render {
         let req = InsertRequest {
             table: "docs".into(),
             columns: vec!["id".into(), "body".into()],
-            rows: vec![
-                vec!["1".into(), "hi".into()],
-                vec!["2".into(), "yo".into()],
-            ],
+            rows: vec![vec!["1".into(), "hi".into()], vec!["2".into(), "yo".into()]],
         };
         let (stmts, params) = req.row_statements_with_params().unwrap();
         assert_eq!(
@@ -224,7 +233,12 @@ mod params_render {
         );
         assert_eq!(
             params,
-            vec![Param::Int(1), Param::Str("hi".into()), Param::Int(2), Param::Str("yo".into())]
+            vec![
+                Param::Int(1),
+                Param::Str("hi".into()),
+                Param::Int(2),
+                Param::Str("yo".into())
+            ]
         );
     }
 
@@ -236,7 +250,12 @@ mod params_render {
             table: "t".into(),
             select: vec![],
             filters: vec![
-                Filter { column: "name".into(), op: Operator::Eq, negated: true, value: "amy".into() },
+                Filter {
+                    column: "name".into(),
+                    op: Operator::Eq,
+                    negated: true,
+                    value: "amy".into(),
+                },
                 Filter::new("id", Operator::In, "(1,2)"),
             ],
             order: vec![],
@@ -244,7 +263,13 @@ mod params_render {
             offset: None,
         };
         let (sql, params) = q.to_sql_with_params().unwrap();
-        assert_eq!(sql, "SELECT * FROM t WHERE NOT (name = $1) AND id IN ($2, $3);");
-        assert_eq!(params, vec![Param::Str("amy".into()), Param::Int(1), Param::Int(2)]);
+        assert_eq!(
+            sql,
+            "SELECT * FROM t WHERE NOT (name = $1) AND id IN ($2, $3);"
+        );
+        assert_eq!(
+            params,
+            vec![Param::Str("amy".into()), Param::Int(1), Param::Int(2)]
+        );
     }
 }

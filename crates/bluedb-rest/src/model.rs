@@ -37,10 +37,10 @@ pub enum Param {
 
 /// Type a stringly-typed DSL value into a [`Param`].
 ///
-/// Same rule the old `render_value` used to pick a literal, so behavior is
-/// unchanged: `null`/`true`/`false` (case-insensitive) → those; else `i64` if it
-/// parses; else `f64` if it parses; else a string.
-pub fn render_param(value: &str) -> Param {
+/// Typing rule: `null`/`true`/`false` (case-insensitive) → those variants;
+/// text that parses as `i64` → [`Param::Int`]; else `f64` → [`Param::Float`];
+/// everything else → [`Param::Str`].
+pub(crate) fn render_param(value: &str) -> Param {
     let lower = value.to_ascii_lowercase();
     if lower == "null" {
         return Param::Null;
@@ -247,7 +247,6 @@ impl Filter {
             Ok(inner)
         }
     }
-
 }
 
 /// A read query: `SELECT … FROM table [WHERE …] [ORDER BY …] [LIMIT …] [OFFSET …]`.
@@ -355,19 +354,35 @@ mod param_tests {
         // `in` binds each element; placeholders continue the running index.
         let mut params = Vec::new();
         let f = Filter::new("id", Operator::In, "(1,2,3)");
-        assert_eq!(f.to_sql_with_params(&mut params).unwrap(), "id IN ($1, $2, $3)");
+        assert_eq!(
+            f.to_sql_with_params(&mut params).unwrap(),
+            "id IN ($1, $2, $3)"
+        );
         assert_eq!(params, vec![Param::Int(1), Param::Int(2), Param::Int(3)]);
 
         // `is` binds nothing (keywords only).
         let mut params = Vec::new();
-        let f = Filter { column: "x".into(), op: Operator::Is, negated: true, value: "null".into() };
+        let f = Filter {
+            column: "x".into(),
+            op: Operator::Is,
+            negated: true,
+            value: "null".into(),
+        };
         assert_eq!(f.to_sql_with_params(&mut params).unwrap(), "x IS NOT NULL");
         assert!(params.is_empty());
 
         // negation wraps the comparison.
         let mut params = Vec::new();
-        let f = Filter { column: "name".into(), op: Operator::Eq, negated: true, value: "amy".into() };
-        assert_eq!(f.to_sql_with_params(&mut params).unwrap(), "NOT (name = $1)");
+        let f = Filter {
+            column: "name".into(),
+            op: Operator::Eq,
+            negated: true,
+            value: "amy".into(),
+        };
+        assert_eq!(
+            f.to_sql_with_params(&mut params).unwrap(),
+            "NOT (name = $1)"
+        );
         assert_eq!(params, vec![Param::Str("amy".into())]);
     }
 }

@@ -42,10 +42,12 @@ fn parse_filter(column: &str, value: &str) -> Result<Filter, RestError> {
         Some(rest) => (true, rest),
         None => (false, value),
     };
-    let (op_token, operand) = rest.split_once('.').ok_or_else(|| RestError::MalformedValue {
-        op: rest.to_string(),
-        value: value.to_string(),
-    })?;
+    let (op_token, operand) = rest
+        .split_once('.')
+        .ok_or_else(|| RestError::MalformedValue {
+            op: rest.to_string(),
+            value: value.to_string(),
+        })?;
     let op = Operator::parse(op_token)?;
     Ok(Filter {
         column: column.to_string(),

@@ -335,11 +335,7 @@ fn insert_escapes_quotes_and_types_values() {
         req.row_statements_with_params().unwrap(),
         (
             vec!["INSERT INTO t (name, active, note) VALUES ($1, $2, $3)".to_string()],
-            vec![
-                Param::Str("O'Brien".into()),
-                Param::Bool(true),
-                Param::Null,
-            ]
+            vec![Param::Str("O'Brien".into()), Param::Bool(true), Param::Null,]
         )
     );
 }
@@ -530,10 +526,7 @@ fn parser_order_defaults_to_asc() {
     let q = parse_query("t", "order=name").unwrap();
     assert_eq!(
         q.to_sql_with_params().unwrap(),
-        (
-            "SELECT * FROM t ORDER BY name ASC;".to_string(),
-            vec![]
-        )
+        ("SELECT * FROM t ORDER BY name ASC;".to_string(), vec![])
     );
 }
 
