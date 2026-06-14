@@ -62,6 +62,7 @@
 //! [`bluedb-fts`]: https://docs.rs/bluedb-fts
 
 mod connection;
+mod cte;
 mod error;
 mod keyspace;
 mod pushdown;
@@ -71,6 +72,7 @@ mod setops;
 mod storage;
 
 pub use connection::Database;
+pub use cte::inline_ctes;
 pub use error::SqlError;
 pub use keyspace::DEFAULT_TENANT;
 pub use registry::SchemaRegistry;
