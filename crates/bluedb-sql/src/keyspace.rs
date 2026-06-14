@@ -5,9 +5,9 @@
 //! with no chance of a cross-tenant read: a tenant's keys form a contiguous,
 //! self-delimiting byte range that no other tenant's keys can fall inside.
 //!
-//! Inside a tenant we pack four logical namespaces — table **schemas**, table
-//! **data rows**, secondary-**index definitions**, and secondary-**index
-//! entries** — and we rely on SlateDB's byte-ordered range
+//! Inside a tenant we pack logical namespaces — table **schemas**, table **data
+//! rows**, secondary-**index entries**, and per-table **metadata** (creation
+//! time, for `GLUE_OBJECTS`) — and we rely on SlateDB's byte-ordered range
 //! [`scan`](slatedb::Db::scan) to read rows back in primary-key (or
 //! indexed-value) order. The encoding below is designed so that a lexicographic
 //! scan over a per-table prefix yields rows in the right
@@ -26,6 +26,7 @@
 //! index entry:   <tenant> [TAG_INDEX]     <len(table)::u32-be> <table_utf8>
 //!                          <len(index)::u32-be> <index_utf8>
 //!                          <value_cmp_be escaped + 0x00 0x00> <pk_cmp_be>
+//! meta key:      <tenant> [TAG_META]      <table_utf8>          (value: i64-be µs)
 //! ```
 //!
 //! The indexed `<value>` is wrapped in an order-preserving, self-terminating
@@ -106,6 +107,9 @@ const TAG_SCHEMA: u8 = 0x01;
 const TAG_DATA: u8 = 0x02;
 /// Tag byte for secondary-index *entries* (one per indexed row).
 const TAG_INDEX: u8 = 0x03;
+/// Tag byte for per-table metadata (creation timestamp), backing `GLUE_OBJECTS`.
+/// Sorts after all data/index keys.
+const TAG_META: u8 = 0x04;
 
 /// The default tenant used by [`SlateDbStorage::new`](crate::SlateDbStorage::new).
 ///
@@ -183,6 +187,21 @@ impl Keyspace {
     /// The prefix shared by every schema key in this tenant.
     pub fn schema_prefix(&self) -> Vec<u8> {
         self.tagged(TAG_SCHEMA, 0)
+    }
+
+    /// Encode the storage key for a table's metadata record (creation time).
+    /// Like [`Self::schema_key`], the table name is the final segment, so a scan
+    /// over [`Self::meta_prefix`] recovers each name by stripping the prefix.
+    pub fn meta_key(&self, table_name: &str) -> Vec<u8> {
+        let name = table_name.as_bytes();
+        let mut key = self.tagged(TAG_META, name.len());
+        key.extend_from_slice(name);
+        key
+    }
+
+    /// The prefix shared by every table-metadata key in this tenant.
+    pub fn meta_prefix(&self) -> Vec<u8> {
+        self.tagged(TAG_META, 0)
     }
 
     /// The shared prefix of every row key for `table_name`:

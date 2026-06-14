@@ -84,7 +84,7 @@ use gluesql_core::error::Result as GlueResult;
 use gluesql_core::executor::evaluate_stateless;
 use gluesql_core::store::{
     AlterTable, CustomFunction, CustomFunctionMut, DataRow, Index, IndexError, IndexMut, Metadata,
-    Planner, RowIter, Store, StoreMut, Transaction,
+    MetaIter, Planner, RowIter, Store, StoreMut, Transaction,
 };
 use serde::{Deserialize, Serialize};
 use slatedb::config::ScanOptions;
@@ -489,6 +489,14 @@ impl StoreMut for SlateDbStorage {
     async fn insert_schema(&mut self, schema: &Schema) -> GlueResult<()> {
         let key = self.keyspace.schema_key(&schema.table_name);
         self.write_key(key, encode(schema)?).await?;
+        // Stamp the table's creation time once, for `GLUE_OBJECTS.CREATED`. Set
+        // it only if absent so `ALTER TABLE` (which re-inserts the schema) keeps
+        // the original creation time. Stored as i64 microseconds, big-endian.
+        let meta_key = self.keyspace.meta_key(&schema.table_name);
+        if self.read_key(&meta_key).await?.is_none() {
+            let micros = chrono::Utc::now().timestamp_micros();
+            self.write_key(meta_key, micros.to_be_bytes().to_vec()).await?;
+        }
         Ok(())
     }
 
@@ -504,6 +512,7 @@ impl StoreMut for SlateDbStorage {
             self.delete_key(storage_key).await?;
         }
         self.delete_key(self.keyspace.schema_key(table_name)).await?;
+        self.delete_key(self.keyspace.meta_key(table_name)).await?;
         Ok(())
     }
 
@@ -787,16 +796,46 @@ impl IndexMut for SlateDbStorage {
 //   (and Glue additionally requires Planner)
 //
 // The traits below ship full default method implementations in gluesql-core:
-//   * `Metadata`            — `scan_table_meta` defaults to empty.
 //   * `CustomFunction(Mut)` — user-defined functions: default "not supported".
 //   * `AlterTable`          — default impls drive RENAME/ADD/DROP COLUMN on top
 //                             of our Store + StoreMut, so they work for free.
 //                             (DROP COLUMN with a dropped index calls
 //                             `drop_index`, which we now implement.)
-//   * `Planner`             — default query planner; it consults `schema.indexes`
-//                             and routes eligible predicates to
-//                             `Index::scan_indexed_data`.
-impl Metadata for SlateDbStorage {}
+//   * `Planner`             — overridden above (pushdown / index / coercion).
+
+// `Metadata` backs the `GLUE_OBJECTS` introspection table. We return each
+// table's creation timestamp (stamped in `insert_schema`); GlueSQL synthesizes
+// `OBJECT_NAME`/`OBJECT_TYPE` and merges these in (see `executor::fetch`).
+#[async_trait]
+impl Metadata for SlateDbStorage {
+    async fn scan_table_meta(&self) -> GlueResult<MetaIter> {
+        let prefix = self.keyspace.meta_prefix();
+        let strip = prefix.len();
+        let end = prefix_upper_bound(&prefix);
+        let pairs = self.scan_range(prefix, end).await?;
+
+        let mut metas = Vec::with_capacity(pairs.len());
+        for (key, value) in pairs {
+            // Recover the table name (the bytes after the meta prefix) and the
+            // i64-microsecond creation time. Skip any malformed record rather
+            // than failing the whole introspection scan.
+            let Ok(micros_bytes) = <[u8; 8]>::try_from(value.as_slice()) else {
+                continue;
+            };
+            let Some(created) =
+                chrono::DateTime::from_timestamp_micros(i64::from_be_bytes(micros_bytes))
+                    .map(|dt| dt.naive_utc())
+            else {
+                continue;
+            };
+            let table_name = String::from_utf8_lossy(&key[strip..]).into_owned();
+            let meta = BTreeMap::from([("CREATED".to_owned(), Value::Timestamp(created))]);
+            metas.push(Ok((table_name, meta)));
+        }
+        Ok(Box::new(metas.into_iter()))
+    }
+}
+
 impl CustomFunction for SlateDbStorage {}
 impl CustomFunctionMut for SlateDbStorage {}
 impl AlterTable for SlateDbStorage {}
@@ -817,7 +856,9 @@ impl Planner for SlateDbStorage {
         &self,
         statement: gluesql_core::ast::Statement,
     ) -> GlueResult<gluesql_core::ast::Statement> {
-        use gluesql_core::plan::{fetch_schema_map, plan_join, plan_primary_key, validate};
+        use gluesql_core::plan::{
+            fetch_schema_map, plan_index, plan_join, plan_primary_key, validate,
+        };
 
         let schema_map = fetch_schema_map(self, &statement).await?;
         validate(&schema_map, &statement)?;
@@ -825,6 +866,11 @@ impl Planner for SlateDbStorage {
         crate::pushdown::reject_cross_products(&statement)?;
         let statement = crate::coerce::coerce_comparisons(&schema_map, statement);
         let statement = plan_primary_key(&schema_map, statement);
+        // Secondary-index selection: route eligible `WHERE` predicates to
+        // `Index::scan_indexed_data`. The default `Planner::plan` omits this, so
+        // overriding `plan()` dropped it — without this pass our `CREATE INDEX`es
+        // are built but never used (correct results, but full scans).
+        let statement = plan_index(&schema_map, statement);
         let statement = plan_join(&schema_map, statement);
         Ok(statement)
     }
