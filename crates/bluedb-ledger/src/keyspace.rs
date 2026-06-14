@@ -7,6 +7,8 @@ use bluedb_sql::{Keyspace, TAG_EXTERNAL_BASE};
 const TAG_ACCOUNT: u8 = TAG_EXTERNAL_BASE; // 0x10
 /// Tag for native transfer records.
 const TAG_TRANSFER: u8 = TAG_EXTERNAL_BASE + 1; // 0x11
+/// Tag for the "pending transfer resolved" marker (present ⇒ posted/voided).
+const TAG_PENDING_RESOLVED: u8 = TAG_EXTERNAL_BASE + 2; // 0x12
 
 /// Builds the storage keys for ledger records within one tenant. Account and
 /// transfer ids are encoded big-endian so a range scan yields them in id order.
@@ -25,6 +27,10 @@ impl LedgerKeyspace {
 
     pub(crate) fn transfer_key(&self, id: u128) -> Vec<u8> {
         self.ks.external_key(TAG_TRANSFER, &id.to_be_bytes())
+    }
+
+    pub(crate) fn pending_resolved_key(&self, pending_id: u128) -> Vec<u8> {
+        self.ks.external_key(TAG_PENDING_RESOLVED, &pending_id.to_be_bytes())
     }
 
     #[allow(dead_code)] // used by range scans in later plans (lookup-all / sweeps)
@@ -59,5 +65,18 @@ mod tests {
         let ks = LedgerKeyspace::new("_");
         assert!(ks.account_key(1) < ks.account_key(2));
         assert!(ks.account_key(2) < ks.account_key(u128::MAX));
+    }
+
+    #[test]
+    fn resolved_marker_key_is_distinct_namespace() {
+        let ks = LedgerKeyspace::new("_");
+        let r = ks.pending_resolved_key(5);
+        // Distinct from account (0x10) and transfer (0x11) for the same id, and
+        // sorts after both (tag 0x12).
+        assert_ne!(r, ks.account_key(5));
+        assert_ne!(r, ks.transfer_key(5));
+        assert!(ks.transfer_key(5) < r);
+        // Ordered by id within the namespace.
+        assert!(ks.pending_resolved_key(1) < ks.pending_resolved_key(2));
     }
 }

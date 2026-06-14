@@ -123,9 +123,10 @@ impl Ledger {
         for t in &accepted {
             batch.put(self.keyspace.transfer_key(t.id), &encode(t)?);
         }
-        // (Resolved markers are written in a later task once the key exists; the
-        // set is always empty until then, so this is a harmless no-op for now.)
-        let _ = &state.resolved;
+        for pending_id in &state.resolved {
+            // 1-byte value (SlateDB values must be non-empty); presence is the signal.
+            batch.put(self.keyspace.pending_resolved_key(*pending_id), &[1u8]);
+        }
         if !batch.is_empty() {
             writer.write(batch).await?;
         }

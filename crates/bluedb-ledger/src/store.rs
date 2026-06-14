@@ -42,6 +42,16 @@ pub(crate) async fn get_transfer(
     }
 }
 
+/// Whether a pending transfer has already been posted or voided (its resolved
+/// marker is present in committed state).
+pub(crate) async fn is_resolved(
+    substrate: &Substrate,
+    ks: &LedgerKeyspace,
+    pending_id: u128,
+) -> Result<bool> {
+    Ok(substrate.get(&ks.pending_resolved_key(pending_id)).await?.is_some())
+}
+
 #[cfg(test)]
 pub(crate) mod test_harness {
     //! Shared test helper: an in-memory writer `Database` over a fresh
