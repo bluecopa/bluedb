@@ -163,6 +163,20 @@ impl AppState {
         }
     }
 
+    /// Like [`Self::connection`] but the connection serializes autocommit writes
+    /// (see [`bluedb_sql::Database::connection_serialized`]). Used by the routes
+    /// that can run a single-statement read-modify-write (`/sql`, `PATCH`,
+    /// `DELETE`) so concurrent RMWs can't lose an update.
+    async fn connection_serialized(&self) -> Result<SlateDbStorage, AppError> {
+        match self.inner.db.read().await.as_ref() {
+            Some(db) => Ok(db.connection_serialized()),
+            None => Err(AppError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                message: "node has no database yet (no writer has been promoted)".to_string(),
+            }),
+        }
+    }
+
     /// Reject a mutating request unless this node is the active writer.
     fn require_active(&self) -> Result<(), AppError> {
         if self.inner.writer.is_active() {
@@ -203,7 +217,8 @@ async fn health() -> Json<Value> {
 /// `POST /sql` — run raw SQL (DDL + queries). Gated to the active writer.
 async fn exec_sql(State(state): State<AppState>, body: String) -> Result<Json<Value>, AppError> {
     state.require_active()?;
-    let mut glue = Glue::new(state.connection().await?);
+    // Raw SQL may be a read-modify-write (or an explicit transaction); serialize.
+    let mut glue = Glue::new(state.connection_serialized().await?);
     let payloads = glue.execute(&body).await.map_err(EngineError::from)?;
     Ok(Json(payloads_to_json(payloads)))
 }
@@ -246,7 +261,8 @@ async fn update(
         .map(|(col, value)| Ok((col, json_scalar_to_dsl(&value)?)))
         .collect::<Result<Vec<_>, AppError>>()?;
     let req = UpdateRequest { table, assignments, filters };
-    let mut glue = Glue::new(state.connection().await?);
+    // UPDATE is a read-modify-write; serialize so concurrent ones can't lose.
+    let mut glue = Glue::new(state.connection_serialized().await?);
     let payloads = rest_sql::execute_update(&mut glue, &req).await?;
     Ok(Json(payloads_to_json(payloads)))
 }
@@ -260,7 +276,8 @@ async fn delete_rows(
     state.require_active()?;
     let filters = parse_filters(query.as_deref().unwrap_or("")).map_err(EngineError::from)?;
     let req = DeleteRequest { table, filters };
-    let mut glue = Glue::new(state.connection().await?);
+    // DELETE reads the rows it removes; serialize for the same reason as UPDATE.
+    let mut glue = Glue::new(state.connection_serialized().await?);
     let payloads = rest_sql::execute_delete(&mut glue, &req).await?;
     Ok(Json(payloads_to_json(payloads)))
 }

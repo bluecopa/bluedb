@@ -111,6 +111,15 @@ impl Database {
         self.connection_for_tenant(DEFAULT_TENANT)
     }
 
+    /// A new connection whose autocommit statements serialize on the write lease
+    /// (see [`SlateDbStorage::serialize_writes`]). Use for request routes that
+    /// can run a single-statement read-modify-write (`UPDATE`/`DELETE`/raw SQL)
+    /// so they can't lose an update under concurrency; the append/insert route
+    /// should use [`Self::connection`] to keep group-committing.
+    pub fn connection_serialized(&self) -> SlateDbStorage {
+        self.connection_for_tenant(DEFAULT_TENANT).serialize_writes()
+    }
+
     /// A new connection scoped to `tenant` (its keyspace is namespaced; see
     /// [`SlateDbStorage::new_for_tenant`]). It still shares this `Database`'s
     /// write lease, so write transactions across tenants serialize on the one

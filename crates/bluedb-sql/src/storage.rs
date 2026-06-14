@@ -170,6 +170,13 @@ pub struct SlateDbStorage {
     write_lease: WriteLease,
     /// Shared per-table auto-increment counters (see [`SeqAllocator`]).
     seq: SeqAllocator,
+    /// When set, autocommit statements on this connection also take the write
+    /// lease eagerly at `begin` (snapshotting under it) — so a single-statement
+    /// read-modify-write like `UPDATE n = n + 1` is serialized and can't lose an
+    /// update against a concurrent writer. Set by the server for the routes that
+    /// can RMW (`/sql`, `PATCH`, `DELETE`); left off for the append/insert path
+    /// so it keeps group-committing. See [`SlateDbStorage::serialize_writes`].
+    serialize_writes: bool,
     /// `Some` while a `BEGIN ... COMMIT/ROLLBACK` block is open.
     txn: Option<TxnState>,
 }
@@ -212,8 +219,19 @@ impl SlateDbStorage {
             keyspace: Keyspace::new(tenant),
             write_lease,
             seq,
+            serialize_writes: false,
             txn: None,
         }
+    }
+
+    /// Make autocommit statements on this connection serialize on the write lease
+    /// (snapshotting under it), so a single-statement read-modify-write like
+    /// `UPDATE n = n + 1` can't lose an update against a concurrent writer. Use
+    /// for RMW-capable request routes; leave off so the append/insert path keeps
+    /// group-committing.
+    pub fn serialize_writes(mut self) -> Self {
+        self.serialize_writes = true;
+        self
     }
 
     /// The writer handle, or a read-only error if this connection is a replica.
@@ -674,36 +692,30 @@ impl Transaction for SlateDbStorage {
             }
             return Ok(false);
         }
-        if autocommit {
-            // Plain statement: snapshot now WITHOUT the lease so it never blocks
-            // (and is never blocked by) a writer. Auto-increment keys come from
-            // the collision-free shared counter (see `append_data`), so no lease
-            // is needed even for writes — and concurrent commits batch at the
-            // SlateDB WAL (group commit). Return `true` so GlueSQL commits
-            // (flushes the overlay) afterwards.
-            let snapshot = self.writer()?.snapshot().await.map_err(SqlError::from)?;
-            self.txn = Some(TxnState {
-                overlay: BTreeMap::new(),
-                snapshot,
-                _lease: None,
-            });
-            Ok(true)
+        // Acquire the write lease eagerly when this is an explicit `BEGIN`, or an
+        // autocommit statement on a connection that opted into serialized writes
+        // (the read-modify-write routes). The lease is taken FIRST, then the
+        // snapshot under it, so the statement's reads see every prior commit and
+        // its read-modify-write can't lose against a concurrent writer. A plain
+        // autocommit statement (unflagged) snapshots lock-free — it never blocks
+        // (or is blocked by) a writer; auto-increment keys stay collision-free
+        // via the shared counter (see `append_data`), and concurrent commits
+        // batch at the SlateDB WAL (group commit).
+        let eager = !autocommit || self.serialize_writes;
+        let lease = if eager {
+            Some(self.write_lease.clone().lock_owned().await)
         } else {
-            // Explicit BEGIN: acquire the exclusive write lease FIRST, then take
-            // the snapshot. Holding the lease for the whole block serializes the
-            // txn's *reads* too (so an `UPDATE`'s row scan can't lose against a
-            // concurrent explicit transaction), and the snapshot taken after it
-            // sees every previously-committed write. The return value is ignored
-            // for the `StartTransaction` statement; the user drives COMMIT/ROLLBACK.
-            let lease = self.write_lease.clone().lock_owned().await;
-            let snapshot = self.writer()?.snapshot().await.map_err(SqlError::from)?;
-            self.txn = Some(TxnState {
-                overlay: BTreeMap::new(),
-                snapshot,
-                _lease: Some(lease),
-            });
-            Ok(false)
-        }
+            None
+        };
+        let snapshot = self.writer()?.snapshot().await.map_err(SqlError::from)?;
+        self.txn = Some(TxnState {
+            overlay: BTreeMap::new(),
+            snapshot,
+            _lease: lease,
+        });
+        // Return `autocommit` so GlueSQL commits after a plain statement; the
+        // value is ignored for the explicit `StartTransaction` statement.
+        Ok(autocommit)
     }
 
     async fn rollback(&mut self) -> GlueResult<()> {

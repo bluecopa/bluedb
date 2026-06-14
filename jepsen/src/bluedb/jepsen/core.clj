@@ -21,6 +21,7 @@
     lein run test --workload list-append --nemesis mix --time-limit 120 \\
       --concurrency 10 --node node1 --node node2 --node node3"
   (:require [bluedb.jepsen.client :as bc]
+            [bluedb.jepsen.counter :as bcnt]
             [bluedb.jepsen.http :as h]
             [bluedb.jepsen.list-append :as la]
             [bluedb.jepsen.nemesis :as bn]
@@ -45,12 +46,16 @@
         (info "resetting schema on" node)
         (h/exec-sql! node "DROP TABLE IF EXISTS jset;")
         (h/exec-sql! node "DROP TABLE IF EXISTS la;")
+        (h/exec-sql! node "DROP TABLE IF EXISTS cnt;")
         (h/exec-sql! node "CREATE TABLE jset (v INTEGER);")
-        (h/exec-sql! node "CREATE TABLE la (k INTEGER, v INTEGER);")))
+        (h/exec-sql! node "CREATE TABLE la (k INTEGER, v INTEGER);")
+        (h/exec-sql! node "CREATE TABLE cnt (id INTEGER PRIMARY KEY, n INTEGER);")
+        (h/exec-sql! node "INSERT INTO cnt VALUES (1, 0);")))
     (teardown! [_ _test node]
       (when (= node (h/active-node))
         (h/exec-sql! node "DROP TABLE IF EXISTS jset;")
-        (h/exec-sql! node "DROP TABLE IF EXISTS la;")))))
+        (h/exec-sql! node "DROP TABLE IF EXISTS la;")
+        (h/exec-sql! node "DROP TABLE IF EXISTS cnt;")))))
 
 (defn- set-workload
   "Grow-only set: infinite stream of unique-int adds + a final whole-set read."
@@ -72,6 +77,16 @@
      :generator       (:generator base)
      :final-generator (:final-generator base)
      :checker         (:checker base)}))
+
+(defn- counter-workload
+  "Concurrent autocommit increments of one shared counter; checked that no
+  acknowledged increment is lost (the autocommit read-modify-write path)."
+  [_opts]
+  {:client          (bcnt/client)
+   :generator       (gen/mix [(map (constantly {:type :invoke :f :add :value 1}) (range))
+                              (map (constantly {:type :invoke :f :read}) (range))])
+   :final-generator (gen/each-thread {:type :invoke :f :read})
+   :checker         (checker/counter)})
 
 (def fault-cycles
   "Maps --nemesis to the cycle of nemesis ops. Sleeps straddle the lease TTL
@@ -101,6 +116,7 @@
         wname     (:workload opts "set")
         wl        ((case wname
                      "list-append" list-append-workload
+                     "counter"     counter-workload
                      set-workload)
                    opts)]
     (merge tests/noop-test
@@ -135,9 +151,9 @@
     :default "mix"
     :validate [#{"kill" "partition" "skew" "mix" "chaos" "none"}
                "must be kill, partition, skew, mix, chaos, or none"]]
-   [nil "--workload NAME" "Workload: set | list-append"
+   [nil "--workload NAME" "Workload: set | list-append | counter"
     :default "set"
-    :validate [#{"set" "list-append"} "must be set or list-append"]]])
+    :validate [#{"set" "list-append" "counter"} "must be set, list-append, or counter"]]])
 
 (defn -main [& args]
   (cli/run! (merge (cli/single-test-cmd {:test-fn bluedb-test :opt-spec cli-opts})
