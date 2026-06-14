@@ -18,6 +18,57 @@
 use crate::error::RestError;
 use serde::{Deserialize, Serialize};
 
+/// A typed value to be bound as a gluesql `$N` parameter — never interpolated
+/// into SQL text. This is the injection-proof replacement for emitting a literal:
+/// user data flows through `params`, so it can never change query structure.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Param {
+    /// SQL `NULL`.
+    Null,
+    /// Boolean.
+    Bool(bool),
+    /// 64-bit integer.
+    Int(i64),
+    /// 64-bit float.
+    Float(f64),
+    /// UTF-8 string (the default for anything not recognized as the above).
+    Str(String),
+}
+
+/// Type a stringly-typed DSL value into a [`Param`].
+///
+/// Same rule the old `render_value` used to pick a literal, so behavior is
+/// unchanged: `null`/`true`/`false` (case-insensitive) → those; else `i64` if it
+/// parses; else `f64` if it parses; else a string.
+pub fn render_param(value: &str) -> Param {
+    let lower = value.to_ascii_lowercase();
+    if lower == "null" {
+        return Param::Null;
+    }
+    if lower == "true" {
+        return Param::Bool(true);
+    }
+    if lower == "false" {
+        return Param::Bool(false);
+    }
+    if let Ok(i) = value.parse::<i64>() {
+        return Param::Int(i);
+    }
+    if let Ok(f) = value.parse::<f64>() {
+        return Param::Float(f);
+    }
+    Param::Str(value.to_string())
+}
+
+/// Push `render_param(value)` onto `params` and return its 1-based `$N`
+/// placeholder (gluesql positional-parameter syntax).
+// used from Task 2 onward
+#[allow(dead_code)]
+pub(crate) fn bind(value: &str, params: &mut Vec<Param>) -> String {
+    params.push(render_param(value));
+    format!("${}", params.len())
+}
+
 /// A PostgREST filter operator.
 ///
 /// # Operator mapping
@@ -312,6 +363,28 @@ pub fn render_value(value: &str) -> String {
 /// Single-quote a string literal, doubling any embedded single quotes.
 fn quote_string(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+#[cfg(test)]
+mod param_tests {
+    use super::{render_param, Param};
+
+    #[test]
+    fn render_param_types_like_the_old_rule() {
+        assert_eq!(render_param("null"), Param::Null);
+        assert_eq!(render_param("NULL"), Param::Null);
+        assert_eq!(render_param("true"), Param::Bool(true));
+        assert_eq!(render_param("false"), Param::Bool(false));
+        assert_eq!(render_param("10"), Param::Int(10));
+        assert_eq!(render_param("-3"), Param::Int(-3));
+        assert_eq!(render_param("10.5"), Param::Float(10.5));
+        assert_eq!(render_param("hello"), Param::Str("hello".to_string()));
+        // The injection payload becomes plain string DATA, never structure:
+        assert_eq!(
+            render_param("'); DROP TABLE t; --"),
+            Param::Str("'); DROP TABLE t; --".to_string())
+        );
+    }
 }
 
 /// Render the comma-separated body of an `IN (…)` list.
