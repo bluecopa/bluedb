@@ -9,7 +9,7 @@ use bluedb_storage::Substrate;
 use slatedb::WriteBatch;
 
 use crate::keyspace::LedgerKeyspace;
-use crate::model::{Account, AccountFlags, CreateResult, LedgerError, NewAccount, Transfer, TransferFlags};
+use crate::model::{Account, AccountFlags, CreateResult, LedgerError, NewAccount, Transfer, TransferKind};
 use crate::store::{encode, get_account, get_transfer};
 
 /// A double-entry ledger over one bluedb database.
@@ -79,8 +79,9 @@ impl Ledger {
         Ok(results)
     }
 
-    /// Apply transfers (batch). Each item is validated and applied independently
-    /// (Plan 1: single posted transfers — no linked/pending/balancing flags).
+    /// Apply transfers (batch). Each item is validated and applied independently:
+    /// posted movements and two-phase pending/post/void. Linked, balancing, and
+    /// timeout flags are not implemented yet and are rejected by [`Transfer::kind`].
     /// A failing item yields [`CreateResult::Failed`] and applies no change; a
     /// duplicate id yields [`CreateResult::Exists`]. All accepted items commit in
     /// one atomic batch. Requires the active writer.
@@ -134,30 +135,43 @@ impl Ledger {
         Ok(results)
     }
 
-    /// Validate one transfer and, if accepted, fold its balance deltas into
-    /// `state` (working set + dirty ids) and return the transfer record (stamped
-    /// with `timestamp`). `Exists` if the id is already committed; `Rejected` (no
-    /// change) on validation failure. Errors bubble for I/O failures only.
+    /// Validate one transfer, dispatch by kind, and (if accepted) fold its
+    /// effects into `state`. `Exists` if the id is already committed; `Rejected`
+    /// (no change) on validation failure. I/O failures bubble.
     async fn stage_transfer(
         &self,
         t: &Transfer,
         timestamp: u64,
         state: &mut ApplyState,
     ) -> Result<StageOutcome> {
-        if t.debit_account_id == t.credit_account_id {
-            return Ok(StageOutcome::Rejected(LedgerError::AccountsMustDiffer));
-        }
-        // Posted transfers only: reject any flag whose semantics aren't
-        // implemented yet (linked / two-phase / balancing) so a flagged transfer
-        // is never silently persisted as a plain posted one.
-        if t.flags != TransferFlags::NONE {
-            return Ok(StageOutcome::Rejected(LedgerError::UnsupportedFlag));
-        }
         // Idempotency: committed transfer with this id already exists.
         if get_transfer(&self.substrate, &self.keyspace, t.id).await?.is_some() {
             return Ok(StageOutcome::Exists);
         }
+        match t.kind() {
+            Err(e) => Ok(StageOutcome::Rejected(e)),
+            Ok(TransferKind::Posted) => self.stage_movement(t, timestamp, state, false).await,
+            Ok(TransferKind::Pending) => self.stage_movement(t, timestamp, state, true).await,
+            Ok(TransferKind::PostPending) => self.stage_resolution(t, timestamp, state, true).await,
+            Ok(TransferKind::VoidPending) => self.stage_resolution(t, timestamp, state, false).await,
+        }
+    }
 
+    /// Stage a posted (`is_pending == false`) or pending (`true`) movement: move
+    /// `amount` from the debit account to the credit account, into the posted or
+    /// pending buckets respectively, enforcing single-ledger + distinct accounts
+    /// + balance constraints. Balance constraints use `posted + pending` on the
+    /// constrained side, so a pending reserve is constrained exactly like a post.
+    async fn stage_movement(
+        &self,
+        t: &Transfer,
+        timestamp: u64,
+        state: &mut ApplyState,
+        is_pending: bool,
+    ) -> Result<StageOutcome> {
+        if t.debit_account_id == t.credit_account_id {
+            return Ok(StageOutcome::Rejected(LedgerError::AccountsMustDiffer));
+        }
         let mut debit = match self.load_account(t.debit_account_id, state).await? {
             Some(a) => a,
             None => return Ok(StageOutcome::Rejected(LedgerError::AccountNotFound(t.debit_account_id))),
@@ -166,20 +180,36 @@ impl Ledger {
             Some(a) => a,
             None => return Ok(StageOutcome::Rejected(LedgerError::AccountNotFound(t.credit_account_id))),
         };
-
         if t.ledger != debit.ledger || t.ledger != credit.ledger {
             return Ok(StageOutcome::Rejected(LedgerError::LedgerMismatch));
         }
 
-        debit.debits_posted = match debit.debits_posted.checked_add(t.amount) {
-            Some(v) => v,
-            None => return Ok(StageOutcome::Rejected(LedgerError::Overflow)),
-        };
-        credit.credits_posted = match credit.credits_posted.checked_add(t.amount) {
-            Some(v) => v,
-            None => return Ok(StageOutcome::Rejected(LedgerError::Overflow)),
-        };
+        if is_pending {
+            debit.debits_pending = match debit.debits_pending.checked_add(t.amount) {
+                Some(v) => v,
+                None => return Ok(StageOutcome::Rejected(LedgerError::Overflow)),
+            };
+            credit.credits_pending = match credit.credits_pending.checked_add(t.amount) {
+                Some(v) => v,
+                None => return Ok(StageOutcome::Rejected(LedgerError::Overflow)),
+            };
+        } else {
+            debit.debits_posted = match debit.debits_posted.checked_add(t.amount) {
+                Some(v) => v,
+                None => return Ok(StageOutcome::Rejected(LedgerError::Overflow)),
+            };
+            credit.credits_posted = match credit.credits_posted.checked_add(t.amount) {
+                Some(v) => v,
+                None => return Ok(StageOutcome::Rejected(LedgerError::Overflow)),
+            };
+        }
 
+        // Balance constraints — asymmetric on purpose, matching TigerBeetle: the
+        // CONSTRAINED side counts posted + pending (a reserved outflow already
+        // commits the account), but the LIMIT side counts posted ONLY. Unconfirmed
+        // (pending) credits do NOT grant debit headroom, and unconfirmed debits do
+        // not grant credit headroom — i.e. `debits_posted + debits_pending <=
+        // credits_posted`, NOT `<= credits_posted + credits_pending`.
         if debit.flags.contains(AccountFlags::DEBITS_MUST_NOT_EXCEED_CREDITS) {
             let debits_used = match debit.debits_posted.checked_add(debit.debits_pending) {
                 Some(v) => v,
@@ -204,6 +234,17 @@ impl Ledger {
         state.working.insert(credit.id, credit);
         state.dirty.insert(credit.id);
         Ok(StageOutcome::Applied(Transfer { timestamp, ..*t }))
+    }
+
+    /// Stage a post/void of a pending transfer. (Implemented in the next task.)
+    async fn stage_resolution(
+        &self,
+        _t: &Transfer,
+        _timestamp: u64,
+        _state: &mut ApplyState,
+        _post: bool,
+    ) -> Result<StageOutcome> {
+        Ok(StageOutcome::Rejected(LedgerError::UnsupportedFlag))
     }
 
     /// Get an account from the working set, loading it read-through on first
@@ -551,12 +592,90 @@ mod tests {
         setup_two_accounts(&ledger).await;
 
         // A flag whose semantics aren't implemented yet is rejected, not
-        // silently applied as a plain posted transfer.
+        // silently applied as a plain posted transfer. LINKED is not implemented.
         let mut t = Transfer::new(1, 1, 2, 100, 7);
-        t.flags = TransferFlags::PENDING;
+        t.flags = TransferFlags::LINKED;
         let res = ledger.create_transfers(&[t], 1).await.unwrap();
         assert_eq!(res, vec![CreateResult::Failed(LedgerError::UnsupportedFlag)]);
         assert_eq!(ledger.lookup_account(1).await.unwrap().unwrap().debits_posted, 0);
         assert!(ledger.lookup_transfer(1).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn pending_transfer_reserves_into_pending_buckets() {
+        use crate::model::{CreateResult, Transfer, TransferFlags};
+        let database = writer_database().await;
+        let ledger = Ledger::new(&database);
+        setup_two_accounts(&ledger).await;
+
+        let mut p = Transfer::new(500, 1, 2, 100, 7);
+        p.flags = TransferFlags::PENDING;
+        assert_eq!(ledger.create_transfers(&[p], 9).await.unwrap(), vec![CreateResult::Ok]);
+
+        let debit = ledger.lookup_account(1).await.unwrap().unwrap();
+        let credit = ledger.lookup_account(2).await.unwrap().unwrap();
+        assert_eq!(debit.debits_pending, 100);
+        assert_eq!(debit.debits_posted, 0);
+        assert_eq!(credit.credits_pending, 100);
+        assert_eq!(credit.credits_posted, 0);
+        assert_eq!(debit.debits_pending, credit.credits_pending);
+        assert!(ledger.lookup_transfer(500).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn pending_respects_balance_constraint() {
+        use crate::model::{AccountFlags, CreateResult, LedgerError, NewAccount, Transfer, TransferFlags};
+        let database = writer_database().await;
+        let ledger = Ledger::new(&database);
+        ledger
+            .create_accounts(
+                &[
+                    NewAccount::new(1, 7).with_flags(AccountFlags::DEBITS_MUST_NOT_EXCEED_CREDITS),
+                    NewAccount::new(2, 7),
+                ],
+                1,
+            )
+            .await
+            .unwrap();
+        let mut p = Transfer::new(1, 1, 2, 50, 7);
+        p.flags = TransferFlags::PENDING;
+        assert_eq!(
+            ledger.create_transfers(&[p], 2).await.unwrap(),
+            vec![CreateResult::Failed(LedgerError::ExceedsCredits)]
+        );
+        assert_eq!(ledger.lookup_account(1).await.unwrap().unwrap().debits_pending, 0);
+    }
+
+    #[tokio::test]
+    async fn pending_credits_do_not_grant_debit_headroom() {
+        // TigerBeetle's asymmetry: for DEBITS_MUST_NOT_EXCEED_CREDITS the limit is
+        // credits_POSTED only — an unconfirmed (pending) credit must NOT let the
+        // account take on more debits. (A symmetric formula would wrongly allow it.)
+        use crate::model::{AccountFlags, CreateResult, LedgerError, NewAccount, Transfer, TransferFlags};
+        let database = writer_database().await;
+        let ledger = Ledger::new(&database);
+        ledger
+            .create_accounts(
+                &[
+                    NewAccount::new(1, 7).with_flags(AccountFlags::DEBITS_MUST_NOT_EXCEED_CREDITS),
+                    NewAccount::new(2, 7),
+                ],
+                1,
+            )
+            .await
+            .unwrap();
+
+        // Give account 1 a PENDING credit of 100 (2 → 1, pending): credits_pending
+        // becomes 100, credits_posted stays 0.
+        let mut p = Transfer::new(10, 2, 1, 100, 7);
+        p.flags = TransferFlags::PENDING;
+        assert_eq!(ledger.create_transfers(&[p], 2).await.unwrap(), vec![CreateResult::Ok]);
+        let a1 = ledger.lookup_account(1).await.unwrap().unwrap();
+        assert_eq!((a1.credits_pending, a1.credits_posted), (100, 0));
+
+        // A posted debit of 1 on account 1 is still rejected: debits_used (1) >
+        // credits_posted (0); the 100 pending credit grants NO headroom.
+        let r = ledger.create_transfers(&[Transfer::new(11, 1, 2, 1, 7)], 3).await.unwrap();
+        assert_eq!(r, vec![CreateResult::Failed(LedgerError::ExceedsCredits)]);
     }
 }
