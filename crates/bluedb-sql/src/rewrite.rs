@@ -19,8 +19,8 @@
 //! never makes a query worse than it was.
 
 use sqlparser::ast::{
-    CreateTable, Cte, DataType, Expr, Join, JoinConstraint, JoinOperator, Query, Select, SetExpr,
-    Statement, TableFactor, TableWithJoins, Value, With,
+    CreateTable, Cte, DataType, Expr, Join, JoinConstraint, JoinOperator, Query, Select, SelectItem,
+    SetExpr, Statement, TableFactor, TableWithJoins, Value, With,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -90,11 +90,47 @@ fn rewrite_select(select: &mut Select, changed: &mut bool) {
             rewrite_table_factor(&mut join.relation, changed);
         }
     }
+    // Recurse into subqueries in the projection / WHERE / HAVING — e.g. the
+    // `IN (SELECT ... FROM a, b ...)` subqueries that the set-op rewrite
+    // produces, whose branches may themselves contain comma-joins.
+    for item in &mut select.projection {
+        if let SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } = item {
+            fold_expr_subqueries(expr, changed);
+        }
+    }
+    if let Some(selection) = &mut select.selection {
+        fold_expr_subqueries(selection, changed);
+    }
+    if let Some(having) = &mut select.having {
+        fold_expr_subqueries(having, changed);
+    }
 }
 
 fn rewrite_table_factor(factor: &mut TableFactor, changed: &mut bool) {
     if let TableFactor::Derived { subquery, .. } = factor {
         rewrite_query(subquery, changed);
+    }
+}
+
+/// Walk an expression and fold comma-joins inside any subquery it contains
+/// (`IN (SELECT ...)`, `EXISTS (...)`, scalar `(SELECT ...)`).
+fn fold_expr_subqueries(expr: &mut Expr, changed: &mut bool) {
+    match expr {
+        Expr::Subquery(query)
+        | Expr::InSubquery { subquery: query, .. }
+        | Expr::Exists { subquery: query, .. } => rewrite_query(query, changed),
+        Expr::BinaryOp { left, right, .. } => {
+            fold_expr_subqueries(left, changed);
+            fold_expr_subqueries(right, changed);
+        }
+        Expr::UnaryOp { expr, .. } | Expr::Nested(expr) => fold_expr_subqueries(expr, changed),
+        Expr::InList { expr, list, .. } => {
+            fold_expr_subqueries(expr, changed);
+            for item in list {
+                fold_expr_subqueries(item, changed);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -193,5 +229,13 @@ mod tests {
         let out = rewrite_multitable("CREATE TABLE t (a INTEGER, x VARCHAR(30))");
         assert!(out.to_uppercase().contains("TEXT"), "got: {out}");
         assert!(!out.to_uppercase().contains("VARCHAR"), "got: {out}");
+    }
+
+    #[test]
+    fn folds_comma_join_inside_where_subquery() {
+        // The set-op rewrite emits `... IN (SELECT ... FROM a, b ...)`; the inner
+        // comma-join must fold too, or it reaches gluesql unfolded.
+        let out = rewrite_multitable("SELECT a FROM t1 WHERE a IN (SELECT b FROM t2, t3 WHERE x = y)");
+        assert!(out.contains("JOIN t3"), "inner comma-join should fold: {out}");
     }
 }

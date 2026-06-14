@@ -121,6 +121,7 @@ async fn main() -> anyhow::Result<()> {
     let mut backlog: BTreeMap<String, usize> = BTreeMap::new();
     let mut wrong_examples: Vec<String> = Vec::new();
     let mut other_examples: Vec<String> = Vec::new();
+    let mut wrong_hashed = 0usize;
 
     for file in &files {
         let records = match parse_file::<DefaultColumnType>(file) {
@@ -153,8 +154,20 @@ async fn main() -> anyhow::Result<()> {
                     match classify(&msg) {
                         Cat::WrongResult => {
                             t.wrong += 1;
-                            if wrong_examples.len() < 8 {
-                                wrong_examples.push(one_line(&sql));
+                            // Hashed results (corpus uses hash-threshold 8) need
+                            // byte-exact value formatting to match; literal-block
+                            // mismatches are more likely just rendering/order.
+                            if msg.contains("hashing") {
+                                wrong_hashed += 1;
+                            }
+                            if wrong_examples.len() < 10 {
+                                let detail: String =
+                                    msg.lines().take(4).collect::<Vec<_>>().join(" | ");
+                                wrong_examples.push(format!(
+                                    "{}\n      {}",
+                                    one_line(&sql),
+                                    detail.chars().take(220).collect::<String>()
+                                ));
                             }
                         }
                         Cat::Unsupported => {
@@ -190,7 +203,7 @@ async fn main() -> anyhow::Result<()> {
     println!();
     println!("  of accepted (output comparison — lower bound, rendering still minimal):");
     println!("      PASS         {:>6}", t.pass);
-    println!("      WRONG-RESULT {:>6}", t.wrong);
+    println!("      WRONG-RESULT {:>6}  ({wrong_hashed} hashed / {} literal)", t.wrong, t.wrong - wrong_hashed);
     println!("=======================================================");
 
     if !backlog.is_empty() {
