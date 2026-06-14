@@ -27,7 +27,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use axum::extract::{Path, RawQuery, State};
@@ -53,6 +53,13 @@ use slatedb::{Db, DbReader, Settings};
 /// the latency-sensitive HTTP profile. Override with `BLUEDB_FLUSH_INTERVAL_MS`.
 const DEFAULT_FLUSH_INTERVAL_MS: u64 = 25;
 
+/// The node-level default FTS seal/compaction interval. Deliberately long (30 s):
+/// the background seal's drain→durable-write window is non-atomic, so a sub-second
+/// interval could race a test mid-seal — at 30 s no sub-second test ever triggers
+/// a seal. Override with `BLUEDB_FTS_SEAL_INTERVAL_MS`. (Per-DB PRAGMA tuning is
+/// deferred; this is the node-level knob.)
+const DEFAULT_FTS_SEAL_INTERVAL_MS: u64 = 30_000;
+
 /// Parse a `BLUEDB_FLUSH_INTERVAL_MS` value into a `Duration`. `None`, empty, or
 /// unparseable → the 25 ms default (total + non-panicking).
 fn parse_flush_interval_ms(raw: Option<&str>) -> Duration {
@@ -60,6 +67,22 @@ fn parse_flush_interval_ms(raw: Option<&str>) -> Duration {
         .and_then(|s| s.trim().parse::<u64>().ok())
         .unwrap_or(DEFAULT_FLUSH_INTERVAL_MS);
     Duration::from_millis(ms)
+}
+
+/// Parse a `BLUEDB_FTS_SEAL_INTERVAL_MS` value into a `Duration`. `None`, empty, or
+/// unparseable → the 30 s default (total + non-panicking). Mirrors
+/// [`parse_flush_interval_ms`].
+fn parse_fts_seal_interval_ms(raw: Option<&str>) -> Duration {
+    let ms = raw
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_FTS_SEAL_INTERVAL_MS);
+    Duration::from_millis(ms)
+}
+
+/// The FTS background seal interval for this node, from `BLUEDB_FTS_SEAL_INTERVAL_MS`
+/// (default 30 s).
+fn fts_seal_interval() -> Duration {
+    parse_fts_seal_interval_ms(std::env::var("BLUEDB_FTS_SEAL_INTERVAL_MS").ok().as_deref())
 }
 
 /// SlateDB `Settings` for the writer `Db`: bluedb's `flush_interval` default,
@@ -94,11 +117,17 @@ struct Inner {
     /// Bearer-token → scopes map. Unset = open mode (all requests allowed).
     /// Set once at startup via [`AppState::with_authz`].
     authz: OnceLock<Arc<authz::Authz>>,
-    /// The shared FTS engine — one instance for the node's lifetime, so it holds
-    /// the in-memory live segments. Installed as a commit observer on every write
-    /// connection (maintains the live index) and consulted by `/sql` to rewrite
-    /// `@@`/`ts_rank` against the live segment (read-your-writes).
-    fts: Arc<FtsEngine>,
+    /// The active FTS engine, swapped by role. Before the first promote it is a
+    /// pure in-memory [`FtsEngine::new`]; on promote it is replaced by a **durable**
+    /// engine reopened over the writer's substrate ([`FtsEngine::reopen`]) — which
+    /// reconnects persisted index defs to their existing splits — and on demote it
+    /// reverts to an empty in-memory engine (a passive node serves no FTS reads).
+    /// Installed as a commit observer on every write connection (maintains the live
+    /// index) and consulted by `/sql` to rewrite `@@`/`ts_rank` (read-your-writes).
+    fts: RwLock<Arc<FtsEngine>>,
+    /// The background seal/compaction scheduler for the durable FTS engine, spawned
+    /// on promote and aborted on demote / re-promote. `None` until the first promote.
+    seal_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl AppState {
@@ -119,7 +148,8 @@ impl AppState {
                 db: RwLock::new(None),
                 admin_sql_enabled: AtomicBool::new(false),
                 authz: OnceLock::new(),
-                fts: FtsEngine::new(),
+                fts: RwLock::new(FtsEngine::new()),
+                seal_handle: Mutex::new(None),
             }),
         }
     }
@@ -176,7 +206,24 @@ impl AppState {
             .build()
             .await
             .map_err(|err| AppError::internal(format!("open writer db: {err}")))?;
-        *self.inner.db.write().await = Some(Database::new(Arc::new(db)));
+        // One `Database` handle backs BOTH the SQL slot AND the durable FTS engine
+        // (it's `Clone` + carries the shared substrate), so FTS splits live in the
+        // same object store as the SQL data.
+        let database = Database::new(Arc::new(db));
+        *self.inner.db.write().await = Some(database.clone());
+
+        // Reopen a durable FTS engine over the writer's substrate: this reconnects
+        // any persisted index defs to their existing splits (restart durability).
+        let fts = FtsEngine::reopen(database.substrate())
+            .await
+            .map_err(|e| AppError::internal(format!("reopen fts: {e}")))?;
+        // Stop a prior scheduler (re-promote) before starting a new one (no leak).
+        if let Some(h) = self.inner.seal_handle.lock().unwrap().take() {
+            h.abort();
+        }
+        let handle = fts.clone().spawn_seal_scheduler(fts_seal_interval());
+        *self.inner.seal_handle.lock().unwrap() = Some(handle);
+        *self.inner.fts.write().await = fts;
         Ok(())
     }
 
@@ -192,6 +239,14 @@ impl AppState {
             .demote()
             .await
             .map_err(|err| AppError::internal(format!("demote: {err}")))?;
+        // Stop the background seal scheduler and revert to an empty in-memory FTS
+        // engine — a demoted (passive) node serves no FTS reads (they 503 on
+        // `require_active`), so an empty in-memory engine is safe and drops the
+        // durable handles.
+        if let Some(h) = self.inner.seal_handle.lock().unwrap().take() {
+            h.abort();
+        }
+        *self.inner.fts.write().await = FtsEngine::new();
         self.attach_reader().await;
         Ok(())
     }
@@ -235,16 +290,19 @@ impl AppState {
         *self.inner.db.write().await = bound;
     }
 
-    /// The shared FTS engine (for the `/schema/.../fulltext-indexes` handler).
-    pub(crate) fn fts(&self) -> &std::sync::Arc<FtsEngine> {
-        &self.inner.fts
+    /// The currently-bound FTS engine (for the `/schema/.../fulltext-indexes` and
+    /// `/sql` handlers). Clones the `Arc` out of the role-swap `RwLock`, so callers
+    /// hold a snapshot of the engine that was active when they asked.
+    pub(crate) async fn fts(&self) -> Arc<FtsEngine> {
+        self.inner.fts.read().await.clone()
     }
 
     /// A connection to the currently-bound database, or `503` if unbound. Carries
     /// the FTS commit observer so the live index is maintained on every commit.
     async fn connection(&self) -> Result<SlateDbStorage, AppError> {
+        let fts = self.inner.fts.read().await.clone();
         match self.inner.db.read().await.as_ref() {
-            Some(db) => Ok(db.connection().with_commit_observer(self.inner.fts.clone())),
+            Some(db) => Ok(db.connection().with_commit_observer(fts)),
             None => Err(AppError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 message: "node has no database yet (no writer has been promoted)".to_string(),
@@ -257,10 +315,11 @@ impl AppState {
     /// that can run a single-statement read-modify-write (`/sql`, `PATCH`,
     /// `DELETE`) so concurrent RMWs can't lose an update.
     pub(crate) async fn connection_serialized(&self) -> Result<SlateDbStorage, AppError> {
+        let fts = self.inner.fts.read().await.clone();
         match self.inner.db.read().await.as_ref() {
             Some(db) => Ok(db
                 .connection_serialized()
-                .with_commit_observer(self.inner.fts.clone())),
+                .with_commit_observer(fts)),
             None => Err(AppError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 message: "node has no database yet (no writer has been promoted)".to_string(),
@@ -356,7 +415,7 @@ async fn exec_sql(
     let mut glue = Glue::new(state.connection_serialized().await?);
     // Route through the FTS engine: it rewrites `@@`/`ts_rank` against the live
     // segment when a fulltext index is declared, else runs the SQL unchanged.
-    let payloads = state.inner.fts.execute_fts(&mut glue, &req.sql, &params).await?;
+    let payloads = state.fts().await.execute_fts(&mut glue, &req.sql, &params).await?;
     Ok(Json(payloads_to_json(payloads)))
 }
 
@@ -644,6 +703,22 @@ mod flush_interval_cfg {
         assert_eq!(parse_flush_interval_ms(Some("abc")), Duration::from_millis(25));
         assert_eq!(parse_flush_interval_ms(Some("")), Duration::from_millis(25));
         assert_eq!(parse_flush_interval_ms(Some("0")), Duration::from_millis(0));
+    }
+}
+
+#[cfg(test)]
+mod fts_seal_interval_cfg {
+    use super::parse_fts_seal_interval_ms;
+    use std::time::Duration;
+
+    #[test]
+    fn defaults_to_30s_and_parses_override() {
+        assert_eq!(parse_fts_seal_interval_ms(None), Duration::from_millis(30_000));
+        assert_eq!(parse_fts_seal_interval_ms(Some("5000")), Duration::from_millis(5_000));
+        assert_eq!(parse_fts_seal_interval_ms(Some("100")), Duration::from_millis(100));
+        assert_eq!(parse_fts_seal_interval_ms(Some("abc")), Duration::from_millis(30_000));
+        assert_eq!(parse_fts_seal_interval_ms(Some("")), Duration::from_millis(30_000));
+        assert_eq!(parse_fts_seal_interval_ms(Some("0")), Duration::from_millis(0));
     }
 }
 

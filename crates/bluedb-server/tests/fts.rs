@@ -142,6 +142,93 @@ async fn fts_over_http_read_your_writes() {
 }
 
 #[tokio::test]
+async fn durable_engine_serves_a_second_fulltext_index() {
+    // After B4-4, `promote` binds a durable, reopened `FtsEngine` over the writer's
+    // substrate (empty registry on a fresh in-memory DB → behaves like the old
+    // in-memory engine). This proves the durable engine, bound through the
+    // promote/demote lifecycle, serves MORE than one index definition end-to-end
+    // over HTTP — i.e. the read-lock-clone wiring in `connection*`/`fts()` and the
+    // `create_fulltext_index_auto`/`execute_fts` handlers all resolve the same
+    // engine instance.
+    let app = make_app(true).await;
+
+    // Two tables, each with its own text column + fulltext index.
+    for (table, col) in [("invoices", "memo"), ("emails", "subject")] {
+        let (s, body) = call(
+            &app,
+            "POST",
+            "/schema/tables",
+            Some(json!({
+                "name": table,
+                "columns": [
+                    {"name": "id", "type": "INTEGER", "primary_key": true},
+                    {"name": col, "type": "TEXT"}
+                ]
+            })),
+        )
+        .await;
+        assert!(s.is_success(), "create table {table}: {s} {body}");
+
+        let (s, body) = call(
+            &app,
+            "POST",
+            &format!("/schema/tables/{table}/fulltext-indexes"),
+            Some(json!({"column": col, "analyzer": "english"})),
+        )
+        .await;
+        assert!(s.is_success(), "create fulltext index on {table}: {s} {body}");
+    }
+
+    // Insert into both tables on the observed connection (maintains both live indexes).
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({
+            "sql": "INSERT INTO invoices (id, memo) VALUES (1, 'quarterly invoice overdue'), (2, 'paid on time')"
+        })),
+    )
+    .await;
+    assert!(s.is_success(), "insert invoices: {s}");
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({
+            "sql": "INSERT INTO emails (id, subject) VALUES (10, 'overdue payment reminder'), (11, 'welcome aboard')"
+        })),
+    )
+    .await;
+    assert!(s.is_success(), "insert emails: {s}");
+
+    // A `@@` query on the SECOND index resolves through the same durable engine.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({
+            "sql": "SELECT id FROM emails WHERE to_tsvector('english', subject) @@ plainto_tsquery('overdue payment')"
+        })),
+    )
+    .await;
+    assert!(s.is_success(), "@@ on second index: {s} {body}");
+    assert_eq!(body, json!([{ "id": 10 }]), "second index returns its matching row");
+
+    // And the first index still works (both defs coexist on one bound engine).
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({
+            "sql": "SELECT id FROM invoices WHERE to_tsvector('english', memo) @@ plainto_tsquery('invoice overdue')"
+        })),
+    )
+    .await;
+    assert!(s.is_success(), "@@ on first index: {s} {body}");
+    assert_eq!(body, json!([{ "id": 1 }]), "first index still resolves");
+}
+
+#[tokio::test]
 async fn fulltext_index_on_missing_table_is_400() {
     let app = make_app(true).await;
     let (s, body) = call(

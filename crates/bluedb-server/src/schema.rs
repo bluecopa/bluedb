@@ -211,6 +211,7 @@ pub(crate) async fn create_fulltext_index(
     let conn = state.connection().await?;
     state
         .fts()
+        .await
         .create_fulltext_index_auto(&conn, &table, &column, &req.analyzer)
         .await?;
     Ok(Json(json!({

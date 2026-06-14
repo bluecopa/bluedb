@@ -23,6 +23,9 @@
 //!   (or `POST /admin/promote`) to take the lease; default bootstraps to writer.
 //! - `BLUEDB_FLUSH_INTERVAL_MS` — WAL flush interval in ms (default 25). Set at
 //!   writer open; lower = lower write latency + more object-store PUTs under load.
+//! - `BLUEDB_FTS_SEAL_INTERVAL_MS` — interval in ms for the background FTS
+//!   seal/compaction scheduler (default 30000). On promote the node binds a durable
+//!   FTS engine on the active writer and runs this scheduler; demote stops it.
 //! - `BLUEDB_ENABLE_ADMIN_SQL` — set to `1` or `true` to enable `POST /admin/sql`
 //!   (arbitrary SQL including DDL, audited). Off by default. `/sql` is always
 //!   available but restricted to a single parameterized SELECT/INSERT/UPDATE/DELETE.
@@ -59,7 +62,15 @@
 //! rewrites it against the live index, returning matching rows. The index is
 //! maintained on every committed write, so a `@@` query reads its own writes with
 //! no explicit flush. (`/admin/sql` is left as the raw escape hatch and does *not*
-//! rewrite `@@`. The full-text index lives in memory and is rebuilt on restart.)
+//! rewrite `@@`.)
+//!
+//! The full-text index is **durable on the active writer**: on promote the node
+//! reopens a durable FTS engine over the writer's substrate (reconnecting persisted
+//! index defs to their sealed splits), and a background scheduler
+//! (`BLUEDB_FTS_SEAL_INTERVAL_MS`, default 30000) folds the in-memory live tier into
+//! object-storage splits and bounds split growth — so sealed splits survive a
+//! restart. FTS reads run only on the active node (`require_active`); a demoted node
+//! reverts to an empty in-memory engine and serves no FTS.
 
 use std::sync::Arc;
 use std::time::Duration;
