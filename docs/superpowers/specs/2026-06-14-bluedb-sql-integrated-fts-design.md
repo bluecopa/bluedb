@@ -66,12 +66,18 @@ high-text-selectivity / low-filter-selectivity queries.
 4. REST parity: `?col=fts.<query>` lowers to the predicate, combinable with the existing
    filter/order/pagination DSL — the input-table-v2 surface.
 5. Correct update/delete semantics (tombstones reflected in search immediately).
+6. **Trigram index for `LIKE '%…%'` and regex (`~`) acceleration** (the `pg_trgm` analog) —
+   so substring/regex predicates aren't full scans. In scope for v1 (§4.6).
 
 **Non-goals**
 
 - Cross-region real-time search (bounded-staleness by design).
 - The Elasticsearch denormalization model (deferred optimization).
-- Exposing tantivy as a direct/standalone search API (explicitly rejected).
+- **A separate/standalone tantivy search API.** SQL is the interface. tantivy's *further*
+  capabilities are **deferred and, when added, surfaced as SQL extensions** (more functions /
+  index modes), not a parallel API — see §10. A standalone API is reserved only for
+  something SQL genuinely can't shape (one-round-trip faceted aggregations is the lone
+  candidate), and even then we'd prefer extending SQL.
 - A persistent FTS query cache.
 
 ## 4. Architecture
@@ -158,11 +164,44 @@ bluedb-sql already has **B-tree-style secondary indexes** for regular columns:
 lookups, **range** scans, and `ORDER BY`), maintained through the txn overlay, and used by
 the planner (`plan_index`). Single-column.
 
-The FTS index in this spec is the **GIN analog** — a separate index *type* (tantivy splits
-+ live segment) for text relevance, declared via `CREATE FULLTEXT INDEX` / the DDL surface,
-queried via `@@`. The two compose: in an FTS query, the relevance predicate hits the FTS
-index and the structured filters (`status = 'open'`) hit the B-tree secondary index. So
-"Postgres way" holds on both axes — B-tree for structured, GIN for full-text.
+This spec adds **two GIN-analog index types**, both tantivy-backed (splits + live segment),
+declared via the DDL surface, sharing the maintenance/RYW machinery:
+- **Full-text (BM25)** — word-tokenized + stemmed, queried via `@@` / `ts_rank` (§4.3).
+- **Trigram** — character-3-gram tokenized, accelerates `LIKE '%…%'` and regex `~` (§4.6).
+
+They compose with the B-tree: in any query, the text predicate hits the FTS/trigram index
+and structured filters (`status = 'open'`) hit the B-tree. So "Postgres way" holds on all
+three axes — **B-tree** for structured + prefix-`LIKE`, **BM25-GIN** for full-text,
+**trigram-GIN** for substring/regex.
+
+### 4.6 Trigram index — `LIKE '%…%'` and regex acceleration
+
+The `pg_trgm` + GIN analog. A trigram index tokenizes the column into overlapping character
+3-grams (stored as tantivy terms). A substring/regex predicate becomes a **candidate query
+then a verify**:
+
+- **`col LIKE '%foo%'`** *(light path)* — gluesql supports `LIKE`/`ILIKE` natively (`Expr::Like`),
+  so it survives translate. We extract the literal's trigrams (`foo` → {`foo`}; longer
+  literals → multiple trigrams AND-ed), search the trigram index → candidate pks, and rewrite
+  to `… WHERE pk IN (<candidates>) AND col LIKE '%foo%'` — **gluesql does the verify.** Can be
+  a `Planner::plan` rewrite (LIKE survives translate) or pre-parse.
+- **`col ~ 'regex'`** *(heavy path)* — sqlparser parses `~`/`~*`/`!~` (Tilde → `PGRegexMatch`),
+  but gluesql `translate` rejects it **and** gluesql has **no regex evaluation**. So the
+  predicate is fully resolved in our **pre-parse shim**: extract the regex's *mandatory*
+  trigrams (pg_trgm-style analysis) → trigram candidate search → **verify the regex in Rust**
+  (the `regex` crate) over candidate column values → rewrite to `pk IN (<final pks>)`. gluesql
+  never sees `~`.
+
+**Prefix `LIKE 'foo%'`** doesn't need a trigram index — it's a **B-tree range scan**
+(`>= 'foo' AND < 'fop'`); add a planner rewrite for it. Suffix `LIKE '%foo'` and infix use
+the trigram index.
+
+**Fallbacks (match `pg_trgm`'s limits):** patterns shorter than 3 chars (`LIKE '%ab%'`) and
+regexes with no extractable mandatory trigrams (e.g. `.*`, broad alternations) can't be
+pruned → fall back to a full scan (correct, slow) with a `log()`/EXPLAIN note.
+
+Maintenance/RYW is **shared** with the BM25 index: the same sync-on-commit tap feeds the
+trigram live segment, the same seal/failover-replay model applies.
 
 ## 5. Read-your-writes — flow & guarantee
 
@@ -200,15 +239,19 @@ interval.
 ## 7. Components & isolation
 
 - `bluedb-fts` — **unchanged** engine (append/seal/search/tombstones/merge/gc).
-- **New: `LiveSegment`** — in-memory tantivy index + tombstone set on the active node;
-  `index(pk, text)`, `tombstone(pk)`, `search(query, k) -> [(pk, score)]`, `seal() ->
-  Split`. Independently testable in-memory.
+- **New: `LiveSegment`** — in-memory tantivy index + tombstone set on the active node, in
+  **two modes** (BM25 word index, trigram index); `index(pk, text)`, `tombstone(pk)`,
+  `search(query, k) -> [(pk, score)]`, `seal() -> Split`. Independently testable in-memory.
 - **New: commit tap** — a hook in `bluedb-sql`'s `StoreMut` commit emitting indexed-column
-  changes for FTS-indexed tables.
-- **New: SQL↔FTS bridge** — a **pre-parse sqlparser pass** detecting the `@@` predicate +
-  `to_tsvector`/`*_tsquery`/`ts_rank` constructs and rewriting via an injected
-  `FtsSearcher` (which fans the search over splits ∪ live), re-emitting FTS-free SQL for
-  gluesql. (Not the `Planner::plan` hook — gluesql `translate` rejects `@@` first.)
+  changes for any FTS/trigram-indexed table (shared by both index modes).
+- **New: SQL↔text bridge** — a **pre-parse sqlparser pass** detecting (a) the `@@` predicate +
+  `to_tsvector`/`*_tsquery`/`ts_rank`, (b) `LIKE '%…%'`, and (c) regex `~`/`~*`/`!~`, then
+  rewriting via an injected `FtsSearcher` (fans over splits ∪ live), re-emitting predicate-free
+  SQL for gluesql. `@@` and `~` must be pre-parse (gluesql `translate` rejects both); `LIKE`
+  could be a `Planner::plan` rewrite (survives translate) but we keep it in the same pass.
+- **New: regex verifier** — for `~`, after the trigram candidate search the shim verifies the
+  regex in Rust (the `regex` crate) over candidate values (gluesql has no regex), yielding the
+  final `pk IN (…)`. `LIKE` verification is left to gluesql (`Expr::Like`).
 - `bluedb-engine` — wires the `LiveSegment` + `FtsSearcher` into the SQL connection and
   drives the background seal scheduler (it already has the `FtsIndex` compaction scheduler
   pattern to follow).
@@ -226,6 +269,11 @@ interval.
   are lost; fresh `MATCH` is gated until caught up.
 - **Analyzer:** stemming/keyword/whitespace behave per the index definition.
 - **Injection:** the query string is a bound `$N` param end-to-end.
+- **Trigram `LIKE`:** `col LIKE '%foo%'` returns the same rows as a full scan, but via
+  trigram candidates + gluesql `LIKE` verify (assert index is consulted, not scanned).
+- **Trigram regex:** `col ~ 'pat'` matches a scan's result; mandatory-trigram extraction +
+  Rust verify; unanchored regex and <3-char patterns fall back to scan (and say so).
+- **Prefix `LIKE 'foo%'`:** served by the B-tree range rewrite, not the trigram index.
 
 ## 9. Open questions
 
@@ -242,3 +290,21 @@ interval.
   iterative widening until the page fills).
 - **Multi-column / multiple FTS indexes** per table (v1 may restrict to one indexed column
   per `@@` predicate).
+
+## 10. Deferred extensions (SQL-surfaced, post-v1)
+
+tantivy (Lucene-class) supports more than v1 ships. Each of these, **when added, is exposed
+through SQL** (an added function or index mode) — **never** a separate/standalone search API
+(per §3). v1 = PG-FTS core (`@@`/`ts_rank`) + trigram `LIKE`/regex (§4.6). Deferred:
+
+- **Fuzzy / typo-tolerance** (edit-distance) — e.g. a `fts_fuzzy(col, term, dist)` function or
+  a similarity operator (pg_trgm-style). Reuses tantivy fuzzy queries.
+- **Typeahead / autocomplete** — an edge-ngram index mode + prefix query.
+- **Faceting / aggregation counts** (ES-style, index-accelerated) — the one capability that
+  *might* justify a structured (non-SQL) response shape; revisit only if SQL `GROUP BY` over
+  candidates proves insufficient.
+- **Relevance tuning** — per-field boosting (`title^3 + body`), BM25 `k1`/`b` params,
+  `EXPLAIN`-style scoring — via index config + query options.
+
+Deferring these keeps v1 focused; none requires architectural change beyond a new function or
+index mode on the machinery this spec already builds.
