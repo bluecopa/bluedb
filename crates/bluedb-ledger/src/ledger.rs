@@ -1,7 +1,7 @@
 //! The public [`Ledger`]: built from a [`bluedb_sql::Database`], it runs the
 //! double-entry apply state machine inside that database's active writer.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use anyhow::Result;
 use bluedb_sql::{Database, WriteLease, DEFAULT_TENANT};
@@ -88,13 +88,10 @@ impl Ledger {
         let _lease = self.write_lease.lock().await; // exclusive
         let writer = self.substrate.require_writer()?; // fail fast on a replica; held for the commit
 
-        let mut working: HashMap<u128, Account> = HashMap::new();
-        // Ids of accounts an accepted transfer actually mutated — only these are
-        // written back (accounts merely read by a rejected transfer are skipped).
-        let mut dirty: HashSet<u128> = HashSet::new();
+        let mut state = ApplyState::default();
         // Transfer ids accepted in THIS batch, so a duplicate id within one call
-        // is treated as Exists (the committed-state check in stage_transfer can't
-        // see uncommitted siblings) and cannot double-apply balances.
+        // is treated as Exists (the committed-state check can't see uncommitted
+        // siblings) and cannot double-apply.
         let mut staged: HashSet<u128> = HashSet::new();
         let mut accepted: Vec<Transfer> = Vec::new();
         let mut results = Vec::with_capacity(transfers.len());
@@ -104,11 +101,9 @@ impl Ledger {
                 results.push(CreateResult::Exists);
                 continue;
             }
-            match self.stage_transfer(t, timestamp, &mut working).await? {
+            match self.stage_transfer(t, timestamp, &mut state).await? {
                 StageOutcome::Applied(applied) => {
                     staged.insert(applied.id);
-                    dirty.insert(applied.debit_account_id);
-                    dirty.insert(applied.credit_account_id);
                     accepted.push(applied);
                     results.push(CreateResult::Ok);
                 }
@@ -117,14 +112,20 @@ impl Ledger {
             }
         }
 
-        // Build one atomic batch: every mutated account + every accepted transfer.
+        // One atomic batch: every mutated account + every accepted transfer +
+        // a resolved marker for every pending resolved this batch.
         let mut batch = WriteBatch::new();
-        for account in working.values().filter(|a| dirty.contains(&a.id)) {
-            batch.put(self.keyspace.account_key(account.id), &encode(account)?);
+        for id in &state.dirty {
+            if let Some(account) = state.working.get(id) {
+                batch.put(self.keyspace.account_key(*id), &encode(account)?);
+            }
         }
         for t in &accepted {
             batch.put(self.keyspace.transfer_key(t.id), &encode(t)?);
         }
+        // (Resolved markers are written in a later task once the key exists; the
+        // set is always empty until then, so this is a harmless no-op for now.)
+        let _ = &state.resolved;
         if !batch.is_empty() {
             writer.write(batch).await?;
         }
@@ -132,15 +133,15 @@ impl Ledger {
         Ok(results)
     }
 
-    /// Validate one transfer and, if accepted, fold its balance deltas into the
-    /// `working` set and return the transfer record (stamped with `timestamp`).
-    /// `Exists` if the id is already committed; `Rejected` (no change) on a
-    /// validation failure. Errors bubble for I/O failures only.
+    /// Validate one transfer and, if accepted, fold its balance deltas into
+    /// `state` (working set + dirty ids) and return the transfer record (stamped
+    /// with `timestamp`). `Exists` if the id is already committed; `Rejected` (no
+    /// change) on validation failure. Errors bubble for I/O failures only.
     async fn stage_transfer(
         &self,
         t: &Transfer,
         timestamp: u64,
-        working: &mut HashMap<u128, Account>,
+        state: &mut ApplyState,
     ) -> Result<StageOutcome> {
         if t.debit_account_id == t.credit_account_id {
             return Ok(StageOutcome::Rejected(LedgerError::AccountsMustDiffer));
@@ -156,12 +157,11 @@ impl Ledger {
             return Ok(StageOutcome::Exists);
         }
 
-        // Load both accounts into the working set (read-through, copies).
-        let mut debit = match self.load_account(t.debit_account_id, working).await? {
+        let mut debit = match self.load_account(t.debit_account_id, state).await? {
             Some(a) => a,
             None => return Ok(StageOutcome::Rejected(LedgerError::AccountNotFound(t.debit_account_id))),
         };
-        let mut credit = match self.load_account(t.credit_account_id, working).await? {
+        let mut credit = match self.load_account(t.credit_account_id, state).await? {
             Some(a) => a,
             None => return Ok(StageOutcome::Rejected(LedgerError::AccountNotFound(t.credit_account_id))),
         };
@@ -170,7 +170,6 @@ impl Ledger {
             return Ok(StageOutcome::Rejected(LedgerError::LedgerMismatch));
         }
 
-        // Apply posted deltas with overflow checks.
         debit.debits_posted = match debit.debits_posted.checked_add(t.amount) {
             Some(v) => v,
             None => return Ok(StageOutcome::Rejected(LedgerError::Overflow)),
@@ -180,9 +179,6 @@ impl Ledger {
             None => return Ok(StageOutcome::Rejected(LedgerError::Overflow)),
         };
 
-        // Balance constraints (post-mutation, unsigned). For
-        // DEBITS_MUST_NOT_EXCEED_CREDITS: debits_posted + debits_pending must not
-        // exceed credits_posted (net debit exposure stays within credits).
         if debit.flags.contains(AccountFlags::DEBITS_MUST_NOT_EXCEED_CREDITS) {
             let debits_used = match debit.debits_posted.checked_add(debit.debits_pending) {
                 Some(v) => v,
@@ -192,7 +188,6 @@ impl Ledger {
                 return Ok(StageOutcome::Rejected(LedgerError::ExceedsCredits));
             }
         }
-        // Mirror of the debit-side check above, for the credit account.
         if credit.flags.contains(AccountFlags::CREDITS_MUST_NOT_EXCEED_DEBITS) {
             let credits_used = match credit.credits_posted.checked_add(credit.credits_pending) {
                 Some(v) => v,
@@ -203,9 +198,10 @@ impl Ledger {
             }
         }
 
-        // Accept: write the mutated copies back into the working set.
-        working.insert(debit.id, debit);
-        working.insert(credit.id, credit);
+        state.working.insert(debit.id, debit);
+        state.dirty.insert(debit.id);
+        state.working.insert(credit.id, credit);
+        state.dirty.insert(credit.id);
         Ok(StageOutcome::Applied(Transfer { timestamp, ..*t }))
     }
 
@@ -214,19 +210,31 @@ impl Ledger {
     async fn load_account(
         &self,
         id: u128,
-        working: &mut HashMap<u128, Account>,
+        state: &mut ApplyState,
     ) -> Result<Option<Account>> {
-        if let Some(a) = working.get(&id) {
+        if let Some(a) = state.working.get(&id) {
             return Ok(Some(*a));
         }
         match get_account(&self.substrate, &self.keyspace, id).await? {
             Some(a) => {
-                working.insert(id, a);
+                state.working.insert(id, a);
                 Ok(Some(a))
             }
             None => Ok(None),
         }
     }
+}
+
+/// Mutable state threaded through one `create_transfers` apply: the read-through
+/// working set of touched accounts, the ids of accounts actually mutated (only
+/// these are written back), and the ids of pending transfers resolved this batch
+/// (each gets a resolved marker). Lets a resolution mutate the *pending's*
+/// accounts and still be batched/dirtied correctly.
+#[derive(Default)]
+struct ApplyState {
+    working: std::collections::HashMap<u128, Account>,
+    dirty: std::collections::HashSet<u128>,
+    resolved: std::collections::HashSet<u128>,
 }
 
 /// The outcome of staging one transfer in [`Ledger::stage_transfer`].
