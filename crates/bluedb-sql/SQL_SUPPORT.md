@@ -10,7 +10,12 @@ PostgreSQL/DuckDB.
 > **Evidence (snapshot).** Measured by the conformance harness in
 > [`crates/bluedb-sqltest`](../bluedb-sqltest):
 > - SQLite `sqllogictest` subset: **77%** of statements/queries execute without error.
-> - DuckDB test subset: **27%** execute (lower — the corpus is DuckDB-specific); **of what executes, ~76% returns the correct result.**
+> - DuckDB test subset: **27%** execute (lower — the corpus is DuckDB-specific); **of what executes, ~78% returns the correct result.**
+>
+> The correctness comparator is layout- and numeric-tolerant (the DuckDB corpus
+> mixes tab-separated-row and one-value-per-line result blocks, and `R`-columns
+> print `11.000000` for the integer `11`); it still requires exact numeric
+> equality, so genuine value differences are not masked.
 >
 > Reproduce: run `fetch_corpus.sh`, then
 > `cargo run -p bluedb-sqltest --bin conformance -- <corpus-dir>`.

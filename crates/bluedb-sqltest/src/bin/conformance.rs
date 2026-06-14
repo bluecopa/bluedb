@@ -153,6 +153,9 @@ async fn main() -> anyhow::Result<()> {
 
         // Fresh engine per file so files never see each other's state.
         let mut runner = Runner::new(|| async { GlueTester::connect().await });
+        // The DuckDB corpus mixes tab-separated-row and one-value-per-line result
+        // layouts; accept either so correct-but-differently-laid-out results count.
+        runner.with_validator(bluedb_sqltest::lenient_validator);
 
         for record in records {
             // Only statements and queries are scored; everything else (control,
