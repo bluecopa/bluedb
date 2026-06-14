@@ -6,7 +6,7 @@ recorded history.
 
 ## What it checks
 
-Two workloads, pick with `--workload`:
+Four workloads, pick with `--workload`:
 
 **`set` (default) — grow-only set.** Clients append unique integers through the
 active writer; a final-read phase reads the whole set back. The `set-full`
@@ -22,11 +22,19 @@ Best for durability / no-lost-update under failover.
 COMMIT;` of appends + reads over several keys, sent as one `POST /sql` so it runs
 as one explicit transaction on the active writer. Elle reconstructs the
 transaction dependency graph from the observed reads and flags any
-serializability anomaly (G0/G1/G2, write skew, lost update). This exercises the
-explicit-transaction path under concurrency — the stronger guarantee that
-`set-full` doesn't cover.
+serializability anomaly (G0/G1/G2, write skew, lost update). Checked against
+`--consistency serializable` (default) or `strict-serializable` (also adds
+real-time order). Exercises the explicit-transaction path under concurrency.
 
-In both cases the cluster is driven as a single logical writer whose identity
+**`counter` — lost-update probe.** Concurrent autocommit `UPDATE cnt SET n=n+1`
+(a single-statement read-modify-write), checked with `jepsen.checker/counter`:
+any read below the count of acknowledged increments is a lost update.
+
+**`unique` — same-primary-key race.** Many clients race to `INSERT` the same
+fresh primary key; the checker flags any id acknowledged (HTTP 200) more than
+once. Uses a tiny id space + no stagger to maximize the narrow insert TOCTOU.
+
+In the set/list-append/counter cases the cluster is driven as a single logical writer whose identity
 moves on failover (bluedb's guarantee: one serial writer + async read replicas).
 The client discovers the active writer via `/admin/status` and re-discovers on a
 `503` (its node became a replica) — i.e. it follows the leader across promotions.
@@ -76,6 +84,12 @@ NODES="--node node1 --node node2 --node node3"
 # list-append workload (serializability) — baseline and through failover
 ./bin/lein run test --workload list-append --nemesis none --time-limit 60  --concurrency 10 $NODES
 ./bin/lein run test --workload list-append --nemesis mix  --time-limit 120 --concurrency 10 $NODES
+# stronger: strict-serializable (adds real-time order)
+./bin/lein run test --workload list-append --consistency strict-serializable --nemesis chaos --time-limit 150 --concurrency 10 $NODES
+
+# counter (lost-update) and unique (same-PK) — use high concurrency
+./bin/lein run test --workload counter --nemesis kill --time-limit 90 --concurrency 10 $NODES
+./bin/lein run test --workload unique  --nemesis none --time-limit 15 --concurrency 40 $NODES
 ```
 
 Results land in `store/`; `store/latest/results.edn` holds the verdict and
@@ -87,5 +101,7 @@ checker found no anomalies.
 - `src/bluedb/jepsen/http.clj` — REST/`/admin` HTTP layer + leader discovery
 - `src/bluedb/jepsen/client.clj` — leader-aware set client (add / read)
 - `src/bluedb/jepsen/list_append.clj` — Elle list-append client (txn → `/sql`)
-- `src/bluedb/jepsen/nemesis.clj` — docker-driven kill / partition / heal
+- `src/bluedb/jepsen/counter.clj` — counter client (autocommit RMW increments)
+- `src/bluedb/jepsen/unique.clj` — same-PK insert client + soundness checker
+- `src/bluedb/jepsen/nemesis.clj` — docker-driven kill / partition / pause / skew
 - `src/bluedb/jepsen/core.clj` — workloads, generator, checker, CLI

@@ -26,6 +26,7 @@
             [bluedb.jepsen.http :as h]
             [bluedb.jepsen.list-append :as la]
             [bluedb.jepsen.nemesis :as bn]
+            [bluedb.jepsen.unique :as bu]
             [clojure.tools.logging :refer [info]]
             [jepsen [cli :as cli]
                     [checker :as checker]
@@ -48,15 +49,18 @@
         (h/exec-sql! node "DROP TABLE IF EXISTS jset;")
         (h/exec-sql! node "DROP TABLE IF EXISTS la;")
         (h/exec-sql! node "DROP TABLE IF EXISTS cnt;")
+        (h/exec-sql! node "DROP TABLE IF EXISTS u;")
         (h/exec-sql! node "CREATE TABLE jset (v INTEGER);")
         (h/exec-sql! node "CREATE TABLE la (k INTEGER, v INTEGER);")
         (h/exec-sql! node "CREATE TABLE cnt (id INTEGER PRIMARY KEY, n INTEGER);")
-        (h/exec-sql! node "INSERT INTO cnt VALUES (1, 0);")))
+        (h/exec-sql! node "INSERT INTO cnt VALUES (1, 0);")
+        (h/exec-sql! node "CREATE TABLE u (id INTEGER PRIMARY KEY);")))
     (teardown! [_ _test node]
       (when (= node (h/active-node))
         (h/exec-sql! node "DROP TABLE IF EXISTS jset;")
         (h/exec-sql! node "DROP TABLE IF EXISTS la;")
-        (h/exec-sql! node "DROP TABLE IF EXISTS cnt;")))))
+        (h/exec-sql! node "DROP TABLE IF EXISTS cnt;")
+        (h/exec-sql! node "DROP TABLE IF EXISTS u;")))))
 
 (defn- set-workload
   "Grow-only set: infinite stream of unique-int adds + a final whole-set read."
@@ -67,13 +71,15 @@
    :checker         (checker/set-full {:linearizable? false})})
 
 (defn- list-append-workload
-  "Elle list-append over a handful of keys; checked for serializability."
-  [_opts]
-  (let [base (append/test {:key-count          8
+  "Elle list-append over a handful of keys; checked against the requested
+  consistency model (--consistency, default serializable)."
+  [opts]
+  (let [model (keyword (:consistency opts "serializable"))
+        base (append/test {:key-count          8
                            :min-txn-length     1
                            :max-txn-length     4
                            :max-writes-per-key 16
-                           :consistency-models [:serializable]})]
+                           :consistency-models [model]})]
     {:client          (la/client)
      :generator       (:generator base)
      :final-generator (:final-generator base)
@@ -88,6 +94,19 @@
                               (map (constantly {:type :invoke :f :read}) (range))])
    :final-generator (gen/each-thread {:type :invoke :f :read})
    :checker         (checker/counter)})
+
+(defn- unique-workload
+  "Concurrent INSERT/DELETE over a small id space; checked that the database
+  never acknowledges two inserts of the same primary key (the same-PK race)."
+  [_opts]
+  {:client          (bu/client)
+   ;; Inserts only (no reuse → sound checker). A TINY id space + no stagger +
+   ;; high concurrency maximizes the chance two clients insert the same fresh PK
+   ;; within the commit window (the narrow TOCTOU the fix closes).
+   :stagger         0
+   :generator       (repeatedly (fn [] {:type :invoke :f :insert :value (rand-int 4)}))
+   :final-generator (gen/once {:type :invoke :f :insert :value 999999})
+   :checker         (bu/checker)})
 
 (def fault-cycles
   "Maps --nemesis to the cycle of nemesis ops. Sleeps straddle the lease TTL
@@ -124,6 +143,7 @@
         wl        ((case wname
                      "list-append" list-append-workload
                      "counter"     counter-workload
+                     "unique"      unique-workload
                      set-workload)
                    opts)]
     (merge tests/noop-test
@@ -137,8 +157,8 @@
             :nodes     (vec (keys h/ports))
             :generator
             (gen/phases
-             (->> (:generator wl)
-                  (gen/stagger 1/50)
+             (->> (let [g (:generator wl), s (:stagger wl 1/50)]
+                    (if (and s (pos? s)) (gen/stagger s g) g))
                   (gen/nemesis (when (seq cycle-ops) (gen/cycle cycle-ops)))
                   (gen/time-limit (:time-limit opts 120)))
              (gen/nemesis (gen/once {:type :info :f :heal}))
@@ -159,9 +179,14 @@
     :default "mix"
     :validate [#{"kill" "partition" "partition-half" "skew" "pause" "mix" "chaos" "none"}
                "must be kill, partition, partition-half, skew, pause, mix, chaos, or none"]]
-   [nil "--workload NAME" "Workload: set | list-append | counter"
+   [nil "--workload NAME" "Workload: set | list-append | counter | unique"
     :default "set"
-    :validate [#{"set" "list-append" "counter"} "must be set, list-append, or counter"]]])
+    :validate [#{"set" "list-append" "counter" "unique"}
+               "must be set, list-append, counter, or unique"]]
+   [nil "--consistency MODEL" "list-append model: serializable | strict-serializable"
+    :default "serializable"
+    :validate [#{"serializable" "strict-serializable"}
+               "must be serializable or strict-serializable"]]])
 
 (defn -main [& args]
   (cli/run! (merge (cli/single-test-cmd {:test-fn bluedb-test :opt-spec cli-opts})
