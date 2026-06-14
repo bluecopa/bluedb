@@ -58,6 +58,26 @@ fn expiry_of(timestamp: u64, timeout: u32) -> u64 {
     timestamp.saturating_add((timeout as u64).saturating_mul(NANOS_PER_SECOND))
 }
 
+/// The effective amount of a (possibly) balancing transfer against the current
+/// debit/credit balances: `t.amount` reduced to the headroom on each balancing
+/// side so the constrained sum cannot be exceeded. Non-balancing → `t.amount`.
+fn balancing_amount(t: &Transfer, debit: &Account, credit: &Account) -> u128 {
+    let mut amount = t.amount;
+    if t.flags.contains(TransferFlags::BALANCING_DEBIT) {
+        let headroom = debit
+            .credits_posted
+            .saturating_sub(debit.debits_posted.saturating_add(debit.debits_pending));
+        amount = amount.min(headroom);
+    }
+    if t.flags.contains(TransferFlags::BALANCING_CREDIT) {
+        let headroom = credit
+            .debits_posted
+            .saturating_sub(credit.credits_posted.saturating_add(credit.credits_pending));
+        amount = amount.min(headroom);
+    }
+    amount
+}
+
 /// A double-entry ledger over one bluedb database.
 ///
 /// Construct one per use from the live [`Database`] (e.g. per request on the
@@ -357,13 +377,16 @@ impl Ledger {
         // regular/pending; materialized for post/void) or a rejection code.
         let op = classify(t);
         let staged_record: StageRecord = match op {
-            TransferOp::Regular => self.stage_regular(t, state).await?.map(|()| *t),
+            // A balancing transfer records the reduced (effective) amount.
+            TransferOp::Regular => self.stage_regular(t, state).await?.map(|amount| Transfer { amount, ..*t }),
             TransferOp::PendingReserve => {
                 // The timestamp this item will get on accept (for the
                 // timeout-overflow check); equals `ts.next(now)` since no accept
                 // happens between this peek and the accept below.
                 let prospective_ts = ts.peek(now);
-                self.stage_pending(t, prospective_ts, state).await?.map(|()| *t)
+                self.stage_pending(t, prospective_ts, state)
+                    .await?
+                    .map(|amount| Transfer { amount, ..*t })
             }
             TransferOp::Post | TransferOp::Void => {
                 let post = matches!(op, TransferOp::Post);
@@ -437,8 +460,9 @@ impl Ledger {
     /// Apply one plain posted transfer into `state`. The outer `Result` is I/O;
     /// the inner [`StageOutcome`] is the per-item validation result — `Err(code)`
     /// on the first failing TigerBeetle check (account resolution → ledger
-    /// agreement → overflow → balance constraint). On success the debit/credit
-    /// accounts are folded into `state` (not yet persisted).
+    /// agreement → overflow → balance constraint), `Ok(effective_amount)` on
+    /// accept (the amount moved, reduced for a balancing transfer). On success
+    /// the debit/credit accounts are folded into `state` (not yet persisted).
     async fn stage_regular(&self, t: &Transfer, state: &mut ApplyState) -> Result<StageOutcome> {
         use CreateTransferResult as R;
 
@@ -459,12 +483,15 @@ impl Ledger {
             return Ok(Err(R::TransferMustHaveTheSameLedgerAsAccounts));
         }
 
+        // Balancing: reduce the amount to the headroom on each balancing side.
+        let amount = balancing_amount(t, &debit, &credit);
+
         // 62 / 63: per-bucket posted overflow.
-        debit.debits_posted = match debit.debits_posted.checked_add(t.amount) {
+        debit.debits_posted = match debit.debits_posted.checked_add(amount) {
             Some(v) => v,
             None => return Ok(Err(R::OverflowsDebitsPosted)),
         };
-        credit.credits_posted = match credit.credits_posted.checked_add(t.amount) {
+        credit.credits_posted = match credit.credits_posted.checked_add(amount) {
             Some(v) => v,
             None => return Ok(Err(R::OverflowsCreditsPosted)),
         };
@@ -485,7 +512,9 @@ impl Ledger {
         // unconfirmed debits do not grant credit headroom — i.e.
         // `debits_posted + debits_pending <= credits_posted`, NOT
         // `<= credits_posted + credits_pending`. (The 64/65 checks above already
-        // proved these sums don't overflow.)
+        // proved these sums don't overflow.) A balancing side cannot trip its
+        // own check (`amount` was reduced to fit); a non-balancing constrained
+        // side is still hard-enforced here.
         if debit.flags.contains(AccountFlags::DEBITS_MUST_NOT_EXCEED_CREDITS)
             && debit.debits_posted + debit.debits_pending > debit.credits_posted
         {
@@ -501,7 +530,7 @@ impl Ledger {
         state.dirty.insert(debit.id);
         state.working.insert(credit.id, credit);
         state.dirty.insert(credit.id);
-        Ok(Ok(()))
+        Ok(Ok(amount))
     }
 
     /// Stage a two-phase **pending reserve**: move `amount` into the `*_pending`
@@ -532,12 +561,15 @@ impl Ledger {
             return Ok(Err(R::TransferMustHaveTheSameLedgerAsAccounts));
         }
 
+        // Balancing: reduce the reserved amount to the headroom on each balancing side.
+        let amount = balancing_amount(t, &debit, &credit);
+
         // 60 / 61: per-bucket pending overflow.
-        debit.debits_pending = match debit.debits_pending.checked_add(t.amount) {
+        debit.debits_pending = match debit.debits_pending.checked_add(amount) {
             Some(v) => v,
             None => return Ok(Err(R::OverflowsDebitsPending)),
         };
-        credit.credits_pending = match credit.credits_pending.checked_add(t.amount) {
+        credit.credits_pending = match credit.credits_pending.checked_add(amount) {
             Some(v) => v,
             None => return Ok(Err(R::OverflowsCreditsPending)),
         };
@@ -579,7 +611,7 @@ impl Ledger {
         state.dirty.insert(debit.id);
         state.working.insert(credit.id, credit);
         state.dirty.insert(credit.id);
-        Ok(Ok(()))
+        Ok(Ok(amount))
     }
 
     /// Stage a **post** (`post == true`) or **void** (`false`) of the pending
@@ -764,10 +796,11 @@ impl TimestampSource {
     }
 }
 
-/// The per-item validation result of staging one transfer: `Ok(())` accepted,
-/// `Err(code)` rejected with a TigerBeetle result code. Distinct from the I/O
+/// The per-item validation result of staging one regular/pending movement:
+/// `Ok(effective_amount)` accepted (the amount actually moved, reduced for a
+/// balancing transfer), `Err(code)` rejected. Distinct from the I/O
 /// `anyhow::Result` that wraps it.
-type StageOutcome = std::result::Result<(), CreateTransferResult>;
+type StageOutcome = std::result::Result<u128, CreateTransferResult>;
 
 /// Like [`StageOutcome`] but carries the (materialized) transfer to persist on
 /// accept — used by [`Ledger::stage_resolution`], which fills inherited fields.
@@ -961,10 +994,8 @@ mod tests {
         let db = writer_database().await;
         let l = Ledger::new(&db);
         setup_two_accounts(&l).await;
-        // Later-phase flags still gate (balancing E, imported G; closing F via pending).
-        for f in [TransferFlags::BALANCING_DEBIT, TransferFlags::BALANCING_CREDIT, TransferFlags::IMPORTED] {
-            assert_eq!(l.create_transfers(&[xfer(1, 1, 2, 5).with_flags(f)]).await.unwrap(), vec![R::NotImplementedYet]);
-        }
+        // Later-phase flags still gate (imported G; closing F via pending).
+        assert_eq!(l.create_transfers(&[xfer(1, 1, 2, 5).with_flags(TransferFlags::IMPORTED)]).await.unwrap(), vec![R::NotImplementedYet]);
         // A closing transfer (requires pending) is gated to Phase F.
         let closing = xfer(1, 1, 2, 5).with_flags(TransferFlags::PENDING | TransferFlags::CLOSING_DEBIT);
         assert_eq!(l.create_transfers(&[closing]).await.unwrap(), vec![R::NotImplementedYet]);
@@ -1515,6 +1546,122 @@ mod tests {
         assert_eq!(l.create_transfers(&batch).await.unwrap(), vec![R::Exists, R::Exists]);
         // Balances unchanged (applied exactly once).
         assert_eq!(l.lookup_account(2).await.unwrap().unwrap().credits_posted, 100);
+    }
+
+    // ---- Phase E: balancing transfers ----
+
+    /// Give `account` real `credits_posted` of `amount` by a posted `other → account`.
+    async fn fund_credits(l: &Ledger, id: u128, other: u128, account: u128, amount: u128) {
+        l.create_transfers(&[xfer(id, other, account, amount)]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn balancing_debit_reduces_to_headroom() {
+        use CreateTransferResult as R;
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
+        // Give account 1 credits_posted = 50 (2 → 1).
+        fund_credits(&l, 1, 2, 1, 50).await;
+        // balancing_debit 1 → 2 of 200 transfers only the 50 of headroom.
+        let bd = xfer(2, 1, 2, 200).with_flags(TransferFlags::BALANCING_DEBIT);
+        assert_eq!(l.create_transfers(&[bd]).await.unwrap(), vec![R::Created]);
+        let a1 = l.lookup_account(1).await.unwrap().unwrap();
+        assert_eq!(a1.debits_posted, 50, "reduced to credits_posted headroom");
+        assert_eq!(l.lookup_transfer(2).await.unwrap().unwrap().amount, 50, "records reduced amount");
+    }
+
+    #[tokio::test]
+    async fn balancing_debit_zero_headroom_transfers_zero() {
+        use CreateTransferResult as R;
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
+        // No credits on account 1 → headroom 0 → transfers 0, still Created.
+        let bd = xfer(1, 1, 2, 100).with_flags(TransferFlags::BALANCING_DEBIT);
+        assert_eq!(l.create_transfers(&[bd]).await.unwrap(), vec![R::Created]);
+        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_posted, 0);
+        assert_eq!(l.lookup_transfer(1).await.unwrap().unwrap().amount, 0);
+    }
+
+    #[tokio::test]
+    async fn balancing_credit_reduces_to_headroom() {
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
+        // Give account 2 debits_posted = 30 (2 → 1).
+        fund_credits(&l, 1, 2, 1, 30).await; // account 2 debits_posted = 30
+        // balancing_credit 1 → 2 of 100 transfers only 30 (credit headroom).
+        let bc = xfer(2, 1, 2, 100).with_flags(TransferFlags::BALANCING_CREDIT);
+        l.create_transfers(&[bc]).await.unwrap();
+        assert_eq!(l.lookup_account(2).await.unwrap().unwrap().credits_posted, 30);
+        assert_eq!(l.lookup_transfer(2).await.unwrap().unwrap().amount, 30);
+    }
+
+    #[tokio::test]
+    async fn balancing_both_flags_takes_min_headroom() {
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        l.create_accounts(&[acct(1, 7), acct(2, 7), acct(3, 7)]).await.unwrap();
+        // Account 1 credits_posted = 40 (debit headroom 40); account 2 debits_posted = 25 (credit headroom 25).
+        fund_credits(&l, 1, 3, 1, 40).await; // 1.credits_posted = 40
+        fund_credits(&l, 2, 2, 3, 25).await; // 2.debits_posted = 25
+        let b = xfer(3, 1, 2, 100).with_flags(TransferFlags::BALANCING_DEBIT | TransferFlags::BALANCING_CREDIT);
+        l.create_transfers(&[b]).await.unwrap();
+        assert_eq!(l.lookup_transfer(3).await.unwrap().unwrap().amount, 25, "min(40, 25)");
+    }
+
+    #[tokio::test]
+    async fn balancing_pending_reserves_reduced_then_posts() {
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
+        fund_credits(&l, 1, 2, 1, 60).await; // 1.credits_posted = 60
+        // balancing_debit | pending of 100 reserves 60.
+        let bp = xfer(2, 1, 2, 100).with_flags(TransferFlags::BALANCING_DEBIT | TransferFlags::PENDING);
+        l.create_transfers(&[bp]).await.unwrap();
+        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_pending, 60);
+        assert_eq!(l.lookup_transfer(2).await.unwrap().unwrap().amount, 60, "pending records reduced amount");
+        // Post the full reservation (60).
+        assert_eq!(l.create_transfers(&[post(3, 2, AMOUNT_MAX)]).await.unwrap(), vec![CreateTransferResult::Created]);
+        let a1 = l.lookup_account(1).await.unwrap().unwrap();
+        assert_eq!((a1.debits_pending, a1.debits_posted), (0, 60));
+    }
+
+    #[tokio::test]
+    async fn balancing_debit_still_checks_credit_constraint() {
+        use CreateTransferResult as R;
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        // Account 2 is credits_must_not_exceed_debits with 0 debits.
+        l.create_accounts(&[acct(1, 7), acct(2, 7).with_flags(AccountFlags::CREDITS_MUST_NOT_EXCEED_DEBITS)]).await.unwrap();
+        // Give account 1 headroom so balancing_debit doesn't reduce to 0.
+        fund_credits(&l, 1, 2, 1, 50).await; // also gives account 2 debits_posted = 50
+        // Now account 2 has debits_posted 50, credits_posted 0 → credit headroom 50.
+        // balancing_debit 1→2 of 100 reduces to debit headroom (1.credits_posted=50),
+        // and 2's credit constraint allows up to 50 → ok here. Make it fail: drain 2's debit room.
+        // Simpler: a fresh credit-constrained account with 0 debits rejects any credit.
+        l.create_accounts(&[acct(3, 7).with_flags(AccountFlags::CREDITS_MUST_NOT_EXCEED_DEBITS)]).await.unwrap();
+        fund_credits(&l, 2, 2, 1, 20).await; // 1.credits_posted now 70
+        let bd = xfer(3, 1, 3, 100).with_flags(TransferFlags::BALANCING_DEBIT);
+        // debit headroom = 1.credits_posted(70) - debits(50) = 20; reduced to 20.
+        // account 3 credits_must_not_exceed_debits, debits 0 → exceeds_debits.
+        assert_eq!(l.create_transfers(&[bd]).await.unwrap(), vec![R::ExceedsDebits]);
+        assert!(l.lookup_transfer(3).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn balancing_in_linked_chain() {
+        use CreateTransferResult as R;
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
+        fund_credits(&l, 1, 2, 1, 50).await;
+        // [balancing_debit(linked, reduces to 50), terminator] both commit.
+        let bd = xfer(2, 1, 2, 200).with_flags(TransferFlags::BALANCING_DEBIT | TransferFlags::LINKED);
+        let res = l.create_transfers(&[bd, xfer(3, 2, 1, 5)]).await.unwrap();
+        assert_eq!(res, vec![R::Created, R::Created]);
+        assert_eq!(l.lookup_transfer(2).await.unwrap().unwrap().amount, 50);
     }
 
     #[tokio::test]

@@ -354,17 +354,12 @@ pub(crate) enum TransferOp {
     Gated,
 }
 
-/// Classify a transfer that has already passed input validation. `LINKED` is
-/// orthogonal to the op (handled by the chain driver), so it does not affect the
-/// classification.
+/// Classify a transfer that has already passed input validation. `LINKED` and
+/// the `BALANCING_*` flags are orthogonal to the op (handled by the chain driver
+/// and the apply paths respectively), so they do not affect the classification.
 pub(crate) fn classify(t: &Transfer) -> TransferOp {
     use TransferFlags as F;
-    if t.flags.contains(F::BALANCING_DEBIT)
-        || t.flags.contains(F::BALANCING_CREDIT)
-        || t.flags.contains(F::CLOSING_DEBIT)
-        || t.flags.contains(F::CLOSING_CREDIT)
-        || t.flags.contains(F::IMPORTED)
-    {
+    if t.flags.contains(F::CLOSING_DEBIT) || t.flags.contains(F::CLOSING_CREDIT) || t.flags.contains(F::IMPORTED) {
         return TransferOp::Gated;
     }
     if t.flags.contains(F::POST_PENDING_TRANSFER) {
@@ -734,7 +729,9 @@ mod tests {
         assert_eq!(classify(&t(F::VOID_PENDING_TRANSFER, 0)), TransferOp::Void);
         assert_eq!(classify(&t(F::LINKED, 0)), TransferOp::Regular); // LINKED is orthogonal
         assert_eq!(classify(&t(F::LINKED | F::PENDING, 0)), TransferOp::PendingReserve);
-        assert_eq!(classify(&t(F::BALANCING_DEBIT, 0)), TransferOp::Gated);
+        assert_eq!(classify(&t(F::BALANCING_DEBIT, 0)), TransferOp::Regular); // balancing is orthogonal
+        assert_eq!(classify(&t(F::BALANCING_CREDIT | F::PENDING, 0)), TransferOp::PendingReserve);
+        assert_eq!(classify(&t(F::IMPORTED, 0)), TransferOp::Gated); // imported → Phase G
         assert_eq!(classify(&t(F::PENDING | F::CLOSING_DEBIT, 0)), TransferOp::Gated); // closing → Phase F
     }
 
