@@ -1464,6 +1464,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn linked_chain_first_member_is_offender() {
+        use CreateTransferResult as R;
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
+        // The FIRST member fails (offender=0); the terminator gets LinkedEventFailed.
+        let res = l.create_transfers(&[linked_xfer(10, 1, 99, 5), xfer(11, 1, 2, 5)]).await.unwrap();
+        assert_eq!(res, vec![R::CreditAccountNotFound, R::LinkedEventFailed]);
+        assert!(l.lookup_transfer(11).await.unwrap().is_none());
+        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_posted, 0);
+    }
+
+    #[tokio::test]
+    async fn transfer_open_chain_is_rejected() {
+        use CreateTransferResult as R;
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
+        // A lone trailing LINKED transfer (no terminator) → chain open, not applied.
+        assert_eq!(l.create_transfers(&[linked_xfer(10, 1, 2, 5)]).await.unwrap(), vec![R::LinkedEventChainOpen]);
+        assert!(l.lookup_transfer(10).await.unwrap().is_none());
+        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_posted, 0);
+    }
+
+    #[tokio::test]
     async fn linked_two_phase_chain() {
         use CreateTransferResult as R;
         let db = writer_database().await;
