@@ -581,7 +581,9 @@ pub(crate) fn transfer_exists_result(incoming: &Transfer, existing: &Transfer) -
     if differs(resolution, incoming.credit_account_id, existing.credit_account_id) {
         return R::ExistsWithDifferentCreditAccountId;
     }
-    // amount: the resolution wildcard is the sentinel, not zero.
+    // amount is special-cased because its resolution wildcard is a sentinel, not
+    // zero: `AMOUNT_MAX` for a post (void's wildcard happens to be 0, so it could
+    // use `differs`, but both are handled here for symmetry).
     let amount_wildcard = if incoming.flags.contains(F::POST_PENDING_TRANSFER) { AMOUNT_MAX } else { 0 };
     let amount_differs = if resolution {
         incoming.amount != amount_wildcard && incoming.amount != existing.amount

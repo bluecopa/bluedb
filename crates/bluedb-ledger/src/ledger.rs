@@ -1,12 +1,13 @@
 //! The public [`Ledger`]: built from a [`bluedb_sql::Database`], it runs the
 //! double-entry apply state machine inside that database's active writer.
 //!
-//! Phase A implements TigerBeetle's `create_accounts` exactly and **regular
-//! posted** transfers exactly, with the full per-item result-code surface and
-//! TB's input-validation ordering. Two-phase (pending/post/void), linked,
-//! balancing, closing, imported, and timeout behaviour are gated to later
-//! phases and return [`CreateTransferResult::NotImplementedYet`] /
-//! [`CreateAccountResult::NotImplementedYet`].
+//! Implements TigerBeetle's `create_accounts` exactly and, for transfers,
+//! **regular posted** plus **two-phase** (pending reserve / post / void)
+//! transfers exactly, with the full per-item result-code surface and TB's
+//! input-validation ordering. Still gated to later phases (returning
+//! [`CreateTransferResult::NotImplementedYet`] / `CreateAccountResult::NotImplementedYet`):
+//! linked chains, balancing, closing, imported events, and pending transfers
+//! with a nonzero timeout.
 
 use std::collections::{HashMap, HashSet};
 
@@ -114,12 +115,13 @@ impl Ledger {
     }
 
     /// Apply transfers (batch). Each item is validated against TigerBeetle's
-    /// `create_transfers` check ordering. Phase A applies only **regular posted**
-    /// transfers; anything requiring a later-phase feature (any flag, a nonzero
-    /// timeout, or a pending reference) returns
-    /// [`CreateTransferResult::NotImplementedYet`]. Accepted transfers are
-    /// assigned an engine timestamp; all mutated accounts + accepted transfers
-    /// commit in one atomic batch. Requires the active writer.
+    /// `create_transfers` check ordering, then classified and applied: regular
+    /// posted movements, pending reserves, and post/void resolutions. Features
+    /// gated to later phases (linked, balancing, closing, imported, pending with
+    /// a nonzero timeout) return [`CreateTransferResult::NotImplementedYet`].
+    /// Accepted transfers are assigned an engine timestamp; all mutated accounts,
+    /// accepted transfers, and pending-state records commit in one atomic batch.
+    /// Requires the active writer.
     pub async fn create_transfers(&self, transfers: &[Transfer]) -> Result<Vec<CreateTransferResult>> {
         use CreateTransferResult as R;
         let _lease = self.write_lease.lock().await; // exclusive
@@ -154,7 +156,7 @@ impl Ledger {
             // Classify and apply. Each arm yields the record to persist (raw for
             // regular/pending; materialized for post/void) or a rejection code.
             let op = classify(t);
-            let staged_record: std::result::Result<Transfer, CreateTransferResult> = match op {
+            let staged_record: StageRecord = match op {
                 TransferOp::Regular => self.stage_regular(t, &mut state).await?.map(|()| *t),
                 TransferOp::PendingReserve => self.stage_pending(t, &mut state).await?.map(|()| *t),
                 TransferOp::Post | TransferOp::Void => {
@@ -346,7 +348,7 @@ impl Ledger {
         pending: Option<Transfer>,
         post: bool,
         state: &mut ApplyState,
-    ) -> Result<std::result::Result<Transfer, CreateTransferResult>> {
+    ) -> Result<StageRecord> {
         use crate::model::TransferFlags as F;
         use CreateTransferResult as R;
 
@@ -495,6 +497,10 @@ impl TimestampSource {
 /// `Err(code)` rejected with a TigerBeetle result code. Distinct from the I/O
 /// `anyhow::Result` that wraps it.
 type StageOutcome = std::result::Result<(), CreateTransferResult>;
+
+/// Like [`StageOutcome`] but carries the (materialized) transfer to persist on
+/// accept — used by [`Ledger::stage_resolution`], which fills inherited fields.
+type StageRecord = std::result::Result<Transfer, CreateTransferResult>;
 
 /// Mutable state threaded through one `create_transfers` apply: the read-through
 /// working set of touched accounts, the ids of accounts actually mutated (only
@@ -800,6 +806,44 @@ mod tests {
         // Void with the exact pending amount also works.
         reserve(&l, 600, 1, 2, 40).await;
         assert_eq!(l.create_transfers(&[void(601, 600, 40)]).await.unwrap(), vec![CreateTransferResult::Created]);
+    }
+
+    #[tokio::test]
+    async fn void_materialized_record_inherits_pending() {
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        l.create_accounts(&[acct(1, 7).with_code(3), acct(2, 7).with_code(3)]).await.unwrap();
+        // Reserve with code 3; void with all-zero inheritable fields.
+        let mut p = xfer(500, 1, 2, 100).with_code(3);
+        p.flags = TransferFlags::PENDING;
+        l.create_transfers(&[p]).await.unwrap();
+        assert_eq!(l.create_transfers(&[void(501, 500, 0)]).await.unwrap(), vec![CreateTransferResult::Created]);
+        let stored = l.lookup_transfer(501).await.unwrap().unwrap();
+        // Inherited accounts/ledger/code; amount materialized to the full pending amount.
+        assert_eq!(
+            (stored.debit_account_id, stored.credit_account_id, stored.ledger, stored.code, stored.amount),
+            (1, 2, 7, 3, 100)
+        );
+    }
+
+    #[tokio::test]
+    async fn in_batch_double_resolve_is_rejected() {
+        use CreateTransferResult as R;
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        setup_two_accounts(&l).await;
+        // Reserve, post, and post-again all in ONE batch: the in-batch resolved
+        // set (not committed state) must reject the second resolution.
+        let mut p = xfer(500, 1, 2, 100);
+        p.flags = TransferFlags::PENDING;
+        let res = l
+            .create_transfers(&[p, post(501, 500, AMOUNT_MAX), post(502, 500, AMOUNT_MAX), void(503, 500, 0)])
+            .await
+            .unwrap();
+        assert_eq!(res, vec![R::Created, R::Created, R::PendingTransferAlreadyPosted, R::PendingTransferAlreadyPosted]);
+        // Settled exactly once.
+        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_posted, 100);
+        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_pending, 0);
     }
 
     #[tokio::test]
