@@ -9,7 +9,7 @@ use bluedb_storage::Substrate;
 use slatedb::WriteBatch;
 
 use crate::keyspace::LedgerKeyspace;
-use crate::model::{Account, CreateResult, LedgerError, NewAccount, Transfer};
+use crate::model::{Account, AccountFlags, CreateResult, LedgerError, NewAccount, Transfer};
 use crate::store::{encode, get_account, get_transfer};
 
 /// A double-entry ledger over one bluedb database.
@@ -165,7 +165,28 @@ impl Ledger {
             None => return Ok(StageOutcome::Rejected(LedgerError::Overflow)),
         };
 
-        // (Balance-constraint checks added in Task 10.)
+        // Balance constraints (post-mutation, unsigned). For
+        // DEBITS_MUST_NOT_EXCEED_CREDITS: debits_posted + debits_pending must not
+        // exceed credits_posted (net debit exposure stays within credits).
+        if debit.flags.contains(AccountFlags::DEBITS_MUST_NOT_EXCEED_CREDITS) {
+            let debits_used = match debit.debits_posted.checked_add(debit.debits_pending) {
+                Some(v) => v,
+                None => return Ok(StageOutcome::Rejected(LedgerError::Overflow)),
+            };
+            if debits_used > debit.credits_posted {
+                return Ok(StageOutcome::Rejected(LedgerError::ExceedsCredits));
+            }
+        }
+        // Mirror of the debit-side check above, for the credit account.
+        if credit.flags.contains(AccountFlags::CREDITS_MUST_NOT_EXCEED_DEBITS) {
+            let credits_used = match credit.credits_posted.checked_add(credit.credits_pending) {
+                Some(v) => v,
+                None => return Ok(StageOutcome::Rejected(LedgerError::Overflow)),
+            };
+            if credits_used > credit.debits_posted {
+                return Ok(StageOutcome::Rejected(LedgerError::ExceedsDebits));
+            }
+        }
 
         // Accept: write the mutated copies back into the working set.
         working.insert(debit.id, debit);
@@ -352,6 +373,75 @@ mod tests {
         // The overflowing transfer applied nothing and was not persisted.
         assert_eq!(ledger.lookup_account(1).await.unwrap().unwrap().debits_posted, 10);
         assert!(ledger.lookup_transfer(2).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn debits_must_not_exceed_credits_is_enforced() {
+        use crate::model::{AccountFlags, CreateResult, LedgerError, NewAccount, Transfer};
+        let database = writer_database().await;
+        let ledger = Ledger::new(&database);
+        // Account 1 may not let debits_posted exceed its credits_posted.
+        ledger
+            .create_accounts(
+                &[
+                    NewAccount::new(1, 7).with_flags(AccountFlags::DEBITS_MUST_NOT_EXCEED_CREDITS),
+                    NewAccount::new(2, 7),
+                ],
+                1,
+            )
+            .await
+            .unwrap();
+
+        // With zero credits, any debit on account 1 breaches the constraint.
+        let r = ledger.create_transfers(&[Transfer::new(10, 1, 2, 100, 7)], 2).await.unwrap();
+        assert_eq!(r, vec![CreateResult::Failed(LedgerError::ExceedsCredits)]);
+        assert_eq!(ledger.lookup_account(1).await.unwrap().unwrap().debits_posted, 0);
+
+        // Give account 1 some credits first (2 → 1), then an equal debit is fine.
+        assert_eq!(
+            ledger.create_transfers(&[Transfer::new(11, 2, 1, 100, 7)], 3).await.unwrap(),
+            vec![CreateResult::Ok]
+        );
+        assert_eq!(
+            ledger.create_transfers(&[Transfer::new(12, 1, 2, 100, 7)], 4).await.unwrap(),
+            vec![CreateResult::Ok]
+        );
+        // But one more unit over its credits is rejected.
+        let r = ledger.create_transfers(&[Transfer::new(13, 1, 2, 1, 7)], 5).await.unwrap();
+        assert_eq!(r, vec![CreateResult::Failed(LedgerError::ExceedsCredits)]);
+    }
+
+    #[tokio::test]
+    async fn credits_must_not_exceed_debits_is_enforced() {
+        use crate::model::{AccountFlags, CreateResult, LedgerError, NewAccount, Transfer};
+        let database = writer_database().await;
+        let ledger = Ledger::new(&database);
+        ledger
+            .create_accounts(
+                &[
+                    NewAccount::new(1, 7),
+                    NewAccount::new(2, 7).with_flags(AccountFlags::CREDITS_MUST_NOT_EXCEED_DEBITS),
+                ],
+                1,
+            )
+            .await
+            .unwrap();
+        // Crediting account 2 (1 → 2) with no debits on 2 breaches its constraint.
+        let r = ledger.create_transfers(&[Transfer::new(20, 1, 2, 100, 7)], 2).await.unwrap();
+        assert_eq!(r, vec![CreateResult::Failed(LedgerError::ExceedsDebits)]);
+
+        // Give account 2 some debits first (2 → 1), then an equal credit is fine.
+        assert_eq!(
+            ledger.create_transfers(&[Transfer::new(21, 2, 1, 100, 7)], 3).await.unwrap(),
+            vec![CreateResult::Ok]
+        );
+        assert_eq!(
+            ledger.create_transfers(&[Transfer::new(22, 1, 2, 100, 7)], 4).await.unwrap(),
+            vec![CreateResult::Ok]
+        );
+        // One more unit over its debits is rejected.
+        let r = ledger.create_transfers(&[Transfer::new(23, 1, 2, 1, 7)], 5).await.unwrap();
+        assert_eq!(r, vec![CreateResult::Failed(LedgerError::ExceedsDebits)]);
     }
 
     #[tokio::test]
