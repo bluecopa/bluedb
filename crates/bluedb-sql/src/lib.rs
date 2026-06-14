@@ -71,4 +71,4 @@ pub use connection::Database;
 pub use error::SqlError;
 pub use keyspace::{Keyspace, DEFAULT_TENANT, TAG_EXTERNAL_BASE};
 pub use registry::SchemaRegistry;
-pub use storage::{SlateDbStorage, WriteLease};
+pub use storage::{CommitObserver, RowChange, SlateDbStorage, WriteLease};

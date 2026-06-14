@@ -133,6 +133,25 @@ struct StoredRow {
     row: DataRow,
 }
 
+/// A single committed row change reported to a [`CommitObserver`] after the
+/// durable write. `row` is `Some` for an insert/update (the new row), `None`
+/// for a delete.
+#[derive(Debug, Clone)]
+pub struct RowChange {
+    pub table: String,
+    pub key: Key,
+    pub row: Option<DataRow>,
+}
+
+/// Observes committed row changes on a [`SlateDbStorage`] connection — the seam
+/// the FTS engine uses to maintain its live index synchronously with SQL commit
+/// (Spec B §4.2). Called **after** the durable `WriteBatch` write succeeds, so
+/// an observer never sees a change that didn't commit. `on_commit` runs inline
+/// on the commit path: keep it cheap (in-memory work only).
+pub trait CommitObserver: Send + Sync {
+    fn on_commit(&self, changes: &[RowChange]);
+}
+
 /// State for an in-flight transaction. Every statement on the writer runs
 /// inside one of these (autocommit statements get a short-lived one — see
 /// [`SlateDbStorage::begin`]); explicit `BEGIN ... COMMIT` blocks keep one open
@@ -160,6 +179,11 @@ struct TxnState {
     /// inserts of the same primary key can't both succeed (the loser aborts with
     /// [`SqlError::UniqueViolation`]).
     unique_checks: Vec<Vec<u8>>,
+    /// Decoded row mutations this txn made, buffered for the
+    /// [`CommitObserver`] and flushed to it **after** the durable commit write
+    /// (Spec B §4.2). Only populated when an observer is installed; empty
+    /// otherwise so non-observed commits pay nothing.
+    changes: Vec<RowChange>,
 }
 
 /// GlueSQL custom storage over a SlateDB database.
@@ -189,6 +213,11 @@ pub struct SlateDbStorage {
     /// can RMW (`/sql`, `PATCH`, `DELETE`); left off for the append/insert path
     /// so it keeps group-committing. See [`SlateDbStorage::serialize_writes`].
     serialize_writes: bool,
+    /// Optional commit observer (e.g. the FTS live-index maintainer). When set,
+    /// data mutations are buffered as decoded [`RowChange`]s and reported via
+    /// [`CommitObserver::on_commit`] after the durable commit write. `None` by
+    /// default → zero behavior change and no per-row clone cost.
+    commit_observer: Option<Arc<dyn CommitObserver>>,
     /// `Some` while a `BEGIN ... COMMIT/ROLLBACK` block is open.
     txn: Option<TxnState>,
 }
@@ -235,6 +264,7 @@ impl SlateDbStorage {
             insert_lock,
             seq,
             serialize_writes: false,
+            commit_observer: None,
             txn: None,
         }
     }
@@ -247,6 +277,30 @@ impl SlateDbStorage {
     pub fn serialize_writes(mut self) -> Self {
         self.serialize_writes = true;
         self
+    }
+
+    /// Install a commit observer (e.g. the FTS live-index maintainer). Reported
+    /// changes are decoded row mutations, emitted after the durable commit write.
+    pub fn with_commit_observer(mut self, observer: Arc<dyn CommitObserver>) -> Self {
+        self.commit_observer = Some(observer);
+        self
+    }
+
+    /// Buffer a row change for the commit observer, but only when one is
+    /// installed and a txn is active (gluesql always runs statements inside a
+    /// txn). The caller guards the (potentially cloning) call site on
+    /// `commit_observer.is_some()` so a non-observed commit pays nothing.
+    fn record_change(&mut self, table: &str, key: Key, row: Option<DataRow>) {
+        if self.commit_observer.is_none() {
+            return;
+        }
+        if let Some(txn) = self.txn.as_mut() {
+            txn.changes.push(RowChange {
+                table: table.to_string(),
+                key,
+                row,
+            });
+        }
     }
 
     /// The writer handle, or a read-only error if this connection is a replica.
@@ -637,6 +691,11 @@ impl StoreMut for SlateDbStorage {
             let storage_key = self.keyspace.row_key(table_name, &key)?;
             self.apply_index_entries(table_name, &key, &row, true)
                 .await?;
+            // Commit tap: buffer the committed insert for the observer (guarded
+            // so the clone only happens when an observer is installed).
+            if self.commit_observer.is_some() {
+                self.record_change(table_name, key.clone(), Some(row.clone()));
+            }
             let stored = StoredRow {
                 key: key.clone(),
                 row,
@@ -662,6 +721,11 @@ impl StoreMut for SlateDbStorage {
             }
             self.apply_index_entries(table_name, &key, &row, true)
                 .await?;
+            // Commit tap: buffer the committed insert/update (UPDATE re-inserts
+            // the same key with the new row → the engine's `index()` supersedes).
+            if self.commit_observer.is_some() {
+                self.record_change(table_name, key.clone(), Some(row.clone()));
+            }
             let stored = StoredRow {
                 key: key.clone(),
                 row,
@@ -678,6 +742,10 @@ impl StoreMut for SlateDbStorage {
                 let old: StoredRow = decode(&bytes)?;
                 self.apply_index_entries(table_name, &key, &old.row, false)
                     .await?;
+            }
+            // Commit tap: buffer the committed delete (row None).
+            if self.commit_observer.is_some() {
+                self.record_change(table_name, key.clone(), None);
             }
             self.delete_key(storage_key).await?;
         }
@@ -732,6 +800,7 @@ impl Transaction for SlateDbStorage {
             snapshot,
             _lease: lease,
             unique_checks: Vec::new(),
+            changes: Vec::new(),
         });
         // Return `autocommit` so GlueSQL commits after a plain statement; the
         // value is ignored for the explicit `StartTransaction` statement.
@@ -775,13 +844,22 @@ impl Transaction for SlateDbStorage {
                     }
                 }
                 let mut batch = WriteBatch::new();
-                for (key, op) in txn.overlay {
+                // Borrow the overlay so `txn.changes` is still usable after the
+                // write to fire the observer (Spec B §4.2).
+                for (key, op) in &txn.overlay {
                     match op {
-                        Some(value) => batch.put(&key, &value),
-                        None => batch.delete(&key),
+                        Some(value) => batch.put(key, value),
+                        None => batch.delete(key),
                     }
                 }
                 self.writer()?.write(batch).await.map_err(SqlError::from)?;
+                // Commit tap: the durable write succeeded → report the buffered
+                // changes. An observer thus never sees a change that didn't commit.
+                if let Some(obs) = self.commit_observer.as_ref() {
+                    if !txn.changes.is_empty() {
+                        obs.on_commit(&txn.changes);
+                    }
+                }
             }
         }
         Ok(())
