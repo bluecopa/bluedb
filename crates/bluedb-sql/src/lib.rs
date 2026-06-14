@@ -61,6 +61,7 @@
 //! [`bluedb-storage`]: https://docs.rs/bluedb-storage
 //! [`bluedb-fts`]: https://docs.rs/bluedb-fts
 
+mod coerce;
 mod connection;
 mod cte;
 mod error;

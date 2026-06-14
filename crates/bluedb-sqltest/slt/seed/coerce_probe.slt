@@ -1,0 +1,38 @@
+# Probe for implicit text<->number coercion (bluedb-sql coerce pass).
+# Without coercion, `id = '5'` takes GlueSQL's (Number, Text) path and matches
+# nothing, so these queries return 0 rows and FAIL. With coercion they PASS.
+
+statement ok
+CREATE TABLE t (id INTEGER PRIMARY KEY, price DECIMAL, code TEXT)
+
+statement ok
+INSERT INTO t VALUES (5, 9.99, 'x')
+
+# numeric column = quoted number
+query I
+SELECT id FROM t WHERE id = '5'
+----
+5
+
+# decimal column = quoted number
+query I
+SELECT id FROM t WHERE price = '9.99'
+----
+5
+
+# ordering across the text/number boundary
+query I
+SELECT id FROM t WHERE id < '6'
+----
+5
+
+# text literal vs number literal (the documented `'1' = 1` gotcha)
+query I
+SELECT id FROM t WHERE '5' = 5
+----
+5
+
+# a real text column must NOT be coerced — string compare, no match, 0 rows
+query I
+SELECT id FROM t WHERE code = 5
+----

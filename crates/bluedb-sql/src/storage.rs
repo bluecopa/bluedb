@@ -800,12 +800,17 @@ impl Metadata for SlateDbStorage {}
 impl CustomFunction for SlateDbStorage {}
 impl CustomFunctionMut for SlateDbStorage {}
 impl AlterTable for SlateDbStorage {}
-// Override the default planner to add equi-join predicate pushdown before
-// gluesql's `plan_join` runs: the comma-join shim leaves join keys in the
-// `WHERE` as `... JOIN b ON TRUE`, and pushing them into the `ON` lets
-// `plan_join` build hash joins instead of nested-loop cartesian products.
-// All passes below are gluesql's own public plan helpers; this is the same
-// pipeline as the default `plan()` with our pass inserted.
+// Override the default planner with two schema-aware passes inserted into
+// gluesql's own plan pipeline (`fetch_schema_map` gives us column types here):
+//   1. `pushdown_equijoins` — the comma-join shim leaves join keys in the
+//      `WHERE` as `... JOIN b ON TRUE`; pushing them into the `ON` lets
+//      `plan_join` build hash joins instead of nested-loop cartesian products
+//      (`reject_cross_products` fast-fails anything left without a key).
+//   2. `coerce_comparisons` — insert implicit `CAST`s so a numeric operand vs a
+//      numeric string literal compares numerically, instead of GlueSQL's silent
+//      text/number mismatch. See `crate::coerce`.
+// Everything else is gluesql's own public plan helpers; this is the default
+// `plan()` pipeline with our two passes inserted.
 #[async_trait]
 impl Planner for SlateDbStorage {
     async fn plan(
@@ -818,6 +823,7 @@ impl Planner for SlateDbStorage {
         validate(&schema_map, &statement)?;
         let statement = crate::pushdown::pushdown_equijoins(&schema_map, statement);
         crate::pushdown::reject_cross_products(&statement)?;
+        let statement = crate::coerce::coerce_comparisons(&schema_map, statement);
         let statement = plan_primary_key(&schema_map, statement);
         let statement = plan_join(&schema_map, statement);
         Ok(statement)

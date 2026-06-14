@@ -27,10 +27,13 @@ The rewrite shim (in `bluedb-sql`) applies, in order:
 2. **Set-op rewrite** — `UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT` → joins / `IN`-subqueries.
 3. **Comma-join fold + type normalization** — `FROM a, b` → `a JOIN b ON TRUE`; `VARCHAR(n)`→`TEXT`, `DECIMAL(p,s)`→`DECIMAL`, `INT(n)`/`BIGINT`/…→`INTEGER`.
 
-Then GlueSQL's **`Planner` hook** pushes equi-join predicates from `WHERE` into
-the join `ON` (so GlueSQL builds **hash joins**, not nested-loop cross products),
-and a **backstop** rejects any multi-table query left without a join key (an
-unbounded cartesian product) at plan time.
+Then GlueSQL's **`Planner` hook** runs three schema-aware passes on the planned
+statement (it has the column types): it **pushes equi-join predicates** from
+`WHERE` into the join `ON` (so GlueSQL builds **hash joins**, not nested-loop
+cross products); it **rejects** any multi-table query left without a join key (an
+unbounded cartesian product); and it **inserts implicit `CAST`s** so a comparison
+between a numeric operand and a numeric string literal compares *numerically*
+(see [Supported](#-supported)).
 
 ## ✅ Supported
 
@@ -48,6 +51,13 @@ unbounded cartesian product) at plan time.
 - **Set operations** `UNION` / `UNION ALL` / `INTERSECT` / `EXCEPT` — **single-column branches only** (rewritten to joins/subqueries).
 - **Non-recursive CTEs** (`WITH c AS (…) SELECT … FROM c`) — inlined as derived tables.
 - Subqueries — `IN` / `NOT IN`, `EXISTS`, scalar subqueries, derived tables (`FROM (…) AS x`).
+- **Implicit text↔number coercion in comparisons** — `num_col = '5'`, `price < '9.99'`,
+  `'1' = 1`. A comparison between a numeric operand and a *numeric string literal*
+  is cast to compare numerically (DuckDB/affinity-engine semantics) instead of
+  GlueSQL's silent type-segregated mismatch. Conservative: only string **literals**
+  are cast (never a stored text column), and only when the literal parses into the
+  target type, so an inserted `CAST` never fails. `bool`↔`int` is **not** coerced
+  (see gotchas).
 
 **Data types**
 - Native: `BOOLEAN`, `INTEGER`, `FLOAT`, `DECIMAL`, `TEXT`, `BYTEA`, `DATE`, `TIME`, `TIMESTAMP`, `INTERVAL`, `UUID`
@@ -75,9 +85,15 @@ unbounded cartesian product) at plan time.
 These execute **without error** but behave differently from PostgreSQL/DuckDB —
 they will not be flagged at runtime, so know them:
 
-- **No implicit type coercion in comparisons.** `true = 1`, `'1' = 1`,
-  `'1' = true` all evaluate to **FALSE** (no auto-cast), unlike DuckDB/MySQL.
-  Use an explicit `CAST`.
+- **`bool`↔`int` comparisons are not coerced.** `true = 1` / `flag = 1` evaluate
+  to **FALSE** (no auto-cast). This is intentionally left alone — engines disagree
+  (DuckDB/MySQL say true, PostgreSQL errors), so there is no safe universal answer.
+  Use an explicit `CAST`. *(Text↔number comparisons such as `num_col = '5'` and
+  `'1' = 1` **are** coerced — see Supported.)*
+- **A number compared to a non-numeric text column is not coerced.** `name = 5`
+  where `name` is `TEXT` stays a no-match rather than casting the column to a
+  number — we never reinterpret stored text. Comparing a number to a text string
+  literal that *isn't* numeric (`id = 'abc'`) is likewise left alone.
 - **Aggregate result types differ.** `SUM`/`AVG` over integers may return an
   integer where other engines return a decimal/float.
 - **Default row order.** Without `ORDER BY`, rows come back in **storage-key
