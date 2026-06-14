@@ -88,7 +88,7 @@ bitflags TransferFlags: u16 {
 
 (`amount_must_not_be_zero` is deprecated/removed ≥ 0.16 — amounts of 0 are allowed; do not enforce.)
 
-**Transient vs terminal:** a small set are *transient* (`debit/credit_account_not_found`, `pending_transfer_not_found`, `exceeds_credits/debits`, `debit/credit_account_already_closed`). TB lets the same `id` be retried after a transient failure; a retry of an `id` that failed *terminally* returns `id_already_failed`. We replicate: track ids that failed terminally (within the cluster's history) and return `id_already_failed` on reuse.
+**Transient vs terminal (CORRECTED — verified against TB source `tigerbeetle.zig::transient()` + `state_machine.zig`):** a small set are *transient* (`debit/credit_account_not_found`, `pending_transfer_not_found`, `exceeds_credits/debits`, `debit/credit_account_already_closed`). TB **burns the `id` of a transient failure** — because the outcome depends on point-in-time state, TB locks the id to "failed" so a retry can never produce a different result; a later attempt with that id returns `id_already_failed`, and the logical operation must be resubmitted under a *new* id. **Terminal (deterministic) failures and `linked_event_failed` do NOT burn** — an identical retry deterministically re-fails the same way, and a corrected / unchained retry is allowed. (An earlier draft of this section had this backwards.) We replicate: record only transient-failed ids (tag 0x14) and return `id_already_failed` on reuse.
 
 ## 4. Validation + apply order (per transfer)
 
@@ -99,7 +99,7 @@ Mirror TB's order precisely (so the *first* failing check determines the code):
 4. account-id & pending-id field rules (zero/int-max; `accounts_must_be_different`; `pending_id_must_be_zero`/`not_be_zero`/`not_be_int_max`/`be_different`).
 5. `ledger`/`code` not zero.
 6. existence: if `id` already committed → `exists` or `exists_with_different_*` (compare every field).
-7. id_already_failed check (terminal-failure history).
+7. id_already_failed check (transient-failure history).
 8. resolve accounts / pending; field-match + inherit for post/void.
 9. ledger agreement (`accounts_must_have_the_same_ledger`, `transfer_must_have_the_same_ledger_as_accounts`).
 10. closed-account checks (`debit/credit_account_already_closed`).
@@ -140,7 +140,7 @@ The active writer holds a **monotonic timestamp source** (nanoseconds; `max(prev
 - Account/Transfer native records (postcard) gain the new fields — `postcard` handles the struct growth; old records won't exist (pre-merge).
 - Resolved marker (tag `0x12`) → **pending-state record** (status: posted/voided/expired + the posted amount + expires_at).
 - New **expiry index** (tag `0x13`): `<expires_at::u64-be> <pending_id::u128-be>` for the timeout sweep.
-- New **terminal-failure index** (tag `0x14`): `<transfer_id::u128-be>` → for `id_already_failed`. (Only ids that failed *terminally* are recorded.)
+- New **failed-id index** (tag `0x14`): `<transfer_id::u128-be>` → for `id_already_failed`. (Only ids that failed with a *transient* error are recorded.)
 - `closed` is a flag on the account record (no separate keyspace).
 
 ## 12. Phasing (each phase = its own plan, lands green)

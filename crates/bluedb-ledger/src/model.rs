@@ -356,8 +356,9 @@ pub(crate) enum PendingStatus {
     Expired,
 }
 
-/// How a validated transfer is applied. `Gated` is a later-phase feature
-/// (linked, balancing, closing, imported, or a pending with a timeout).
+/// How a validated transfer is applied. Orthogonal flags (linked, balancing,
+/// closing, imported) do not affect this — they are handled by the chain driver,
+/// the apply paths, and the timestamp logic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TransferOp {
     Regular,
@@ -386,26 +387,24 @@ pub(crate) fn classify(t: &Transfer) -> TransferOp {
 }
 
 /// True if a transfer result burns its id (a later attempt with the same id
-/// returns `id_already_failed`): every failure — terminal, the transient set,
-/// and `linked_event_failed` — burns; `Created` and the `Exists`/`ExistsWith*`
-/// family never burn.
+/// returns `id_already_failed`). Per TigerBeetle, **only the transient errors
+/// burn**: they depend on point-in-time database state, so TB locks the id to
+/// its failed outcome to guarantee a retry can never produce a different result.
+/// Terminal (deterministic) validation failures and `linked_event_failed` do
+/// NOT burn — an identical retry deterministically fails the same way, and a
+/// corrected / unchained retry is allowed. `Created` and the `Exists`/
+/// `ExistsWith*` family never burn.
 pub(crate) fn transfer_burns_id(r: CreateTransferResult) -> bool {
     use CreateTransferResult as R;
-    !matches!(
+    matches!(
         r,
-        R::Created
-            | R::Exists
-            | R::ExistsWithDifferentFlags
-            | R::ExistsWithDifferentPendingId
-            | R::ExistsWithDifferentTimeout
-            | R::ExistsWithDifferentDebitAccountId
-            | R::ExistsWithDifferentCreditAccountId
-            | R::ExistsWithDifferentAmount
-            | R::ExistsWithDifferentUserData128
-            | R::ExistsWithDifferentUserData64
-            | R::ExistsWithDifferentUserData32
-            | R::ExistsWithDifferentLedger
-            | R::ExistsWithDifferentCode
+        R::DebitAccountNotFound
+            | R::CreditAccountNotFound
+            | R::PendingTransferNotFound
+            | R::ExceedsCredits
+            | R::ExceedsDebits
+            | R::DebitAccountAlreadyClosed
+            | R::CreditAccountAlreadyClosed
     )
 }
 
@@ -823,12 +822,22 @@ mod tests {
     #[test]
     fn burns_id_predicate() {
         use CreateTransferResult as R;
+        // Only the 7 transient codes burn.
+        assert!(transfer_burns_id(R::DebitAccountNotFound));
+        assert!(transfer_burns_id(R::CreditAccountNotFound));
+        assert!(transfer_burns_id(R::PendingTransferNotFound));
+        assert!(transfer_burns_id(R::ExceedsCredits));
+        assert!(transfer_burns_id(R::ExceedsDebits));
+        assert!(transfer_burns_id(R::DebitAccountAlreadyClosed));
+        assert!(transfer_burns_id(R::CreditAccountAlreadyClosed));
+        // Success / idempotent never burn.
         assert!(!transfer_burns_id(R::Created));
         assert!(!transfer_burns_id(R::Exists));
         assert!(!transfer_burns_id(R::ExistsWithDifferentAmount));
-        assert!(transfer_burns_id(R::CreditAccountNotFound)); // transient burns
-        assert!(transfer_burns_id(R::LedgerMustNotBeZero)); // terminal burns
-        assert!(transfer_burns_id(R::LinkedEventFailed)); // linked failure burns
+        // Terminal validation + linked failures do NOT burn (retryable).
+        assert!(!transfer_burns_id(R::LedgerMustNotBeZero));
+        assert!(!transfer_burns_id(R::LinkedEventFailed));
+        assert!(!transfer_burns_id(R::PendingTransferAlreadyPosted));
     }
 
     #[test]

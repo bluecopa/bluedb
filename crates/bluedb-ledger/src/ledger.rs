@@ -932,6 +932,13 @@ impl TimestampSource {
 /// The imported-timestamp apply-path checks for a transfer (TB codes 54–57),
 /// run after the referenced debit/credit accounts are resolved. `imported_ts`
 /// is `Some` only in an imported batch. Returns the first failing code.
+///
+/// Note the postdate checks (55/56) are effectively unreachable under our
+/// watermark invariant — the watermark tracks the max assigned timestamp
+/// *including* account timestamps, so a transfer that clears `must_not_regress`
+/// (`ts > last_ts >= any account ts`) necessarily postdates both accounts. They
+/// are kept for structural parity with TigerBeetle (which carries them as the
+/// same defense-in-depth under the same invariant).
 fn imported_transfer_checks(
     imported_ts: Option<u64>,
     last_ts: u64,
@@ -1721,15 +1728,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn id_already_failed_terminal_burns() {
+    async fn terminal_failure_does_not_burn() {
         use CreateTransferResult as R;
         let db = writer_database().await;
         let l = Ledger::new(&db);
         setup_two_accounts(&l).await;
-        // Terminal failure (ledger 0).
+        // A terminal (deterministic) failure does NOT burn the id — TB only burns
+        // transient errors. A corrected retry of the same id therefore succeeds.
         assert_eq!(l.create_transfers(&[Transfer::new(5, 1, 2, 10, 0).with_code(1)]).await.unwrap(), vec![R::LedgerMustNotBeZero]);
-        // Retry of the same id (even well-formed now) → id_already_failed.
-        assert_eq!(l.create_transfers(&[xfer(5, 1, 2, 10)]).await.unwrap(), vec![R::IdAlreadyFailed]);
+        assert_eq!(l.create_transfers(&[xfer(5, 1, 2, 10)]).await.unwrap(), vec![R::Created]);
     }
 
     #[tokio::test]
@@ -1749,23 +1756,27 @@ mod tests {
         let db = writer_database().await;
         let l = Ledger::new(&db);
         setup_two_accounts(&l).await;
-        // Same id twice in one batch: first fails terminally, second is burned.
-        let bad = Transfer::new(5, 1, 2, 10, 0).with_code(1); // ledger 0
-        let good = xfer(5, 1, 2, 10);
-        assert_eq!(l.create_transfers(&[bad, good]).await.unwrap(), vec![R::LedgerMustNotBeZero, R::IdAlreadyFailed]);
+        // Same id twice in one batch: the first fails TRANSIENTLY (burns), the
+        // second sees the in-batch burn → id_already_failed.
+        let bad = xfer(5, 1, 99, 10); // credit account missing → transient
+        let again = xfer(5, 1, 2, 10);
+        assert_eq!(l.create_transfers(&[bad, again]).await.unwrap(), vec![R::CreditAccountNotFound, R::IdAlreadyFailed]);
     }
 
     #[tokio::test]
-    async fn linked_event_failed_burns_id() {
+    async fn linked_event_failed_does_not_burn_only_transient_offender() {
         use CreateTransferResult as R;
         let db = writer_database().await;
         let l = Ledger::new(&db);
         l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
-        // A failed chain: member 10 gets linked_event_failed.
+        // A failed chain: member 10 → linked_event_failed (NOT burned); the
+        // offender 11 → CreditAccountNotFound (transient → burned).
         let res = l.create_transfers(&[linked_xfer(10, 1, 2, 5), xfer(11, 1, 99, 5)]).await.unwrap();
         assert_eq!(res, vec![R::LinkedEventFailed, R::CreditAccountNotFound]);
-        // Retrying id 10 alone → id_already_failed (burned by linked_event_failed).
-        assert_eq!(l.create_transfers(&[xfer(10, 1, 2, 5)]).await.unwrap(), vec![R::IdAlreadyFailed]);
+        // The offender's id is burned.
+        assert_eq!(l.create_transfers(&[xfer(11, 1, 2, 5)]).await.unwrap(), vec![R::IdAlreadyFailed]);
+        // The linked sibling's id is NOT burned — an unchained retry succeeds.
+        assert_eq!(l.create_transfers(&[xfer(10, 1, 2, 5)]).await.unwrap(), vec![R::Created]);
     }
 
     #[tokio::test]
@@ -1855,6 +1866,25 @@ mod tests {
         timed.timestamp = 6_000;
         timed.timeout = 10;
         assert_eq!(l.create_transfers(&[timed]).await.unwrap(), vec![R::ImportedEventTimeoutMustBeZero]);
+    }
+
+    #[tokio::test]
+    async fn imported_transfer_idempotent_retry() {
+        use CreateTransferResult as R;
+        let db = writer_database().await;
+        let (l, _clk) = manual_ledger(&db, 1_000_000);
+        let mut a1 = acct(1, 7).with_flags(AccountFlags::IMPORTED);
+        a1.timestamp = 100;
+        let mut a2 = acct(2, 7).with_flags(AccountFlags::IMPORTED);
+        a2.timestamp = 200;
+        l.create_accounts(&[a1, a2]).await.unwrap();
+        let mut t = xfer(10, 1, 2, 50).with_flags(TransferFlags::IMPORTED);
+        t.timestamp = 300;
+        assert_eq!(l.create_transfers(&[t]).await.unwrap(), vec![R::Created]);
+        // Resubmitting the identical imported transfer → Exists (the existence
+        // check fires before the imported timestamp checks, so no regress error).
+        assert_eq!(l.create_transfers(&[t]).await.unwrap(), vec![R::Exists]);
+        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_posted, 50);
     }
 
     #[tokio::test]
