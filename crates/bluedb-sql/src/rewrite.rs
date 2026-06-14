@@ -19,8 +19,8 @@
 //! never makes a query worse than it was.
 
 use sqlparser::ast::{
-    CreateTable, Cte, DataType, Expr, Join, JoinConstraint, JoinOperator, Query, Select, SelectItem,
-    SetExpr, Statement, TableFactor, TableWithJoins, Value, With,
+    CreateTable, Cte, DataType, ExactNumberInfo, Expr, Join, JoinConstraint, JoinOperator, Query,
+    Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, Value, With,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -119,6 +119,12 @@ fn fold_expr_subqueries(expr: &mut Expr, changed: &mut bool) {
         Expr::Subquery(query)
         | Expr::InSubquery { subquery: query, .. }
         | Expr::Exists { subquery: query, .. } => rewrite_query(query, changed),
+        Expr::Cast { expr, data_type, .. } => {
+            if normalize_data_type(data_type) {
+                *changed = true;
+            }
+            fold_expr_subqueries(expr, changed);
+        }
         Expr::BinaryOp { left, right, .. } => {
             fold_expr_subqueries(left, changed);
             fold_expr_subqueries(right, changed);
@@ -164,28 +170,51 @@ fn fold_from(from: &mut Vec<TableWithJoins>, changed: &mut bool) {
     *changed = true;
 }
 
-/// Normalize parameterized string column types (`VARCHAR(n)`, `CHAR(n)`, ...) to
-/// `TEXT`. GlueSQL rejects the length-parameterized forms, so a `CREATE TABLE`
-/// using them fails outright — which then cascades into "table not found" for
-/// every query against that table. `TEXT` is the type GlueSQL supports.
+/// Normalize column data types GlueSQL rejects (see [`normalize_data_type`]). A
+/// `CREATE TABLE` using an unsupported type fails outright and then cascades
+/// into "table not found" for every query against that table.
 fn rewrite_create_table(create: &mut CreateTable, changed: &mut bool) {
     for column in &mut create.columns {
-        if is_parameterized_string(&column.data_type) {
-            column.data_type = DataType::Text;
+        if normalize_data_type(&mut column.data_type) {
             *changed = true;
         }
     }
 }
 
-fn is_parameterized_string(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::Varchar(_)
-            | DataType::Char(_)
-            | DataType::CharVarying(_)
-            | DataType::Nvarchar(_)
-            | DataType::Clob(_)
-    )
+/// Map a data type GlueSQL rejects to the nearest type it accepts:
+/// parameterized/extra string types -> `TEXT`, any decimal/numeric -> bare
+/// `DECIMAL`, and every integer width (`INT(n)`, `BIGINT`, `SMALLINT`, ...) ->
+/// `INTEGER`. GlueSQL only accepts a small set of bare types, so width/precision
+/// parameters and unsupported integer widths otherwise fail at translate.
+///
+/// Compares by the rendered base word to avoid enumerating sqlparser's ~30
+/// numeric/string variants. Returns whether it changed the type.
+fn normalize_data_type(data_type: &mut DataType) -> bool {
+    let rendered = data_type.to_string().to_ascii_uppercase();
+    let base = rendered.split(['(', ' ']).next().unwrap_or("");
+    let has_param = rendered.contains('(');
+
+    let replacement = match base {
+        "VARCHAR" | "CHAR" | "CHARACTER" | "NVARCHAR" | "NCHAR" | "CLOB" | "STRING" => {
+            Some(DataType::Text)
+        }
+        "DECIMAL" | "NUMERIC" | "DEC" | "BIGDECIMAL" | "BIGNUMERIC" => {
+            Some(DataType::Decimal(ExactNumberInfo::None))
+        }
+        "BIGINT" | "SMALLINT" | "TINYINT" | "MEDIUMINT" | "INT2" | "INT4" | "INT8" | "HUGEINT" => {
+            Some(DataType::Integer(None))
+        }
+        "INT" | "INTEGER" if has_param => Some(DataType::Integer(None)),
+        _ => None,
+    };
+
+    match replacement {
+        Some(rep) if *data_type != rep => {
+            *data_type = rep;
+            true
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -237,5 +266,27 @@ mod tests {
         // comma-join must fold too, or it reaches gluesql unfolded.
         let out = rewrite_multitable("SELECT a FROM t1 WHERE a IN (SELECT b FROM t2, t3 WHERE x = y)");
         assert!(out.contains("JOIN t3"), "inner comma-join should fold: {out}");
+    }
+
+    #[test]
+    fn normalizes_parameterized_types_in_create() {
+        let out =
+            rewrite_multitable("CREATE TABLE t (a DECIMAL(10,2), b INT(11), c BIGINT, d VARCHAR(20))");
+        let up = out.to_uppercase();
+        assert!(!up.contains("(10, 2)") && !up.contains("(11)") && !up.contains("(20)"), "params not stripped: {out}");
+        assert!(up.contains("DECIMAL") && up.contains("INTEGER") && up.contains("TEXT"), "got: {out}");
+        assert!(!up.contains("BIGINT"), "BIGINT should become INTEGER: {out}");
+    }
+
+    #[test]
+    fn normalizes_cast_target_type() {
+        let out = rewrite_multitable("SELECT CAST(x AS DECIMAL(10,2)) FROM t");
+        assert!(!out.contains("10, 2") && !out.contains("10,2"), "cast type param not stripped: {out}");
+    }
+
+    #[test]
+    fn leaves_supported_bare_types_untouched() {
+        let sql = "CREATE TABLE t (a INTEGER, b TEXT, c BOOLEAN)";
+        assert_eq!(rewrite_multitable(sql), sql);
     }
 }
