@@ -34,7 +34,11 @@ pub(crate) struct ColumnDef {
     pub name: String,
     #[serde(rename = "type")]
     pub ty: String,
-    #[serde(default)]
+    // Accept the REST-natural camelCase `primaryKey` (what clients and our own
+    // tests send) plus the snake_case form. Before this, `primaryKey` was
+    // silently dropped → no PK → a follow-up CREATE FULLTEXT INDEX (which needs
+    // a PK) would 400 confusingly.
+    #[serde(default, rename = "primaryKey", alias = "primary_key")]
     pub primary_key: bool,
     /// Defaults to `true` (nullable) unless the caller says `false`.
     #[serde(default = "default_nullable")]
