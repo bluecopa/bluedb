@@ -68,7 +68,7 @@ impl Ledger {
                 continue;
             }
             let account = spec.into_account(timestamp);
-            batch.put(&self.keyspace.account_key(account.id), &encode(&account)?);
+            batch.put(self.keyspace.account_key(account.id), &encode(&account)?);
             staged.insert(spec.id);
             results.push(CreateResult::Ok);
         }
@@ -111,10 +111,10 @@ impl Ledger {
         // Build one atomic batch: every mutated account + every accepted transfer.
         let mut batch = WriteBatch::new();
         for account in working.values().filter(|a| dirty.contains(&a.id)) {
-            batch.put(&self.keyspace.account_key(account.id), &encode(account)?);
+            batch.put(self.keyspace.account_key(account.id), &encode(account)?);
         }
         for t in &accepted {
-            batch.put(&self.keyspace.transfer_key(t.id), &encode(t)?);
+            batch.put(self.keyspace.transfer_key(t.id), &encode(t)?);
         }
         if !batch.is_empty() {
             writer.write(batch).await?;
@@ -464,5 +464,42 @@ mod tests {
         let a = ledger.lookup_account(42).await.unwrap().unwrap();
         assert_eq!(a.ledger, 1);
         assert_eq!(a.timestamp, 10);
+    }
+
+    #[tokio::test]
+    async fn conservation_holds_over_a_sequence() {
+        use crate::model::{NewAccount, Transfer};
+        let database = writer_database().await;
+        let ledger = Ledger::new(&database);
+        // Four unconstrained accounts in one ledger.
+        ledger
+            .create_accounts(
+                &[NewAccount::new(1, 7), NewAccount::new(2, 7), NewAccount::new(3, 7), NewAccount::new(4, 7)],
+                1,
+            )
+            .await
+            .unwrap();
+
+        // A deterministic spread of transfers (ids unique, varied directions).
+        let mut id = 1000u128;
+        let pairs = [(1, 2, 100), (2, 3, 40), (3, 4, 25), (4, 1, 10), (1, 3, 7), (2, 4, 3)];
+        for (d, c, amt) in pairs {
+            let r = ledger.create_transfers(&[Transfer::new(id, d, c, amt, 7)], id as u64).await.unwrap();
+            assert_eq!(r, vec![crate::model::CreateResult::Ok]);
+            id += 1;
+        }
+
+        // Conservation: Σ debits_posted == Σ credits_posted across all accounts.
+        let mut total_debits = 0u128;
+        let mut total_credits = 0u128;
+        for acct_id in 1..=4u128 {
+            let a = ledger.lookup_account(acct_id).await.unwrap().unwrap();
+            total_debits += a.debits_posted;
+            total_credits += a.credits_posted;
+        }
+        let moved: u128 = pairs.iter().map(|&(_, _, amt)| amt).sum();
+        assert_eq!(total_debits, moved);
+        assert_eq!(total_credits, moved);
+        assert_eq!(total_debits, total_credits);
     }
 }
