@@ -13,8 +13,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bluedb_sql::SlateDbStorage;
 use gluesql_core::prelude::{Glue, Payload, Value};
+use slatedb::config::Settings;
 use slatedb::object_store::memory::InMemory;
 use slatedb::Db;
+use std::time::Duration;
 use sqllogictest::{AsyncDB, DBOutput, DefaultColumnType};
 
 /// A GlueSQL engine error, surfaced to sqllogictest as the backend `Error`.
@@ -34,7 +36,17 @@ impl GlueTester {
     /// Open a brand-new in-memory-backed engine. Each `.slt` file gets its own,
     /// so files never see each other's schema or rows.
     pub async fn connect() -> Result<Self, GlueError> {
-        let db = Db::open("bluedb-slt", Arc::new(InMemory::new()))
+        // The test DB is ephemeral in-memory, so durability is irrelevant — but
+        // SlateDB's default 100ms flush interval makes each durable autocommit
+        // insert wait ~100ms. A 1ms interval makes serial corpus loads ~100x
+        // faster. (This is a harness-only knob; it does not touch bluedb-sql.)
+        let settings = Settings {
+            flush_interval: Some(Duration::from_millis(1)),
+            ..Default::default()
+        };
+        let db = Db::builder("bluedb-slt", Arc::new(InMemory::new()))
+            .with_settings(settings)
+            .build()
             .await
             .map_err(|e| GlueError(format!("open slatedb: {e}")))?;
         Ok(Self {
