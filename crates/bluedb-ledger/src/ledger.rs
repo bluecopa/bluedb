@@ -15,6 +15,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use bluedb_sql::{Database, WriteLease, DEFAULT_TENANT};
 use bluedb_storage::Substrate;
+use slatedb::config::WriteOptions;
 use slatedb::WriteBatch;
 
 use crate::keyspace::LedgerKeyspace;
@@ -135,7 +136,7 @@ impl Ledger {
     /// batch. Requires the active writer.
     pub async fn create_accounts(&self, specs: &[Account]) -> Result<Vec<CreateAccountResult>> {
         use CreateAccountResult as R;
-        let _lease = self.write_lease.lock().await; // exclusive: we are the sole mutator
+        let _lease = self.write_lease.lock().await; // exclusive for the apply (released before the durable flush)
         let writer = self.substrate.require_writer()?;
 
         let now = self.clock.now_ns();
@@ -205,8 +206,18 @@ impl Ledger {
         if !accepted.is_empty() {
             batch.put(self.keyspace.watermark_key(), ts.last.to_be_bytes());
         }
-        if !batch.is_empty() {
-            writer.write(batch).await?;
+        // Group commit (see create_transfers): write visible under the lease,
+        // release the lease, then await durability lease-free so concurrent
+        // applies coalesce into shared WAL flushes.
+        let wrote = !batch.is_empty();
+        if wrote {
+            writer
+                .write_with_options(batch, &WriteOptions { await_durable: false, ..Default::default() })
+                .await?;
+        }
+        drop(_lease);
+        if wrote {
+            writer.flush().await?;
         }
         Ok(results)
     }
@@ -267,8 +278,8 @@ impl Ledger {
     /// the active writer.
     pub async fn create_transfers(&self, transfers: &[Transfer]) -> Result<Vec<CreateTransferResult>> {
         use CreateTransferResult as R;
-        let _lease = self.write_lease.lock().await; // exclusive
-        let writer = self.substrate.require_writer()?; // fail fast on a replica; held for the commit
+        let _lease = self.write_lease.lock().await; // exclusive for the apply (released before the durable flush)
+        let writer = self.substrate.require_writer()?; // fail fast on a replica
 
         let now = self.clock.now_ns();
         let batch_imported = transfers.first().is_some_and(|t| t.flags.contains(TransferFlags::IMPORTED));
@@ -397,8 +408,22 @@ impl Ledger {
         if !accepted.is_empty() {
             batch.put(self.keyspace.watermark_key(), ts.last.to_be_bytes());
         }
-        if !batch.is_empty() {
-            writer.write(batch).await?;
+        // Group commit: apply the batch to the memtable (visible to the next
+        // apply via DurabilityLevel::Memory reads) WITHOUT blocking on
+        // object-store durability, then drop the write lease so concurrent
+        // applies proceed immediately. Their writes coalesce into shared WAL
+        // flushes. We still await durability below before acking; WAL durability
+        // is prefix-ordered, so a crash can never leave a later transfer durable
+        // while an earlier one it read is lost.
+        let wrote = !batch.is_empty();
+        if wrote {
+            writer
+                .write_with_options(batch, &WriteOptions { await_durable: false, ..Default::default() })
+                .await?;
+        }
+        drop(_lease); // release before the durable flush — this is what unblocks concurrency
+        if wrote {
+            writer.flush().await?; // durable-before-ack, lease-free (coalesces under load)
         }
         Ok(results)
     }
@@ -1017,6 +1042,60 @@ mod tests {
     async fn setup_two_accounts(ledger: &Ledger) {
         let r = ledger.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
         assert_eq!(r, vec![CreateAccountResult::Created, CreateAccountResult::Created]);
+    }
+
+    /// Many clients applying transfers concurrently (group-commit path: the
+    /// write lease is released before the durable flush) must still conserve
+    /// and apply each transfer exactly once — no lost or doubled writes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_transfers_conserve_and_apply_once() {
+        let database = writer_database().await;
+        let ledger = Ledger::new(&database);
+        let accts: Vec<Account> = (1..=4u128).map(|id| acct(id, 7)).collect();
+        ledger.create_accounts(&accts).await.unwrap();
+
+        let clients = 8usize;
+        let per = 25usize;
+        let amount = 10u128;
+        let mut handles = Vec::new();
+        for t in 0..clients {
+            let db = database.clone();
+            handles.push(tokio::spawn(async move {
+                let ledger = Ledger::new(&db);
+                let base = 1_000_000u128 * (t as u128 + 1);
+                for i in 0..per {
+                    let id = base + i as u128;
+                    let d = (id % 4) + 1;
+                    let c = (d % 4) + 1; // != d
+                    let r = ledger
+                        .create_transfers(&[Transfer::new(id, d, c, amount, 7).with_code(1)])
+                        .await
+                        .unwrap();
+                    assert_eq!(r, vec![CreateTransferResult::Created]);
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        // Conservation + exactly-once: total posted debits == credits == every
+        // transfer's amount, counted once.
+        let expected = (clients * per) as u128 * amount;
+        let mut sum_d = 0u128;
+        let mut sum_c = 0u128;
+        for id in 1..=4u128 {
+            let a = ledger.lookup_account(id).await.unwrap().unwrap();
+            sum_d += a.debits_posted;
+            sum_c += a.credits_posted;
+        }
+        assert_eq!(sum_d, sum_c, "debits and credits conserved under concurrency");
+        assert_eq!(sum_d, expected, "every concurrent transfer applied exactly once");
+        // Spot-check a transfer from each client landed (no lost writes).
+        for t in 0..clients {
+            let id = 1_000_000u128 * (t as u128 + 1);
+            assert!(ledger.lookup_transfer(id).await.unwrap().is_some(), "client {t}'s transfer durable");
+        }
     }
 
     #[tokio::test]
