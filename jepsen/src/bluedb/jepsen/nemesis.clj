@@ -26,7 +26,17 @@
     :isolate-half      asymmetric partition: cut the active writer AND one peer
                        off the network (a 2-node minority that loses the Postgres
                        arbiter + MinIO), leaving a lone node + infra to lead.
-                       Healed by :heal."
+                       Healed by :heal.
+
+  Faults on the dependencies bluedb relies on (the cluster should stay CONSISTENT
+  — no split-brain, no lost acked writes — while losing availability):
+    :pause-postgres / :resume-postgres  freeze/thaw the lease arbiter. The writer
+                       can't renew (self-fences after TTL) and standbys can't
+                       acquire, so the cluster goes writer-less until thaw.
+    :pause-minio / :resume-minio  freeze/thaw the object store. The writer keeps
+                       its lease but can't durably write, so writes don't ack.
+    :fill-disk / :free-disk  fill MinIO's (size-bounded tmpfs) data dir so PUTs
+                       fail with ENOSPC, then free it."
   (:require [bluedb.jepsen.http :as h]
             [jepsen.nemesis :as nemesis]
             [clojure.java.shell :as shell]
@@ -34,6 +44,9 @@
             [clojure.tools.logging :refer [info]]))
 
 (def ^:private net "bluedb_default")
+(def ^:private pg-container "bluedb-postgres-1")
+(def ^:private minio-container "bluedb-minio-1")
+(def ^:private filler "/data/.jepsen-filler")
 
 (defn- docker [& args]
   (let [{:keys [exit out err]} (apply shell/sh "docker" args)]
@@ -104,14 +117,33 @@
               (docker "network" "disconnect" net (h/node->container n)))
             (reset! partitioned victims)
             (info "nemesis isolated minority" victims)
-            (assoc op :value (str "isolated " (vec victims))))))
+            (assoc op :value (str "isolated " (vec victims))))
+
+          ;; --- dependency faults (arbiter / storage / disk) ---
+          :pause-postgres  (do (docker "pause" pg-container)
+                               (info "nemesis paused Postgres (lease arbiter)")
+                               (assoc op :value :postgres-paused))
+          :resume-postgres (do (docker "unpause" pg-container) (assoc op :value :postgres-resumed))
+          :pause-minio     (do (docker "pause" minio-container)
+                               (info "nemesis paused MinIO (object store)")
+                               (assoc op :value :minio-paused))
+          :resume-minio    (do (docker "unpause" minio-container) (assoc op :value :minio-resumed))
+          :fill-disk       (let [r (docker "exec" minio-container "sh" "-c"
+                                           (str "dd if=/dev/zero of=" filler " bs=1M count=4096 2>/dev/null; true"))]
+                             (info "nemesis filled MinIO disk" (:err r))
+                             (assoc op :value :disk-filled))
+          :free-disk       (do (docker "exec" minio-container "sh" "-c" (str "rm -f " filler "; true"))
+                               (assoc op :value :disk-freed))))
 
       (teardown! [_this _test]
         ;; best-effort: bring everything back so the cluster is usable after the
-        ;; run — unpause first (a paused container can't exec), then reconnect and
-        ;; reset clocks.
+        ;; run — unpause first (a paused container can't exec), then reconnect,
+        ;; reset clocks, thaw infra, and free the disk.
         (doseq [c (containers)] (docker "unpause" c))
         (doseq [c (containers)]
           (docker "start" c)
           (docker "network" "connect" net c)
-          (docker "exec" c "sh" "-c" "echo '+0' > /faketime/offset"))))))
+          (docker "exec" c "sh" "-c" "echo '+0' > /faketime/offset"))
+        (docker "unpause" pg-container)
+        (docker "unpause" minio-container)
+        (docker "exec" minio-container "sh" "-c" (str "rm -f " filler "; true"))))))

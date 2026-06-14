@@ -14,8 +14,10 @@
     the explicit-transaction path under concurrency.
 
   Faults (--nemesis): none | kill | partition | partition-half | skew | pause |
-  mix | chaos, injected via the docker CLI (skew = wall-clock skew via
-  libfaketime; pause = docker pause; partition-half = isolate a 2-node minority).
+  arbiter | storage | disk-full | mix | chaos, injected via the docker CLI (skew
+  = libfaketime; pause = docker pause; partition-half = isolate a 2-node
+  minority; arbiter/storage = freeze Postgres/MinIO; disk-full = fill MinIO's
+  bounded data dir).
 
   Run against the up docker-compose cluster, e.g.:
 
@@ -125,6 +127,12 @@
                 (gen/sleep 14) {:type :info :f :resume}]
    "partition-half" [(gen/sleep 6)  {:type :info :f :isolate-half}
                      (gen/sleep 14) {:type :info :f :heal}]
+   "arbiter"   [(gen/sleep 6)  {:type :info :f :pause-postgres}
+                (gen/sleep 16) {:type :info :f :resume-postgres}]
+   "storage"   [(gen/sleep 6)  {:type :info :f :pause-minio}
+                (gen/sleep 16) {:type :info :f :resume-minio}]
+   "disk-full" [(gen/sleep 6)  {:type :info :f :fill-disk}
+                (gen/sleep 16) {:type :info :f :free-disk}]
    "chaos"     [(gen/sleep 6)  {:type :info :f :kill-writer}
                 (gen/sleep 14) {:type :info :f :start-all}
                 (gen/sleep 5)  {:type :info :f :pause-writer}
@@ -161,9 +169,15 @@
                     (if (and s (pos? s)) (gen/stagger s g) g))
                   (gen/nemesis (when (seq cycle-ops) (gen/cycle cycle-ops)))
                   (gen/time-limit (:time-limit opts 120)))
+             ;; recover everything (network, processes, infra, disk) before the
+             ;; final read, so a run cut mid-outage still has a writer to read.
              (gen/nemesis (gen/once {:type :info :f :heal}))
              (gen/nemesis (gen/once {:type :info :f :start-all}))
-             (gen/sleep 20)
+             (gen/nemesis (gen/once {:type :info :f :resume}))
+             (gen/nemesis (gen/once {:type :info :f :resume-postgres}))
+             (gen/nemesis (gen/once {:type :info :f :resume-minio}))
+             (gen/nemesis (gen/once {:type :info :f :free-disk}))
+             (gen/sleep 25)
              (gen/clients (:final-generator wl)))
             :checker
             (checker/compose
@@ -175,10 +189,11 @@
 (def cli-opts
   "Extra command-line options beyond Jepsen's defaults."
   [[nil "--nemesis NAME"
-    "Faults: kill | partition | partition-half | skew | pause | mix | chaos | none"
+    "Faults: kill|partition|partition-half|skew|pause|arbiter|storage|disk-full|mix|chaos|none"
     :default "mix"
-    :validate [#{"kill" "partition" "partition-half" "skew" "pause" "mix" "chaos" "none"}
-               "must be kill, partition, partition-half, skew, pause, mix, chaos, or none"]]
+    :validate [#{"kill" "partition" "partition-half" "skew" "pause"
+                 "arbiter" "storage" "disk-full" "mix" "chaos" "none"}
+               "unknown nemesis"]]
    [nil "--workload NAME" "Workload: set | list-append | counter | unique"
     :default "set"
     :validate [#{"set" "list-append" "counter" "unique"}

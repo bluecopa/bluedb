@@ -34,6 +34,10 @@ services:
     ports:
       - "9000:9000"
       - "9001:9001"
+    # Size-bounded RAM-backed data dir: ample for the small test data, but lets
+    # the disk-full nemesis fill it to trigger ENOSPC without filling the VM disk.
+    tmpfs:
+      - /data:size=512m
 
   # One-shot: wait for MinIO, create the bucket, exit.
   createbucket:

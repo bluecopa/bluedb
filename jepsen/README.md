@@ -52,9 +52,16 @@ true}`):
 | `partition-half` | isolate the writer **+ one peer** (a 2-node minority) from the network | a lone node + infra must take/keep leadership; the arbiter-less minority steps down |
 | `skew` | shift the writer's wall clock 8 s **backward** (via libfaketime) | the writer over-estimates its lease validity, so a standby can acquire concurrently — checks the SlateDB `writer_epoch` fence still blocks divergent writes |
 | `pause` | `docker pause` the writer (SIGSTOP, no crash) | the frozen writer stops renewing; a standby promotes; on resume it wakes to an expired lease + bumped epoch and must step down |
+| `arbiter` | `docker pause` Postgres (the lease arbiter) | writer can't renew → self-fences; standbys can't acquire → cluster goes writer-less (no split-brain) → recovers on thaw |
+| `storage` | `docker pause` MinIO (the object store) | writer keeps its lease but can't durably write → writes don't ack → recovers on thaw |
+| `disk-full` | fill MinIO's bounded `/data` tmpfs → ENOSPC | durable writes fail until space is freed |
 | `mix` | kill + partition, alternating | combined |
 | `chaos` | kill + pause + skew + partition-half | everything |
 | `none` | — | baseline (no faults) |
+
+The `arbiter`/`storage`/`disk-full` faults verify bluedb stays **consistent**
+(no split-brain, no lost acked writes) while losing availability when a
+dependency fails — CP, not AP. All three are `:valid? true` / `lost-count 0`.
 
 Fault windows straddle the 10 s lease TTL so failover completes inside each
 window. The clock-skew nemesis needs the image's libfaketime entrypoint
