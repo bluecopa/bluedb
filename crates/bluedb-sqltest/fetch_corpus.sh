@@ -22,4 +22,24 @@ cp "$TMP"/test/select[1-5].test "$DEST/"
 # condition; strip it so every file parses.
 find "$DEST" -name '*.test' -print0 | xargs -0 sed -i '' -E '/^(onlyif|skipif) /{ s/[[:space:]]*#.*$//; }'
 
-echo "corpus ready: $(find "$DEST" -name '*.test' | wc -l) files under $DEST"
+echo "sqlite corpus: $(find "$DEST" -name '*.test' | wc -l) files under $DEST"
+
+# --- DuckDB corpus subset ---
+# DuckDB's tests use *literal* expected results (not MD5 hashes like the SQLite
+# suite), so PASS actually measures correctness. DuckDB-extension files that
+# sqllogictest-rs can't parse (require/loop/foreach/mode) are skipped by the
+# runner. We take a focused subset of core standard-SQL areas.
+DDEST="$HERE/slt/corpus/duckdb"
+DTMP="$(mktemp -d)"
+trap 'rm -rf "$TMP" "$DTMP"' EXIT
+
+git clone --depth 1 --filter=blob:none --sparse https://github.com/duckdb/duckdb.git "$DTMP"
+git -C "$DTMP" sparse-checkout set test/sql
+for area in aggregate filter order projection subquery join cte cast types; do
+    if [ -d "$DTMP/test/sql/$area" ]; then
+        mkdir -p "$DDEST/$area"
+        cp -r "$DTMP/test/sql/$area/." "$DDEST/$area/"
+    fi
+done
+
+echo "duckdb corpus: $(find "$DDEST" -name '*.test' | wc -l) files under $DDEST"
