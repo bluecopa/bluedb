@@ -13,4 +13,4 @@ mod store;
 
 // Re-exports are enabled as each module gains content (Tasks 4 and 7):
 // pub use ledger::Ledger;
-// pub use model::{Account, AccountFlags, CreateResult, LedgerError, NewAccount, Transfer, TransferFlags};
+pub use model::{Account, AccountFlags, CreateResult, LedgerError, NewAccount, Transfer, TransferFlags};
