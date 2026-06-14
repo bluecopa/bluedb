@@ -72,6 +72,14 @@ impl AsyncDB for GlueTester {
             self.nulls_first = Some(nulls_first);
             return Ok(DBOutput::StatementComplete(0));
         }
+        // Other `SET`/`PRAGMA` knobs (e.g. `SET debug_force_external`) are engine
+        // config GlueSQL has no concept of; treat them as no-op session settings
+        // rather than rejecting (which would also cascade-fail the rest of the
+        // file). `default_null_order` is excluded above so its negative-value
+        // tests still surface an error.
+        if is_ignorable_setting(sql) {
+            return Ok(DBOutput::StatementComplete(0));
+        }
 
         // Reject SQL GlueSQL would silently mis-execute (window functions) with
         // a clear error rather than returning wrong rows.
@@ -109,6 +117,16 @@ impl AsyncDB for GlueTester {
     fn engine_name(&self) -> &str {
         "gluesql-slatedb"
     }
+}
+
+/// True for a `SET`/`PRAGMA` session knob we treat as a no-op (everything except
+/// `default_null_order`, which is handled separately so its negative-value tests
+/// still error).
+fn is_ignorable_setting(sql: &str) -> bool {
+    let lower = sql.trim().to_ascii_lowercase();
+    let body = lower.strip_suffix(';').unwrap_or(&lower).trim();
+    (body.starts_with("set ") || body.starts_with("pragma "))
+        && !body.contains("default_null_order")
 }
 
 /// A layout-tolerant result validator.
