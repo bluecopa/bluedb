@@ -10,7 +10,7 @@ PostgreSQL/DuckDB.
 > **Evidence (snapshot).** Measured by the conformance harness in
 > [`crates/bluedb-sqltest`](../bluedb-sqltest):
 > - SQLite `sqllogictest` subset: **77%** of statements/queries execute without error.
-> - DuckDB test subset: **27%** execute (lower — the corpus is DuckDB-specific); **of what executes, ~78% returns the correct result.**
+> - DuckDB test subset: **28%** execute (lower — the corpus is DuckDB-specific); **of what executes, ~80% returns the correct result.**
 >
 > The correctness comparator is layout- and numeric-tolerant (the DuckDB corpus
 > mixes tab-separated-row and one-value-per-line result blocks, and `R`-columns
@@ -105,6 +105,13 @@ they will not be flagged at runtime, so know them:
   literal that *isn't* numeric (`id = 'abc'`) is likewise left alone.
 - **Aggregate result types differ.** `SUM`/`AVG` over integers may return an
   integer where other engines return a decimal/float.
+- **Aggregate over an empty match returns no row.** A no-`GROUP BY` aggregate
+  whose `WHERE` matches nothing yields **0 rows**, where SQL wants **1** row
+  (`COUNT → 0`, others `→ NULL`). This is GlueSQL executor behavior; a plan-time
+  rewrite can synthesize the row for most aggregates but not `COUNT(*)`, so it's
+  left to a future executor fix.
+- **`AVG`/`STDDEV`/`VARIANCE` over `INTERVAL`** is incorrect — GlueSQL has no
+  interval division, so the float-cast/divide path produces a wrong value.
 - **Default row order.** Without `ORDER BY`, rows come back in **storage-key
   (primary-key) order**, not insertion order.
 - **Default NULL ordering.** With `ORDER BY` but no `SET default_null_order`,
