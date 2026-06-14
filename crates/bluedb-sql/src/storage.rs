@@ -115,7 +115,7 @@ use crate::keyspace::{prefix_upper_bound, Keyspace, DEFAULT_TENANT};
 /// transactions across connections to one [`Db`]. Connections created from the
 /// same [`crate::Database`] share one of these; a standalone
 /// [`SlateDbStorage::new`] gets its own (it is the sole writer).
-pub(crate) type WriteLease = Arc<Mutex<()>>;
+pub type WriteLease = Arc<Mutex<()>>;
 
 /// Shared per-table auto-increment row-key counters (keyed by the table's data
 /// keyspace prefix, so tenants don't collide). Holds the *next* key already

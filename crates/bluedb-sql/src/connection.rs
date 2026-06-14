@@ -96,6 +96,26 @@ impl Database {
         self.substrate.is_writer()
     }
 
+    /// A clone of the bound [`Substrate`] (writer `Db` or read replica). Layers
+    /// above SQL (e.g. `bluedb-ledger`) read/write through the same handle this
+    /// database uses, so they see the node's current role.
+    pub fn substrate(&self) -> Substrate {
+        self.substrate.clone()
+    }
+
+    /// A clone of the shared write lease. A layered writer (e.g. the ledger) that
+    /// takes this lease for the duration of a read-modify-write serializes against
+    /// this database's explicit SQL transactions on the same node.
+    ///
+    /// Note this is *not* the `insert_lock` that the SQL store holds briefly at
+    /// commit to re-validate keyed-insert uniqueness — that lock is internal and
+    /// covers only the SQL `insert_data` path. A layered writer that performs its
+    /// own keyed inserts must do its own idempotency check under this lease (the
+    /// ledger does), or route keyed inserts through a [`Database`] connection.
+    pub fn write_lease(&self) -> WriteLease {
+        self.write_lease.clone()
+    }
+
     /// Flush outstanding writes to object storage (writer only; a no-op on a
     /// read replica). Use before a graceful step-down so a successor that opens
     /// the database observes every acked write.
@@ -134,5 +154,23 @@ impl Database {
             self.insert_lock.clone(),
             self.seq.clone(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use slatedb::object_store::memory::InMemory;
+    use slatedb::Db;
+
+    #[tokio::test]
+    async fn writer_database_exposes_substrate_and_lease() {
+        let db = Arc::new(Db::open("conn-test", Arc::new(InMemory::new())).await.unwrap());
+        let database = Database::new(db);
+        assert!(database.substrate().is_writer());
+        // Two clones of the lease are the same underlying mutex (Arc).
+        let l1 = database.write_lease();
+        let l2 = database.write_lease();
+        assert!(Arc::ptr_eq(&l1, &l2));
     }
 }
