@@ -84,11 +84,12 @@ pub(crate) async fn scan_expired(
     while let Some(kv) = iter.next().await? {
         let key = kv.key.to_vec();
         // Suffix layout: <expires_at::8> <pending_id::16>; id is the last 16 bytes.
-        let n = key.len();
-        let pid = u128::from_be_bytes(
-            key[n - 16..].try_into().context("expiry index key: pending_id")?,
-        );
-        out.push((key, pid));
+        let tail: [u8; 16] = key
+            .get(key.len().saturating_sub(16)..)
+            .filter(|t| t.len() == 16)
+            .and_then(|t| t.try_into().ok())
+            .with_context(|| format!("expiry index key too short: {} bytes", key.len()))?;
+        out.push((key, u128::from_be_bytes(tail)));
     }
     Ok(out)
 }

@@ -2,12 +2,12 @@
 //! double-entry apply state machine inside that database's active writer.
 //!
 //! Implements TigerBeetle's `create_accounts` exactly and, for transfers,
-//! **regular posted** plus **two-phase** (pending reserve / post / void)
-//! transfers exactly, with the full per-item result-code surface and TB's
-//! input-validation ordering. Still gated to later phases (returning
-//! [`CreateTransferResult::NotImplementedYet`] / `CreateAccountResult::NotImplementedYet`):
-//! linked chains, balancing, closing, imported events, and pending transfers
-//! with a nonzero timeout.
+//! **regular posted**, **two-phase** (pending reserve / post / void), and
+//! **timeouts** (pending expiry via an apply-time sweep) exactly, with the full
+//! per-item result-code surface and TB's input-validation ordering. Still gated
+//! to later phases (returning [`CreateTransferResult::NotImplementedYet`] /
+//! `CreateAccountResult::NotImplementedYet`): linked chains, balancing, closing,
+//! and imported events.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -162,13 +162,14 @@ impl Ledger {
         Ok(results)
     }
 
-    /// Apply transfers (batch). Each item is validated against TigerBeetle's
-    /// `create_transfers` check ordering, then classified and applied: regular
-    /// posted movements, pending reserves, and post/void resolutions. Features
-    /// gated to later phases (linked, balancing, closing, imported, pending with
-    /// a nonzero timeout) return [`CreateTransferResult::NotImplementedYet`].
-    /// Accepted transfers are assigned an engine timestamp; all mutated accounts,
-    /// accepted transfers, and pending-state records commit in one atomic batch.
+    /// Apply transfers (batch). Begins by sweeping expired pendings, then
+    /// validates each item against TigerBeetle's `create_transfers` check ordering
+    /// and classifies + applies it: regular posted movements, pending reserves
+    /// (incl. timed), and post/void resolutions. Features gated to later phases
+    /// (linked, balancing, closing, imported) return
+    /// [`CreateTransferResult::NotImplementedYet`]. Accepted transfers are
+    /// assigned an engine timestamp; all mutated accounts, accepted transfers,
+    /// pending-state records, and expiry-index churn commit in one atomic batch.
     /// Requires the active writer.
     pub async fn create_transfers(&self, transfers: &[Transfer]) -> Result<Vec<CreateTransferResult>> {
         use CreateTransferResult as R;
@@ -210,12 +211,13 @@ impl Ledger {
             // Classify and apply. Each arm yields the record to persist (raw for
             // regular/pending; materialized for post/void) or a rejection code.
             let op = classify(t);
-            // The timestamp this item will get on accept (for the timeout-overflow
-            // check); equals `ts.next(now)` since no accept happens in between.
-            let prospective_ts = ts.peek(now);
             let staged_record: StageRecord = match op {
                 TransferOp::Regular => self.stage_regular(t, &mut state).await?.map(|()| *t),
                 TransferOp::PendingReserve => {
+                    // The timestamp this item will get on accept (for the
+                    // timeout-overflow check); equals `ts.next(now)` since no
+                    // accept happens between this peek and the accept below.
+                    let prospective_ts = ts.peek(now);
                     self.stage_pending(t, prospective_ts, &mut state).await?.map(|()| *t)
                 }
                 TransferOp::Post | TransferOp::Void => {
@@ -534,9 +536,11 @@ impl Ledger {
             Some(PendingStatus::Expired) => return Ok(Err(R::PendingTransferExpired)),
             None => {}
         }
-        // 53: lazy expiry — a timed pending past its expiry is rejected even if the
-        // sweep hasn't run yet (the sweep at the start of this batch handles the
-        // proactive release; this guards a resolution slipping in at/after expiry).
+        // 53: lazy expiry backstop. In normal operation the start-of-batch sweep
+        // already released any committed expired pending and recorded `Expired`
+        // (caught above), and a same-batch reserve always has expiry > now — so
+        // this rarely decides the result. It remains as a correctness guard so a
+        // resolution can never settle an expired pending regardless of sweep state.
         if pending.timeout != 0 && expiry_of(pending.timestamp, pending.timeout) <= now {
             return Ok(Err(R::PendingTransferExpired));
         }
@@ -1147,7 +1151,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lazy_expiry_rejects_late_resolution() {
+    async fn expired_pending_rejects_resolution() {
         use CreateTransferResult as R;
         let db = writer_database().await;
         let t0 = 1_000_000_000_000;
@@ -1160,6 +1164,38 @@ mod tests {
         // Reservation was released by the sweep; nothing posted.
         let d = l.lookup_account(1).await.unwrap().unwrap();
         assert_eq!((d.debits_pending, d.debits_posted), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn timeout_overflow_in_range_no_u64_overflow() {
+        // The middle arm of the overflow check: timestamp + timeout·1e9 fits in
+        // u64 but exceeds TigerBeetle's 2^63-1 ceiling → OverflowsTimeout.
+        use CreateTransferResult as R;
+        let db = writer_database().await;
+        let t0 = (i64::MAX as u64) - 5_000_000_000; // ~5s below the ceiling
+        let (l, _clk) = manual_ledger(&db, t0);
+        l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
+        // 10s timeout → expiry ≈ ceiling + 5s, within u64 but past 2^63-1.
+        let res = l.create_transfers(&[timed_pending(500, 1, 2, 100, 10)]).await.unwrap();
+        assert_eq!(res, vec![R::OverflowsTimeout]);
+        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_pending, 0);
+    }
+
+    #[tokio::test]
+    async fn sweep_releases_multiple_expired_on_same_account() {
+        let db = writer_database().await;
+        let t0 = 1_000_000_000_000;
+        let (l, clk) = manual_ledger(&db, t0);
+        l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
+        // Two timed reservations 1→2 (compounding debits_pending on account 1).
+        l.create_transfers(&[timed_pending(500, 1, 2, 30, 10)]).await.unwrap();
+        l.create_transfers(&[timed_pending(501, 1, 2, 70, 10)]).await.unwrap();
+        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_pending, 100);
+        // Advance past both expiries; one sweep must release both.
+        clk.store(t0 + 11_000_000_000, Ordering::SeqCst);
+        l.create_transfers(&[]).await.unwrap();
+        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_pending, 0);
+        assert_eq!(l.lookup_account(2).await.unwrap().unwrap().credits_pending, 0);
     }
 
     #[tokio::test]
