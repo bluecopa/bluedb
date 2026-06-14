@@ -11,6 +11,8 @@ const TAG_TRANSFER: u8 = TAG_EXTERNAL_BASE + 1; // 0x11
 const TAG_PENDING_STATE: u8 = TAG_EXTERNAL_BASE + 2; // 0x12
 /// Tag for the timeout expiry index (`<expires_at::u64-be> <pending_id::u128-be>`).
 const TAG_EXPIRY: u8 = TAG_EXTERNAL_BASE + 3; // 0x13
+/// Tag for the terminal-failure index (present ⇒ this transfer id is burned).
+const TAG_FAILED: u8 = TAG_EXTERNAL_BASE + 4; // 0x14
 /// Tag for the per-tenant monotonic timestamp watermark (a single key).
 const TAG_TS_WATERMARK: u8 = TAG_EXTERNAL_BASE + 5; // 0x15
 
@@ -54,6 +56,11 @@ impl LedgerKeyspace {
     /// The prefix shared by every expiry-index entry (scan lower bound).
     pub(crate) fn expiry_prefix(&self) -> Vec<u8> {
         self.ks.external_prefix(TAG_EXPIRY)
+    }
+
+    /// Key for the terminal-failure index of a burned transfer id.
+    pub(crate) fn failed_key(&self, id: u128) -> Vec<u8> {
+        self.ks.external_key(TAG_FAILED, &id.to_be_bytes())
     }
 
     /// Exclusive scan upper bound covering exactly the entries with
@@ -120,6 +127,16 @@ mod tests {
         let end = ks.expiry_scan_end(100);
         assert!(ks.expiry_key(100, u128::MAX) < end, "expires_at == now is included");
         assert!(end <= ks.expiry_key(101, 0), "expires_at == now+1 is excluded");
+    }
+
+    #[test]
+    fn failed_key_is_distinct_namespace() {
+        let ks = LedgerKeyspace::new("_");
+        let f = ks.failed_key(5);
+        assert_ne!(f, ks.account_key(5));
+        assert_ne!(f, ks.transfer_key(5));
+        assert_ne!(f, ks.pending_state_key(5));
+        assert!(ks.failed_key(1) < ks.failed_key(2));
     }
 
     #[test]

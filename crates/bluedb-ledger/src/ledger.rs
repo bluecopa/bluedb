@@ -1,13 +1,12 @@
 //! The public [`Ledger`]: built from a [`bluedb_sql::Database`], it runs the
 //! double-entry apply state machine inside that database's active writer.
 //!
-//! Implements TigerBeetle's `create_accounts` exactly and, for transfers,
-//! **regular posted**, **two-phase** (pending reserve / post / void),
-//! **timeouts** (pending expiry via an apply-time sweep), **linked chains**,
-//! **balancing**, and **closing** (closed accounts) exactly, with the full
-//! per-item result-code surface and TB's input-validation ordering. Still gated
-//! (returning [`CreateTransferResult::NotImplementedYet`] /
-//! `CreateAccountResult::NotImplementedYet`): imported events.
+//! Implements TigerBeetle's full data-plane state machine: `create_accounts`
+//! and `create_transfers` with regular posted, two-phase (pending reserve /
+//! post / void), timeouts (apply-time expiry sweep), linked chains, balancing,
+//! closing (closed accounts), imported events (user timestamps), and
+//! `id_already_failed` — the complete per-item result-code surface in TB's
+//! input-validation order.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,14 +19,15 @@ use slatedb::WriteBatch;
 
 use crate::keyspace::LedgerKeyspace;
 use crate::model::{
-    account_exists_result, account_is_gated, chains, classify, transfer_exists_result,
+    account_exists_result, chains, classify, transfer_burns_id, transfer_exists_result,
     validate_account_post_existence, validate_account_pre_existence,
     validate_transfer_post_existence, validate_transfer_pre_existence, Account, AccountFlags,
     CreateAccountResult, CreateTransferResult, PendingStatus, Transfer, TransferFlags, TransferOp,
     AMOUNT_MAX,
 };
 use crate::store::{
-    encode, get_account, get_pending_state, get_transfer, get_watermark, now_ns, scan_expired,
+    encode, get_account, get_pending_state, get_transfer, get_watermark, is_failed, now_ns,
+    scan_expired,
 };
 
 /// One second in nanoseconds — the unit of a transfer `timeout`.
@@ -139,6 +139,7 @@ impl Ledger {
         let writer = self.substrate.require_writer()?;
 
         let now = self.clock.now_ns();
+        let batch_imported = specs.first().is_some_and(|a| a.flags.contains(AccountFlags::IMPORTED));
         let mut ts = TimestampSource::new(get_watermark(&self.substrate, &self.keyspace).await?);
         let mut staged: HashMap<u128, Account> = HashMap::new();
         let mut accepted: Vec<Account> = Vec::new();
@@ -148,7 +149,9 @@ impl Ledger {
         for chain in chains(&linked) {
             // Fast path: an independent (single, non-linked) account.
             if chain.start == chain.end && !chain.open {
-                let r = self.stage_account(&specs[chain.start], now, &mut ts, &mut staged, &mut accepted).await?;
+                let r = self
+                    .stage_account(&specs[chain.start], batch_imported, now, &mut ts, &mut staged, &mut accepted)
+                    .await?;
                 results.push(r);
                 continue;
             }
@@ -160,7 +163,9 @@ impl Ledger {
             let mut offender = None;
             if !chain.open {
                 for (pos, spec) in specs[chain.start..=chain.end].iter().enumerate() {
-                    let r = self.stage_account(spec, now, &mut ts, &mut staged, &mut accepted).await?;
+                    let r = self
+                        .stage_account(spec, batch_imported, now, &mut ts, &mut staged, &mut accepted)
+                        .await?;
                     let ok = matches!(r, R::Created | R::Exists);
                     chain_results.push(r);
                     if !ok {
@@ -204,16 +209,18 @@ impl Ledger {
     /// Validate + (on success) stage one account into `staged`/`accepted`,
     /// assigning a timestamp. Returns the per-item result; mutates nothing on a
     /// failure/exists result.
+    #[allow(clippy::too_many_arguments)]
     async fn stage_account(
         &self,
         spec: &Account,
+        batch_imported: bool,
         now: u64,
         ts: &mut TimestampSource,
         staged: &mut HashMap<u128, Account>,
         accepted: &mut Vec<Account>,
     ) -> Result<CreateAccountResult> {
         use CreateAccountResult as R;
-        if let Some(code) = validate_account_pre_existence(spec) {
+        if let Some(code) = validate_account_pre_existence(spec, batch_imported, now) {
             return Ok(code);
         }
         // Existence (TB 13–19): committed first, then staged this batch.
@@ -226,11 +233,18 @@ impl Ledger {
         if let Some(code) = validate_account_post_existence(spec) {
             return Ok(code);
         }
-        if account_is_gated(spec) {
-            return Ok(R::NotImplementedYet);
-        }
         let mut acct = *spec;
-        acct.timestamp = ts.next(now);
+        // Timestamp: engine-assigned, or (imported) the validated user timestamp.
+        // 27: an imported timestamp must exceed the last assigned (must_not_regress).
+        if batch_imported {
+            if spec.timestamp <= ts.last {
+                return Ok(R::ImportedEventTimestampMustNotRegress);
+            }
+            ts.assign_imported(spec.timestamp);
+            acct.timestamp = spec.timestamp;
+        } else {
+            acct.timestamp = ts.next(now);
+        }
         staged.insert(acct.id, acct);
         accepted.push(acct);
         Ok(R::Created)
@@ -239,18 +253,20 @@ impl Ledger {
     /// Apply transfers (batch). Begins by sweeping expired pendings, then
     /// validates each item against TigerBeetle's `create_transfers` check ordering
     /// and classifies + applies it: regular posted movements, pending reserves
-    /// (incl. timed), and post/void resolutions. Features gated to later phases
-    /// (linked, balancing, closing, imported) return
-    /// [`CreateTransferResult::NotImplementedYet`]. Accepted transfers are
-    /// assigned an engine timestamp; all mutated accounts, accepted transfers,
-    /// pending-state records, and expiry-index churn commit in one atomic batch.
-    /// Requires the active writer.
+    /// (incl. timed), post/void resolutions, linked chains, balancing, and
+    /// closing. Timestamps are engine-assigned unless the (whole) batch is
+    /// `flags.imported` (then each user timestamp is validated and used). A
+    /// transfer that fails has its id burned (`id_already_failed` on retry). All
+    /// mutated accounts, accepted transfers, pending-state records, expiry-index
+    /// churn, burned ids, and the watermark commit in one atomic batch. Requires
+    /// the active writer.
     pub async fn create_transfers(&self, transfers: &[Transfer]) -> Result<Vec<CreateTransferResult>> {
         use CreateTransferResult as R;
         let _lease = self.write_lease.lock().await; // exclusive
         let writer = self.substrate.require_writer()?; // fail fast on a replica; held for the commit
 
         let now = self.clock.now_ns();
+        let batch_imported = transfers.first().is_some_and(|t| t.flags.contains(TransferFlags::IMPORTED));
         let mut ts = TimestampSource::new(get_watermark(&self.substrate, &self.keyspace).await?);
         let mut state = ApplyState::default();
 
@@ -261,60 +277,84 @@ impl Ledger {
         // Transfers accepted in THIS batch, for in-batch existence comparison.
         let mut staged: HashMap<u128, Transfer> = HashMap::new();
         let mut accepted: Vec<Transfer> = Vec::new();
+        // Ids burned this batch (failed) — for the in-batch id_already_failed check
+        // on later events and for persisting to the failure index.
+        let mut failed_ids: HashSet<u128> = HashSet::new();
         let mut results = Vec::with_capacity(transfers.len());
 
         let linked: Vec<bool> = transfers.iter().map(|t| t.flags.contains(TransferFlags::LINKED)).collect();
         for chain in chains(&linked) {
+            let results_start = results.len();
             // Fast path: an independent (single, non-linked) transfer.
             if chain.start == chain.end && !chain.open {
                 let r = self
-                    .process_transfer(&transfers[chain.start], now, &mut ts, &mut state, &mut staged, &mut accepted)
+                    .process_transfer(
+                        &transfers[chain.start],
+                        batch_imported,
+                        now,
+                        &mut ts,
+                        &mut state,
+                        &mut staged,
+                        &mut accepted,
+                        &failed_ids,
+                    )
                     .await?;
                 results.push(r);
-                continue;
-            }
-            // Linked chain (or open): tentatively apply, roll back on any failure.
-            let state_snap = state.clone();
-            let staged_snap = staged.clone();
-            let accepted_len = accepted.len();
-            let ts_snap = ts.last;
-            let mut chain_results = Vec::new();
-            let mut offender = None;
-            if !chain.open {
-                for (pos, t) in transfers[chain.start..=chain.end].iter().enumerate() {
-                    let r = self
-                        .process_transfer(t, now, &mut ts, &mut state, &mut staged, &mut accepted)
-                        .await?;
-                    let ok = matches!(r, R::Created | R::Exists);
-                    chain_results.push(r);
-                    if !ok {
-                        offender = Some(pos);
-                        break;
+            } else {
+                // Linked chain (or open): tentatively apply, roll back on any failure.
+                let state_snap = state.clone();
+                let staged_snap = staged.clone();
+                let accepted_len = accepted.len();
+                let ts_snap = ts.last;
+                let mut chain_results = Vec::new();
+                let mut offender = None;
+                if !chain.open {
+                    for (pos, t) in transfers[chain.start..=chain.end].iter().enumerate() {
+                        let r = self
+                            .process_transfer(
+                                t, batch_imported, now, &mut ts, &mut state, &mut staged, &mut accepted,
+                                &failed_ids,
+                            )
+                            .await?;
+                        let ok = matches!(r, R::Created | R::Exists);
+                        chain_results.push(r);
+                        if !ok {
+                            offender = Some(pos);
+                            break;
+                        }
                     }
                 }
-            }
-            if chain.open || offender.is_some() {
-                state = state_snap;
-                staged = staged_snap;
-                accepted.truncate(accepted_len);
-                ts.last = ts_snap;
-                for k in chain.start..=chain.end {
-                    let pos = k - chain.start;
-                    results.push(if chain.open {
-                        if k == chain.end { R::LinkedEventChainOpen } else { R::LinkedEventFailed }
-                    } else if Some(pos) == offender {
-                        chain_results[pos]
-                    } else {
-                        R::LinkedEventFailed
-                    });
+                if chain.open || offender.is_some() {
+                    state = state_snap;
+                    staged = staged_snap;
+                    accepted.truncate(accepted_len);
+                    ts.last = ts_snap;
+                    for k in chain.start..=chain.end {
+                        let pos = k - chain.start;
+                        results.push(if chain.open {
+                            if k == chain.end { R::LinkedEventChainOpen } else { R::LinkedEventFailed }
+                        } else if Some(pos) == offender {
+                            chain_results[pos]
+                        } else {
+                            R::LinkedEventFailed
+                        });
+                    }
+                } else {
+                    results.extend(chain_results);
                 }
-            } else {
-                results.extend(chain_results);
+            }
+            // Burn the ids of any failed events in this chain (visible to later
+            // chains' id_already_failed check). Final after rollback.
+            for (offset, r) in results[results_start..].iter().enumerate() {
+                if transfer_burns_id(*r) {
+                    failed_ids.insert(transfers[chain.start + offset].id);
+                }
             }
         }
 
         // One atomic batch: mutated accounts + accepted transfers + pending-state
-        // records (incl. swept `Expired`) + expiry-index churn + the watermark.
+        // records (incl. swept `Expired`) + expiry-index churn + burned ids + the
+        // watermark.
         let mut batch = WriteBatch::new();
         for id in &state.dirty {
             if let Some(account) = state.working.get(id) {
@@ -336,6 +376,10 @@ impl Ledger {
         for key in &state.expiry_removals {
             batch.delete(key);
         }
+        // Burn failed ids so a later attempt with the same id → id_already_failed.
+        for id in &failed_ids {
+            batch.put(self.keyspace.failed_key(*id), [1u8]);
+        }
         if !accepted.is_empty() {
             batch.put(self.keyspace.watermark_key(), ts.last.to_be_bytes());
         }
@@ -352,14 +396,16 @@ impl Ledger {
     async fn process_transfer(
         &self,
         t: &Transfer,
+        batch_imported: bool,
         now: u64,
         ts: &mut TimestampSource,
         state: &mut ApplyState,
         staged: &mut HashMap<u128, Transfer>,
         accepted: &mut Vec<Transfer>,
+        failed_ids: &HashSet<u128>,
     ) -> Result<CreateTransferResult> {
         use CreateTransferResult as R;
-        if let Some(code) = validate_transfer_pre_existence(t) {
+        if let Some(code) = validate_transfer_pre_existence(t, batch_imported, now) {
             return Ok(code);
         }
         // Existence (TB 12–23): committed first, then staged this batch.
@@ -369,22 +415,33 @@ impl Ledger {
         if let Some(existing) = staged.get(&t.id) {
             return Ok(transfer_exists_result(t, existing));
         }
+        // 24: id_already_failed — a burned id (this batch or committed) can't retry.
+        if failed_ids.contains(&t.id) || is_failed(&self.substrate, &self.keyspace, t.id).await? {
+            return Ok(R::IdAlreadyFailed);
+        }
         if let Some(code) = validate_transfer_post_existence(t) {
             return Ok(code);
         }
+
+        // In an imported batch, the user-supplied timestamp is used (validated in
+        // the apply path); otherwise the engine assigns one.
+        let imported_ts = batch_imported.then_some(t.timestamp);
+        let last_ts = ts.last;
 
         // Classify and apply. Each arm yields the record to persist (raw for
         // regular/pending; materialized for post/void) or a rejection code.
         let op = classify(t);
         let staged_record: StageRecord = match op {
             // A balancing transfer records the reduced (effective) amount.
-            TransferOp::Regular => self.stage_regular(t, state).await?.map(|amount| Transfer { amount, ..*t }),
+            TransferOp::Regular => self
+                .stage_regular(t, imported_ts, last_ts, state)
+                .await?
+                .map(|amount| Transfer { amount, ..*t }),
             TransferOp::PendingReserve => {
                 // The timestamp this item will get on accept (for the
-                // timeout-overflow check); equals `ts.next(now)` since no accept
-                // happens between this peek and the accept below.
-                let prospective_ts = ts.peek(now);
-                self.stage_pending(t, prospective_ts, state)
+                // timeout-overflow check); equals the assignment below.
+                let prospective_ts = imported_ts.unwrap_or_else(|| ts.peek(now));
+                self.stage_pending(t, prospective_ts, imported_ts, last_ts, state)
                     .await?
                     .map(|amount| Transfer { amount, ..*t })
             }
@@ -395,15 +452,21 @@ impl Ledger {
                     Some(p) => Some(p),
                     None => staged.get(&t.pending_id).copied(),
                 };
-                self.stage_resolution(t, pending, post, now, state).await?
+                self.stage_resolution(t, pending, post, now, imported_ts, last_ts, state).await?
             }
-            TransferOp::Gated => Err(R::NotImplementedYet),
         };
 
         match staged_record {
             Ok(record) => {
-                // Timestamp assigned only on accept (failed items don't advance it).
-                let applied = Transfer { timestamp: ts.next(now), ..record };
+                // Timestamp: the validated user ts (imported) or engine-assigned.
+                let timestamp = match imported_ts {
+                    Some(its) => {
+                        ts.assign_imported(its);
+                        its
+                    }
+                    None => ts.next(now),
+                };
+                let applied = Transfer { timestamp, ..record };
                 staged.insert(applied.id, applied);
                 accepted.push(applied);
                 Ok(R::Created)
@@ -470,7 +533,13 @@ impl Ledger {
     /// agreement → overflow → balance constraint), `Ok(effective_amount)` on
     /// accept (the amount moved, reduced for a balancing transfer). On success
     /// the debit/credit accounts are folded into `state` (not yet persisted).
-    async fn stage_regular(&self, t: &Transfer, state: &mut ApplyState) -> Result<StageOutcome> {
+    async fn stage_regular(
+        &self,
+        t: &Transfer,
+        imported_ts: Option<u64>,
+        last_ts: u64,
+        state: &mut ApplyState,
+    ) -> Result<StageOutcome> {
         use CreateTransferResult as R;
 
         // 39 / 40: account resolution.
@@ -488,6 +557,10 @@ impl Ledger {
         }
         if t.ledger != debit.ledger {
             return Ok(Err(R::TransferMustHaveTheSameLedgerAsAccounts));
+        }
+        // 54–57: imported-timestamp checks (regress / postdate accounts / timeout).
+        if let Some(code) = imported_transfer_checks(imported_ts, last_ts, debit.timestamp, credit.timestamp, t.timeout) {
+            return Ok(Err(code));
         }
         // 58 / 59: a closed account rejects new movements.
         if debit.flags.contains(AccountFlags::CLOSED) {
@@ -556,6 +629,8 @@ impl Ledger {
         &self,
         t: &Transfer,
         prospective_ts: u64,
+        imported_ts: Option<u64>,
+        last_ts: u64,
         state: &mut ApplyState,
     ) -> Result<StageOutcome> {
         use CreateTransferResult as R;
@@ -573,6 +648,10 @@ impl Ledger {
         }
         if t.ledger != debit.ledger {
             return Ok(Err(R::TransferMustHaveTheSameLedgerAsAccounts));
+        }
+        // 54–57: imported-timestamp checks (an imported pending must have timeout 0).
+        if let Some(code) = imported_transfer_checks(imported_ts, last_ts, debit.timestamp, credit.timestamp, t.timeout) {
+            return Ok(Err(code));
         }
         // 58 / 59: a closed account rejects new movements. (A closing pending's own
         // accounts are not yet closed here, so it passes and closes them below.)
@@ -653,12 +732,15 @@ impl Ledger {
     /// (inherited fields filled, `amount` = effective) to persist, or a rejection
     /// code. Releasing/posting cannot breach a balance constraint that held at
     /// reserve time, so 67/68 are not re-checked.
+    #[allow(clippy::too_many_arguments)]
     async fn stage_resolution(
         &self,
         t: &Transfer,
         pending: Option<Transfer>,
         post: bool,
         now: u64,
+        imported_ts: Option<u64>,
+        last_ts: u64,
         state: &mut ApplyState,
     ) -> Result<StageRecord> {
         use crate::model::TransferFlags as F;
@@ -730,6 +812,11 @@ impl Ledger {
             .load_account(pending.credit_account_id, state)
             .await?
             .ok_or_else(|| anyhow::anyhow!("ledger invariant: pending credit account missing"))?;
+
+        // 54–57: imported-timestamp checks (post/void have timeout 0).
+        if let Some(code) = imported_transfer_checks(imported_ts, last_ts, debit.timestamp, credit.timestamp, t.timeout) {
+            return Ok(Err(code));
+        }
 
         // Release the full reservation (checked_sub guards the invariant that the
         // reservation is still outstanding).
@@ -834,6 +921,39 @@ impl TimestampSource {
         self.last = self.peek(now);
         self.last
     }
+
+    /// Adopt a user-supplied imported timestamp as the last assigned (its
+    /// monotonicity vs `last` was validated by the caller as `must_not_regress`).
+    fn assign_imported(&mut self, ts: u64) {
+        self.last = ts;
+    }
+}
+
+/// The imported-timestamp apply-path checks for a transfer (TB codes 54–57),
+/// run after the referenced debit/credit accounts are resolved. `imported_ts`
+/// is `Some` only in an imported batch. Returns the first failing code.
+fn imported_transfer_checks(
+    imported_ts: Option<u64>,
+    last_ts: u64,
+    debit_ts: u64,
+    credit_ts: u64,
+    timeout: u32,
+) -> Option<CreateTransferResult> {
+    use CreateTransferResult as R;
+    let its = imported_ts?;
+    if its <= last_ts {
+        return Some(R::ImportedEventTimestampMustNotRegress); // 54
+    }
+    if its <= debit_ts {
+        return Some(R::ImportedEventTimestampMustPostdateDebitAccount); // 55
+    }
+    if its <= credit_ts {
+        return Some(R::ImportedEventTimestampMustPostdateCreditAccount); // 56
+    }
+    if timeout != 0 {
+        return Some(R::ImportedEventTimeoutMustBeZero); // 57
+    }
+    None
 }
 
 /// The per-item validation result of staging one regular/pending movement:
@@ -992,16 +1112,17 @@ mod tests {
         let db = writer_database().await;
         let l = Ledger::new(&db);
         setup_two_accounts(&l).await;
+        // Distinct ids per assertion: a failed id is burned (id_already_failed).
         assert_eq!(l.create_transfers(&[xfer(0, 1, 2, 5)]).await.unwrap(), vec![R::IdMustNotBeZero]);
         assert_eq!(l.create_transfers(&[xfer(u128::MAX, 1, 2, 5)]).await.unwrap(), vec![R::IdMustNotBeIntMax]);
         assert_eq!(l.create_transfers(&[xfer(1, 0, 2, 5)]).await.unwrap(), vec![R::DebitAccountIdMustNotBeZero]);
-        assert_eq!(l.create_transfers(&[xfer(1, 1, 1, 5)]).await.unwrap(), vec![R::AccountsMustBeDifferent]);
-        assert_eq!(l.create_transfers(&[xfer(1, 1, 2, 5).with_pending_id(9)]).await.unwrap(), vec![R::PendingIdMustBeZero]);
-        assert_eq!(l.create_transfers(&[Transfer::new(1, 1, 2, 5, 0).with_code(1)]).await.unwrap(), vec![R::LedgerMustNotBeZero]);
-        assert_eq!(l.create_transfers(&[Transfer::new(1, 1, 2, 5, 7)]).await.unwrap(), vec![R::CodeMustNotBeZero]);
-        assert_eq!(l.create_transfers(&[xfer(1, 1, 99, 5)]).await.unwrap(), vec![R::CreditAccountNotFound]);
-        assert_eq!(l.create_transfers(&[xfer(1, 99, 2, 5)]).await.unwrap(), vec![R::DebitAccountNotFound]);
-        assert_eq!(l.create_transfers(&[Transfer::new(1, 1, 2, 5, 8).with_code(1)]).await.unwrap(), vec![R::TransferMustHaveTheSameLedgerAsAccounts]);
+        assert_eq!(l.create_transfers(&[xfer(2, 1, 1, 5)]).await.unwrap(), vec![R::AccountsMustBeDifferent]);
+        assert_eq!(l.create_transfers(&[xfer(3, 1, 2, 5).with_pending_id(9)]).await.unwrap(), vec![R::PendingIdMustBeZero]);
+        assert_eq!(l.create_transfers(&[Transfer::new(4, 1, 2, 5, 0).with_code(1)]).await.unwrap(), vec![R::LedgerMustNotBeZero]);
+        assert_eq!(l.create_transfers(&[Transfer::new(5, 1, 2, 5, 7)]).await.unwrap(), vec![R::CodeMustNotBeZero]);
+        assert_eq!(l.create_transfers(&[xfer(6, 1, 99, 5)]).await.unwrap(), vec![R::CreditAccountNotFound]);
+        assert_eq!(l.create_transfers(&[xfer(7, 99, 2, 5)]).await.unwrap(), vec![R::DebitAccountNotFound]);
+        assert_eq!(l.create_transfers(&[Transfer::new(8, 1, 2, 5, 8).with_code(1)]).await.unwrap(), vec![R::TransferMustHaveTheSameLedgerAsAccounts]);
     }
 
     #[tokio::test]
@@ -1029,21 +1150,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gated_flags_return_not_implemented_yet() {
+    async fn no_flags_are_gated_anymore() {
         use CreateTransferResult as R;
         let db = writer_database().await;
         let l = Ledger::new(&db);
         setup_two_accounts(&l).await;
-        // Imported (Phase G) is still gated.
-        assert_eq!(l.create_transfers(&[xfer(1, 1, 2, 5).with_flags(TransferFlags::IMPORTED)]).await.unwrap(), vec![R::NotImplementedYet]);
-        // Nothing persisted by a gated item.
-        assert!(l.lookup_transfer(1).await.unwrap().is_none());
-        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_posted, 0);
-        // A gated account flag too.
-        assert_eq!(
-            l.create_accounts(&[acct(9, 7).with_flags(AccountFlags::IMPORTED)]).await.unwrap(),
-            vec![CreateAccountResult::NotImplementedYet]
-        );
+        // A lone imported transfer in a non-imported batch is a real TB code now
+        // (not the transitional NotImplementedYet, which no longer exists). Here
+        // the first batch event is imported, so batch_imported=true; with no
+        // user timestamp it fails the imported range check.
+        let r = l.create_transfers(&[xfer(1, 1, 2, 5).with_flags(TransferFlags::IMPORTED)]).await.unwrap();
+        assert_eq!(r, vec![R::ImportedEventTimestampOutOfRange]);
     }
 
     // ---- Phase B: two-phase transfers ----
@@ -1225,9 +1342,10 @@ mod tests {
         let l = Ledger::new(&db);
         setup_two_accounts(&l).await;
         assert_eq!(l.create_transfers(&[post(501, 999, AMOUNT_MAX)]).await.unwrap(), vec![R::PendingTransferNotFound]);
-        // A regular (non-pending) transfer cannot be posted.
+        // A regular (non-pending) transfer cannot be posted. (Distinct post id 502
+        // since id 501 was burned by the transient failure above.)
         l.create_transfers(&[xfer(600, 1, 2, 5)]).await.unwrap();
-        assert_eq!(l.create_transfers(&[post(501, 600, AMOUNT_MAX)]).await.unwrap(), vec![R::PendingTransferNotPending]);
+        assert_eq!(l.create_transfers(&[post(502, 600, AMOUNT_MAX)]).await.unwrap(), vec![R::PendingTransferNotPending]);
     }
 
     #[tokio::test]
@@ -1583,6 +1701,171 @@ mod tests {
         assert_eq!(l.create_transfers(&batch).await.unwrap(), vec![R::Exists, R::Exists]);
         // Balances unchanged (applied exactly once).
         assert_eq!(l.lookup_account(2).await.unwrap().unwrap().credits_posted, 100);
+    }
+
+    // ---- Phase G: imported events + id_already_failed ----
+
+    #[tokio::test]
+    async fn id_already_failed_transient_burns() {
+        use CreateTransferResult as R;
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
+        // Transient failure (credit account missing).
+        assert_eq!(l.create_transfers(&[xfer(5, 1, 99, 10)]).await.unwrap(), vec![R::CreditAccountNotFound]);
+        // Create the previously-missing account; the SAME id is now burned.
+        l.create_accounts(&[acct(99, 7)]).await.unwrap();
+        assert_eq!(l.create_transfers(&[xfer(5, 1, 99, 10)]).await.unwrap(), vec![R::IdAlreadyFailed]);
+        // A NEW id with the same logical transfer succeeds.
+        assert_eq!(l.create_transfers(&[xfer(6, 1, 99, 10)]).await.unwrap(), vec![R::Created]);
+    }
+
+    #[tokio::test]
+    async fn id_already_failed_terminal_burns() {
+        use CreateTransferResult as R;
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        setup_two_accounts(&l).await;
+        // Terminal failure (ledger 0).
+        assert_eq!(l.create_transfers(&[Transfer::new(5, 1, 2, 10, 0).with_code(1)]).await.unwrap(), vec![R::LedgerMustNotBeZero]);
+        // Retry of the same id (even well-formed now) → id_already_failed.
+        assert_eq!(l.create_transfers(&[xfer(5, 1, 2, 10)]).await.unwrap(), vec![R::IdAlreadyFailed]);
+    }
+
+    #[tokio::test]
+    async fn exists_does_not_burn() {
+        use CreateTransferResult as R;
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        setup_two_accounts(&l).await;
+        assert_eq!(l.create_transfers(&[xfer(5, 1, 2, 10)]).await.unwrap(), vec![R::Created]);
+        // A retry is Exists (committed), never id_already_failed.
+        assert_eq!(l.create_transfers(&[xfer(5, 1, 2, 10)]).await.unwrap(), vec![R::Exists]);
+    }
+
+    #[tokio::test]
+    async fn id_already_failed_in_batch() {
+        use CreateTransferResult as R;
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        setup_two_accounts(&l).await;
+        // Same id twice in one batch: first fails terminally, second is burned.
+        let bad = Transfer::new(5, 1, 2, 10, 0).with_code(1); // ledger 0
+        let good = xfer(5, 1, 2, 10);
+        assert_eq!(l.create_transfers(&[bad, good]).await.unwrap(), vec![R::LedgerMustNotBeZero, R::IdAlreadyFailed]);
+    }
+
+    #[tokio::test]
+    async fn linked_event_failed_burns_id() {
+        use CreateTransferResult as R;
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
+        // A failed chain: member 10 gets linked_event_failed.
+        let res = l.create_transfers(&[linked_xfer(10, 1, 2, 5), xfer(11, 1, 99, 5)]).await.unwrap();
+        assert_eq!(res, vec![R::LinkedEventFailed, R::CreditAccountNotFound]);
+        // Retrying id 10 alone → id_already_failed (burned by linked_event_failed).
+        assert_eq!(l.create_transfers(&[xfer(10, 1, 2, 5)]).await.unwrap(), vec![R::IdAlreadyFailed]);
+    }
+
+    #[tokio::test]
+    async fn imported_accounts_use_user_timestamps() {
+        use CreateAccountResult as R;
+        let db = writer_database().await;
+        let (l, _clk) = manual_ledger(&db, 1_000_000);
+        // Imported batch with explicit, increasing user timestamps (≤ now).
+        let mut a1 = acct(1, 7).with_flags(AccountFlags::IMPORTED);
+        a1.timestamp = 100;
+        let mut a2 = acct(2, 7).with_flags(AccountFlags::IMPORTED);
+        a2.timestamp = 200;
+        assert_eq!(l.create_accounts(&[a1, a2]).await.unwrap(), vec![R::Created, R::Created]);
+        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().timestamp, 100);
+        assert_eq!(l.lookup_account(2).await.unwrap().unwrap().timestamp, 200);
+    }
+
+    #[tokio::test]
+    async fn imported_account_validation_codes() {
+        use CreateAccountResult as R;
+        let db = writer_database().await;
+        let (l, _clk) = manual_ledger(&db, 1_000);
+        // Non-imported event in an imported batch (first is imported).
+        let mut imp = acct(1, 7).with_flags(AccountFlags::IMPORTED);
+        imp.timestamp = 100;
+        let plain = acct(2, 7);
+        assert_eq!(l.create_accounts(&[imp, plain]).await.unwrap(), vec![R::Created, R::ImportedEventExpected]);
+        // Imported event in a non-imported batch.
+        let mut imp2 = acct(3, 7).with_flags(AccountFlags::IMPORTED);
+        imp2.timestamp = 50;
+        assert_eq!(l.create_accounts(&[acct(4, 7), imp2]).await.unwrap(), vec![R::Created, R::ImportedEventNotExpected]);
+        // Imported timestamp in the future (> now=1000).
+        let mut future = acct(5, 7).with_flags(AccountFlags::IMPORTED);
+        future.timestamp = 5_000;
+        assert_eq!(l.create_accounts(&[future]).await.unwrap(), vec![R::ImportedEventTimestampMustNotAdvance]);
+        // Imported timestamp 0 → out of range.
+        let zero = acct(6, 7).with_flags(AccountFlags::IMPORTED);
+        assert_eq!(l.create_accounts(&[zero]).await.unwrap(), vec![R::ImportedEventTimestampOutOfRange]);
+    }
+
+    #[tokio::test]
+    async fn imported_account_regress_is_rejected() {
+        use CreateAccountResult as R;
+        let db = writer_database().await;
+        let (l, _clk) = manual_ledger(&db, 1_000_000);
+        let mut a1 = acct(1, 7).with_flags(AccountFlags::IMPORTED);
+        a1.timestamp = 500;
+        let mut a2 = acct(2, 7).with_flags(AccountFlags::IMPORTED);
+        a2.timestamp = 400; // regresses vs a1
+        assert_eq!(l.create_accounts(&[a1, a2]).await.unwrap(), vec![R::Created, R::ImportedEventTimestampMustNotRegress]);
+    }
+
+    #[tokio::test]
+    async fn imported_transfer_uses_user_timestamp_and_validates() {
+        use CreateTransferResult as R;
+        let db = writer_database().await;
+        let (l, _clk) = manual_ledger(&db, 1_000_000);
+        // Imported accounts at ts 100/200.
+        let mut a1 = acct(1, 7).with_flags(AccountFlags::IMPORTED);
+        a1.timestamp = 100;
+        let mut a2 = acct(2, 7).with_flags(AccountFlags::IMPORTED);
+        a2.timestamp = 200;
+        l.create_accounts(&[a1, a2]).await.unwrap();
+        // An imported transfer with ts > both accounts and > watermark, ≤ now.
+        let mut t = xfer(10, 1, 2, 50).with_flags(TransferFlags::IMPORTED);
+        t.timestamp = 300;
+        assert_eq!(l.create_transfers(&[t]).await.unwrap(), vec![R::Created]);
+        assert_eq!(l.lookup_transfer(10).await.unwrap().unwrap().timestamp, 300);
+
+        // Postdate-debit: ts must exceed the debit account's timestamp.
+        let mut bad = xfer(11, 1, 2, 5).with_flags(TransferFlags::IMPORTED);
+        bad.timestamp = 100; // == account 1's ts, also regresses vs 300
+        // Regress (54) is checked before postdate (55): ts 100 <= last 300 → regress.
+        assert_eq!(l.create_transfers(&[bad]).await.unwrap(), vec![R::ImportedEventTimestampMustNotRegress]);
+
+        // postdate via a fresh ledger position: ts above watermark but ≤ credit acct ts.
+        let mut a3 = acct(3, 7).with_flags(AccountFlags::IMPORTED);
+        a3.timestamp = 5_000; // a high account timestamp
+        l.create_accounts(&[a3]).await.unwrap();
+        let mut pd = xfer(12, 1, 3, 5).with_flags(TransferFlags::IMPORTED);
+        pd.timestamp = 4_000; // > watermark? watermark is now 5000 → regress first
+        // watermark is 5000 (a3), so ts 4000 regresses.
+        assert_eq!(l.create_transfers(&[pd]).await.unwrap(), vec![R::ImportedEventTimestampMustNotRegress]);
+
+        // imported transfer with a nonzero timeout → ImportedEventTimeoutMustBeZero.
+        let mut timed = xfer(13, 1, 2, 5).with_flags(TransferFlags::IMPORTED | TransferFlags::PENDING);
+        timed.timestamp = 6_000;
+        timed.timeout = 10;
+        assert_eq!(l.create_transfers(&[timed]).await.unwrap(), vec![R::ImportedEventTimeoutMustBeZero]);
+    }
+
+    #[tokio::test]
+    async fn non_imported_still_requires_zero_timestamp() {
+        use CreateTransferResult as R;
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        setup_two_accounts(&l).await;
+        let mut t = xfer(5, 1, 2, 10);
+        t.timestamp = 123; // non-imported with a nonzero ts
+        assert_eq!(l.create_transfers(&[t]).await.unwrap(), vec![R::TimestampMustBeZero]);
     }
 
     // ---- Phase F: closing transfers + closed accounts ----

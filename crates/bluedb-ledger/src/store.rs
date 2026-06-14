@@ -69,6 +69,12 @@ pub(crate) async fn get_watermark(substrate: &Substrate, ks: &LedgerKeyspace) ->
     }
 }
 
+/// Whether a transfer id is in the terminal-failure index (burned ⇒ a retry
+/// returns `id_already_failed`).
+pub(crate) async fn is_failed(substrate: &Substrate, ks: &LedgerKeyspace, id: u128) -> Result<bool> {
+    Ok(substrate.get(&ks.failed_key(id)).await?.is_some())
+}
+
 /// Expiry-index entries with `expires_at <= now`, as `(full_index_key,
 /// pending_id)` pairs in ascending `expires_at` order — the timed pendings the
 /// sweep must auto-void. The full key is returned so the caller can delete it.

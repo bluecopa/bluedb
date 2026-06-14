@@ -8,6 +8,10 @@ use serde::{Deserialize, Serialize};
 /// (and the reserved `id`/`pending_id` value): `2^128 - 1`.
 pub const AMOUNT_MAX: u128 = u128::MAX;
 
+/// TigerBeetle caps a timestamp at `2^63 - 1`; an imported timestamp must be in
+/// `1..=TIMESTAMP_MAX`.
+const TIMESTAMP_MAX: u64 = i64::MAX as u64;
+
 /// Account behavior flags (bitset). Mirrors TigerBeetle's account flags.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountFlags(pub u16);
@@ -235,15 +239,17 @@ impl Transfer {
 
 /// Per-item result of `create_accounts`. Variant ordering mirrors TigerBeetle's
 /// create_accounts result codes. `Created` is success; `Exists` / `ExistsWith*`
-/// are idempotent (not failures). `NotImplementedYet` is a transitional,
-/// non-TigerBeetle code for features gated to later phases (linked, imported);
-/// it is removed once every phase lands.
+/// are idempotent (not failures).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CreateAccountResult {
     Created,
     LinkedEventFailed,
     LinkedEventChainOpen,
+    ImportedEventExpected,
+    ImportedEventNotExpected,
     TimestampMustBeZero,
+    ImportedEventTimestampOutOfRange,
+    ImportedEventTimestampMustNotAdvance,
     ReservedField,
     ReservedFlag,
     IdMustNotBeZero,
@@ -262,21 +268,21 @@ pub enum CreateAccountResult {
     CreditsPostedMustBeZero,
     LedgerMustNotBeZero,
     CodeMustNotBeZero,
-    /// Transitional, non-TigerBeetle: a feature gated to a later phase.
-    NotImplementedYet,
+    ImportedEventTimestampMustNotRegress,
 }
 
 /// Per-item result of `create_transfers`. Variant ordering mirrors TigerBeetle's
-/// create_transfers result codes. Many variants are reserved for later phases
-/// (pending resolution, closed accounts, imported, timeout) but are declared now
-/// so the enum's shape is stable. `NotImplementedYet` is transitional (removed
-/// once every phase lands).
+/// create_transfers result codes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CreateTransferResult {
     Created,
     LinkedEventFailed,
     LinkedEventChainOpen,
+    ImportedEventExpected,
+    ImportedEventNotExpected,
     TimestampMustBeZero,
+    ImportedEventTimestampOutOfRange,
+    ImportedEventTimestampMustNotAdvance,
     ReservedFlag,
     IdMustNotBeZero,
     IdMustNotBeIntMax,
@@ -322,6 +328,10 @@ pub enum CreateTransferResult {
     PendingTransferAlreadyPosted,
     PendingTransferAlreadyVoided,
     PendingTransferExpired,
+    ImportedEventTimestampMustNotRegress,
+    ImportedEventTimestampMustPostdateDebitAccount,
+    ImportedEventTimestampMustPostdateCreditAccount,
+    ImportedEventTimeoutMustBeZero,
     DebitAccountAlreadyClosed,
     CreditAccountAlreadyClosed,
     OverflowsDebitsPending,
@@ -333,8 +343,6 @@ pub enum CreateTransferResult {
     OverflowsTimeout,
     ExceedsCredits,
     ExceedsDebits,
-    /// Transitional, non-TigerBeetle: a feature gated to a later phase.
-    NotImplementedYet,
 }
 
 /// Resolution state of a pending transfer, recorded once it is posted, voided,
@@ -356,19 +364,15 @@ pub(crate) enum TransferOp {
     PendingReserve,
     Post,
     Void,
-    Gated,
 }
 
 /// Classify a transfer that has already passed input validation. `LINKED`, the
-/// `BALANCING_*` flags, and the `CLOSING_*` flags are orthogonal to the op
-/// (handled by the chain driver / apply paths), so they do not affect the
-/// classification — a closing transfer always has `PENDING` set (validated), so
-/// it classifies as `PendingReserve`.
+/// `BALANCING_*` / `CLOSING_*` flags, and `IMPORTED` are orthogonal to the op
+/// (handled by the chain driver / apply paths / timestamp logic), so they do not
+/// affect the classification — a closing transfer always has `PENDING` set
+/// (validated), so it classifies as `PendingReserve`.
 pub(crate) fn classify(t: &Transfer) -> TransferOp {
     use TransferFlags as F;
-    if t.flags.contains(F::IMPORTED) {
-        return TransferOp::Gated;
-    }
     if t.flags.contains(F::POST_PENDING_TRANSFER) {
         return TransferOp::Post;
     }
@@ -376,9 +380,33 @@ pub(crate) fn classify(t: &Transfer) -> TransferOp {
         return TransferOp::Void;
     }
     if t.flags.contains(F::PENDING) {
-        return TransferOp::PendingReserve; // timeout handled in Phase C
+        return TransferOp::PendingReserve;
     }
     TransferOp::Regular
+}
+
+/// True if a transfer result burns its id (a later attempt with the same id
+/// returns `id_already_failed`): every failure — terminal, the transient set,
+/// and `linked_event_failed` — burns; `Created` and the `Exists`/`ExistsWith*`
+/// family never burn.
+pub(crate) fn transfer_burns_id(r: CreateTransferResult) -> bool {
+    use CreateTransferResult as R;
+    !matches!(
+        r,
+        R::Created
+            | R::Exists
+            | R::ExistsWithDifferentFlags
+            | R::ExistsWithDifferentPendingId
+            | R::ExistsWithDifferentTimeout
+            | R::ExistsWithDifferentDebitAccountId
+            | R::ExistsWithDifferentCreditAccountId
+            | R::ExistsWithDifferentAmount
+            | R::ExistsWithDifferentUserData128
+            | R::ExistsWithDifferentUserData64
+            | R::ExistsWithDifferentUserData32
+            | R::ExistsWithDifferentLedger
+            | R::ExistsWithDifferentCode
+    )
 }
 
 /// A contiguous run of batch events forming one linked chain (or one independent
@@ -420,10 +448,28 @@ pub(crate) fn chains(linked: &[bool]) -> Vec<Chain> {
 
 /// Input-only checks that run *before* the existence lookup (TB codes 6, 9–12).
 /// Returns the first failing code, or `None` if the pre-existence input is ok.
-pub(crate) fn validate_account_pre_existence(a: &Account) -> Option<CreateAccountResult> {
+pub(crate) fn validate_account_pre_existence(
+    a: &Account,
+    batch_imported: bool,
+    now: u64,
+) -> Option<CreateAccountResult> {
     use CreateAccountResult as R;
-    if a.timestamp != 0 {
-        return Some(R::TimestampMustBeZero); // 6 (non-imported)
+    let imported = a.flags.contains(AccountFlags::IMPORTED);
+    if batch_imported && !imported {
+        return Some(R::ImportedEventExpected); // 4
+    }
+    if !batch_imported && imported {
+        return Some(R::ImportedEventNotExpected); // 5
+    }
+    if imported {
+        if a.timestamp == 0 || a.timestamp > TIMESTAMP_MAX {
+            return Some(R::ImportedEventTimestampOutOfRange); // 7
+        }
+        if a.timestamp > now {
+            return Some(R::ImportedEventTimestampMustNotAdvance); // 8
+        }
+    } else if a.timestamp != 0 {
+        return Some(R::TimestampMustBeZero); // 6
     }
     if a.reserved != 0 {
         return Some(R::ReservedField); // 9
@@ -493,19 +539,31 @@ pub(crate) fn account_exists_result(incoming: &Account, existing: &Account) -> C
     R::Exists
 }
 
-/// IMPORTED (Phase G) account creation is gated for now. (LINKED is handled by
-/// the chain driver, not gated.)
-pub(crate) fn account_is_gated(a: &Account) -> bool {
-    a.flags.contains(AccountFlags::IMPORTED)
-}
-
 // ---- Transfer input validators (mirror TB create_transfers order) ----
 
-/// Input-only checks that run *before* the existence lookup (TB codes 6, 9–11).
-pub(crate) fn validate_transfer_pre_existence(t: &Transfer) -> Option<CreateTransferResult> {
+/// Input-only checks that run *before* the existence lookup (TB codes 4–11).
+pub(crate) fn validate_transfer_pre_existence(
+    t: &Transfer,
+    batch_imported: bool,
+    now: u64,
+) -> Option<CreateTransferResult> {
     use CreateTransferResult as R;
-    if t.timestamp != 0 {
-        return Some(R::TimestampMustBeZero); // 6 (non-imported)
+    let imported = t.flags.contains(TransferFlags::IMPORTED);
+    if batch_imported && !imported {
+        return Some(R::ImportedEventExpected); // 4
+    }
+    if !batch_imported && imported {
+        return Some(R::ImportedEventNotExpected); // 5
+    }
+    if imported {
+        if t.timestamp == 0 || t.timestamp > TIMESTAMP_MAX {
+            return Some(R::ImportedEventTimestampOutOfRange); // 7
+        }
+        if t.timestamp > now {
+            return Some(R::ImportedEventTimestampMustNotAdvance); // 8
+        }
+    } else if t.timestamp != 0 {
+        return Some(R::TimestampMustBeZero); // 6
     }
     if t.flags.has_reserved_bits() {
         return Some(R::ReservedFlag); // 9
@@ -520,8 +578,7 @@ pub(crate) fn validate_transfer_pre_existence(t: &Transfer) -> Option<CreateTran
 }
 
 /// Input-only checks that run *after* the existence lookup, only for a new id
-/// (TB codes 25–38). The gate (`NotImplementedYet`) is applied by the caller
-/// *after* this returns `None`.
+/// (TB codes 25–38).
 pub(crate) fn validate_transfer_post_existence(t: &Transfer) -> Option<CreateTransferResult> {
     use CreateTransferResult as R;
     use TransferFlags as F;
@@ -684,17 +741,38 @@ mod tests {
     #[test]
     fn account_pre_existence_order() {
         use CreateAccountResult as R;
+        // Non-imported batch (batch_imported=false, now irrelevant for these).
+        let chk = |a: &Account| validate_account_pre_existence(a, false, 1_000);
         let mut a = Account::input(1, 7).with_code(1);
         a.timestamp = 5;
-        assert_eq!(validate_account_pre_existence(&a), Some(R::TimestampMustBeZero));
+        assert_eq!(chk(&a), Some(R::TimestampMustBeZero));
         let mut a = Account::input(1, 7).with_code(1);
         a.reserved = 1;
-        assert_eq!(validate_account_pre_existence(&a), Some(R::ReservedField));
-        let a = Account::input(0, 7).with_code(1);
-        assert_eq!(validate_account_pre_existence(&a), Some(R::IdMustNotBeZero));
-        let a = Account::input(u128::MAX, 7).with_code(1);
-        assert_eq!(validate_account_pre_existence(&a), Some(R::IdMustNotBeIntMax));
-        assert_eq!(validate_account_pre_existence(&Account::input(1, 7).with_code(1)), None);
+        assert_eq!(chk(&a), Some(R::ReservedField));
+        assert_eq!(chk(&Account::input(0, 7).with_code(1)), Some(R::IdMustNotBeZero));
+        assert_eq!(chk(&Account::input(u128::MAX, 7).with_code(1)), Some(R::IdMustNotBeIntMax));
+        assert_eq!(chk(&Account::input(1, 7).with_code(1)), None);
+    }
+
+    #[test]
+    fn imported_pre_existence_rules() {
+        use CreateAccountResult as R;
+        // Imported batch: a non-imported event → ImportedEventExpected.
+        let plain = Account::input(1, 7).with_code(1);
+        assert_eq!(validate_account_pre_existence(&plain, true, 1_000), Some(R::ImportedEventExpected));
+        // Non-imported batch: an imported event → ImportedEventNotExpected.
+        let imp = Account::input(1, 7).with_code(1).with_flags(AccountFlags::IMPORTED);
+        assert_eq!(validate_account_pre_existence(&imp, false, 1_000), Some(R::ImportedEventNotExpected));
+        // Imported with timestamp 0 → out of range.
+        assert_eq!(validate_account_pre_existence(&imp, true, 1_000), Some(R::ImportedEventTimestampOutOfRange));
+        // Imported timestamp in the future → must not advance.
+        let mut future = imp;
+        future.timestamp = 2_000;
+        assert_eq!(validate_account_pre_existence(&future, true, 1_000), Some(R::ImportedEventTimestampMustNotAdvance));
+        // Imported timestamp valid (0 < ts <= now) → passes pre-existence.
+        let mut ok = imp;
+        ok.timestamp = 500;
+        assert_eq!(validate_account_pre_existence(&ok, true, 1_000), None);
     }
 
     #[test]
@@ -738,8 +816,19 @@ mod tests {
         assert_eq!(classify(&t(F::LINKED | F::PENDING, 0)), TransferOp::PendingReserve);
         assert_eq!(classify(&t(F::BALANCING_DEBIT, 0)), TransferOp::Regular); // balancing is orthogonal
         assert_eq!(classify(&t(F::BALANCING_CREDIT | F::PENDING, 0)), TransferOp::PendingReserve);
-        assert_eq!(classify(&t(F::IMPORTED, 0)), TransferOp::Gated); // imported → Phase G
+        assert_eq!(classify(&t(F::IMPORTED, 0)), TransferOp::Regular); // imported is orthogonal
         assert_eq!(classify(&t(F::PENDING | F::CLOSING_DEBIT, 0)), TransferOp::PendingReserve); // closing is a pending
+    }
+
+    #[test]
+    fn burns_id_predicate() {
+        use CreateTransferResult as R;
+        assert!(!transfer_burns_id(R::Created));
+        assert!(!transfer_burns_id(R::Exists));
+        assert!(!transfer_burns_id(R::ExistsWithDifferentAmount));
+        assert!(transfer_burns_id(R::CreditAccountNotFound)); // transient burns
+        assert!(transfer_burns_id(R::LedgerMustNotBeZero)); // terminal burns
+        assert!(transfer_burns_id(R::LinkedEventFailed)); // linked failure burns
     }
 
     #[test]
@@ -755,12 +844,6 @@ mod tests {
             chains(&[true, false, true, false]),
             vec![c(0, 1, false), c(2, 3, false)]
         );
-    }
-
-    #[test]
-    fn account_gating_predicate() {
-        assert!(!account_is_gated(&Account::input(1, 7).with_code(1)));
-        assert!(account_is_gated(&Account::input(1, 7).with_code(1).with_flags(AccountFlags::IMPORTED)));
     }
 
     #[test]
