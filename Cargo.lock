@@ -270,6 +270,8 @@ name = "bluedb-engine"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "bigdecimal",
  "bluedb-fts",
  "bluedb-rest",
  "bluedb-sql",
@@ -348,6 +350,7 @@ dependencies = [
  "bluedb-sql",
  "gluesql-core",
  "http-body-util",
+ "reqwest",
  "serde",
  "serde_json",
  "slatedb",

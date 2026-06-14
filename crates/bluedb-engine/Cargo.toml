@@ -16,6 +16,8 @@ slatedb        = { workspace = true }
 tantivy        = { workspace = true }
 tokio          = { workspace = true }
 anyhow         = { workspace = true }
+async-trait    = { workspace = true }
+bigdecimal     = { version = "0.4", features = ["serde", "string-only"] }
 thiserror      = { workspace = true }
 bytes          = { workspace = true }
 
