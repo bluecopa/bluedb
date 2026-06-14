@@ -73,7 +73,7 @@ pub mod model;
 
 pub use error::RestError;
 pub use model::{
-    render_value, validate_ident, DeleteRequest, Direction, Filter, InsertRequest, Operator,
+    render_value, validate_ident, DeleteRequest, Direction, Filter, InsertRequest, Operator, Param,
     OrderKey, RestQuery, UpdateRequest,
 };
 pub use parse::{parse_filters, parse_query};
