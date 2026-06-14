@@ -402,6 +402,7 @@ dependencies = [
  "chrono",
  "futures",
  "gluesql-core",
+ "gluesql-test-suite",
  "serde",
  "serde_json",
  "slatedb",
@@ -865,6 +866,12 @@ dependencies = [
  "quote",
  "syn 2.0.117",
 ]
+
+[[package]]
+name = "diff"
+version = "0.1.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "56254986775e3233ffa9c4d7d3faaf6d36a2c09d30b20687e9f88bc8bafc16c8"
 
 [[package]]
 name = "digest"
@@ -1472,6 +1479,23 @@ dependencies = [
  "sqlparser",
  "strum_macros",
  "thiserror 1.0.69",
+ "uuid",
+]
+
+[[package]]
+name = "gluesql-test-suite"
+version = "0.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9bc22493ae0823713ea8eddb72eb42853af1888aadcbf6a22bada12e69ff7ff"
+dependencies = [
+ "async-trait",
+ "bigdecimal",
+ "chrono",
+ "gluesql-core",
+ "hex",
+ "pretty_assertions",
+ "rust_decimal",
+ "serde_json",
  "uuid",
 ]
 
@@ -2596,6 +2620,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
 dependencies = [
  "zerocopy",
+]
+
+[[package]]
+name = "pretty_assertions"
+version = "1.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ae130e2f271fbc2ac3a40fb1d07180839cdbbe443c7a27e1e3c13c5cac0116d"
+dependencies = [
+ "diff",
+ "yansi",
 ]
 
 [[package]]
