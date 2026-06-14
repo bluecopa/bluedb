@@ -9,8 +9,8 @@ use bluedb_storage::Substrate;
 use slatedb::WriteBatch;
 
 use crate::keyspace::LedgerKeyspace;
-use crate::model::{Account, AccountFlags, CreateResult, LedgerError, NewAccount, Transfer, TransferKind};
-use crate::store::{encode, get_account, get_transfer};
+use crate::model::{Account, AccountFlags, CreateResult, LedgerError, NewAccount, Transfer, TransferFlags, TransferKind};
+use crate::store::{encode, get_account, get_transfer, is_resolved};
 
 /// A double-entry ledger over one bluedb database.
 ///
@@ -236,15 +236,83 @@ impl Ledger {
         Ok(StageOutcome::Applied(Transfer { timestamp, ..*t }))
     }
 
-    /// Stage a post/void of a pending transfer. (Implemented in the next task.)
+    /// Stage a post (`post == true`) or void (`false`) of the pending transfer
+    /// referenced by `t.pending_id`. Releases the full reserved amount from the
+    /// `*_pending` buckets; for a post, also moves the settled amount into
+    /// `*_posted` (`t.amount == 0` posts the full reserved amount; a non-zero
+    /// amount must be ≤ the reserved amount, and the remainder is released).
+    /// Records a resolved marker so the pending can never be resolved twice.
     async fn stage_resolution(
         &self,
-        _t: &Transfer,
-        _timestamp: u64,
-        _state: &mut ApplyState,
-        _post: bool,
+        t: &Transfer,
+        timestamp: u64,
+        state: &mut ApplyState,
+        post: bool,
     ) -> Result<StageOutcome> {
-        Ok(StageOutcome::Rejected(LedgerError::UnsupportedFlag))
+        // Look up the referenced pending transfer.
+        let pending = match get_transfer(&self.substrate, &self.keyspace, t.pending_id).await? {
+            Some(p) if p.flags.contains(TransferFlags::PENDING) => p,
+            _ => return Ok(StageOutcome::Rejected(LedgerError::PendingNotFound(t.pending_id))),
+        };
+        // Exactly-once: reject if already resolved (committed marker OR resolved
+        // earlier in THIS batch).
+        if state.resolved.contains(&t.pending_id)
+            || is_resolved(&self.substrate, &self.keyspace, t.pending_id).await?
+        {
+            return Ok(StageOutcome::Rejected(LedgerError::PendingAlreadyResolved(t.pending_id)));
+        }
+
+        // Settled amount: 0 ⇒ post the full reserved amount; else must be ≤ it.
+        let posted = if post {
+            let amount = if t.amount == 0 { pending.amount } else { t.amount };
+            if amount > pending.amount {
+                return Ok(StageOutcome::Rejected(LedgerError::PostExceedsPending));
+            }
+            amount
+        } else {
+            0
+        };
+
+        // Load the PENDING transfer's accounts (not this transfer's fields).
+        let mut debit = match self.load_account(pending.debit_account_id, state).await? {
+            Some(a) => a,
+            None => return Ok(StageOutcome::Rejected(LedgerError::AccountNotFound(pending.debit_account_id))),
+        };
+        let mut credit = match self.load_account(pending.credit_account_id, state).await? {
+            Some(a) => a,
+            None => return Ok(StageOutcome::Rejected(LedgerError::AccountNotFound(pending.credit_account_id))),
+        };
+
+        // Release the full reservation from the pending buckets (checked_sub
+        // guards an invariant violation — the reservation must still be there).
+        debit.debits_pending = match debit.debits_pending.checked_sub(pending.amount) {
+            Some(v) => v,
+            None => return Ok(StageOutcome::Rejected(LedgerError::Overflow)),
+        };
+        credit.credits_pending = match credit.credits_pending.checked_sub(pending.amount) {
+            Some(v) => v,
+            None => return Ok(StageOutcome::Rejected(LedgerError::Overflow)),
+        };
+        if post {
+            debit.debits_posted = match debit.debits_posted.checked_add(posted) {
+                Some(v) => v,
+                None => return Ok(StageOutcome::Rejected(LedgerError::Overflow)),
+            };
+            credit.credits_posted = match credit.credits_posted.checked_add(posted) {
+                Some(v) => v,
+                None => return Ok(StageOutcome::Rejected(LedgerError::Overflow)),
+            };
+        }
+        // No balance-constraint re-check: resolving a hold leaves
+        // (posted + pending) non-increasing on each account, so it cannot newly
+        // breach a constraint that held when the hold was placed.
+
+        state.working.insert(debit.id, debit);
+        state.dirty.insert(debit.id);
+        state.working.insert(credit.id, credit);
+        state.dirty.insert(credit.id);
+        state.resolved.insert(t.pending_id);
+        Ok(StageOutcome::Applied(Transfer { timestamp, ..*t }))
     }
 
     /// Get an account from the working set, loading it read-through on first
@@ -582,6 +650,95 @@ mod tests {
         assert_eq!(res, vec![CreateResult::Ok, CreateResult::Exists]);
         assert_eq!(ledger.lookup_account(1).await.unwrap().unwrap().debits_posted, 100);
         assert_eq!(ledger.lookup_account(2).await.unwrap().unwrap().credits_posted, 100);
+    }
+
+    async fn reserve(ledger: &Ledger, id: u128, debit: u128, credit: u128, amount: u128, ts: u64) {
+        use crate::model::{CreateResult, Transfer, TransferFlags};
+        let mut p = Transfer::new(id, debit, credit, amount, 7);
+        p.flags = TransferFlags::PENDING;
+        assert_eq!(ledger.create_transfers(&[p], ts).await.unwrap(), vec![CreateResult::Ok]);
+    }
+
+    #[tokio::test]
+    async fn post_pending_full_settles_reservation() {
+        use crate::model::{CreateResult, Transfer, TransferFlags};
+        let database = writer_database().await;
+        let ledger = Ledger::new(&database);
+        setup_two_accounts(&ledger).await;
+        reserve(&ledger, 500, 1, 2, 100, 1).await;
+
+        // amount == 0 posts the FULL pending amount.
+        let mut post = Transfer::new(501, 0, 0, 0, 7);
+        post.flags = TransferFlags::POST_PENDING_TRANSFER;
+        post.pending_id = 500;
+        assert_eq!(ledger.create_transfers(&[post], 2).await.unwrap(), vec![CreateResult::Ok]);
+
+        let debit = ledger.lookup_account(1).await.unwrap().unwrap();
+        let credit = ledger.lookup_account(2).await.unwrap().unwrap();
+        assert_eq!(debit.debits_pending, 0);
+        assert_eq!(debit.debits_posted, 100);
+        assert_eq!(credit.credits_pending, 0);
+        assert_eq!(credit.credits_posted, 100);
+    }
+
+    #[tokio::test]
+    async fn post_pending_partial_releases_remainder() {
+        use crate::model::{CreateResult, Transfer, TransferFlags};
+        let database = writer_database().await;
+        let ledger = Ledger::new(&database);
+        setup_two_accounts(&ledger).await;
+        reserve(&ledger, 500, 1, 2, 100, 1).await;
+
+        // Post 60 of the 100 reserved; the remaining 40 is released, not posted.
+        let mut post = Transfer::new(501, 0, 0, 60, 7);
+        post.flags = TransferFlags::POST_PENDING_TRANSFER;
+        post.pending_id = 500;
+        assert_eq!(ledger.create_transfers(&[post], 2).await.unwrap(), vec![CreateResult::Ok]);
+
+        let debit = ledger.lookup_account(1).await.unwrap().unwrap();
+        let credit = ledger.lookup_account(2).await.unwrap().unwrap();
+        assert_eq!(debit.debits_pending, 0);
+        assert_eq!(debit.debits_posted, 60);
+        assert_eq!(credit.credits_pending, 0);
+        assert_eq!(credit.credits_posted, 60);
+    }
+
+    #[tokio::test]
+    async fn post_pending_rejects_over_amount_and_unknown_pending() {
+        use crate::model::{CreateResult, LedgerError, Transfer, TransferFlags};
+        let database = writer_database().await;
+        let ledger = Ledger::new(&database);
+        setup_two_accounts(&ledger).await;
+        reserve(&ledger, 500, 1, 2, 100, 1).await;
+
+        // Posting more than reserved is rejected; the reservation is untouched.
+        let mut over = Transfer::new(501, 0, 0, 101, 7);
+        over.flags = TransferFlags::POST_PENDING_TRANSFER;
+        over.pending_id = 500;
+        assert_eq!(
+            ledger.create_transfers(&[over], 2).await.unwrap(),
+            vec![CreateResult::Failed(LedgerError::PostExceedsPending)]
+        );
+        assert_eq!(ledger.lookup_account(1).await.unwrap().unwrap().debits_pending, 100);
+
+        // Unknown pending id.
+        let mut bad = Transfer::new(502, 0, 0, 0, 7);
+        bad.flags = TransferFlags::POST_PENDING_TRANSFER;
+        bad.pending_id = 999999;
+        assert_eq!(
+            ledger.create_transfers(&[bad], 3).await.unwrap(),
+            vec![CreateResult::Failed(LedgerError::PendingNotFound(999999))]
+        );
+
+        // A pending_id that points at a NON-pending (posted) transfer.
+        ledger.create_transfers(&[Transfer::new(600, 1, 2, 5, 7)], 4).await.unwrap();
+        let mut wrong = Transfer::new(503, 0, 0, 0, 7);
+        wrong.flags = TransferFlags::POST_PENDING_TRANSFER;
+        wrong.pending_id = 600;
+        assert_eq!(
+            ledger.create_transfers(&[wrong], 5).await.unwrap(),
+            vec![CreateResult::Failed(LedgerError::PendingNotFound(600))]
+        );
     }
 
     #[tokio::test]
