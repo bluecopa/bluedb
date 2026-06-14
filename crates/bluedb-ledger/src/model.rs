@@ -328,14 +328,15 @@ pub enum CreateTransferResult {
     NotImplementedYet,
 }
 
-/// Resolution state of a pending transfer, recorded once it is posted or voided
-/// (Phase C adds `Expired`). Persisted under the pending-state keyspace and used
-/// to return `pending_transfer_already_posted` / `_already_voided` on a second
-/// resolution.
+/// Resolution state of a pending transfer, recorded once it is posted, voided,
+/// or expired. Persisted under the pending-state keyspace and used to return
+/// `pending_transfer_already_posted` / `_already_voided` / `_expired` on a later
+/// resolution attempt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum PendingStatus {
     Posted,
     Voided,
+    Expired,
 }
 
 /// How a validated transfer is applied. `Gated` is a later-phase feature
@@ -368,10 +369,7 @@ pub(crate) fn classify(t: &Transfer) -> TransferOp {
         return TransferOp::Void;
     }
     if t.flags.contains(F::PENDING) {
-        if t.timeout != 0 {
-            return TransferOp::Gated; // pending-with-timeout is Phase C
-        }
-        return TransferOp::PendingReserve;
+        return TransferOp::PendingReserve; // timeout handled in Phase C
     }
     TransferOp::Regular
 }
@@ -690,7 +688,7 @@ mod tests {
         };
         assert_eq!(classify(&Transfer::new(1, 1, 2, 5, 7).with_code(1)), TransferOp::Regular);
         assert_eq!(classify(&t(F::PENDING, 0)), TransferOp::PendingReserve);
-        assert_eq!(classify(&t(F::PENDING, 30)), TransferOp::Gated); // pending+timeout → Phase C
+        assert_eq!(classify(&t(F::PENDING, 30)), TransferOp::PendingReserve); // pending+timeout handled in C
         assert_eq!(classify(&t(F::POST_PENDING_TRANSFER, 0)), TransferOp::Post);
         assert_eq!(classify(&t(F::VOID_PENDING_TRANSFER, 0)), TransferOp::Void);
         assert_eq!(classify(&t(F::LINKED, 0)), TransferOp::Gated);

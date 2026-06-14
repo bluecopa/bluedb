@@ -69,6 +69,30 @@ pub(crate) async fn get_watermark(substrate: &Substrate, ks: &LedgerKeyspace) ->
     }
 }
 
+/// Expiry-index entries with `expires_at <= now`, as `(full_index_key,
+/// pending_id)` pairs in ascending `expires_at` order — the timed pendings the
+/// sweep must auto-void. The full key is returned so the caller can delete it.
+pub(crate) async fn scan_expired(
+    substrate: &Substrate,
+    ks: &LedgerKeyspace,
+    now: u64,
+) -> Result<Vec<(Vec<u8>, u128)>> {
+    let start = ks.expiry_prefix();
+    let end = ks.expiry_scan_end(now);
+    let mut out = Vec::new();
+    let mut iter = substrate.scan_range(&start, Some(&end)).await?;
+    while let Some(kv) = iter.next().await? {
+        let key = kv.key.to_vec();
+        // Suffix layout: <expires_at::8> <pending_id::16>; id is the last 16 bytes.
+        let n = key.len();
+        let pid = u128::from_be_bytes(
+            key[n - 16..].try_into().context("expiry index key: pending_id")?,
+        );
+        out.push((key, pid));
+    }
+    Ok(out)
+}
+
 /// Wall clock in nanoseconds since the Unix epoch — the engine's timestamp
 /// source (combined with the persisted watermark to stay strictly monotonic).
 pub(crate) fn now_ns() -> u64 {

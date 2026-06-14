@@ -9,6 +9,8 @@ const TAG_ACCOUNT: u8 = TAG_EXTERNAL_BASE; // 0x10
 const TAG_TRANSFER: u8 = TAG_EXTERNAL_BASE + 1; // 0x11
 /// Tag for the pending-state record (present ⇒ posted/voided; holds the status).
 const TAG_PENDING_STATE: u8 = TAG_EXTERNAL_BASE + 2; // 0x12
+/// Tag for the timeout expiry index (`<expires_at::u64-be> <pending_id::u128-be>`).
+const TAG_EXPIRY: u8 = TAG_EXTERNAL_BASE + 3; // 0x13
 /// Tag for the per-tenant monotonic timestamp watermark (a single key).
 const TAG_TS_WATERMARK: u8 = TAG_EXTERNAL_BASE + 5; // 0x15
 
@@ -38,6 +40,26 @@ impl LedgerKeyspace {
     /// The single per-tenant key holding the monotonic timestamp watermark.
     pub(crate) fn watermark_key(&self) -> Vec<u8> {
         self.ks.external_key(TAG_TS_WATERMARK, b"ts")
+    }
+
+    /// Expiry-index key for a timed pending: `<expires_at::u64-be> <pending_id::u128-be>`,
+    /// so a range scan yields entries in ascending `expires_at` then id order.
+    pub(crate) fn expiry_key(&self, expires_at: u64, pending_id: u128) -> Vec<u8> {
+        let mut suffix = Vec::with_capacity(24);
+        suffix.extend_from_slice(&expires_at.to_be_bytes());
+        suffix.extend_from_slice(&pending_id.to_be_bytes());
+        self.ks.external_key(TAG_EXPIRY, &suffix)
+    }
+
+    /// The prefix shared by every expiry-index entry (scan lower bound).
+    pub(crate) fn expiry_prefix(&self) -> Vec<u8> {
+        self.ks.external_prefix(TAG_EXPIRY)
+    }
+
+    /// Exclusive scan upper bound covering exactly the entries with
+    /// `expires_at <= now` (i.e. everything that has expired by `now`).
+    pub(crate) fn expiry_scan_end(&self, now: u64) -> Vec<u8> {
+        self.ks.external_key(TAG_EXPIRY, &now.saturating_add(1).to_be_bytes())
     }
 
     #[allow(dead_code)] // used by range scans in later plans (lookup-all / sweeps)
@@ -85,6 +107,19 @@ mod tests {
         assert!(ks.transfer_key(5) < r);
         // Ordered by id within the namespace.
         assert!(ks.pending_state_key(1) < ks.pending_state_key(2));
+    }
+
+    #[test]
+    fn expiry_keys_sort_and_bound_correctly() {
+        let ks = LedgerKeyspace::new("_");
+        // Ordered by expires_at, then by pending_id.
+        assert!(ks.expiry_key(100, 5) < ks.expiry_key(100, 6));
+        assert!(ks.expiry_key(100, u128::MAX) < ks.expiry_key(101, 0));
+        assert!(ks.expiry_key(100, 5).starts_with(&ks.expiry_prefix()));
+        // expiry_scan_end(now) excludes entries with expires_at > now, includes <= now.
+        let end = ks.expiry_scan_end(100);
+        assert!(ks.expiry_key(100, u128::MAX) < end, "expires_at == now is included");
+        assert!(end <= ks.expiry_key(101, 0), "expires_at == now+1 is excluded");
     }
 
     #[test]

@@ -11,7 +11,7 @@ mod ledger;
 mod model;
 mod store;
 
-pub use ledger::Ledger;
+pub use ledger::{Clock, Ledger};
 pub use model::{
     Account, AccountFlags, CreateAccountResult, CreateTransferResult, Transfer, TransferFlags,
 };

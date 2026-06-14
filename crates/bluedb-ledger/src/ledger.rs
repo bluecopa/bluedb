@@ -10,6 +10,8 @@
 //! with a nonzero timeout.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use anyhow::Result;
 use bluedb_sql::{Database, WriteLease, DEFAULT_TENANT};
@@ -21,9 +23,40 @@ use crate::model::{
     account_exists_result, account_is_gated, classify, transfer_exists_result,
     validate_account_post_existence, validate_account_pre_existence,
     validate_transfer_post_existence, validate_transfer_pre_existence, Account, AccountFlags,
-    CreateAccountResult, CreateTransferResult, PendingStatus, Transfer, TransferOp, AMOUNT_MAX,
+    CreateAccountResult, CreateTransferResult, PendingStatus, Transfer, TransferFlags, TransferOp,
+    AMOUNT_MAX,
 };
-use crate::store::{encode, get_account, get_pending_state, get_transfer, get_watermark, now_ns};
+use crate::store::{
+    encode, get_account, get_pending_state, get_transfer, get_watermark, now_ns, scan_expired,
+};
+
+/// One second in nanoseconds — the unit of a transfer `timeout`.
+const NANOS_PER_SECOND: u64 = 1_000_000_000;
+/// TigerBeetle caps a timestamp + timeout at `2^63 - 1` (`overflows_timeout`).
+const TIMESTAMP_MAX: u64 = i64::MAX as u64;
+
+/// Time source for timestamp assignment and timeout expiry. `Wall` reads the
+/// system clock; `Manual` is an advanceable clock for deterministic tests.
+#[derive(Clone)]
+pub enum Clock {
+    Wall,
+    Manual(Arc<AtomicU64>),
+}
+
+impl Clock {
+    fn now_ns(&self) -> u64 {
+        match self {
+            Clock::Wall => now_ns(),
+            Clock::Manual(a) => a.load(Ordering::SeqCst),
+        }
+    }
+}
+
+/// The absolute expiry timestamp of a timed pending. Saturating: the value was
+/// validated not to overflow `2^63 - 1` at reserve time (`overflows_timeout`).
+fn expiry_of(timestamp: u64, timeout: u32) -> u64 {
+    timestamp.saturating_add((timeout as u64).saturating_mul(NANOS_PER_SECOND))
+}
 
 /// A double-entry ledger over one bluedb database.
 ///
@@ -35,17 +68,31 @@ pub struct Ledger {
     substrate: Substrate,
     write_lease: WriteLease,
     keyspace: LedgerKeyspace,
+    clock: Clock,
 }
 
 impl Ledger {
     /// Build a ledger over `database` under the default tenant, sharing its
     /// substrate and write lease (so ledger applies serialize against the
-    /// database's explicit SQL transactions).
+    /// database's explicit SQL transactions). Uses the wall clock for timestamp
+    /// assignment and timeout expiry.
     pub fn new(database: &Database) -> Self {
         Self {
             substrate: database.substrate(),
             write_lease: database.write_lease(),
             keyspace: LedgerKeyspace::new(DEFAULT_TENANT),
+            clock: Clock::Wall,
+        }
+    }
+
+    /// Build a ledger with an injected [`Clock`] — e.g. a [`Clock::Manual`] for
+    /// deterministic timeout testing or simulation.
+    pub fn with_clock(database: &Database, clock: Clock) -> Self {
+        Self {
+            substrate: database.substrate(),
+            write_lease: database.write_lease(),
+            keyspace: LedgerKeyspace::new(DEFAULT_TENANT),
+            clock,
         }
     }
 
@@ -71,6 +118,7 @@ impl Ledger {
         let _lease = self.write_lease.lock().await; // exclusive: we are the sole mutator
         let writer = self.substrate.require_writer()?;
 
+        let now = self.clock.now_ns();
         let mut ts = TimestampSource::new(get_watermark(&self.substrate, &self.keyspace).await?);
         let mut batch = WriteBatch::new();
         let mut results = Vec::with_capacity(specs.len());
@@ -101,7 +149,7 @@ impl Ledger {
             }
 
             let mut acct = *spec;
-            acct.timestamp = ts.next();
+            acct.timestamp = ts.next(now);
             batch.put(self.keyspace.account_key(acct.id), &encode(&acct)?);
             staged.insert(acct.id, acct);
             results.push(R::Created);
@@ -127,8 +175,14 @@ impl Ledger {
         let _lease = self.write_lease.lock().await; // exclusive
         let writer = self.substrate.require_writer()?; // fail fast on a replica; held for the commit
 
+        let now = self.clock.now_ns();
         let mut ts = TimestampSource::new(get_watermark(&self.substrate, &self.keyspace).await?);
         let mut state = ApplyState::default();
+
+        // Auto-void every pending whose timeout has elapsed by `now` before
+        // processing the batch, so resolutions and re-reads see released funds.
+        self.sweep_expired(now, &mut state).await?;
+
         // Transfers accepted in THIS batch, for in-batch existence comparison.
         let mut staged: HashMap<u128, Transfer> = HashMap::new();
         let mut accepted: Vec<Transfer> = Vec::new();
@@ -156,9 +210,14 @@ impl Ledger {
             // Classify and apply. Each arm yields the record to persist (raw for
             // regular/pending; materialized for post/void) or a rejection code.
             let op = classify(t);
+            // The timestamp this item will get on accept (for the timeout-overflow
+            // check); equals `ts.next(now)` since no accept happens in between.
+            let prospective_ts = ts.peek(now);
             let staged_record: StageRecord = match op {
                 TransferOp::Regular => self.stage_regular(t, &mut state).await?.map(|()| *t),
-                TransferOp::PendingReserve => self.stage_pending(t, &mut state).await?.map(|()| *t),
+                TransferOp::PendingReserve => {
+                    self.stage_pending(t, prospective_ts, &mut state).await?.map(|()| *t)
+                }
                 TransferOp::Post | TransferOp::Void => {
                     let post = matches!(op, TransferOp::Post);
                     // The referenced pending may be committed or staged this batch.
@@ -166,7 +225,7 @@ impl Ledger {
                         Some(p) => Some(p),
                         None => staged.get(&t.pending_id).copied(),
                     };
-                    self.stage_resolution(t, pending, post, &mut state).await?
+                    self.stage_resolution(t, pending, post, now, &mut state).await?
                 }
                 TransferOp::Gated => Err(R::NotImplementedYet),
             };
@@ -174,7 +233,7 @@ impl Ledger {
             match staged_record {
                 Ok(record) => {
                     // Timestamp assigned only on accept (failed items don't advance it).
-                    let applied = Transfer { timestamp: ts.next(), ..record };
+                    let applied = Transfer { timestamp: ts.next(now), ..record };
                     staged.insert(applied.id, applied);
                     accepted.push(applied);
                     results.push(R::Created);
@@ -183,8 +242,8 @@ impl Ledger {
             }
         }
 
-        // One atomic batch: every mutated account + every accepted transfer +
-        // every pending-state record from this batch + the advanced watermark.
+        // One atomic batch: mutated accounts + accepted transfers + pending-state
+        // records (incl. swept `Expired`) + expiry-index churn + the watermark.
         let mut batch = WriteBatch::new();
         for id in &state.dirty {
             if let Some(account) = state.working.get(id) {
@@ -193,15 +252,71 @@ impl Ledger {
         }
         for t in &accepted {
             batch.put(self.keyspace.transfer_key(t.id), &encode(t)?);
+            // A new timed pending gets an expiry-index entry for the sweep.
+            if t.flags.contains(TransferFlags::PENDING) && t.timeout != 0 {
+                let expires_at = expiry_of(t.timestamp, t.timeout);
+                batch.put(self.keyspace.expiry_key(expires_at, t.id), [1u8]);
+            }
         }
         for (pending_id, status) in &state.resolved {
             batch.put(self.keyspace.pending_state_key(*pending_id), &encode(status)?);
         }
+        // Drop expiry-index entries for pendings resolved or swept this batch.
+        for key in &state.expiry_removals {
+            batch.delete(key);
+        }
         if !accepted.is_empty() {
             batch.put(self.keyspace.watermark_key(), ts.last.to_be_bytes());
+        }
+        if !batch.is_empty() {
             writer.write(batch).await?;
         }
         Ok(results)
+    }
+
+    /// Auto-void every timed pending whose `expires_at <= now`: release the
+    /// reservation back to its accounts, record pending-state `Expired`, and
+    /// mark the expiry-index entry for deletion. Folded into the caller's batch.
+    async fn sweep_expired(&self, now: u64, state: &mut ApplyState) -> Result<()> {
+        for (key, pending_id) in scan_expired(&self.substrate, &self.keyspace, now).await? {
+            // If it was already resolved, the index entry is stale — just drop it.
+            if state.resolved.contains_key(&pending_id)
+                || get_pending_state(&self.substrate, &self.keyspace, pending_id).await?.is_some()
+            {
+                state.expiry_removals.push(key);
+                continue;
+            }
+            let pending = match get_transfer(&self.substrate, &self.keyspace, pending_id).await? {
+                Some(p) => p,
+                None => {
+                    state.expiry_removals.push(key);
+                    continue;
+                }
+            };
+            let mut debit = self
+                .load_account(pending.debit_account_id, state)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("ledger invariant: expired pending debit account missing"))?;
+            let mut credit = self
+                .load_account(pending.credit_account_id, state)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("ledger invariant: expired pending credit account missing"))?;
+            debit.debits_pending = debit
+                .debits_pending
+                .checked_sub(pending.amount)
+                .ok_or_else(|| anyhow::anyhow!("ledger invariant: debits_pending underflow on expiry"))?;
+            credit.credits_pending = credit
+                .credits_pending
+                .checked_sub(pending.amount)
+                .ok_or_else(|| anyhow::anyhow!("ledger invariant: credits_pending underflow on expiry"))?;
+            state.working.insert(debit.id, debit);
+            state.dirty.insert(debit.id);
+            state.working.insert(credit.id, credit);
+            state.dirty.insert(credit.id);
+            state.resolved.insert(pending_id, PendingStatus::Expired);
+            state.expiry_removals.push(key);
+        }
+        Ok(())
     }
 
     /// Apply one plain posted transfer into `state`. The outer `Result` is I/O;
@@ -279,7 +394,12 @@ impl Ledger {
     /// guards (64/65), and the same asymmetric balance constraint as a post
     /// (the constrained side counts posted + pending). The reservation is later
     /// settled by a post or released by a void.
-    async fn stage_pending(&self, t: &Transfer, state: &mut ApplyState) -> Result<StageOutcome> {
+    async fn stage_pending(
+        &self,
+        t: &Transfer,
+        prospective_ts: u64,
+        state: &mut ApplyState,
+    ) -> Result<StageOutcome> {
         use CreateTransferResult as R;
 
         let mut debit = match self.load_account(t.debit_account_id, state).await? {
@@ -315,6 +435,19 @@ impl Ledger {
             return Ok(Err(R::OverflowsCredits));
         }
 
+        // 66: a timed reservation's expiry (timestamp + timeout·1e9) must fit in
+        // TigerBeetle's 2^63 - 1 timestamp ceiling. Checked against the timestamp
+        // this item will get on accept (`prospective_ts`).
+        if t.timeout != 0 {
+            let expires = (t.timeout as u64)
+                .checked_mul(NANOS_PER_SECOND)
+                .and_then(|d| prospective_ts.checked_add(d));
+            match expires {
+                Some(e) if e <= TIMESTAMP_MAX => {}
+                _ => return Ok(Err(R::OverflowsTimeout)),
+            }
+        }
+
         // 67 / 68: a reserved outflow is constrained exactly like a post.
         if debit.flags.contains(AccountFlags::DEBITS_MUST_NOT_EXCEED_CREDITS)
             && debit.debits_posted + debit.debits_pending > debit.credits_posted
@@ -347,6 +480,7 @@ impl Ledger {
         t: &Transfer,
         pending: Option<Transfer>,
         post: bool,
+        now: u64,
         state: &mut ApplyState,
     ) -> Result<StageRecord> {
         use crate::model::TransferFlags as F;
@@ -397,7 +531,14 @@ impl Ledger {
         match prior {
             Some(PendingStatus::Posted) => return Ok(Err(R::PendingTransferAlreadyPosted)),
             Some(PendingStatus::Voided) => return Ok(Err(R::PendingTransferAlreadyVoided)),
+            Some(PendingStatus::Expired) => return Ok(Err(R::PendingTransferExpired)),
             None => {}
+        }
+        // 53: lazy expiry — a timed pending past its expiry is rejected even if the
+        // sweep hasn't run yet (the sweep at the start of this batch handles the
+        // proactive release; this guards a resolution slipping in at/after expiry).
+        if pending.timeout != 0 && expiry_of(pending.timestamp, pending.timeout) <= now {
+            return Ok(Err(R::PendingTransferExpired));
         }
 
         // Apply against the PENDING transfer's accounts.
@@ -440,6 +581,13 @@ impl Ledger {
             pending.id,
             if post { PendingStatus::Posted } else { PendingStatus::Voided },
         );
+        // A timed pending resolved before expiry: drop its expiry-index entry so
+        // the sweep won't touch it later.
+        if pending.timeout != 0 {
+            state
+                .expiry_removals
+                .push(self.keyspace.expiry_key(expiry_of(pending.timestamp, pending.timeout), pending.id));
+        }
 
         // Materialize the stored record: inherited fields filled from the pending,
         // `amount` set to the effective posted/voided amount.
@@ -487,8 +635,14 @@ impl TimestampSource {
         Self { last: persisted_watermark }
     }
 
-    fn next(&mut self) -> u64 {
-        self.last = now_ns().max(self.last.saturating_add(1));
+    /// The timestamp the next accepted event would get, without consuming it.
+    fn peek(&self, now: u64) -> u64 {
+        now.max(self.last.saturating_add(1))
+    }
+
+    /// Assign (and consume) the next timestamp for an accepted event.
+    fn next(&mut self, now: u64) -> u64 {
+        self.last = self.peek(now);
         self.last
     }
 }
@@ -512,6 +666,8 @@ struct ApplyState {
     working: HashMap<u128, Account>,
     dirty: HashSet<u128>,
     resolved: HashMap<u128, PendingStatus>,
+    /// Expiry-index keys to delete this batch (resolved-before-expiry + swept).
+    expiry_removals: Vec<Vec<u8>>,
 }
 
 #[cfg(test)]
@@ -692,13 +848,9 @@ mod tests {
         for f in [TransferFlags::LINKED, TransferFlags::BALANCING_DEBIT, TransferFlags::IMPORTED] {
             assert_eq!(l.create_transfers(&[xfer(1, 1, 2, 5).with_flags(f)]).await.unwrap(), vec![R::NotImplementedYet]);
         }
-        // A pending WITH a timeout is Phase C → still gated.
-        let mut timed = xfer(1, 1, 2, 5).with_flags(TransferFlags::PENDING);
-        timed.timeout = 30;
-        assert_eq!(l.create_transfers(&[timed]).await.unwrap(), vec![R::NotImplementedYet]);
         // Nothing persisted by a gated item.
         assert!(l.lookup_transfer(1).await.unwrap().is_none());
-        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_pending, 0);
+        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_posted, 0);
         // A gated account flag too.
         assert_eq!(
             l.create_accounts(&[acct(9, 7).with_flags(AccountFlags::IMPORTED)]).await.unwrap(),
@@ -935,6 +1087,110 @@ mod tests {
         assert_eq!(l.create_transfers(&[post(501, 500, 50)]).await.unwrap(), vec![R::ExistsWithDifferentAmount]);
         // Balances moved exactly once.
         assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_posted, 100);
+    }
+
+    // ---- Phase C: timeouts ----
+
+    /// A manual-clock ledger starting at `t0` ns, plus the shared clock handle.
+    fn manual_ledger(db: &Database, t0: u64) -> (Ledger, Arc<AtomicU64>) {
+        let clock = Arc::new(AtomicU64::new(t0));
+        (Ledger::with_clock(db, Clock::Manual(clock.clone())), clock)
+    }
+
+    fn timed_pending(id: u128, debit: u128, credit: u128, amount: u128, timeout: u32) -> Transfer {
+        let mut p = xfer(id, debit, credit, amount).with_flags(TransferFlags::PENDING);
+        p.timeout = timeout;
+        p
+    }
+
+    #[tokio::test]
+    async fn timed_pending_reserves_and_overflow_is_rejected() {
+        use CreateTransferResult as R;
+        let db = writer_database().await;
+        // Clock near the u64 ceiling so timestamp + timeout·1e9 overflows 2^63-1.
+        let (l, _clk) = manual_ledger(&db, u64::MAX - 5);
+        l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
+        let res = l.create_transfers(&[timed_pending(500, 1, 2, 100, u32::MAX)]).await.unwrap();
+        assert_eq!(res, vec![R::OverflowsTimeout]);
+        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_pending, 0, "not reserved");
+    }
+
+    #[tokio::test]
+    async fn sweep_auto_voids_expired_pending() {
+        let db = writer_database().await;
+        let t0 = 1_000_000_000_000; // 1000s in ns
+        let (l, clk) = manual_ledger(&db, t0);
+        l.create_accounts(&[acct(1, 7), acct(2, 7), acct(3, 7)]).await.unwrap();
+        // Reserve with a 10s timeout → expires at t0 + 10e9.
+        assert_eq!(l.create_transfers(&[timed_pending(500, 1, 2, 100, 10)]).await.unwrap(), vec![CreateTransferResult::Created]);
+        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_pending, 100);
+        // Advance past expiry, then trigger the sweep with an unrelated transfer.
+        clk.store(t0 + 11_000_000_000, Ordering::SeqCst);
+        l.create_transfers(&[xfer(600, 1, 3, 5)]).await.unwrap();
+        let d = l.lookup_account(1).await.unwrap().unwrap();
+        assert_eq!(d.debits_pending, 0, "expired reservation released");
+        assert_eq!(d.debits_posted, 5, "only the unrelated regular transfer posted");
+    }
+
+    #[tokio::test]
+    async fn sweep_only_batch_commits_release() {
+        let db = writer_database().await;
+        let t0 = 1_000_000_000_000;
+        let (l, clk) = manual_ledger(&db, t0);
+        l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
+        l.create_transfers(&[timed_pending(500, 1, 2, 100, 10)]).await.unwrap();
+        clk.store(t0 + 11_000_000_000, Ordering::SeqCst);
+        // An empty batch still runs the sweep and must persist the release.
+        l.create_transfers(&[]).await.unwrap();
+        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_pending, 0);
+        assert_eq!(l.lookup_account(2).await.unwrap().unwrap().credits_pending, 0);
+    }
+
+    #[tokio::test]
+    async fn lazy_expiry_rejects_late_resolution() {
+        use CreateTransferResult as R;
+        let db = writer_database().await;
+        let t0 = 1_000_000_000_000;
+        let (l, clk) = manual_ledger(&db, t0);
+        l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
+        l.create_transfers(&[timed_pending(500, 1, 2, 100, 10)]).await.unwrap();
+        // Advance past expiry; the same call sweeps first, so the post sees Expired.
+        clk.store(t0 + 11_000_000_000, Ordering::SeqCst);
+        assert_eq!(l.create_transfers(&[post(501, 500, AMOUNT_MAX)]).await.unwrap(), vec![R::PendingTransferExpired]);
+        // Reservation was released by the sweep; nothing posted.
+        let d = l.lookup_account(1).await.unwrap().unwrap();
+        assert_eq!((d.debits_pending, d.debits_posted), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn resolve_before_expiry_prevents_double_release() {
+        let db = writer_database().await;
+        let t0 = 1_000_000_000_000;
+        let (l, clk) = manual_ledger(&db, t0);
+        l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
+        l.create_transfers(&[timed_pending(500, 1, 2, 100, 10)]).await.unwrap();
+        // Post before expiry (its index entry is removed).
+        assert_eq!(l.create_transfers(&[post(501, 500, AMOUNT_MAX)]).await.unwrap(), vec![CreateTransferResult::Created]);
+        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_posted, 100);
+        // Advance past the old expiry and sweep: nothing to release, balances stable.
+        clk.store(t0 + 11_000_000_000, Ordering::SeqCst);
+        l.create_transfers(&[]).await.unwrap();
+        let d = l.lookup_account(1).await.unwrap().unwrap();
+        assert_eq!((d.debits_pending, d.debits_posted), (0, 100), "no double release");
+    }
+
+    #[tokio::test]
+    async fn zero_timeout_pending_never_expires() {
+        let db = writer_database().await;
+        let t0 = 1_000_000_000_000;
+        let (l, clk) = manual_ledger(&db, t0);
+        l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
+        l.create_transfers(&[xfer(500, 1, 2, 100).with_flags(TransferFlags::PENDING)]).await.unwrap();
+        clk.store(t0 + 1_000_000_000_000, Ordering::SeqCst); // far in the future
+        l.create_transfers(&[]).await.unwrap(); // sweep finds nothing
+        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_pending, 100, "untimed pending outstanding");
+        // And it can still be posted.
+        assert_eq!(l.create_transfers(&[post(501, 500, AMOUNT_MAX)]).await.unwrap(), vec![CreateTransferResult::Created]);
     }
 
     #[tokio::test]
