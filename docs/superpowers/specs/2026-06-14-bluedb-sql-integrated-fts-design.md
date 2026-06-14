@@ -57,8 +57,10 @@ high-text-selectivity / low-filter-selectivity queries.
 **Goals**
 
 1. `CREATE FULLTEXT INDEX` (via Spec A's DDL surface) on a text column, with an analyzer.
-2. A SQL search predicate (`fts_match`) combinable with structured filters, `ORDER BY`
-   relevance (`fts_rank`), and `LIMIT/OFFSET`.
+2. The **PostgreSQL FTS surface** — `to_tsvector(cfg, col) @@ to_tsquery(q)` /
+   `plainto_tsquery` / `websearch_to_tsquery`, `ts_rank(...)` for `ORDER BY`, combinable
+   with structured filters and `LIMIT/OFFSET`. Copy the Postgres way so it's familiar and
+   portable.
 3. **Read-your-writes** on the index: after `COMMIT`, a subsequent `MATCH` sees the row —
    with no synchronous split flush (write path stays fast).
 4. REST parity: `?col=fts.<query>` lowers to the predicate, combinable with the existing
@@ -98,37 +100,63 @@ per-field analyzers), and the FTS doc identity (the SQL row's primary key, or th
   live segment into a durable tantivy split, publishes it to the `bluedb-fts` manifest,
   and resets the live segment. This heavy work is **off the ack path.**
 
-### 4.3 Query path — Planner-hook rewrite (fork-free)
+### 4.3 Query path — PostgreSQL surface, rewritten in the shim (fork-free)
 
-SQL surface (function forms parse cleanly under sqlparser and are rewritten in the
-`Planner::plan` pass *before* execution, so gluesql never sees an unknown function):
+The query uses the genuine Postgres FTS syntax:
 
 ```sql
 SELECT id, title
 FROM docs
-WHERE fts_match(body, 'invoice overdue')   -- relevance predicate
-  AND status = 'open'                        -- ordinary structured filter
-ORDER BY fts_rank(body, 'invoice overdue') DESC
+WHERE to_tsvector('english', body) @@ plainto_tsquery('invoice overdue')   -- relevance predicate
+  AND status = 'open'                                                       -- ordinary structured filter
+ORDER BY ts_rank(to_tsvector('english', body), plainto_tsquery('invoice overdue')) DESC
 LIMIT 20;
 ```
 
-At plan time the hook:
-1. Detects `fts_match(col, $q)` / `fts_rank(col, $q)` nodes (query string is a bound `$N`
-   param — injection-proof per Spec A).
+**Parser feasibility (verified).** sqlparser 0.52 **tokenizes `@@`** (`Token::AtAt` →
+`BinaryOperator::AtAt`), and `to_tsvector` / `to_tsquery` / `plainto_tsquery` /
+`websearch_to_tsquery` / `ts_rank` parse as ordinary function calls — so the surface is
+syntactically accepted. gluesql's *translate/executor* does **not** understand `@@` or the
+`tsvector`/`tsquery` types, so we intercept these constructs in our pre-execution shim
+(the same place we rewrite set-ops, comma-joins, and coercions) and the `Planner::plan`
+pass, rewriting them into the tantivy plan. The query string is a bound `$N` param
+(injection-proof per Spec A).
+
+The rewrite:
+1. Detects `to_tsvector(cfg, col) @@ <tsquery-fn>(q)` and `ts_rank(to_tsvector(cfg,col), …)`.
+   `cfg` (`'english'`) selects the analyzer; the `*_tsquery` variant selects query parsing
+   (`to_tsquery` = boolean/operators, `plainto_tsquery` = AND of terms,
+   `websearch_to_tsquery` = web-search syntax).
 2. Runs the search over **durable splits (minus tombstones) ∪ the in-memory live segment**
-   via an `FtsSearcher` trait, getting back `(pk, score)` for the top candidates
-   (over-fetching a window so structured filters don't under-fill a page).
-3. Rewrites `fts_match(col, q)` → `pk IN (<candidate pks>)` and threads the score so
-   `fts_rank` resolves and `ORDER BY` / `LIMIT` work in GlueSQL as normal.
+   via an `FtsSearcher` trait → `(pk, score)` for the top candidates (over-fetching a
+   window so structured filters don't under-fill a page).
+3. Rewrites the `@@` predicate → `pk IN (<candidate pks>)` and threads the score so
+   `ts_rank` resolves and `ORDER BY` / `LIMIT` work in GlueSQL as normal.
 
 GlueSQL then applies the structured filters, ordering, and pagination over the candidate
-rows. **No GlueSQL executor changes** — same Planner hook we already own for coercion.
+rows — and the `status = 'open'` filter can itself ride a **B-tree secondary index**
+(§4.5). **No GlueSQL executor changes** — same shim/Planner machinery we already own.
 
 ### 4.4 REST mapping
 
 `GET /tables/docs?body=fts.invoice%20overdue&status=eq.open&order=rank.desc&limit=20`
-lowers to the SQL above. `fts.<query>` is a new `bluedb-rest` operator; the query string
-becomes a bound param; `order=rank.desc` maps to `ORDER BY fts_rank(...) DESC`.
+lowers to the SQL in §4.3. `fts.<query>` is a new `bluedb-rest` operator that emits the
+`to_tsvector(cfg, col) @@ plainto_tsquery($q)` predicate (query string as a bound param);
+`order=rank.desc` maps to `ORDER BY ts_rank(...) DESC`. The structured filters
+(`status=eq.open`) and pagination use the existing DSL unchanged.
+
+### 4.5 Indexing model — B-tree (exists) vs FTS/GIN (this spec)
+
+bluedb-sql already has **B-tree-style secondary indexes** for regular columns:
+`CREATE/DROP INDEX`, order-preserving prefix-free value encoding (so they serve equality
+lookups, **range** scans, and `ORDER BY`), maintained through the txn overlay, and used by
+the planner (`plan_index`). Single-column.
+
+The FTS index in this spec is the **GIN analog** — a separate index *type* (tantivy splits
++ live segment) for text relevance, declared via `CREATE FULLTEXT INDEX` / the DDL surface,
+queried via `@@`. The two compose: in an FTS query, the relevance predicate hits the FTS
+index and the structured filters (`status = 'open'`) hit the B-tree secondary index. So
+"Postgres way" holds on both axes — B-tree for structured, GIN for full-text.
 
 ## 5. Read-your-writes — flow & guarantee
 
@@ -171,16 +199,17 @@ interval.
   Split`. Independently testable in-memory.
 - **New: commit tap** — a hook in `bluedb-sql`'s `StoreMut` commit emitting indexed-column
   changes for FTS-indexed tables.
-- **New: SQL↔FTS bridge** — a `Planner::plan` pass detecting `fts_match`/`fts_rank` and
-  rewriting via an injected `FtsSearcher` (which fans the search over splits ∪ live).
+- **New: SQL↔FTS bridge** — a shim/`Planner::plan` pass detecting the `@@` predicate +
+  `to_tsvector`/`*_tsquery`/`ts_rank` constructs and rewriting via an injected
+  `FtsSearcher` (which fans the search over splits ∪ live).
 - `bluedb-engine` — wires the `LiveSegment` + `FtsSearcher` into the SQL connection and
   drives the background seal scheduler (it already has the `FtsIndex` compaction scheduler
   pattern to follow).
 
 ## 8. Testing
 
-- **RYW:** insert → `fts_match` in the same connection sees the row with no explicit flush.
-- **Filter + rank + pagination:** `fts_match AND eq-filter ORDER BY rank LIMIT/OFFSET`
+- **RYW:** insert → `@@` query in the same connection sees the row with no explicit flush.
+- **Filter + rank + pagination:** `… @@ … AND eq-filter ORDER BY ts_rank(…) LIMIT/OFFSET`
   returns the right ranked, filtered, paged set (including the over-fetch-avoids-underfill
   case).
 - **Tombstones:** update changes which rows match; delete removes a match — immediately.
@@ -193,15 +222,17 @@ interval.
 
 ## 9. Open questions
 
-- **Predicate syntax.** Leaning **function forms** `fts_match(col, $q)` / `fts_rank(col, $q)`
-  (parse cleanly as scalar functions under sqlparser, rewritten in the Planner before
-  execution). A `@@` operator sugar could be added later. Confirm sqlparser parses the
-  function form without treating `MATCH` as a reserved keyword (hence the `fts_` prefix).
-- **Score threading mechanism.** How the per-pk score reaches `fts_rank`/`ORDER BY` after
+- **Predicate syntax — resolved to the Postgres surface** (`@@` + `to_tsvector` /
+  `*_tsquery` / `ts_rank`); sqlparser 0.52 parses all of it. **Remaining sub-question:**
+  whether gluesql's `translate` *errors* on `BinaryOperator::AtAt`/unknown functions (→ we
+  must rewrite at the **pre-parse string** level, before gluesql parses) or tolerates them
+  far enough to reach our `Planner::plan` hook (→ rewrite on the typed AST). Determines
+  which shim stage does the rewrite; verify against gluesql 0.19 `translate`.
+- **Score threading mechanism.** How the per-pk score reaches `ts_rank`/`ORDER BY` after
   the `pk IN (…)` rewrite — candidates: a derived `VALUES (pk, score)` join, an injected
   `CASE pk WHEN … THEN score` expression, or a scalar-subquery. Pick by what GlueSQL plans
   efficiently.
 - **Over-fetch window** sizing for filter-under-fill (fixed multiple of `LIMIT`, or
   iterative widening until the page fills).
 - **Multi-column / multiple FTS indexes** per table (v1 may restrict to one indexed column
-  per `fts_match`).
+  per `@@` predicate).

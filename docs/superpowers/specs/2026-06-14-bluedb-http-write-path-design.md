@@ -124,23 +124,37 @@ values, instead of interpolated literals.
 - JSON scalar → `ParamLiteral`: `null`→Null, bool→Bool, integer→I64, float→F64,
   string→Str. (No more "does it parse as a number" heuristic — the JSON type decides.)
 
-**Bulk insert (the batching primitive).** `POST /tables/{t}` already accepts an object
-*or array of objects* (`build_insert`, `lib.rs:319`). For an array, instead of one
-multi-row `VALUES` (which trips the parser bug), emit:
+**Bulk / batch (the driverless throughput primitive).** `POST /tables/{t}` accepts an
+object *or array of objects* (`build_insert`, `lib.rs:319`); the general form is a batch
+of `{sql, params}` elements (the array-of-objects is sugar over it). **The client sends
+only the array — no transaction syntax.** The server wraps the batch in a transaction
+internally:
 
-```
-BEGIN;
-INSERT INTO <ident> (<idents>) VALUES ($1, …, $k);
-INSERT INTO <ident> (<idents>) VALUES ($k+1, …);
-…
-COMMIT;
+Client sends:
+```json
+[ {"sql": "INSERT INTO docs (id, body) VALUES ($1,$2)", "params": [1, "…"]},
+  {"sql": "INSERT INTO docs (id, body) VALUES ($1,$2)", "params": [2, "…"]} ]
 ```
 
-with placeholder indices running **globally** 1..N across all rows (gluesql shares one
-params slice across statements), and all row values flattened in order into the params
-vec. Executed on the **serialized** connection (the txn holds the write lease) →
-**one `WriteBatch` → one durable flush** for the whole batch. This both dodges the
-parser bug and gives driverless clients a one-request bulk load.
+Server executes (one parameterized multi-statement string, `$N` indices renumbered
+**globally** across the batch since gluesql shares one params slice, all values flattened
+in order):
+```
+BEGIN; INSERT INTO docs (id, body) VALUES ($1,$2); INSERT INTO docs (id, body) VALUES ($3,$4); COMMIT;
+```
+via `execute_with_params` on the **serialized** connection (the txn holds the write lease).
+
+Properties (deliberate):
+- **Atomic** — all-or-nothing. The server-emitted `BEGIN…COMMIT` produces **one
+  `WriteBatch` → one durable flush** for the whole batch, *regardless of batch size*
+  (bounded by memory, not flush ticks). This is the best bulk-load throughput: a
+  10,000-row batch is one ~100 ms (or 25 ms) flush, not 10,000.
+- **Dodges the multi-row-`VALUES` parser bug** — each element is a single-row
+  parameterized statement; we never emit `VALUES (..),(..)`.
+- **Injection-proof** — values are `$N`-bound; the client authors no SQL keywords (the
+  `BEGIN/COMMIT/INSERT` skeleton is server-generated, identifiers `validate_ident`-checked).
+- **Cost:** the batch holds the write lease for its duration (serialized) — acceptable for
+  a bulk load, which is one big commit anyway.
 
 ### 4.2 SQL surface — `POST /sql` `{sql, params}`, injection-proof
 
