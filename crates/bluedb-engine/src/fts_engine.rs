@@ -115,6 +115,43 @@ impl FtsEngine {
         Ok(())
     }
 
+    /// Like [`Self::create_fulltext_index`] but resolves the table's primary-key
+    /// column from its schema (the column flagged `is_primary`). Errors if the
+    /// table is missing, schemaless, or has no single primary-key column.
+    pub async fn create_fulltext_index_auto(
+        &self,
+        storage: &SlateDbStorage,
+        table: &str,
+        text_column: &str,
+        analyzer: &str,
+    ) -> Result<()> {
+        let schema = Store::fetch_schema(storage, table)
+            .await
+            .map_err(EngineError::from)?
+            .ok_or_else(|| EngineError::Rejected(format!("no such table: {table}")))?;
+        let cols = schema.column_defs.as_ref().ok_or_else(|| {
+            EngineError::Rejected(format!(
+                "table {table} is schemaless; FTS needs a column schema"
+            ))
+        })?;
+        let pk_column = cols
+            .iter()
+            .find(|c| {
+                matches!(
+                    c.unique,
+                    Some(gluesql_core::ast::ColumnUniqueOption { is_primary: true })
+                )
+            })
+            .map(|c| c.name.clone())
+            .ok_or_else(|| {
+                EngineError::Rejected(format!(
+                    "table {table} has no primary key; fulltext index requires an integer primary key"
+                ))
+            })?;
+        self.create_fulltext_index(storage, table, text_column, &pk_column, analyzer)
+            .await
+    }
+
     /// Rewrite a `@@` query against the matching live segment. `Ok(None)` when
     /// the SQL has no `@@`.
     pub async fn rewrite_for(&self, sql: &str) -> Result<Option<String>> {
@@ -152,6 +189,101 @@ impl FtsEngine {
         let rewritten = self.rewrite_for(sql).await?;
         let final_sql = rewritten.as_deref().unwrap_or(sql);
         rest_sql::execute_sql(glue, final_sql, params, false).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bluedb_sql::Database;
+    use slatedb::object_store::memory::InMemory;
+    use slatedb::Db;
+
+    /// `create_fulltext_index_auto` resolves the PK column from the schema, so a
+    /// `@@` query after an observed insert finds the matching row by its `id` pk
+    /// — i.e. it registered an index whose pk_column is `id` without being told.
+    #[tokio::test]
+    async fn auto_resolves_pk_column_and_indexes() {
+        let db = Arc::new(Db::open("auto-pk", Arc::new(InMemory::new())).await.unwrap());
+        let database = Database::new(db);
+        let fts = FtsEngine::new();
+
+        {
+            let mut g = Glue::new(database.connection_serialized());
+            g.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT);")
+                .await
+                .unwrap();
+        }
+
+        // No pk_column argument — resolved from the schema's is_primary column.
+        fts.create_fulltext_index_auto(&database.connection(), "docs", "body", "english")
+            .await
+            .unwrap();
+
+        {
+            let mut g = Glue::new(database.connection().with_commit_observer(fts.clone()));
+            g.execute(
+                "INSERT INTO docs (id, body) VALUES (1, 'quarterly invoice overdue'), (2, 'weather sunny skies');",
+            )
+            .await
+            .unwrap();
+        }
+
+        let mut g = Glue::new(database.connection_serialized());
+        let sql = "SELECT id FROM docs WHERE to_tsvector('english', body) @@ plainto_tsquery('invoice overdue')";
+        let out = fts.execute_fts(&mut g, sql, &[]).await.unwrap();
+        match out.into_iter().next().unwrap() {
+            Payload::Select { rows, .. } => {
+                let ids: Vec<_> = rows.iter().map(|r| r[0].clone()).collect();
+                assert_eq!(
+                    ids,
+                    vec![GValue::I64(1)],
+                    "auto-resolved pk fetched the matching row by id IN (...)"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A table with no primary key is rejected: FTS needs an integer pk.
+    #[tokio::test]
+    async fn rejects_table_without_primary_key() {
+        let db = Arc::new(Db::open("no-pk", Arc::new(InMemory::new())).await.unwrap());
+        let database = Database::new(db);
+        let fts = FtsEngine::new();
+
+        {
+            let mut g = Glue::new(database.connection_serialized());
+            g.execute("CREATE TABLE notes (id INTEGER, body TEXT);")
+                .await
+                .unwrap();
+        }
+
+        let err = fts
+            .create_fulltext_index_auto(&database.connection(), "notes", "body", "english")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::Rejected(_)),
+            "no-PK table must be Rejected, got {err:?}"
+        );
+    }
+
+    /// A missing table is rejected (no schema to resolve a pk from).
+    #[tokio::test]
+    async fn rejects_missing_table() {
+        let db = Arc::new(Db::open("missing", Arc::new(InMemory::new())).await.unwrap());
+        let database = Database::new(db);
+        let fts = FtsEngine::new();
+
+        let err = fts
+            .create_fulltext_index_auto(&database.connection(), "ghost", "body", "english")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::Rejected(_)),
+            "missing table must be Rejected, got {err:?}"
+        );
     }
 }
 
