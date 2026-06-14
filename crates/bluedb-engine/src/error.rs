@@ -14,6 +14,10 @@ pub enum EngineError {
     #[error("sql: {0}")]
     Sql(#[from] gluesql_core::error::Error),
 
+    /// A statement was rejected by a restricted surface (DDL/multi-statement on `/sql`).
+    #[error("statement not allowed on this surface: {0}")]
+    Rejected(String),
+
     /// Anything from the storage / FTS layers (blob I/O, split open, compaction,
     /// manifest (de)serialization, ...), carried as `anyhow`.
     #[error(transparent)]

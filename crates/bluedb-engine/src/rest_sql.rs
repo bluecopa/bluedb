@@ -27,10 +27,11 @@
 
 use bluedb_rest::{parse_query, DeleteRequest, InsertRequest, Param, RestQuery, UpdateRequest};
 use bluedb_sql::SlateDbStorage;
+use gluesql_core::parse_sql::parse;
 use gluesql_core::prelude::{Glue, Payload};
 use gluesql_core::translate::{IntoParamLiteral, ParamLiteral};
 
-use crate::error::Result;
+use crate::error::{EngineError, Result};
 
 /// Map a `bluedb-rest` [`Param`] to a gluesql [`ParamLiteral`]. Keeps `bluedb-rest`
 /// free of any gluesql dependency — the type bridge lives here.
@@ -96,4 +97,41 @@ pub async fn execute_update(glue: &mut Glue<SlateDbStorage>, req: &UpdateRequest
 pub async fn execute_delete(glue: &mut Glue<SlateDbStorage>, req: &DeleteRequest) -> Result<Vec<Payload>> {
     let (sql, params) = req.to_sql_with_params()?;
     Ok(glue.execute_with_params(&sql, literals(&params)).await?)
+}
+
+/// Execute a `{sql, params}` request. Values bind as `$N` (never interpolated).
+///
+/// When `allow_arbitrary` is false (the `/sql` surface) the SQL must be exactly
+/// ONE `SELECT`/`INSERT`/`UPDATE`/`DELETE` statement — DDL, transactions, and
+/// multi-statement are rejected (`EngineError::Rejected`). When true (the
+/// `/admin/sql` surface) anything goes.
+pub async fn execute_sql(
+    glue: &mut Glue<SlateDbStorage>,
+    sql: &str,
+    params: &[Param],
+    allow_arbitrary: bool,
+) -> Result<Vec<Payload>> {
+    if !allow_arbitrary {
+        let parsed = parse(sql).map_err(|e: gluesql_core::error::Error| EngineError::Rejected(e.to_string()))?;
+        if parsed.len() != 1 {
+            return Err(EngineError::Rejected(format!(
+                "exactly one statement required, got {}",
+                parsed.len()
+            )));
+        }
+        // Classify using sqlparser's AST directly — avoids parameter resolution in translate().
+        let is_dml = matches!(
+            &parsed[0],
+            gluesql_core::sqlparser::ast::Statement::Query(_)
+                | gluesql_core::sqlparser::ast::Statement::Insert(_)
+                | gluesql_core::sqlparser::ast::Statement::Update { .. }
+                | gluesql_core::sqlparser::ast::Statement::Delete(_)
+        );
+        if !is_dml {
+            return Err(EngineError::Rejected(
+                "only SELECT/INSERT/UPDATE/DELETE allowed on /sql; use /admin/sql for DDL".to_string(),
+            ));
+        }
+    }
+    Ok(glue.execute_with_params(sql, literals(params)).await?)
 }
