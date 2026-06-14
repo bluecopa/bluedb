@@ -30,6 +30,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use bluedb_fts::mapping::IndexMapping;
 use bluedb_fts::policy::CompactionPolicy;
@@ -44,6 +45,7 @@ use gluesql_core::prelude::{Glue, Payload};
 use gluesql_core::store::{DataRow, Store};
 use tantivy::schema::Field;
 use tantivy::TantivyDocument;
+use tokio::task::JoinHandle;
 
 use crate::error::{EngineError, Result};
 use crate::fts::FtsIndex;
@@ -435,6 +437,64 @@ impl FtsEngine {
         }
         Ok(())
     }
+
+    /// Run [`FtsIndex::maybe_compact`] on every durable index, bounding split
+    /// growth off the request path. `Ok(None)` (no compaction needed) is ignored;
+    /// a compaction error on one index is logged and the rest still run.
+    ///
+    /// Like [`Self::seal`], the engine read lock is held ONLY to snapshot the
+    /// durable `Arc` handles — the async compaction runs without it (never hold a
+    /// std `RwLock` guard across `.await`).
+    pub async fn compact_all(&self) -> Result<()> {
+        let durables: Vec<Arc<FtsIndex>> = {
+            let idx = self.indexes.read().unwrap();
+            idx.values()
+                .flat_map(|defs| defs.iter())
+                .filter_map(|def| def.durable.clone())
+                .collect()
+        };
+
+        for durable in durables {
+            if let Err(err) = durable.maybe_compact().await {
+                tracing_log(&format!(
+                    "bluedb-engine[{}]: compaction error: {err}",
+                    durable.index_id()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Spawn a background task that, every `interval`, folds the live segments
+    /// into their durable tiers ([`Self::seal`]) and bounds split growth
+    /// ([`Self::compact_all`]) — both off the request path (Spec B §4.2). Mirrors
+    /// [`FtsIndex::spawn_compaction_scheduler`]: the immediate first tick is
+    /// skipped, and a transient error (e.g. a blob hiccup) is logged without
+    /// killing the loop. The returned [`JoinHandle`] runs until aborted or the
+    /// process exits.
+    pub fn spawn_seal_scheduler(self: Arc<Self>, interval: Duration) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            // Skip the immediate first tick so we don't seal a just-opened engine.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                if let Err(err) = self.seal().await {
+                    tracing_log(&format!("bluedb-engine: seal error: {err}"));
+                }
+                if let Err(err) = self.compact_all().await {
+                    tracing_log(&format!("bluedb-engine: compact_all error: {err}"));
+                }
+            }
+        })
+    }
+}
+
+/// Minimal log sink for the background scheduler (mirrors `fts.rs`'s
+/// `tracing_log`). Replaced by `core.observalibity`/OpenTelemetry when the
+/// service wires real tracing (M3); kept dependency-free here.
+fn tracing_log(message: &str) {
+    eprintln!("{message}");
 }
 
 /// Build a durable [`TantivyDocument`] (`id` = `pk.to_string()`, `body`) for the
@@ -602,6 +662,85 @@ mod tests {
         assert!(
             matches!(err, EngineError::Rejected(_)),
             "missing table must be Rejected, got {err:?}"
+        );
+    }
+
+    /// The live segment's covered set for `table.column` — used by the scheduler
+    /// test to observe that a scheduled seal drained the live tier (a private-field
+    /// reach the integration tests can't make).
+    fn covered_for(engine: &FtsEngine, table: &str, column: &str) -> std::collections::HashSet<i64> {
+        let idx = engine.indexes.read().unwrap();
+        idx.get(table)
+            .and_then(|defs| defs.iter().find(|d| d.column == column))
+            .map(|d| d.segment.covered())
+            .expect("index def present")
+    }
+
+    /// The background seal scheduler folds the live segment into the durable tier
+    /// off the request path: after inserting a row on an observed connection (live,
+    /// un-sealed) and spawning the scheduler, the live segment's covered set drains
+    /// to empty (a scheduled seal ran) and the `@@` query still returns the row —
+    /// now served from the durable tier.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn background_seal_scheduler_drains_live_into_durable() {
+        use std::time::Duration;
+
+        let db = Arc::new(Db::open("seal-sched", Arc::new(InMemory::new())).await.unwrap());
+        let database = Database::new(db);
+        let fts = FtsEngine::new_durable(database.substrate());
+
+        {
+            let mut g = Glue::new(database.connection_serialized());
+            g.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT);")
+                .await
+                .unwrap();
+        }
+        fts.create_fulltext_index(&database.connection(), "docs", "body", "id", "english")
+            .await
+            .unwrap();
+
+        // Insert on an observed connection → live segment, un-sealed.
+        {
+            let mut g = Glue::new(database.connection().with_commit_observer(fts.clone()));
+            g.execute("INSERT INTO docs (id, body) VALUES (1, 'quarterly invoice overdue');")
+                .await
+                .unwrap();
+        }
+        assert!(
+            !covered_for(&fts, "docs", "body").is_empty(),
+            "pre-scheduler: the live segment covers pk 1"
+        );
+
+        let sql = "SELECT id FROM docs WHERE to_tsvector('english', body) @@ plainto_tsquery('invoice overdue')";
+
+        // Spawn the scheduler; poll (bounded ~5s) until BOTH hold: a scheduled
+        // seal drained the live segment (covered empty) AND the durable tier now
+        // serves the hit. Checking the durable query inside the loop avoids racing
+        // the (non-atomic) drain→durable-write window in `seal` — `covered` clears
+        // when the live segment is drained, a beat before the durable `update`
+        // commits, so we wait for the durable hit to actually land.
+        let handle = fts.clone().spawn_seal_scheduler(Duration::from_millis(20));
+        let mut sealed = false;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if !covered_for(&fts, "docs", "body").is_empty() {
+                continue; // live not yet drained
+            }
+            // Live is empty → this hit can only come from the durable tier.
+            let mut g = Glue::new(database.connection_serialized());
+            let out = fts.execute_fts(&mut g, sql, &[]).await.unwrap();
+            if let Payload::Select { rows, .. } = out.into_iter().next().unwrap() {
+                let ids: Vec<_> = rows.iter().map(|r| r[0].clone()).collect();
+                if ids == vec![GValue::I64(1)] {
+                    sealed = true;
+                    break;
+                }
+            }
+        }
+        handle.abort();
+        assert!(
+            sealed,
+            "the scheduler should have sealed the live segment empty and the durable tier serve the hit"
         );
     }
 }
