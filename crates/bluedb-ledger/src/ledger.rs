@@ -2636,3 +2636,116 @@ mod tests {
         assert!(ts_after > ts_before, "watermark survived reopen → still monotonic");
     }
 }
+
+/// Write-throughput benchmarks (run with `--release --ignored --nocapture`).
+///
+/// These run against an in-memory object store, so they isolate the engine +
+/// the SlateDB WAL **flush_interval timer** (a real object store adds the PUT
+/// round-trip on top of each flush). They demonstrate the two things that set
+/// ledger write speed:
+///   * a single transfer per call is bounded by `flush_interval` (each
+///     `create_transfers` holds the write lease across its durable flush, so
+///     applies serialize — concurrency does not help, exactly like TB);
+///   * **batching** (many transfers per call) amortizes the one flush and
+///     climbs toward the engine's CPU ceiling — the same lever as TB's batches.
+///
+/// Run: `cargo test -p bluedb-ledger --release --ignored --nocapture bench_`
+#[cfg(test)]
+mod throughput_bench {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use bluedb_sql::Database;
+    use slatedb::object_store::memory::InMemory;
+    use slatedb::{Db, Settings};
+
+    use crate::model::{Account, Transfer};
+    use crate::Ledger;
+
+    /// Open a fresh in-memory ledger with the given WAL `flush_interval`.
+    #[allow(clippy::field_reassign_with_default)] // Settings has private fields
+    async fn open_ledger(flush_ms: u64) -> (Database, Ledger) {
+        let mut settings = Settings::default();
+        settings.flush_interval = Some(Duration::from_millis(flush_ms));
+        let db = Db::builder("bench", Arc::new(InMemory::new()))
+            .with_settings(settings)
+            .build()
+            .await
+            .expect("open db");
+        let database = Database::new(Arc::new(db));
+        crate::projection::ensure_schema(&database).await.unwrap();
+        let ledger = Ledger::new(&database);
+        (database, ledger)
+    }
+
+    const N_ACCTS: u128 = 4;
+
+    async fn setup(ledger: &Ledger) {
+        let accts: Vec<Account> = (1..=N_ACCTS).map(|id| Account::input(id, 7).with_code(1)).collect();
+        ledger.create_accounts(&accts).await.unwrap();
+    }
+
+    /// Build `count` transfers starting at id `next`, cycling debit/credit over
+    /// the account set (debit != credit), amount 1.
+    fn batch(next: &mut u128, count: usize) -> Vec<Transfer> {
+        (0..count)
+            .map(|_| {
+                let id = *next;
+                *next += 1;
+                let d = (id % N_ACCTS) + 1;
+                let c = (d % N_ACCTS) + 1; // always != d for N_ACCTS > 1
+                Transfer::new(id, d, c, 1, 7).with_code(1)
+            })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "benchmark; run explicitly with --release --ignored --nocapture"]
+    async fn bench_serial_single_transfer() {
+        println!("\n--- serial: 1 transfer per create_transfers call ---");
+        for flush_ms in [100u64, 25] {
+            let (_db, ledger) = open_ledger(flush_ms).await;
+            setup(&ledger).await;
+            let mut next = 100u128;
+            let ops = 60usize;
+            let start = Instant::now();
+            for _ in 0..ops {
+                let b = batch(&mut next, 1);
+                ledger.create_transfers(&b).await.unwrap();
+            }
+            let elapsed = start.elapsed();
+            let tps = ops as f64 / elapsed.as_secs_f64();
+            println!(
+                "  flush_interval={flush_ms:>3}ms : {ops} ops in {:>6.2?}  =>  {tps:>8.0} transfers/sec  ({:.1} ms/op)",
+                elapsed,
+                elapsed.as_secs_f64() * 1000.0 / ops as f64
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "benchmark; run explicitly with --release --ignored --nocapture"]
+    async fn bench_batched_transfers() {
+        println!("\n--- batched: B transfers per create_transfers call (flush_interval=25ms) ---");
+        // Fixed call count per batch size: small batches stay flush-bound, large
+        // batches amortize the flush and reveal the engine's CPU ceiling.
+        let calls = 40usize;
+        for b_size in [1usize, 10, 100, 1000, 8190] {
+            let (_db, ledger) = open_ledger(25).await;
+            setup(&ledger).await;
+            let mut next = 100u128;
+            let start = Instant::now();
+            for _ in 0..calls {
+                let b = batch(&mut next, b_size);
+                ledger.create_transfers(&b).await.unwrap();
+            }
+            let elapsed = start.elapsed();
+            let done = calls * b_size;
+            let tps = done as f64 / elapsed.as_secs_f64();
+            println!(
+                "  batch={b_size:>5} : {done:>7} transfers in {:>7.2?}  =>  {tps:>10.0} transfers/sec",
+                elapsed
+            );
+        }
+    }
+}
