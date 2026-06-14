@@ -156,6 +156,69 @@ impl Transfer {
     }
 }
 
+/// The four kinds of transfer this engine applies, derived from the flags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TransferKind {
+    /// A regular posted movement (debits_posted / credits_posted).
+    Posted,
+    /// A two-phase reservation (debits_pending / credits_pending).
+    Pending,
+    /// Settles a pending transfer (referenced by `pending_id`), posting an
+    /// amount (≤ the reserved amount; `0` posts the full reserved amount).
+    PostPending,
+    /// Releases a pending transfer (referenced by `pending_id`), posting nothing.
+    VoidPending,
+}
+
+impl Transfer {
+    /// Classify this transfer by its flags, validating flag combinations and the
+    /// `pending_id` rules. Flags not implemented yet (linked, balancing, timeout)
+    /// are rejected with [`LedgerError::UnsupportedFlag`].
+    pub(crate) fn kind(&self) -> Result<TransferKind, LedgerError> {
+        if self.flags.contains(TransferFlags::LINKED)
+            || self.flags.contains(TransferFlags::BALANCING_DEBIT)
+            || self.flags.contains(TransferFlags::BALANCING_CREDIT)
+            || self.timeout != 0
+        {
+            return Err(LedgerError::UnsupportedFlag);
+        }
+        let post = self.flags.contains(TransferFlags::POST_PENDING_TRANSFER);
+        let void = self.flags.contains(TransferFlags::VOID_PENDING_TRANSFER);
+        let pending = self.flags.contains(TransferFlags::PENDING);
+        match (post, void, pending) {
+            // post + void, or a resolution combined with pending → contradictory.
+            (true, true, _) | (true, _, true) | (_, true, true) => {
+                Err(LedgerError::InvalidTransferFlags)
+            }
+            // A resolution references a pending and must carry a pending_id.
+            (true, false, false) | (false, true, false) => {
+                if self.pending_id == 0 {
+                    Err(LedgerError::InvalidTransferFlags)
+                } else if post {
+                    Ok(TransferKind::PostPending)
+                } else {
+                    Ok(TransferKind::VoidPending)
+                }
+            }
+            // A reserve or a plain posted transfer must NOT carry a pending_id.
+            (false, false, true) => {
+                if self.pending_id != 0 {
+                    Err(LedgerError::InvalidTransferFlags)
+                } else {
+                    Ok(TransferKind::Pending)
+                }
+            }
+            (false, false, false) => {
+                if self.pending_id != 0 {
+                    Err(LedgerError::InvalidTransferFlags)
+                } else {
+                    Ok(TransferKind::Posted)
+                }
+            }
+        }
+    }
+}
+
 /// Per-item outcome of a batch create. Mirrors TigerBeetle's per-event results.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CreateResult {
@@ -184,8 +247,16 @@ pub enum LedgerError {
     ExceedsDebits,
     #[error("balance arithmetic overflowed u128")]
     Overflow,
-    #[error("transfer flag is not supported yet (this engine implements posted transfers only)")]
+    #[error("transfer flag is not supported yet (this engine implements posted + two-phase transfers only)")]
     UnsupportedFlag,
+    #[error("contradictory or incomplete transfer flags")]
+    InvalidTransferFlags,
+    #[error("pending transfer {0:#x} not found (or not a pending transfer)")]
+    PendingNotFound(u128),
+    #[error("pending transfer {0:#x} was already posted or voided")]
+    PendingAlreadyResolved(u128),
+    #[error("post amount exceeds the pending transfer's reserved amount")]
+    PostExceedsPending,
 }
 
 #[cfg(test)]
@@ -219,5 +290,63 @@ mod tests {
         assert_eq!((t.debit_account_id, t.credit_account_id, t.amount), (10, 20, 500));
         assert_eq!(t.flags, TransferFlags::NONE);
         assert_eq!(t.pending_id, 0);
+    }
+
+    #[test]
+    fn transfer_kind_classifies_and_validates() {
+        // Plain posted.
+        assert_eq!(Transfer::new(1, 1, 2, 10, 7).kind(), Ok(TransferKind::Posted));
+
+        // Pending reserve.
+        let mut p = Transfer::new(1, 1, 2, 10, 7);
+        p.flags = TransferFlags::PENDING;
+        assert_eq!(p.kind(), Ok(TransferKind::Pending));
+
+        // Post / void need a pending_id.
+        let mut post = Transfer::new(1, 0, 0, 10, 7);
+        post.flags = TransferFlags::POST_PENDING_TRANSFER;
+        assert_eq!(post.kind(), Err(LedgerError::InvalidTransferFlags)); // pending_id == 0
+        post.pending_id = 99;
+        assert_eq!(post.kind(), Ok(TransferKind::PostPending));
+
+        let mut void = Transfer::new(1, 0, 0, 0, 7);
+        void.flags = TransferFlags::VOID_PENDING_TRANSFER;
+        void.pending_id = 99;
+        assert_eq!(void.kind(), Ok(TransferKind::VoidPending));
+
+        // Mutually exclusive / contradictory flag combos.
+        let mut both = Transfer::new(1, 0, 0, 0, 7);
+        both.flags = TransferFlags(TransferFlags::POST_PENDING_TRANSFER.0 | TransferFlags::VOID_PENDING_TRANSFER.0);
+        both.pending_id = 1;
+        assert_eq!(both.kind(), Err(LedgerError::InvalidTransferFlags));
+
+        let mut pend_and_post = Transfer::new(1, 1, 2, 10, 7);
+        pend_and_post.flags = TransferFlags(TransferFlags::PENDING.0 | TransferFlags::POST_PENDING_TRANSFER.0);
+        pend_and_post.pending_id = 1;
+        assert_eq!(pend_and_post.kind(), Err(LedgerError::InvalidTransferFlags));
+
+        // A pending reserve must NOT carry a pending_id; a posted must not either.
+        let mut pend_with_id = Transfer::new(1, 1, 2, 10, 7);
+        pend_with_id.flags = TransferFlags::PENDING;
+        pend_with_id.pending_id = 5;
+        assert_eq!(pend_with_id.kind(), Err(LedgerError::InvalidTransferFlags));
+
+        let mut posted_with_id = Transfer::new(1, 1, 2, 10, 7);
+        posted_with_id.pending_id = 5;
+        assert_eq!(posted_with_id.kind(), Err(LedgerError::InvalidTransferFlags));
+
+        // Not-yet-supported flags (later plans) → UnsupportedFlag.
+        let mut linked = Transfer::new(1, 1, 2, 10, 7);
+        linked.flags = TransferFlags::LINKED;
+        assert_eq!(linked.kind(), Err(LedgerError::UnsupportedFlag));
+
+        let mut balancing = Transfer::new(1, 1, 2, 10, 7);
+        balancing.flags = TransferFlags::BALANCING_DEBIT;
+        assert_eq!(balancing.kind(), Err(LedgerError::UnsupportedFlag));
+
+        let mut with_timeout = Transfer::new(1, 1, 2, 10, 7);
+        with_timeout.flags = TransferFlags::PENDING;
+        with_timeout.timeout = 30;
+        assert_eq!(with_timeout.kind(), Err(LedgerError::UnsupportedFlag));
     }
 }
