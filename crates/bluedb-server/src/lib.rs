@@ -2,9 +2,10 @@
 //!
 //! A PostgREST-style API: tables are addressed at `/tables/{table}` with
 //! `GET`/`POST`/`PATCH`/`DELETE`, filters/order/limit live in the query string
-//! (parsed by [`bluedb_rest`]), and bodies are JSON. A raw `/sql` endpoint runs
-//! arbitrary SQL (DDL + queries) for setup/admin, `/health` is a liveness probe,
-//! and `/admin/{status,promote,demote}` drive the single-writer role.
+//! (parsed by [`bluedb_rest`]), and bodies are JSON. `/sql` runs a single
+//! parameterized non-DDL statement; `/admin/sql` runs arbitrary SQL (off by
+//! default, audited); `/health` is a liveness probe; and
+//! `/admin/{status,promote,demote}` drive the single-writer role.
 //!
 //! ## Role-aware storage
 //!
@@ -25,6 +26,7 @@
 //! `tower::ServiceExt::oneshot` — no socket required.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -83,6 +85,9 @@ struct Inner {
     /// read-replica `Database` when passive, `None` before the cluster's first
     /// writer has created the database.
     db: RwLock<Option<Database>>,
+    /// Whether `POST /admin/sql` is enabled. Off by default; set via
+    /// [`AppState::with_admin_sql_enabled`] or `BLUEDB_ENABLE_ADMIN_SQL=1`.
+    admin_sql_enabled: AtomicBool,
 }
 
 impl AppState {
@@ -101,8 +106,22 @@ impl AppState {
                 db_path: db_path.into(),
                 writer,
                 db: RwLock::new(None),
+                admin_sql_enabled: AtomicBool::new(false),
             }),
         }
+    }
+
+    /// Enable (or disable) `POST /admin/sql` (arbitrary SQL, audited). Returns
+    /// `self` for chaining; the existing `AppState::new` signature is unchanged.
+    /// Safe to call before or after [`AppState::promote`].
+    pub fn with_admin_sql_enabled(self, enabled: bool) -> Self {
+        self.inner.admin_sql_enabled.store(enabled, Ordering::Relaxed);
+        self
+    }
+
+    /// Whether `POST /admin/sql` is enabled on this node.
+    pub fn admin_sql_enabled(&self) -> bool {
+        self.inner.admin_sql_enabled.load(Ordering::Relaxed)
     }
 
     /// The lease controller (for the HA background loop in `main`).
@@ -231,7 +250,38 @@ pub fn build_app(state: AppState) -> Router {
         .route("/admin/status", get(admin_status))
         .route("/admin/promote", post(admin_promote))
         .route("/admin/demote", post(admin_demote))
+        .route("/admin/sql", post(admin_sql))
         .with_state(state)
+}
+
+// --- SQL request type -------------------------------------------------------
+
+/// JSON body for `/sql` and `/admin/sql`.
+#[derive(serde::Deserialize)]
+struct SqlRequest {
+    sql: String,
+    #[serde(default)]
+    params: Vec<Value>,
+}
+
+/// Map a JSON scalar to a [`bluedb_rest::Param`]. Arrays/objects are rejected.
+fn json_to_param(v: &Value) -> Result<bluedb_rest::Param, AppError> {
+    use bluedb_rest::Param;
+    Ok(match v {
+        Value::Null => Param::Null,
+        Value::Bool(b) => Param::Bool(*b),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Param::Int(i)
+            } else if let Some(f) = n.as_f64() {
+                Param::Float(f)
+            } else {
+                return Err(AppError::bad_request("unrepresentable number param"));
+            }
+        }
+        Value::String(s) => Param::Str(s.clone()),
+        other => return Err(AppError::bad_request(format!("param must be a JSON scalar, got {other}"))),
+    })
 }
 
 // --- handlers ---------------------------------------------------------------
@@ -240,12 +290,34 @@ async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
 }
 
-/// `POST /sql` — run raw SQL (DDL + queries). Gated to the active writer.
-async fn exec_sql(State(state): State<AppState>, body: String) -> Result<Json<Value>, AppError> {
+/// `POST /sql` — one parameterized non-DDL statement (SELECT/INSERT/UPDATE/DELETE).
+async fn exec_sql(
+    State(state): State<AppState>,
+    Json(req): Json<SqlRequest>,
+) -> Result<Json<Value>, AppError> {
     state.require_active()?;
-    // Raw SQL may be a read-modify-write (or an explicit transaction); serialize.
+    let params = req.params.iter().map(json_to_param).collect::<Result<Vec<_>, _>>()?;
     let mut glue = Glue::new(state.connection_serialized().await?);
-    let payloads = glue.execute(&body).await.map_err(EngineError::from)?;
+    let payloads = rest_sql::execute_sql(&mut glue, &req.sql, &params, false).await?;
+    Ok(Json(payloads_to_json(payloads)))
+}
+
+/// `POST /admin/sql` — arbitrary SQL (DDL/txns/multi). Off by default; audited.
+async fn admin_sql(
+    State(state): State<AppState>,
+    Json(req): Json<SqlRequest>,
+) -> Result<Json<Value>, AppError> {
+    if !state.inner.admin_sql_enabled.load(Ordering::Relaxed) {
+        return Err(AppError {
+            status: StatusCode::NOT_FOUND,
+            message: "admin SQL endpoint is disabled".to_string(),
+        });
+    }
+    state.require_active()?;
+    eprintln!("bluedb-audit: /admin/sql executed: {}", req.sql);
+    let params = req.params.iter().map(json_to_param).collect::<Result<Vec<_>, _>>()?;
+    let mut glue = Glue::new(state.connection_serialized().await?);
+    let payloads = rest_sql::execute_sql(&mut glue, &req.sql, &params, true).await?;
     Ok(Json(payloads_to_json(payloads)))
 }
 
@@ -566,8 +638,8 @@ impl AppError {
 
 impl From<EngineError> for AppError {
     fn from(err: EngineError) -> Self {
-        let status = match err {
-            EngineError::Rest(_) | EngineError::Sql(_) => StatusCode::BAD_REQUEST,
+        let status = match &err {
+            EngineError::Rest(_) | EngineError::Sql(_) | EngineError::Rejected(_) => StatusCode::BAD_REQUEST,
             EngineError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         Self {

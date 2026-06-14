@@ -25,16 +25,23 @@ fn node(node_id: &str, store: Arc<dyn ObjectStore>, lease: Arc<dyn LeaseProvider
 
 /// Build an app; `promote` decides whether the node starts as the active writer
 /// (and thus has a bound database). A non-promoted node is unbound (`503`).
-async fn make_app(promote: bool) -> Router {
+/// `admin_sql` enables `POST /admin/sql` (needed for DDL setup in tests).
+async fn make_app_opts(promote: bool, admin_sql: bool) -> Router {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let state = node("test-node", store, Arc::new(LocalLeaseProvider::new()));
+    let state = node("test-node", store, Arc::new(LocalLeaseProvider::new()))
+        .with_admin_sql_enabled(admin_sql);
     if promote {
         state.promote().await.expect("promote");
     }
     build_app(state)
 }
 
-/// The common case: an active (writable) node.
+/// Build an app (promoted + admin SQL enabled for DDL setup).
+async fn make_app(promote: bool) -> Router {
+    make_app_opts(promote, true).await
+}
+
+/// The common case: an active (writable) node with admin SQL enabled for DDL.
 async fn app() -> Router {
     make_app(true).await
 }
@@ -65,17 +72,15 @@ async fn call(
     (status, body)
 }
 
-/// Send raw SQL text to `POST /sql`.
-async fn sql(app: &Router, statement: &str) -> (StatusCode, Value) {
-    let request = Request::builder()
-        .method("POST")
-        .uri("/sql")
-        .body(Body::from(statement.to_owned()))
-        .unwrap();
-    let response = app.clone().oneshot(request).await.unwrap();
-    let status = response.status();
-    let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    (status, serde_json::from_slice(&bytes).unwrap())
+/// Send SQL (no params) to `POST /admin/sql` (DDL + arbitrary).
+async fn sql_admin(app: &Router, statement: &str) -> (StatusCode, Value) {
+    call(app, "POST", "/admin/sql", Some(json!({ "sql": statement }))).await
+}
+
+/// Send a parameterized statement to `POST /sql` (non-DDL only).
+#[allow(dead_code)]
+async fn sql_dml(app: &Router, statement: &str, params: serde_json::Value) -> (StatusCode, Value) {
+    call(app, "POST", "/sql", Some(json!({ "sql": statement, "params": params }))).await
 }
 
 #[tokio::test]
@@ -90,8 +95,8 @@ async fn health_is_ok() {
 async fn full_crud_round_trip() {
     let app = app().await;
 
-    // DDL via the raw /sql endpoint.
-    let (status, _) = sql(
+    // DDL via /admin/sql.
+    let (status, _) = sql_admin(
         &app,
         "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER);",
     )
@@ -167,7 +172,7 @@ async fn unbound_passive_node_refuses_writes_and_answers_status() {
     let app = make_app(false).await; // passive, never promoted → no bound database
 
     // Writes are refused with 503 (not the active writer).
-    let (status, _) = sql(&app, "CREATE TABLE t (id INTEGER PRIMARY KEY);").await;
+    let (status, _) = sql_admin(&app, "CREATE TABLE t (id INTEGER PRIMARY KEY);").await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     let (status, _) = call(&app, "POST", "/tables/t", Some(json!({ "id": 1 }))).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -187,14 +192,14 @@ async fn failover_new_writer_sees_prior_data_and_can_write() {
     // stand-in for a cluster, exercising the role-swap + SlateDB epoch fencing.
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let lease: Arc<dyn LeaseProvider> = Arc::new(LocalLeaseProvider::new());
-    let a = node("a", store.clone(), lease.clone());
+    let a = node("a", store.clone(), lease.clone()).with_admin_sql_enabled(true);
     let b = node("b", store.clone(), lease.clone());
 
     // a is the writer: create a table + a row.
     a.promote().await.expect("a promotes");
     let app_a = build_app(a.clone());
     assert_eq!(
-        sql(&app_a, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);").await.0,
+        sql_admin(&app_a, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);").await.0,
         StatusCode::OK
     );
     assert_eq!(
@@ -237,7 +242,7 @@ async fn promote_enables_writes_and_demote_disables_them() {
     assert_eq!(body["epoch"], json!(1));
 
     // Writes now succeed.
-    let (status, _) = sql(&app, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);").await;
+    let (status, _) = sql_admin(&app, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);").await;
     assert_eq!(status, StatusCode::OK);
     let (status, body) = call(&app, "POST", "/tables/t", Some(json!({ "id": 1, "v": 10 }))).await;
     assert_eq!(status, StatusCode::OK);
@@ -254,4 +259,43 @@ async fn promote_enables_writes_and_demote_disables_them() {
     let (status, body) = call(&app, "GET", "/tables/t?order=id.asc", None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, json!([{ "id": 1, "v": 10 }]), "reads continue while passive");
+}
+
+// --- new surface-enforcement tests ------------------------------------------
+
+/// `POST /sql` must reject DDL (CREATE TABLE) with 400.
+#[tokio::test]
+async fn sql_rejects_ddl_with_400() {
+    let app = app().await;
+    let (status, body) =
+        call(&app, "POST", "/sql", Some(json!({ "sql": "CREATE TABLE t (id INTEGER PRIMARY KEY);" }))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "DDL on /sql should be 400; body: {body}");
+    let err = body.get("error").expect("error field in body");
+    assert!(err.as_str().unwrap_or("").contains("not allowed"), "error should mention 'not allowed': {err}");
+}
+
+/// `POST /admin/sql` returns 404 when the admin flag is off (default).
+#[tokio::test]
+async fn admin_sql_disabled_returns_404() {
+    // Build an app WITHOUT admin SQL enabled (the default).
+    let app = make_app_opts(true, false).await;
+    let (status, body) =
+        call(&app, "POST", "/admin/sql", Some(json!({ "sql": "CREATE TABLE t (id INTEGER PRIMARY KEY);" }))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "admin/sql off → 404; body: {body}");
+}
+
+/// `POST /admin/sql` when enabled can run DDL successfully.
+#[tokio::test]
+async fn admin_sql_enabled_runs_ddl() {
+    // app() already enables admin SQL.
+    let app = app().await;
+    let (status, body) =
+        sql_admin(&app, "CREATE TABLE things (id INTEGER PRIMARY KEY, label TEXT);").await;
+    assert_eq!(status, StatusCode::OK, "DDL on /admin/sql should succeed; body: {body}");
+    // Insert a row and read it back to confirm the table exists.
+    let (status, _) = call(&app, "POST", "/tables/things", Some(json!({ "id": 1, "label": "hello" }))).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = call(&app, "GET", "/tables/things", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!([{ "id": 1, "label": "hello" }]));
 }

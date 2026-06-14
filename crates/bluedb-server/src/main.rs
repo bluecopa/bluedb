@@ -23,6 +23,9 @@
 //!   (or `POST /admin/promote`) to take the lease; default bootstraps to writer.
 //! - `BLUEDB_FLUSH_INTERVAL_MS` — WAL flush interval in ms (default 25). Set at
 //!   writer open; lower = lower write latency + more object-store PUTs under load.
+//! - `BLUEDB_ENABLE_ADMIN_SQL` — set to `1` or `true` to enable `POST /admin/sql`
+//!   (arbitrary SQL including DDL, audited). Off by default. `/sql` is always
+//!   available but restricted to a single parameterized SELECT/INSERT/UPDATE/DELETE.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -92,7 +95,11 @@ async fn main() -> anyhow::Result<()> {
         ttl,
         env_secs("BLUEDB_LEASE_MARGIN_SECS", 5),
     ));
-    let state = AppState::new(object_store, db_path, writer);
+    let admin_sql_enabled = std::env::var("BLUEDB_ENABLE_ADMIN_SQL")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let state = AppState::new(object_store, db_path, writer)
+        .with_admin_sql_enabled(admin_sql_enabled);
 
     // Bootstrap: become writer unless asked to start as a replica.
     if std::env::var("BLUEDB_START_PASSIVE").is_err() {
