@@ -49,9 +49,11 @@ impl AsyncDB for GlueTester {
     type ColumnType = DefaultColumnType;
 
     async fn run(&mut self, sql: &str) -> Result<DBOutput<Self::ColumnType>, Self::Error> {
-        // Apply bluedb's comma-join rewrite shim (FROM a,b -> a JOIN b ON TRUE),
-        // matching how bluedb-sql would preprocess SQL in production.
-        let sql = bluedb_sql::rewrite_multitable(sql);
+        // Apply bluedb's SQL-compat rewrites, matching how bluedb-sql would
+        // preprocess SQL in production: set ops first (UNION/INTERSECT/EXCEPT ->
+        // joins/subqueries), then comma-join folding + VARCHAR(n) normalization.
+        let sql = bluedb_sql::rewrite_set_ops(sql);
+        let sql = bluedb_sql::rewrite_multitable(&sql);
         let mut payloads = self
             .glue
             .execute(&sql)

@@ -67,6 +67,7 @@ mod keyspace;
 mod pushdown;
 mod registry;
 mod rewrite;
+mod setops;
 mod storage;
 
 pub use connection::Database;
@@ -74,4 +75,5 @@ pub use error::SqlError;
 pub use keyspace::DEFAULT_TENANT;
 pub use registry::SchemaRegistry;
 pub use rewrite::rewrite_multitable;
+pub use setops::rewrite_set_ops;
 pub use storage::SlateDbStorage;
