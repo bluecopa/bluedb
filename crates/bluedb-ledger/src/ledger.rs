@@ -1633,21 +1633,73 @@ mod tests {
         use CreateTransferResult as R;
         let db = writer_database().await;
         let l = Ledger::new(&db);
-        // Account 2 is credits_must_not_exceed_debits with 0 debits.
-        l.create_accounts(&[acct(1, 7), acct(2, 7).with_flags(AccountFlags::CREDITS_MUST_NOT_EXCEED_DEBITS)]).await.unwrap();
-        // Give account 1 headroom so balancing_debit doesn't reduce to 0.
-        fund_credits(&l, 1, 2, 1, 50).await; // also gives account 2 debits_posted = 50
-        // Now account 2 has debits_posted 50, credits_posted 0 → credit headroom 50.
-        // balancing_debit 1→2 of 100 reduces to debit headroom (1.credits_posted=50),
-        // and 2's credit constraint allows up to 50 → ok here. Make it fail: drain 2's debit room.
-        // Simpler: a fresh credit-constrained account with 0 debits rejects any credit.
-        l.create_accounts(&[acct(3, 7).with_flags(AccountFlags::CREDITS_MUST_NOT_EXCEED_DEBITS)]).await.unwrap();
-        fund_credits(&l, 2, 2, 1, 20).await; // 1.credits_posted now 70
-        let bd = xfer(3, 1, 3, 100).with_flags(TransferFlags::BALANCING_DEBIT);
-        // debit headroom = 1.credits_posted(70) - debits(50) = 20; reduced to 20.
-        // account 3 credits_must_not_exceed_debits, debits 0 → exceeds_debits.
+        // 1 = plain (will be the debit), 2 = plain funder, 3 = credit-constrained.
+        l.create_accounts(&[
+            acct(1, 7),
+            acct(2, 7),
+            acct(3, 7).with_flags(AccountFlags::CREDITS_MUST_NOT_EXCEED_DEBITS),
+        ])
+        .await
+        .unwrap();
+        // Give account 1 credits_posted = 50 (2 → 1), so balancing_debit has headroom 50.
+        fund_credits(&l, 1, 2, 1, 50).await;
+        // balancing_debit 1 → 3 of 100 reduces to the debit headroom (1.credits_posted
+        // 50 - 1.debits 0 = 50). Account 3 is credits_must_not_exceed_debits with 0
+        // debits, so crediting it by 50 → ExceedsDebits (balancing_debit guards only
+        // the debit side, not account 3's credit constraint).
+        let bd = xfer(2, 1, 3, 100).with_flags(TransferFlags::BALANCING_DEBIT);
         assert_eq!(l.create_transfers(&[bd]).await.unwrap(), vec![R::ExceedsDebits]);
-        assert!(l.lookup_transfer(3).await.unwrap().is_none());
+        assert!(l.lookup_transfer(2).await.unwrap().is_none());
+        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_posted, 0, "nothing applied");
+    }
+
+    #[tokio::test]
+    async fn balancing_no_reduction_when_amount_under_headroom() {
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
+        fund_credits(&l, 1, 2, 1, 100).await; // 1.credits_posted = 100 (headroom 100)
+        // amount 30 < headroom 100 → no reduction, full 30 transfers.
+        let bd = xfer(2, 1, 2, 30).with_flags(TransferFlags::BALANCING_DEBIT);
+        l.create_transfers(&[bd]).await.unwrap();
+        assert_eq!(l.lookup_transfer(2).await.unwrap().unwrap().amount, 30);
+        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_posted, 30);
+    }
+
+    #[tokio::test]
+    async fn balancing_linked_chain_rolls_back() {
+        use CreateTransferResult as R;
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
+        fund_credits(&l, 1, 2, 1, 50).await; // 1.credits_posted = 50
+        let before = l.lookup_account(1).await.unwrap().unwrap().debits_posted;
+        // [balancing_debit(linked, would reduce to 50), bad terminator] → chain fails.
+        let bd = xfer(2, 1, 2, 200).with_flags(TransferFlags::BALANCING_DEBIT | TransferFlags::LINKED);
+        let res = l.create_transfers(&[bd, xfer(3, 1, 99, 5)]).await.unwrap();
+        assert_eq!(res, vec![R::LinkedEventFailed, R::CreditAccountNotFound]);
+        // The balancing member's reduced movement was rolled back.
+        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_posted, before);
+        assert!(l.lookup_transfer(2).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn conservation_with_balancing_reduction() {
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        l.create_accounts(&[acct(1, 7), acct(2, 7), acct(3, 7)]).await.unwrap();
+        fund_credits(&l, 1, 3, 1, 40).await; // 1.credits_posted = 40
+        // balancing_debit 1→2 of 1000 reduces to 40; both sides move the same 40.
+        let bd = xfer(2, 1, 2, 1000).with_flags(TransferFlags::BALANCING_DEBIT);
+        l.create_transfers(&[bd]).await.unwrap();
+        let mut total_d = 0u128;
+        let mut total_c = 0u128;
+        for id in 1..=3u128 {
+            let a = l.lookup_account(id).await.unwrap().unwrap();
+            total_d += a.debits_posted;
+            total_c += a.credits_posted;
+        }
+        assert_eq!(total_d, total_c, "Σdebits_posted == Σcredits_posted with a reduced transfer");
     }
 
     #[tokio::test]
