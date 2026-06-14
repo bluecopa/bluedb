@@ -25,21 +25,36 @@
 //! # }
 //! ```
 
-use bluedb_rest::{parse_query, DeleteRequest, InsertRequest, RestQuery, UpdateRequest};
+use bluedb_rest::{parse_query, DeleteRequest, InsertRequest, Param, RestQuery, UpdateRequest};
 use bluedb_sql::SlateDbStorage;
 use gluesql_core::prelude::{Glue, Payload};
+use gluesql_core::translate::{IntoParamLiteral, ParamLiteral};
 
 use crate::error::Result;
 
-/// Execute a typed [`RestQuery`] (a `SELECT`) against `glue`.
+/// Map a `bluedb-rest` [`Param`] to a gluesql [`ParamLiteral`]. Keeps `bluedb-rest`
+/// free of any gluesql dependency — the type bridge lives here.
+fn param_to_literal(p: &Param) -> ParamLiteral {
+    match p {
+        Param::Null => ParamLiteral::null(),
+        Param::Bool(b) => (*b).into_param_literal(),
+        Param::Int(i) => (*i).into_param_literal(),
+        Param::Float(f) => (*f).into_param_literal(),
+        Param::Str(s) => s.clone().into_param_literal(),
+    }
+}
+
+fn literals(params: &[Param]) -> Vec<ParamLiteral> {
+    params.iter().map(param_to_literal).collect()
+}
+
+/// Execute a typed [`RestQuery`] (`SELECT`) with bound parameters.
 pub async fn execute_query(glue: &mut Glue<SlateDbStorage>, query: &RestQuery) -> Result<Vec<Payload>> {
-    run(glue, &query.to_sql()?).await
+    let (sql, params) = query.to_sql_with_params()?;
+    Ok(glue.execute_with_params(&sql, literals(&params)).await?)
 }
 
 /// Parse a PostgREST query string for `table` and execute it.
-///
-/// `query_string` is the part after `?`, e.g.
-/// `select=id,name&age=gt.20&order=name.asc&limit=10`.
 pub async fn execute_query_str(
     glue: &mut Glue<SlateDbStorage>,
     table: &str,
@@ -49,21 +64,34 @@ pub async fn execute_query_str(
     execute_query(glue, &query).await
 }
 
-/// Execute an [`InsertRequest`] (one or more rows).
+/// Execute a single-row [`InsertRequest`] as one autocommit statement (the
+/// group-commit fast path — caller supplies the group-commit connection).
 pub async fn execute_insert(glue: &mut Glue<SlateDbStorage>, req: &InsertRequest) -> Result<Vec<Payload>> {
-    run(glue, &req.to_sql()?).await
+    let (stmts, params) = req.row_statements_with_params()?;
+    let sql = format!("{};", stmts.join("; "));
+    Ok(glue.execute_with_params(&sql, literals(&params)).await?)
 }
 
-/// Execute an [`UpdateRequest`] (`SET ... WHERE ...`).
+/// Execute a multi-row [`InsertRequest`] atomically: the server-side
+/// `BEGIN; <single-row INSERT…>; …; COMMIT;` batch — one `WriteBatch`, one flush.
+/// Caller supplies the **serialized** connection (the txn holds the write lease).
+pub async fn execute_insert_batch(
+    glue: &mut Glue<SlateDbStorage>,
+    req: &InsertRequest,
+) -> Result<Vec<Payload>> {
+    let (stmts, params) = req.row_statements_with_params()?;
+    let sql = format!("BEGIN; {}; COMMIT;", stmts.join("; "));
+    Ok(glue.execute_with_params(&sql, literals(&params)).await?)
+}
+
+/// Execute an [`UpdateRequest`] with bound parameters.
 pub async fn execute_update(glue: &mut Glue<SlateDbStorage>, req: &UpdateRequest) -> Result<Vec<Payload>> {
-    run(glue, &req.to_sql()?).await
+    let (sql, params) = req.to_sql_with_params()?;
+    Ok(glue.execute_with_params(&sql, literals(&params)).await?)
 }
 
-/// Execute a [`DeleteRequest`] (`DELETE ... WHERE ...`).
+/// Execute a [`DeleteRequest`] with bound parameters.
 pub async fn execute_delete(glue: &mut Glue<SlateDbStorage>, req: &DeleteRequest) -> Result<Vec<Payload>> {
-    run(glue, &req.to_sql()?).await
-}
-
-async fn run(glue: &mut Glue<SlateDbStorage>, sql: &str) -> Result<Vec<Payload>> {
-    Ok(glue.execute(sql).await?)
+    let (sql, params) = req.to_sql_with_params()?;
+    Ok(glue.execute_with_params(&sql, literals(&params)).await?)
 }
