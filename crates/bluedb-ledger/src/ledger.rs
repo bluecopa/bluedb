@@ -2,12 +2,12 @@
 //! double-entry apply state machine inside that database's active writer.
 //!
 //! Implements TigerBeetle's `create_accounts` exactly and, for transfers,
-//! **regular posted**, **two-phase** (pending reserve / post / void), and
-//! **timeouts** (pending expiry via an apply-time sweep) exactly, with the full
+//! **regular posted**, **two-phase** (pending reserve / post / void),
+//! **timeouts** (pending expiry via an apply-time sweep), **linked chains**,
+//! **balancing**, and **closing** (closed accounts) exactly, with the full
 //! per-item result-code surface and TB's input-validation ordering. Still gated
-//! to later phases (returning [`CreateTransferResult::NotImplementedYet`] /
-//! `CreateAccountResult::NotImplementedYet`): linked chains, balancing, closing,
-//! and imported events.
+//! (returning [`CreateTransferResult::NotImplementedYet`] /
+//! `CreateAccountResult::NotImplementedYet`): imported events.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1688,6 +1688,25 @@ mod tests {
         l.create_transfers(&[c]).await.unwrap();
         assert!(l.lookup_account(1).await.unwrap().unwrap().flags.contains(AccountFlags::CLOSED));
         assert!(l.lookup_account(2).await.unwrap().unwrap().flags.contains(AccountFlags::CLOSED));
+        // Voiding that pending reopens BOTH accounts.
+        assert_eq!(l.create_transfers(&[void(11, 10, 0)]).await.unwrap(), vec![CreateTransferResult::Created]);
+        assert!(!l.lookup_account(1).await.unwrap().unwrap().flags.contains(AccountFlags::CLOSED));
+        assert!(!l.lookup_account(2).await.unwrap().unwrap().flags.contains(AccountFlags::CLOSED));
+    }
+
+    #[tokio::test]
+    async fn resolution_on_closed_credit_side_is_allowed() {
+        use CreateTransferResult as R;
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
+        // Reserve p1 (1→2) before closing the CREDIT account (2).
+        l.create_transfers(&[xfer(10, 1, 2, 30).with_flags(TransferFlags::PENDING)]).await.unwrap();
+        l.create_transfers(&[closing_pending(11, 1, 2, 5, TransferFlags::CLOSING_CREDIT)]).await.unwrap();
+        assert!(l.lookup_account(2).await.unwrap().unwrap().flags.contains(AccountFlags::CLOSED));
+        // Posting p1 (account 2 is the closed credit side) is still allowed.
+        assert_eq!(l.create_transfers(&[post(12, 10, AMOUNT_MAX)]).await.unwrap(), vec![R::Created]);
+        assert_eq!(l.lookup_account(2).await.unwrap().unwrap().credits_posted, 30);
     }
 
     #[tokio::test]
