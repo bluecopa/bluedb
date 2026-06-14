@@ -22,12 +22,14 @@
 
 pub mod error;
 pub mod fts;
+pub mod fts_engine;
 pub mod fts_sql;
 pub mod live_segment;
 pub mod rest_sql;
 
 pub use error::{EngineError, Result};
 pub use fts::{CompactionSummary, FtsIndex};
+pub use fts_engine::FtsEngine;
 pub use fts_sql::{FtsHit, FtsPredicate, FtsSearcher, TsQueryKind};
 pub use live_segment::LiveSegment;
 
