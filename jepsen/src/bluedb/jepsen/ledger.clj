@@ -85,11 +85,19 @@
   (try
     (let [r (post-transfer! node t)]
       (case (:status r)
-        200 [:ok (-> (json/parse-string (:body r) true) :results first :result keyword)]
+        ;; A 200 means the batch committed. If the per-item result is somehow
+        ;; unreadable (missing/garbled body), classify it indeterminate rather
+        ;; than failed — it *did* apply, so we must not under-count it (which
+        ;; would falsely trip the accounting lower bound).
+        200 (if-let [res (-> (json/parse-string (:body r) true) :results first :result)]
+              [:ok (keyword res)]
+              :timeout)
         503 :passive
         :failed))
     (catch java.net.ConnectException _ :down)
     (catch java.net.SocketTimeoutException _ :timeout)
+    ;; Catch-all errs toward indeterminate (:timeout → :info), which only
+    ;; *widens* the safe accounting band — never narrows it into a false pass.
     (catch Exception _ :timeout)))
 
 ;; --- client ------------------------------------------------------------------
@@ -148,7 +156,11 @@
 
 (defn client
   "A ledger client. `base` namespaces this run's ids so runs are independent of
-  any persisted cluster state."
+  any persisted cluster state. Within a run, account ids are `base+1..base+n`
+  and transfer ids are `base+1000+k` (disjoint for n < 1000). Cross-run
+  collisions are avoided as long as runs start ≥1 ms apart and a single run
+  issues fewer than 100000 transfers — both hold comfortably for a time-limited
+  fault test."
   []
   (let [base (* (System/currentTimeMillis) 100000)]
     (->LedgerClient (h/make-leader) (atom 0) base n-accounts)))

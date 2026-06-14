@@ -1066,6 +1066,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sql_projection_column_order_is_exact() {
+        // Guards against a silent same-typed column reorder (e.g.
+        // debits_posted <-> credits_posted, or user_data_128 <-> user_data_64):
+        // every column is given a DISTINCT value and read back by name.
+        use gluesql_core::prelude::{Glue, Payload, Value as SqlValue};
+
+        let database = writer_database().await;
+        crate::projection::ensure_schema(&database).await.unwrap();
+        let ledger = Ledger::new(&database);
+
+        // Account 1 carries distinct user_data; account 2 is plain.
+        let a1 = Account::input(1, 7)
+            .with_code(5)
+            .with_user_data_128(111)
+            .with_user_data_64(222)
+            .with_user_data_32(333);
+        assert_eq!(
+            ledger.create_accounts(&[a1, acct(2, 7)]).await.unwrap(),
+            vec![CreateAccountResult::Created, CreateAccountResult::Created]
+        );
+
+        // Make all four balance columns distinct across the two accounts:
+        //   acct 1: debits_pending=30, debits_posted=100, credits_*=0
+        //   acct 2: credits_pending=30, credits_posted=100, debits_*=0
+        let pending = Transfer::new(30, 1, 2, 30, 7).with_code(1).with_flags(TransferFlags::PENDING);
+        assert_eq!(ledger.create_transfers(&[pending]).await.unwrap(), vec![CreateTransferResult::Created]);
+        let posted = Transfer::new(10, 1, 2, 100, 7).with_code(9);
+        assert_eq!(ledger.create_transfers(&[posted]).await.unwrap(), vec![CreateTransferResult::Created]);
+
+        let mut glue = Glue::new(database.connection());
+
+        // Account 1: a debits/credits or user_data swap would change these.
+        let out = glue
+            .execute(
+                "SELECT ledger, code, debits_pending, debits_posted, credits_pending, \
+                 credits_posted, user_data_128, user_data_64, user_data_32 \
+                 FROM ledger_accounts WHERE id = 1",
+            )
+            .await
+            .unwrap();
+        let Payload::Select { rows, .. } = &out[0] else { panic!() };
+        assert_eq!(rows[0][0], SqlValue::U32(7), "ledger");
+        assert_eq!(rows[0][1], SqlValue::U16(5), "code");
+        assert_eq!(rows[0][2], SqlValue::U128(30), "debits_pending");
+        assert_eq!(rows[0][3], SqlValue::U128(100), "debits_posted");
+        assert_eq!(rows[0][4], SqlValue::U128(0), "credits_pending");
+        assert_eq!(rows[0][5], SqlValue::U128(0), "credits_posted");
+        assert_eq!(rows[0][6], SqlValue::U128(111), "user_data_128");
+        assert_eq!(rows[0][7], SqlValue::U64(222), "user_data_64");
+        assert_eq!(rows[0][8], SqlValue::U32(333), "user_data_32");
+
+        // Account 2: the mirror image (catches the reverse swap).
+        let out = glue
+            .execute("SELECT debits_pending, debits_posted, credits_pending, credits_posted FROM ledger_accounts WHERE id = 2")
+            .await
+            .unwrap();
+        let Payload::Select { rows, .. } = &out[0] else { panic!() };
+        assert_eq!(rows[0][0], SqlValue::U128(0), "acct2 debits_pending");
+        assert_eq!(rows[0][1], SqlValue::U128(0), "acct2 debits_posted");
+        assert_eq!(rows[0][2], SqlValue::U128(30), "acct2 credits_pending");
+        assert_eq!(rows[0][3], SqlValue::U128(100), "acct2 credits_posted");
+
+        // Transfers: debit(1) != credit(2), amount(100) distinct → catches a
+        // debit/credit or amount/pending_id reorder.
+        let out = glue
+            .execute(
+                "SELECT debit_account_id, credit_account_id, amount, pending_id, timeout, ledger, code \
+                 FROM ledger_transfers WHERE id = 10",
+            )
+            .await
+            .unwrap();
+        let Payload::Select { rows, .. } = &out[0] else { panic!() };
+        assert_eq!(rows[0][0], SqlValue::U128(1), "debit_account_id");
+        assert_eq!(rows[0][1], SqlValue::U128(2), "credit_account_id");
+        assert_eq!(rows[0][2], SqlValue::U128(100), "amount");
+        assert_eq!(rows[0][3], SqlValue::U128(0), "pending_id");
+        assert_eq!(rows[0][4], SqlValue::U32(0), "timeout");
+        assert_eq!(rows[0][5], SqlValue::U32(7), "ledger");
+        assert_eq!(rows[0][6], SqlValue::U16(9), "code");
+    }
+
+    #[tokio::test]
     async fn sql_projection_reflects_pending_then_post() {
         use gluesql_core::prelude::{Glue, Payload, Value as SqlValue};
 

@@ -21,7 +21,9 @@ pub(crate) const ACCOUNTS_TABLE: &str = "ledger_accounts";
 pub(crate) const TRANSFERS_TABLE: &str = "ledger_transfers";
 
 /// The `ledger_accounts` projection. Column order here is the single source of
-/// truth shared by the DDL and [`project_account`] — they must never drift.
+/// truth shared by the DDL and [`project_account`] — they must never drift (a
+/// same-typed reorder would silently corrupt rows; the
+/// `sql_projection_column_order_is_exact` test guards against it).
 pub(crate) fn accounts_table() -> ProjectedTable {
     use ProjValue::{U128, U16, U32, U64};
     ProjectedTable::new(
@@ -44,7 +46,10 @@ pub(crate) fn accounts_table() -> ProjectedTable {
     )
 }
 
-/// The `ledger_transfers` projection. Column order matches [`project_transfer`].
+/// The `ledger_transfers` projection. As with [`accounts_table`], the column
+/// order here is the single source of truth shared with [`project_transfer`] —
+/// the two must never drift (a same-typed reorder would silently corrupt rows;
+/// `sql_projection_column_order_is_exact` guards against it).
 pub(crate) fn transfers_table() -> ProjectedTable {
     use ProjValue::{U128, U16, U32, U64};
     ProjectedTable::new(
