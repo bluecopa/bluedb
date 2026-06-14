@@ -193,6 +193,9 @@ impl UpdateRequest {
     }
 
     /// Render to `UPDATE … SET … WHERE … ;` with bound `$N` parameters.
+    ///
+    /// Refuses an empty filter set ([`RestError::UnfilteredMutation`]) to avoid
+    /// an accidental full-table update.
     pub fn to_sql_with_params(&self) -> Result<(String, Vec<Param>), RestError> {
         let table = validate_ident(&self.table)?;
         if self.assignments.is_empty() {
@@ -232,6 +235,9 @@ impl DeleteRequest {
     }
 
     /// Render to `DELETE FROM … WHERE … ;` with bound `$N` parameters.
+    ///
+    /// Refuses an empty filter set ([`RestError::UnfilteredMutation`]) to avoid
+    /// an accidental full-table delete.
     pub fn to_sql_with_params(&self) -> Result<(String, Vec<Param>), RestError> {
         let table = validate_ident(&self.table)?;
         if self.filters.is_empty() {
@@ -295,5 +301,25 @@ mod params_render {
         let (sql, params) = d.to_sql_with_params().unwrap();
         assert_eq!(sql, "DELETE FROM t WHERE id = $1;");
         assert_eq!(params, vec![Param::Int(42)]);
+    }
+
+    #[test]
+    fn select_multi_filter_joins_with_and_and_continues_index() {
+        // One negated `eq` and one `IN` — exercises NOT(...) wrapping, the AND join,
+        // and the running $N index spanning multiple filters.
+        let q = RestQuery {
+            table: "t".into(),
+            select: vec![],
+            filters: vec![
+                Filter { column: "name".into(), op: Operator::Eq, negated: true, value: "amy".into() },
+                Filter::new("id", Operator::In, "(1,2)"),
+            ],
+            order: vec![],
+            limit: None,
+            offset: None,
+        };
+        let (sql, params) = q.to_sql_with_params().unwrap();
+        assert_eq!(sql, "SELECT * FROM t WHERE NOT (name = $1) AND id IN ($2, $3);");
+        assert_eq!(params, vec![Param::Str("amy".into()), Param::Int(1), Param::Int(2)]);
     }
 }
