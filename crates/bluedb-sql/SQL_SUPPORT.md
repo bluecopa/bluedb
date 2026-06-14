@@ -10,7 +10,10 @@ PostgreSQL/DuckDB.
 > **Evidence (snapshot).** Measured by the conformance harness in
 > [`crates/bluedb-sqltest`](../bluedb-sqltest):
 > - SQLite `sqllogictest` subset: **77%** of statements/queries execute without error.
-> - DuckDB test subset: **28%** execute (lower — the corpus is DuckDB-specific); **of what executes, ~80% returns the correct result.**
+> - DuckDB test subset: **34%** execute (lower — the corpus is DuckDB-specific); **of what executes, ~78% returns the correct result.** (Both rose as more
+>   statements run — broader type coverage, no-op `SET`/`PRAGMA`, views, `USING`,
+>   `TRY_CAST`, `NULLS FIRST/LAST`; the *correct* fraction dips slightly only
+>   because the newly-running queries are harder.)
 >
 > The correctness comparator is layout- and numeric-tolerant (the DuckDB corpus
 > mixes tab-separated-row and one-value-per-line result blocks, and `R`-columns
@@ -26,11 +29,14 @@ PostgreSQL/DuckDB.
 SQL ──▶ rewrite shim ──▶ GlueSQL translate ──▶ Planner hook ──▶ execute
 ```
 
-The rewrite shim (in `bluedb-sql`) applies, in order:
+The rewrite shim (in `bluedb-sql`, with session-state pieces — `SET`/view capture
+— in the harness) applies, in order:
 
-1. **CTE inlining** — non-recursive `WITH c AS (q) …` → `… FROM (q) AS c`.
-2. **Set-op rewrite** — `UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT` → joins / `IN`-subqueries.
-3. **Comma-join fold + type normalization** — `FROM a, b` → `a JOIN b ON TRUE`; `VARCHAR(n)`→`TEXT`, `DECIMAL(p,s)`→`DECIMAL`, `INT(n)`/`BIGINT`/…→`INTEGER`.
+1. **Session intercepts** — `SET default_null_order` and other `SET`/`PRAGMA` (no-op), `CREATE`/`DROP VIEW` (capture/inline).
+2. **CTE inlining** — non-recursive `WITH c AS (q) …` → `… FROM (q) AS c` (incl. under `CREATE TABLE AS` / `INSERT`); view-reference inlining.
+3. **Set-op rewrite** — `UNION`/`UNION ALL` (any width) / single-column `INTERSECT`/`EXCEPT` → joins / `IN`-subqueries.
+4. **Comma-join fold + `USING`→`ON` + type normalization + `TRY_CAST`→`CAST`** — `FROM a, b` → `a JOIN b ON TRUE`; broad type mapping (text/decimal/integer/float/temporal families).
+5. **NULL-order normalization** — explicit `NULLS FIRST/LAST` and the session default → leading `(e IS NULL)` sort keys.
 
 Then GlueSQL's **`Planner` hook** runs three schema-aware passes on the planned
 statement (it has the column types): it **pushes equi-join predicates** from
@@ -47,14 +53,18 @@ between a numeric operand and a numeric string literal compares *numerically*
 - `INSERT` (single-row), `UPDATE`, `DELETE`
 - `SELECT` — projection, `WHERE`, `ORDER BY`, `GROUP BY`, `HAVING`, `LIMIT`/`OFFSET`, `DISTINCT`
 - `CREATE INDEX` / `DROP INDEX` (single-column)
+- `CREATE VIEW` / `DROP VIEW` — no engine view support; the definition is captured and inlined as a derived table on reference (one level; non-recursive).
+- `SET` / `PRAGMA` — `default_null_order` is honored; other engine-config knobs are accepted as no-ops rather than rejected.
 - Transactions — `BEGIN` / `COMMIT` / `ROLLBACK` (snapshot isolation; write transactions serialized — single writer)
 
 **Queries**
 - Aggregates — `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, `GROUP BY`
-- Joins — `INNER JOIN` / `LEFT JOIN … ON` (equi-joins run as hash joins)
+- Joins — `INNER JOIN` / `LEFT JOIN … ON` (equi-joins run as hash joins); `JOIN … USING (cols)` is rewritten to the equivalent `ON`.
 - **Comma-joins** `FROM a, b WHERE a.x = b.y` — **only with an equi-join key** (rewritten to a hash join). See gotchas.
-- **Set operations** `UNION` / `UNION ALL` / `INTERSECT` / `EXCEPT` — **single-column branches only** (rewritten to joins/subqueries).
-- **Non-recursive CTEs** (`WITH c AS (…) SELECT … FROM c`) — inlined as derived tables.
+- **Set operations** — `UNION` / `UNION ALL` over **any number of columns**; `INTERSECT` / `EXCEPT` **single-column only** (multi-column needs NULL-aware row matching). Rewritten to joins/subqueries.
+- **Non-recursive CTEs** (`WITH c AS (…) SELECT … FROM c`) — inlined as derived tables (also under `CREATE TABLE AS` / `INSERT`).
+- **`NULLS FIRST` / `NULLS LAST`** in `ORDER BY` — rewritten to a leading `(e IS NULL)` sort key (GlueSQL lacks the syntax).
+- **`TRY_CAST` / `SAFE_CAST`** — rewritten to `CAST` (differs only when the cast would fail: `TRY_CAST` yields NULL, `CAST` errors).
 - **`SET default_null_order`** (`'nulls_first'` / `'nulls_last'`) — a session
   setting GlueSQL lacks; honored by rewriting each `ORDER BY e` to
   `ORDER BY (e IS NULL) [DESC], e`, which GlueSQL sorts natively. (GlueSQL's own
@@ -70,7 +80,12 @@ between a numeric operand and a numeric string literal compares *numerically*
 
 **Data types**
 - Native: `BOOLEAN`, `INTEGER`, `FLOAT`, `DECIMAL`, `TEXT`, `BYTEA`, `DATE`, `TIME`, `TIMESTAMP`, `INTERVAL`, `UUID`
-- Accepted via normalization: `VARCHAR(n)`/`CHAR(n)` → `TEXT`; `DECIMAL(p,s)`/`NUMERIC` → `DECIMAL`; `INT(n)`/`BIGINT`/`SMALLINT`/`TINYINT`/`INT2/4/8` → `INTEGER`
+- Accepted via normalization:
+  - text — `VARCHAR(n)`/`CHAR(n)`/`NVARCHAR`/`CLOB`/`STRING` → `TEXT`
+  - decimal — `DECIMAL(p,s)`/`NUMERIC`/`BIGNUM` → `DECIMAL`
+  - integer — `BIGINT`/`SMALLINT`/`TINYINT`/`INT(n)`/`INT2/4/8`/`HUGEINT` and the unsigned/wide family (`UHUGEINT`/`UBIGINT`/`UINT*`/`INT128`…) → `INTEGER` (i64; lossy out of range)
+  - float — `DOUBLE`/`DOUBLE PRECISION`/`REAL`/`FLOAT(n)`/`FLOAT4/8` → `FLOAT`
+  - temporal — `TIMESTAMP(n)`/`TIMESTAMPTZ`/`DATETIME` → `TIMESTAMP`, `TIME(n)` → `TIME` (sub-second precision / timezone dropped)
 
 ## ❌ Not supported (the query **errors** — safe to detect)
 
@@ -80,14 +95,13 @@ between a numeric operand and a numeric string literal compares *numerically*
   "unsupported" error (a pre-execution check walks projection, `WHERE`,
   `HAVING`, and `FROM`-derived subqueries for an `OVER` clause).
 - **Cartesian products** — `CROSS JOIN`, or comma-joins without a join key. Rejected at plan time (would materialize the full product).
-- **`WITH RECURSIVE`** and DML CTEs (`INSERT … WITH …`, `CREATE … AS WITH …`).
-- **Multi-column set operations** (`SELECT a, b … UNION SELECT c, d …`).
-- **Views** — `CREATE VIEW` / `DROP VIEW`.
+- **`WITH RECURSIVE`** — needs iterative evaluation; can't be inlined.
+- **Multi-column `INTERSECT` / `EXCEPT`** (multi-column `UNION`/`UNION ALL` *is* supported).
 - **Composite (multi-column) indexes.**
-- **`EXPLAIN`, `SET`, `PRAGMA`, `SELECT DISTINCT ON`.**
-- **Engine-specific functions** not in GlueSQL — e.g. `TRY_CAST`, and many DuckDB/Postgres builtins.
+- **`EXPLAIN`, `SELECT DISTINCT ON`.**
+- **Engine-specific functions** not in GlueSQL — many DuckDB/Postgres builtins (`arg_min`, `list`, `any_value`, `regexp_*`, …).
 - **Large multi-row `INSERT … VALUES (…),(…),…`** (parser limit). Use single-row inserts, or wrap a batch in one `BEGIN … COMMIT`.
-- **Arbitrary-precision types** (`HUGEINT`, DuckDB `BIGNUM`).
+- **Exotic types** — `BIT`, `STRUCT`, enums (`CREATE TYPE`).
 
 ## ⚠️ Semantic differences & gotchas (runs, but may be **wrong**)
 
