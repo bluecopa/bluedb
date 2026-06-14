@@ -25,8 +25,9 @@ works as in standard SQL.
 
 ## Semantic differences — these run, but differ
 
-> **Warning** — These execute without error but behave differently from
-> PostgreSQL/DuckDB. Know them.
+!!! warning
+    These execute without error but behave differently from
+    PostgreSQL/DuckDB. Know them.
 
 - **`bool`/`int` comparisons are not coerced.** `TRUE = 1` is **FALSE**. Engines
   disagree (DuckDB/MySQL: true; PostgreSQL: error), so bluedb leaves it — use an

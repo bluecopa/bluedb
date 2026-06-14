@@ -56,8 +56,9 @@ SELECT name FROM t ORDER BY id;
 | ada  |
 | lin  |
 
-> **Note** — callouts like this clarify behavior.
->
-> **Warning** — callouts like this flag a sharp edge or a difference from
-> PostgreSQL/DuckDB. The [Limitations & differences](limitations.md) page
-> collects them all.
+!!! note
+    Callouts like this clarify behavior.
+
+!!! warning
+    Callouts like this flag a sharp edge or a difference from PostgreSQL/DuckDB.
+    The [Limitations & differences](limitations.md) page collects them all.

@@ -34,10 +34,11 @@ This coercion is conservative: only string **literals** are cast (never a stored
 text column), and only when the literal parses into the target numeric type — so
 it never turns a working query into a runtime cast error.
 
-> **Warning — `bool`/`int` comparisons are not coerced.** `TRUE = 1` evaluates to
-> **FALSE**. Engines disagree here (DuckDB/MySQL say true, PostgreSQL errors), so
-> bluedb leaves it alone — use an explicit `CAST`. A number compared to a
-> *non-numeric* text column (`name = 5`) is likewise not coerced.
+!!! warning
+    **`bool`/`int` comparisons are not coerced.** `TRUE = 1` evaluates to
+    **FALSE**. Engines disagree here (DuckDB/MySQL say true, PostgreSQL errors), so
+    bluedb leaves it alone — use an explicit `CAST`. A number compared to a
+    *non-numeric* text column (`name = 5`) is likewise not coerced.
 
 ## `CAST` and `TRY_CAST`
 
@@ -48,9 +49,10 @@ SELECT '42'::INTEGER;            -- shorthand cast
 SELECT TRY_CAST(code AS INTEGER) FROM raw;   -- treated as CAST
 ```
 
-> **Note** — `TRY_CAST` / `SAFE_CAST` are accepted and run as `CAST`. They differ
-> only when the cast would *fail*: standard `TRY_CAST` yields `NULL`, whereas
-> bluedb's `CAST` raises an error.
+!!! note
+    `TRY_CAST` / `SAFE_CAST` are accepted and run as `CAST`. They differ
+    only when the cast would *fail*: standard `TRY_CAST` yields `NULL`, whereas
+    bluedb's `CAST` raises an error.
 
 ## `CASE`
 
@@ -93,6 +95,7 @@ SELECT * FROM users WHERE deleted_at IS NULL;
 `EXISTS`, scalar subqueries, and `IN (SELECT …)` are all valid in expressions —
 see [Query syntax › Subqueries](query-syntax.md#subqueries).
 
-> **Warning — window functions are not supported.** `SUM(x) OVER (…)`,
-> `ROW_NUMBER() OVER (…)`, `RANK()`, etc. are **rejected** with a clear error
-> (the engine has no windowing; rejecting prevents silently wrong results).
+!!! warning
+    **window functions are not supported.** `SUM(x) OVER (…)`,
+    `ROW_NUMBER() OVER (…)`, `RANK()`, etc. are **rejected** with a clear error
+    (the engine has no windowing; rejecting prevents silently wrong results).

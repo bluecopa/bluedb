@@ -41,13 +41,14 @@ ROLLBACK;   -- nothing was deleted
 - An explicit `BEGIN … COMMIT` block serializes its read-modify-write against
   other explicit transactions.
 
-> **Tip — bulk loads.** Each autocommit `INSERT` is one durable object-storage
-> write. To load many rows fast, wrap them in a single transaction:
->
-> ```sql
-> BEGIN;
-> INSERT INTO t VALUES (…);
-> INSERT INTO t VALUES (…);
-> -- … many rows …
-> COMMIT;
-> ```
+!!! tip
+    **bulk loads.** Each autocommit `INSERT` is one durable object-storage
+    write. To load many rows fast, wrap them in a single transaction:
+
+    ```sql
+    BEGIN;
+    INSERT INTO t VALUES (…);
+    INSERT INTO t VALUES (…);
+    -- … many rows …
+    COMMIT;
+    ```

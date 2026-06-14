@@ -18,9 +18,10 @@
 | `INTERVAL` | Duration |
 | `UUID` | 128-bit UUID |
 
-> **Note** — `LIST`, `MAP`, and `POINT` values are also supported (mainly for
-> schemaless rows and the list/map functions); they are niche and not covered
-> in depth here.
+!!! note
+    `LIST`, `MAP`, and `POINT` values are also supported (mainly for
+    schemaless rows and the list/map functions); they are niche and not covered
+    in depth here.
 
 ## Accepted aliases (normalized)
 
@@ -48,11 +49,12 @@ CREATE TABLE t (
 );
 ```
 
-> **Warning — lossy normalizations.**
-> - Wide/unsigned integers (`UHUGEINT`, `INT128`, …) become 64-bit `INTEGER`;
->   values outside the signed-64 range will not round-trip.
-> - `TIMESTAMP(n)` / `TIME(n)` drop their sub-second **precision** specifier and
->   any timezone; values are kept, the precision annotation is not.
+!!! warning
+    **lossy normalizations.**
+    - Wide/unsigned integers (`UHUGEINT`, `INT128`, …) become 64-bit `INTEGER`;
+      values outside the signed-64 range will not round-trip.
+    - `TIMESTAMP(n)` / `TIME(n)` drop their sub-second **precision** specifier and
+      any timezone; values are kept, the precision annotation is not.
 
 ## Type literals
 

@@ -5,6 +5,12 @@ storage (S3 / GCS / Azure Blob) via **SlateDB**; compute is **stateless and
 horizontally scalable**. Spun out of `fx-runtime` design work as its own project
 so it can be embedded (PyO3) into `fx-runtime` services and/or run as a service.
 
+## Documentation
+
+Full docs (intro, SQL reference, consistency & Jepsen guarantees, HA, and
+deployment) live in [`docs/`](docs/index.md) and build into a GitHub Pages site
+via MkDocs Material (`mkdocs serve` after `pip install -r docs/requirements.txt`).
+
 ## Why this exists
 
 The driver is enterprise **DDL-clearance pain** → wanting **one schema-flexible

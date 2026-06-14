@@ -6,10 +6,11 @@ These are the built-in functions bluedb's engine provides. Exact argument
 signatures follow [GlueSQL](https://gluesql.org); the groupings below cover the
 common ones.
 
-> **Warning** — bluedb does **not** support **window functions** (`… OVER (…)`)
-> or **user-defined functions** (`CREATE FUNCTION`). Many PostgreSQL/DuckDB-only
-> builtins (`arg_min`, `list_*`, `regexp_*`, `any_value`, …) are also absent.
-> See [Limitations](limitations.md).
+!!! warning
+    bluedb does **not** support **window functions** (`… OVER (…)`)
+    or **user-defined functions** (`CREATE FUNCTION`). Many PostgreSQL/DuckDB-only
+    builtins (`arg_min`, `list_*`, `regexp_*`, `any_value`, …) are also absent.
+    See [Limitations](limitations.md).
 
 ## Aggregate functions
 
@@ -26,9 +27,10 @@ common ones.
 SELECT age, COUNT(*) AS n, AVG(age) FROM users GROUP BY age;
 ```
 
-> **Warning** — An aggregate with **no `GROUP BY`** over a `WHERE` that matches
-> **zero rows** returns **no row** (rather than one `NULL`/`0` row). Guard with a
-> separate `COUNT` if you need the empty case.
+!!! warning
+    An aggregate with **no `GROUP BY`** over a `WHERE` that matches
+    **zero rows** returns **no row** (rather than one `NULL`/`0` row). Guard with a
+    separate `COUNT` if you need the empty case.
 
 ## Math
 

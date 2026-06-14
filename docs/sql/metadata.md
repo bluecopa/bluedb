@@ -56,5 +56,6 @@ One row per index.
 SELECT TABLE_NAME, INDEX_NAME FROM GLUE_INDEXES;
 ```
 
-> **Note** — These tables are read-only and reflect the live catalog. They are
-> the supported way to introspect schema; there is no `information_schema`.
+!!! note
+    These tables are read-only and reflect the live catalog. They are
+    the supported way to introspect schema; there is no `information_schema`.

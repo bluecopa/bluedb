@@ -1,0 +1,94 @@
+site_name: bluedb
+site_description: An object-storage-native OLTP database — SQL, full-text search, and a ledger on S3/GCS/Azure.
+repo_url: https://github.com/bluecopa/bluedb
+repo_name: bluecopa/bluedb
+edit_uri: edit/dev/docs/
+docs_dir: docs
+
+theme:
+  name: material
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - navigation.indexes
+    - navigation.footer
+    - content.code.copy
+    - search.suggest
+    - search.highlight
+    - toc.follow
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+
+# Internal engineering specs/handoffs live under docs/ but are not part of the
+# published site.
+exclude_docs: |
+  superpowers/
+  insert-throughput-handoff.md
+  requirements.txt
+
+nav:
+  - Home: index.md
+  - Quickstart: quickstart.md
+  - Concepts:
+      - Architecture: concepts/architecture.md
+      - Single-writer model: concepts/single-writer.md
+  - SQL:
+      - Overview: sql/README.md
+      - Statements: sql/statements.md
+      - Query syntax: sql/query-syntax.md
+      - Data types: sql/data-types.md
+      - Expressions: sql/expressions.md
+      - Functions: sql/functions.md
+      - Transactions: sql/transactions.md
+      - Metadata: sql/metadata.md
+      - Limitations & differences: sql/limitations.md
+  - Guarantees:
+      - Consistency model: guarantees/consistency.md
+      - Transactions & isolation: guarantees/transactions.md
+      - Jepsen report: guarantees/jepsen.md
+  - High availability:
+      - Active-passive HA: ha/active-passive.md
+      - Multi-region: ha/multi-region.md
+  - Deployment:
+      - Local: deployment/local.md
+      - Docker: deployment/docker.md
+      - Kubernetes: deployment/kubernetes.md
+      - Configuration: deployment/configuration.md
+  - Operations:
+      - Administration: operations/admin.md
+  - API:
+      - REST: api/rest.md

@@ -33,9 +33,10 @@ Options:
 CREATE TABLE adults AS SELECT * FROM users WHERE age >= 18;
 ```
 
-> **Note** — Parameterized and vendor type spellings are accepted and
-> normalized: `VARCHAR(100)` → `TEXT`, `DOUBLE` → `FLOAT`, `BIGINT`/`UHUGEINT`
-> → `INTEGER`, `TIMESTAMP(6)` → `TIMESTAMP`, etc. See [Data types](data-types.md).
+!!! note
+    Parameterized and vendor type spellings are accepted and
+    normalized: `VARCHAR(100)` → `TEXT`, `DOUBLE` → `FLOAT`, `BIGINT`/`UHUGEINT`
+    → `INTEGER`, `TIMESTAMP(6)` → `TIMESTAMP`, etc. See [Data types](data-types.md).
 
 ## `DROP TABLE`
 
@@ -52,9 +53,10 @@ INSERT INTO users VALUES (2, 'lin', 'lin@x.io', 29);
 INSERT INTO users SELECT id, name, email, age FROM staging;
 ```
 
-> **Warning** — Insert **one row per statement** for large loads, or wrap a
-> batch in a single transaction (`BEGIN … COMMIT`). Very large multi-row
-> `VALUES (…), (…), …` lists hit a parser limit. See [Limitations](limitations.md).
+!!! warning
+    Insert **one row per statement** for large loads, or wrap a
+    batch in a single transaction (`BEGIN … COMMIT`). Very large multi-row
+    `VALUES (…), (…), …` lists hit a parser limit. See [Limitations](limitations.md).
 
 ## `UPDATE`
 
@@ -70,7 +72,8 @@ DELETE FROM users WHERE age < 18;
 DELETE FROM users;                     -- no WHERE deletes every row
 ```
 
-> **Warning** — A `DELETE` / `UPDATE` with no `WHERE` affects **all rows**.
+!!! warning
+    A `DELETE` / `UPDATE` with no `WHERE` affects **all rows**.
 
 ## `CREATE INDEX` / `DROP INDEX`
 
@@ -83,8 +86,9 @@ SELECT * FROM users WHERE email = 'ada@x.io';   -- uses users_email
 DROP INDEX users_email ON users;
 ```
 
-> **Warning** — Indexes are **single-column** only. Composite (multi-column)
-> indexes are not supported.
+!!! warning
+    Indexes are **single-column** only. Composite (multi-column)
+    indexes are not supported.
 
 ## `CREATE VIEW` / `DROP VIEW`
 
@@ -98,9 +102,10 @@ SELECT name FROM active_users ORDER BY name;
 DROP VIEW active_users;
 ```
 
-> **Note** — A view referencing another view is resolved one level deep.
-> Materialized views are treated the same as regular views (definition inlined,
-> not precomputed).
+!!! note
+    A view referencing another view is resolved one level deep.
+    Materialized views are treated the same as regular views (definition inlined,
+    not precomputed).
 
 ## Transactions
 
@@ -121,6 +126,7 @@ See [Transactions](transactions.md) for isolation and concurrency details.
   than rejected, so scripts written for other engines run unchanged.
 
 <a name="default-row-order"></a>
-> **Note — default row order.** Without `ORDER BY`, rows come back in
-> **storage (primary-key) order**, not insertion order. Add `ORDER BY` whenever
-> order matters.
+!!! note
+    **default row order.** Without `ORDER BY`, rows come back in
+    **storage (primary-key) order**, not insertion order. Add `ORDER BY` whenever
+    order matters.
