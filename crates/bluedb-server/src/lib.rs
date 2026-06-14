@@ -234,17 +234,30 @@ async fn select(
     Ok(Json(payloads_to_json(payloads)))
 }
 
-/// `POST /tables/{table}` — INSERT (JSON object or array of objects).
+/// `POST /tables/{table}` — INSERT (JSON object → autocommit; array → one txn batch).
 async fn insert(
     State(state): State<AppState>,
     Path(table): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, AppError> {
     state.require_active()?;
-    let req = build_insert(table, body)?;
-    let mut glue = Glue::new(state.connection().await?);
-    let payloads = rest_sql::execute_insert(&mut glue, &req).await?;
-    Ok(Json(payloads_to_json(payloads)))
+    let (req, is_batch) = build_insert(table, body)?;
+    if is_batch {
+        // Multi-row: atomic BEGIN..COMMIT on the serialized (lease-holding) connection.
+        let mut glue = Glue::new(state.connection_serialized().await?);
+        let payloads = rest_sql::execute_insert_batch(&mut glue, &req).await?;
+        // Fold all per-row Insert(n) payloads from the transaction into one count.
+        let total: usize = payloads
+            .iter()
+            .filter_map(|p| if let Payload::Insert(n) = p { Some(*n) } else { None })
+            .sum();
+        Ok(Json(json!({ "inserted": total })))
+    } else {
+        // Single row: autocommit on the group-commit connection (concurrent fast path).
+        let mut glue = Glue::new(state.connection().await?);
+        let payloads = rest_sql::execute_insert(&mut glue, &req).await?;
+        Ok(Json(payloads_to_json(payloads)))
+    }
 }
 
 /// `PATCH /tables/{table}?<filters>` — UPDATE (JSON assignments body).
@@ -315,18 +328,21 @@ fn status_json(status: &Status) -> Value {
 /// Turn a JSON insert body (object, or array of objects) into an
 /// [`InsertRequest`]. Columns are taken from the (sorted) keys of the first
 /// object; every row must carry exactly those keys.
-fn build_insert(table: String, body: Value) -> Result<InsertRequest, AppError> {
-    let objects: Vec<Map<String, Value>> = match body {
-        Value::Object(map) => vec![map],
-        Value::Array(items) => items
-            .into_iter()
-            .map(|item| match item {
-                Value::Object(map) => Ok(map),
-                other => Err(AppError::bad_request(format!(
-                    "insert rows must be JSON objects, got {other}"
-                ))),
-            })
-            .collect::<Result<_, _>>()?,
+fn build_insert(table: String, body: Value) -> Result<(InsertRequest, bool), AppError> {
+    let (objects, is_batch): (Vec<Map<String, Value>>, bool) = match body {
+        Value::Object(map) => (vec![map], false),
+        Value::Array(items) => (
+            items
+                .into_iter()
+                .map(|item| match item {
+                    Value::Object(map) => Ok(map),
+                    other => Err(AppError::bad_request(format!(
+                        "insert rows must be JSON objects, got {other}"
+                    ))),
+                })
+                .collect::<Result<_, _>>()?,
+            true,
+        ),
         other => {
             return Err(AppError::bad_request(format!(
                 "insert body must be an object or array of objects, got {other}"
@@ -354,7 +370,7 @@ fn build_insert(table: String, body: Value) -> Result<InsertRequest, AppError> {
         rows.push(row);
     }
 
-    Ok(InsertRequest { table, columns, rows })
+    Ok((InsertRequest { table, columns, rows }, is_batch))
 }
 
 /// Render a JSON scalar into the DSL string form `bluedb-rest` expects. (Like
@@ -436,6 +452,37 @@ fn sql_value_to_json(value: &SqlValue) -> Value {
         SqlValue::F64(x) => serde_json::Number::from_f64(*x).map(Value::Number).unwrap_or(Value::Null),
         SqlValue::Str(s) => Value::String(s.clone()),
         other => Value::String(format!("{other:?}")),
+    }
+}
+
+// --- tests ------------------------------------------------------------------
+
+#[cfg(test)]
+mod insert_routing {
+    use super::build_insert;
+    use serde_json::json;
+
+    #[test]
+    fn object_body_is_not_batch_single_row() {
+        let (req, is_batch) = build_insert("docs".into(), json!({"id": "1"})).unwrap();
+        assert!(!is_batch);
+        assert_eq!(req.table, "docs");
+        assert_eq!(req.columns, vec!["id".to_string()]);
+        assert_eq!(req.rows.len(), 1);
+        assert_eq!(req.rows[0], vec!["1".to_string()]);
+    }
+
+    #[test]
+    fn array_body_is_batch_multi_row() {
+        let (req, is_batch) =
+            build_insert("docs".into(), json!([{"id": "1"}, {"id": "2"}])).unwrap();
+        assert!(is_batch);
+        assert_eq!(req.rows.len(), 2);
+    }
+
+    #[test]
+    fn scalar_body_is_rejected() {
+        assert!(build_insert("docs".into(), json!(42)).is_err());
     }
 }
 
