@@ -61,6 +61,12 @@ impl AsyncDB for GlueTester {
     type ColumnType = DefaultColumnType;
 
     async fn run(&mut self, sql: &str) -> Result<DBOutput<Self::ColumnType>, Self::Error> {
+        // Reject SQL GlueSQL would silently mis-execute (window functions) with
+        // a clear error rather than returning wrong rows.
+        if let Some(reason) = bluedb_sql::unsupported_reason(sql) {
+            return Err(GlueError(reason));
+        }
+
         // Apply bluedb's SQL-compat rewrites, matching how bluedb-sql would
         // preprocess SQL in production: CTE inlining first (WITH -> derived
         // tables), then set ops (UNION/INTERSECT/EXCEPT -> joins/subqueries),

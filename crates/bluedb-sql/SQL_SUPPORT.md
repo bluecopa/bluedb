@@ -55,6 +55,11 @@ unbounded cartesian product) at plan time.
 
 ## ❌ Not supported (the query **errors** — safe to detect)
 
+- **Window functions (`OVER`)** — `SUM(x) OVER (…)`, `ROW_NUMBER() OVER (…)`,
+  `RANK()`, etc. GlueSQL has no windowing and would *silently mis-execute* them,
+  so they are **detected before execution and rejected** with a clear
+  "unsupported" error (a pre-execution check walks projection, `WHERE`,
+  `HAVING`, and `FROM`-derived subqueries for an `OVER` clause).
 - **Cartesian products** — `CROSS JOIN`, or comma-joins without a join key. Rejected at plan time (would materialize the full product).
 - **`WITH RECURSIVE`** and DML CTEs (`INSERT … WITH …`, `CREATE … AS WITH …`).
 - **Multi-column set operations** (`SELECT a, b … UNION SELECT c, d …`).
@@ -70,10 +75,6 @@ unbounded cartesian product) at plan time.
 These execute **without error** but behave differently from PostgreSQL/DuckDB —
 they will not be flagged at runtime, so know them:
 
-- **Window functions (`OVER`) are silently incorrect.** GlueSQL does not
-  implement windowing; `SUM(x) OVER (…)`, `ROW_NUMBER() OVER (…)`, etc. run but
-  return **wrong results instead of an error**. **Do not use window functions.**
-  *(This is the single most dangerous gap — it fails silently.)*
 - **No implicit type coercion in comparisons.** `true = 1`, `'1' = 1`,
   `'1' = true` all evaluate to **FALSE** (no auto-cast), unlike DuckDB/MySQL.
   Use an explicit `CAST`.
