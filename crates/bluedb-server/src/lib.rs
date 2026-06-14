@@ -41,7 +41,7 @@ use tokio::sync::RwLock;
 pub mod authz;
 mod schema;
 
-use bluedb_engine::{rest_sql, EngineError};
+use bluedb_engine::{rest_sql, EngineError, FtsEngine};
 use bluedb_ha::{HaError, Status, WriterController};
 use bluedb_rest::{parse_filters, DeleteRequest, InsertRequest, UpdateRequest};
 use bluedb_sql::{Database, SlateDbStorage};
@@ -94,6 +94,11 @@ struct Inner {
     /// Bearer-token → scopes map. Unset = open mode (all requests allowed).
     /// Set once at startup via [`AppState::with_authz`].
     authz: OnceLock<Arc<authz::Authz>>,
+    /// The shared FTS engine — one instance for the node's lifetime, so it holds
+    /// the in-memory live segments. Installed as a commit observer on every write
+    /// connection (maintains the live index) and consulted by `/sql` to rewrite
+    /// `@@`/`ts_rank` against the live segment (read-your-writes).
+    fts: Arc<FtsEngine>,
 }
 
 impl AppState {
@@ -114,6 +119,7 @@ impl AppState {
                 db: RwLock::new(None),
                 admin_sql_enabled: AtomicBool::new(false),
                 authz: OnceLock::new(),
+                fts: FtsEngine::new(),
             }),
         }
     }
@@ -229,10 +235,16 @@ impl AppState {
         *self.inner.db.write().await = bound;
     }
 
-    /// A connection to the currently-bound database, or `503` if unbound.
+    /// The shared FTS engine (for the `/schema/.../fulltext-indexes` handler).
+    pub(crate) fn fts(&self) -> &std::sync::Arc<FtsEngine> {
+        &self.inner.fts
+    }
+
+    /// A connection to the currently-bound database, or `503` if unbound. Carries
+    /// the FTS commit observer so the live index is maintained on every commit.
     async fn connection(&self) -> Result<SlateDbStorage, AppError> {
         match self.inner.db.read().await.as_ref() {
-            Some(db) => Ok(db.connection()),
+            Some(db) => Ok(db.connection().with_commit_observer(self.inner.fts.clone())),
             None => Err(AppError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 message: "node has no database yet (no writer has been promoted)".to_string(),
@@ -246,7 +258,9 @@ impl AppState {
     /// `DELETE`) so concurrent RMWs can't lose an update.
     pub(crate) async fn connection_serialized(&self) -> Result<SlateDbStorage, AppError> {
         match self.inner.db.read().await.as_ref() {
-            Some(db) => Ok(db.connection_serialized()),
+            Some(db) => Ok(db
+                .connection_serialized()
+                .with_commit_observer(self.inner.fts.clone())),
             None => Err(AppError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 message: "node has no database yet (no writer has been promoted)".to_string(),
@@ -287,6 +301,10 @@ pub fn build_app(state: AppState) -> Router {
         .route("/schema/tables/{table}", delete(schema::drop_table))
         .route("/schema/tables/{table}/indexes", post(schema::create_index))
         .route("/schema/tables/{table}/indexes/{name}", delete(schema::drop_index))
+        .route(
+            "/schema/tables/{table}/fulltext-indexes",
+            post(schema::create_fulltext_index),
+        )
         .with_state(state)
 }
 
@@ -336,7 +354,9 @@ async fn exec_sql(
     state.require_active()?;
     let params = req.params.iter().map(json_to_param).collect::<Result<Vec<_>, _>>()?;
     let mut glue = Glue::new(state.connection_serialized().await?);
-    let payloads = rest_sql::execute_sql(&mut glue, &req.sql, &params, false).await?;
+    // Route through the FTS engine: it rewrites `@@`/`ts_rank` against the live
+    // segment when a fulltext index is declared, else runs the SQL unchanged.
+    let payloads = state.inner.fts.execute_fts(&mut glue, &req.sql, &params).await?;
     Ok(Json(payloads_to_json(payloads)))
 }
 

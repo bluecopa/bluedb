@@ -42,14 +42,24 @@
 //!   - `GET /health`, `GET /admin/status` → public (no token required)
 //!
 //! ## Structured DDL endpoints (writer-gated, validated)
-//! - `POST   /schema/tables`                        — create table from typed column spec.
-//! - `DELETE /schema/tables/{table}`                — drop table.
-//! - `POST   /schema/tables/{table}/indexes`        — create index on a table.
-//! - `DELETE /schema/tables/{table}/indexes/{name}` — drop index.
+//! - `POST   /schema/tables`                          — create table from typed column spec.
+//! - `DELETE /schema/tables/{table}`                  — drop table.
+//! - `POST   /schema/tables/{table}/indexes`          — create index on a table.
+//! - `DELETE /schema/tables/{table}/indexes/{name}`   — drop index.
+//! - `POST   /schema/tables/{table}/fulltext-indexes` — declare a full-text index
+//!   on a text column (the table's integer primary key is auto-resolved).
 //!
 //! All `/schema/*` endpoints validate every identifier (allow-list `^[A-Za-z_][A-Za-z0-9_]*$`)
 //! and every type keyword against an explicit allow-list before building DDL; no
 //! raw SQL is ever accepted from the client.
+//!
+//! ## Full-text search over `/sql`
+//! Once a full-text index is declared, `POST /sql` accepts the PostgreSQL FTS
+//! surface — `to_tsvector(cfg, col) @@ plainto_tsquery(q)` (and `ts_rank`) — and
+//! rewrites it against the live index, returning matching rows. The index is
+//! maintained on every committed write, so a `@@` query reads its own writes with
+//! no explicit flush. (`/admin/sql` is left as the raw escape hatch and does *not*
+//! rewrite `@@`. The full-text index lives in memory and is rebuilt on restart.)
 
 use std::sync::Arc;
 use std::time::Duration;

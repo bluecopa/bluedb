@@ -61,6 +61,20 @@ pub(crate) struct CreateIndexRequest {
     pub columns: Vec<String>,
 }
 
+/// Body for `POST /schema/tables/{table}/fulltext-indexes`. The table's primary
+/// key is auto-resolved from its schema; the caller names only the text column
+/// and (optionally) the analyzer.
+#[derive(Deserialize)]
+pub(crate) struct CreateFulltextIndexRequest {
+    pub column: String,
+    #[serde(default = "default_analyzer")]
+    pub analyzer: String,
+}
+
+fn default_analyzer() -> String {
+    "english".into()
+}
+
 // ---------------------------------------------------------------------------
 // Validation helpers
 // ---------------------------------------------------------------------------
@@ -175,6 +189,31 @@ pub(crate) async fn create_index(
     let sql = format!("CREATE INDEX {index_name} ON {table} ({});", cols.join(", "));
     run_ddl(&state, sql).await?;
     Ok(Json(json!({ "created_index": true, "name": index_name, "table": table })))
+}
+
+/// `POST /schema/tables/{table}/fulltext-indexes` — declare a fulltext index on
+/// a text column (Spec B §4.1). The table's integer primary key is resolved from
+/// its schema; once declared, `/sql` rewrites `@@`/`ts_rank` over the live index.
+pub(crate) async fn create_fulltext_index(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(table): Path<String>,
+    Json(req): Json<CreateFulltextIndexRequest>,
+) -> Result<Json<Value>, AppError> {
+    state.authorize(&headers, Scope::SchemaAdmin)?;
+    state.require_active()?;
+    let table = ident(&table)?.to_string();
+    let column = ident(&req.column)?.to_string();
+    let conn = state.connection().await?;
+    state
+        .fts()
+        .create_fulltext_index_auto(&conn, &table, &column, &req.analyzer)
+        .await?;
+    Ok(Json(json!({
+        "created_fulltext_index": column,
+        "on": table,
+        "analyzer": req.analyzer,
+    })))
 }
 
 /// `DELETE /schema/tables/{table}/indexes/{name}` — drop an index.
