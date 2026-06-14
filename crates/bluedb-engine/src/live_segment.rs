@@ -23,9 +23,6 @@ use tantivy::schema::{Field, Value};
 use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
 
 use crate::error::{EngineError, Result};
-// `FtsPredicate`/`FtsSearcher` and `DEFAULT_LIMIT` are consumed by the
-// `FtsSearcher` trait impl in Task 3; allow until then so each commit is clean.
-#[allow(unused_imports)]
 use crate::fts_sql::{FtsHit, FtsPredicate, FtsSearcher, TsQueryKind};
 
 /// Heap budget for the in-memory index writer (15 MB — tantivy's documented
@@ -34,7 +31,6 @@ const WRITER_HEAP: usize = 15_000_000;
 
 /// Default result cap for the [`FtsSearcher`] trait path. The over-fetch window
 /// sizing (Spec B §9) is refined in a later increment.
-#[allow(dead_code)]
 const DEFAULT_LIMIT: usize = 100;
 
 /// An in-memory tantivy segment: a RAM-directory BM25 index over a single
@@ -213,6 +209,22 @@ impl LiveSegment {
         }
         hits.truncate(limit);
         Ok(hits)
+    }
+}
+
+/// The B1 [`FtsSearcher`] seam: drive [`LiveSegment::search`] from an extracted
+/// [`FtsPredicate`].
+///
+/// For B2a this is a **single-column** segment, so `predicate.table` and
+/// `predicate.column` are informational only — the live segment indexes one
+/// `body` field and answers from it; routing a predicate to the right segment by
+/// table/column is a later increment (B2c, the DDL registry). The match uses
+/// `predicate.query` and `predicate.kind`, capped at [`DEFAULT_LIMIT`] (the
+/// over-fetch window sizing per Spec B §9 is refined later).
+#[async_trait::async_trait]
+impl FtsSearcher for LiveSegment {
+    async fn search(&self, predicate: &FtsPredicate) -> Result<Vec<FtsHit>> {
+        LiveSegment::search(self, &predicate.query, predicate.kind, DEFAULT_LIMIT)
     }
 }
 
@@ -421,5 +433,90 @@ mod tests {
             .collect();
         o.sort();
         assert_eq!(o, vec![1, 2, 3]);
+    }
+
+    // --- Task 3: FtsSearcher trait + update/tombstone NRT semantics ---
+
+    #[tokio::test]
+    async fn fts_searcher_trait_matches_inherent_search() {
+        let seg = LiveSegment::new("english").unwrap();
+        seg.index(1, "invoice overdue").unwrap();
+        seg.index(2, "weather report").unwrap();
+
+        let predicate = FtsPredicate {
+            table: "docs".into(),
+            column: "body".into(),
+            config: "english".into(),
+            query: "invoice".into(),
+            kind: TsQueryKind::Plain,
+        };
+        // Through the trait (table/column are informational for the single-column
+        // B2a segment).
+        let via_trait = FtsSearcher::search(&seg, &predicate).await.unwrap();
+        let via_inherent = LiveSegment::search(&seg, "invoice", TsQueryKind::Plain, DEFAULT_LIMIT).unwrap();
+        let tp: Vec<i64> = via_trait.iter().map(|h| h.pk).collect();
+        let ip: Vec<i64> = via_inherent.iter().map(|h| h.pk).collect();
+        assert_eq!(tp, ip);
+        assert_eq!(tp, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn update_supersedes_old_text() {
+        let seg = LiveSegment::new("english").unwrap();
+        seg.index(1, "alpha").unwrap();
+        seg.index(1, "beta").unwrap();
+
+        let alpha = seg.search("alpha", TsQueryKind::Plain, 10).unwrap();
+        assert!(alpha.is_empty(), "old text must not match after re-index");
+        let beta: Vec<i64> = seg
+            .search("beta", TsQueryKind::Plain, 10)
+            .unwrap()
+            .iter()
+            .map(|h| h.pk)
+            .collect();
+        assert_eq!(beta, vec![1], "new text matches the single live row");
+    }
+
+    #[tokio::test]
+    async fn hard_delete_is_nrt() {
+        let seg = LiveSegment::new("english").unwrap();
+        seg.index(1, "invoice overdue").unwrap();
+        seg.index(3, "overdue invoice reminder").unwrap();
+        // Both match before delete.
+        let before: Vec<i64> = seg
+            .search("invoice", TsQueryKind::Plain, 10)
+            .unwrap()
+            .iter()
+            .map(|h| h.pk)
+            .collect();
+        assert!(before.contains(&1) && before.contains(&3));
+
+        // Tombstone 3, then search immediately (no explicit flush) — NRT.
+        seg.tombstone(3).unwrap();
+        let after: Vec<i64> = seg
+            .search("invoice", TsQueryKind::Plain, 10)
+            .unwrap()
+            .iter()
+            .map(|h| h.pk)
+            .collect();
+        assert!(after.contains(&1));
+        assert!(!after.contains(&3), "tombstoned pk must not appear immediately");
+    }
+
+    #[tokio::test]
+    async fn over_fetch_fills_limit_past_tombstones() {
+        let seg = LiveSegment::new("english").unwrap();
+        // 5 matching rows; tombstone 3 of them, then ask for limit=2 live hits.
+        for pk in 1..=5 {
+            seg.index(pk, "invoice overdue").unwrap();
+        }
+        seg.tombstone(1).unwrap();
+        seg.tombstone(2).unwrap();
+        seg.tombstone(3).unwrap();
+        let hits = seg.search("invoice", TsQueryKind::Plain, 2).unwrap();
+        assert_eq!(hits.len(), 2, "limit=2 must yield 2 LIVE hits, not 2-minus-tombstones");
+        for h in &hits {
+            assert!(h.pk == 4 || h.pk == 5, "only live pks 4/5 may appear, got {}", h.pk);
+        }
     }
 }
