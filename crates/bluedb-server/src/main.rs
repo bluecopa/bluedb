@@ -26,6 +26,16 @@
 //! - `BLUEDB_ENABLE_ADMIN_SQL` — set to `1` or `true` to enable `POST /admin/sql`
 //!   (arbitrary SQL including DDL, audited). Off by default. `/sql` is always
 //!   available but restricted to a single parameterized SELECT/INSERT/UPDATE/DELETE.
+//!
+//! ## Structured DDL endpoints (writer-gated, validated)
+//! - `POST   /schema/tables`                        — create table from typed column spec.
+//! - `DELETE /schema/tables/{table}`                — drop table.
+//! - `POST   /schema/tables/{table}/indexes`        — create index on a table.
+//! - `DELETE /schema/tables/{table}/indexes/{name}` — drop index.
+//!
+//! All `/schema/*` endpoints validate every identifier (allow-list `^[A-Za-z_][A-Za-z0-9_]*$`)
+//! and every type keyword against an explicit allow-list before building DDL; no
+//! raw SQL is ever accepted from the client.
 
 use std::sync::Arc;
 use std::time::Duration;

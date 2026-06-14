@@ -33,10 +33,12 @@ use std::time::Duration;
 use axum::extract::{Path, RawQuery, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde_json::{json, Map, Value};
 use tokio::sync::RwLock;
+
+mod schema;
 
 use bluedb_engine::{rest_sql, EngineError};
 use bluedb_ha::{HaError, Status, WriterController};
@@ -212,7 +214,7 @@ impl AppState {
     /// (see [`bluedb_sql::Database::connection_serialized`]). Used by the routes
     /// that can run a single-statement read-modify-write (`/sql`, `PATCH`,
     /// `DELETE`) so concurrent RMWs can't lose an update.
-    async fn connection_serialized(&self) -> Result<SlateDbStorage, AppError> {
+    pub(crate) async fn connection_serialized(&self) -> Result<SlateDbStorage, AppError> {
         match self.inner.db.read().await.as_ref() {
             Some(db) => Ok(db.connection_serialized()),
             None => Err(AppError {
@@ -223,7 +225,7 @@ impl AppState {
     }
 
     /// Reject a mutating request unless this node is the active writer.
-    fn require_active(&self) -> Result<(), AppError> {
+    pub(crate) fn require_active(&self) -> Result<(), AppError> {
         if self.inner.writer.is_active() {
             Ok(())
         } else {
@@ -251,6 +253,10 @@ pub fn build_app(state: AppState) -> Router {
         .route("/admin/promote", post(admin_promote))
         .route("/admin/demote", post(admin_demote))
         .route("/admin/sql", post(admin_sql))
+        .route("/schema/tables", post(schema::create_table))
+        .route("/schema/tables/{table}", delete(schema::drop_table))
+        .route("/schema/tables/{table}/indexes", post(schema::create_index))
+        .route("/schema/tables/{table}/indexes/{name}", delete(schema::drop_index))
         .with_state(state)
 }
 
@@ -610,7 +616,7 @@ pub struct AppError {
 }
 
 impl AppError {
-    fn bad_request(message: impl Into<String>) -> Self {
+    pub(crate) fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
