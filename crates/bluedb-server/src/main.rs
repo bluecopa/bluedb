@@ -26,6 +26,20 @@
 //! - `BLUEDB_ENABLE_ADMIN_SQL` — set to `1` or `true` to enable `POST /admin/sql`
 //!   (arbitrary SQL including DDL, audited). Off by default. `/sql` is always
 //!   available but restricted to a single parameterized SELECT/INSERT/UPDATE/DELETE.
+//! - `BLUEDB_AUTHZ_TOKENS` — bearer-token → scope map. Format:
+//!   `tok1=scope,scope;tok2=scope`. Recognized scopes: `data:read`, `data:write`,
+//!   `data:query`, `schema:admin`, `superuser`. When unset the server runs in
+//!   **open mode** (all requests allowed without a token); **production deployments
+//!   should always set this**. `Superuser` satisfies any required scope.
+//!
+//!   Per-route scope table:
+//!   - `GET /tables/{table}` → `data:read`
+//!   - `POST/PATCH/DELETE /tables/{table}` → `data:write`
+//!   - `POST /sql` → `data:query`
+//!   - `POST /admin/sql` → `superuser`
+//!   - `POST|DELETE /schema/*` → `schema:admin`
+//!   - `POST /admin/promote`, `POST /admin/demote` → `superuser`
+//!   - `GET /health`, `GET /admin/status` → public (no token required)
 //!
 //! ## Structured DDL endpoints (writer-gated, validated)
 //! - `POST   /schema/tables`                        — create table from typed column spec.

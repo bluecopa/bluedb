@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 use bluedb_engine::rest_sql;
 use bluedb_rest::validate_ident;
 
-use crate::{AppError, AppState};
+use crate::{authz::Scope, AppError, AppState};
 
 // ---------------------------------------------------------------------------
 // Request types
@@ -106,8 +106,10 @@ async fn run_ddl(state: &AppState, sql: String) -> Result<(), AppError> {
 /// `POST /schema/tables` — create a table from a typed column specification.
 pub(crate) async fn create_table(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<CreateTableRequest>,
 ) -> Result<Json<Value>, AppError> {
+    state.authorize(&headers, Scope::SchemaAdmin)?;
     let table = ident(&req.name)?.to_string();
 
     if req.columns.is_empty() {
@@ -140,8 +142,10 @@ pub(crate) async fn create_table(
 /// `DELETE /schema/tables/{table}` — drop a table.
 pub(crate) async fn drop_table(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(table): Path<String>,
 ) -> Result<Json<Value>, AppError> {
+    state.authorize(&headers, Scope::SchemaAdmin)?;
     let table = ident(&table)?.to_string();
     let sql = format!("DROP TABLE {table};");
     run_ddl(&state, sql).await?;
@@ -151,9 +155,11 @@ pub(crate) async fn drop_table(
 /// `POST /schema/tables/{table}/indexes` — create an index on an existing table.
 pub(crate) async fn create_index(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(table): Path<String>,
     Json(req): Json<CreateIndexRequest>,
 ) -> Result<Json<Value>, AppError> {
+    state.authorize(&headers, Scope::SchemaAdmin)?;
     let table = ident(&table)?.to_string();
     let index_name = ident(&req.name)?.to_string();
 
@@ -174,8 +180,10 @@ pub(crate) async fn create_index(
 /// `DELETE /schema/tables/{table}/indexes/{name}` — drop an index.
 pub(crate) async fn drop_index(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path((table, name)): Path<(String, String)>,
 ) -> Result<Json<Value>, AppError> {
+    state.authorize(&headers, Scope::SchemaAdmin)?;
     let table = ident(&table)?.to_string();
     let index_name = ident(&name)?.to_string();
     // GlueSQL DROP INDEX uses the table-qualified form: DROP INDEX table.index_name

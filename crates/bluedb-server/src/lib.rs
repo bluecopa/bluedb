@@ -329,8 +329,10 @@ async fn health() -> Json<Value> {
 /// `POST /sql` — one parameterized non-DDL statement (SELECT/INSERT/UPDATE/DELETE).
 async fn exec_sql(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<SqlRequest>,
 ) -> Result<Json<Value>, AppError> {
+    state.authorize(&headers, authz::Scope::DataQuery)?;
     state.require_active()?;
     let params = req.params.iter().map(json_to_param).collect::<Result<Vec<_>, _>>()?;
     let mut glue = Glue::new(state.connection_serialized().await?);
@@ -341,8 +343,10 @@ async fn exec_sql(
 /// `POST /admin/sql` — arbitrary SQL (DDL/txns/multi). Off by default; audited.
 async fn admin_sql(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<SqlRequest>,
 ) -> Result<Json<Value>, AppError> {
+    state.authorize(&headers, authz::Scope::Superuser)?;
     if !state.inner.admin_sql_enabled.load(Ordering::Relaxed) {
         return Err(AppError {
             status: StatusCode::NOT_FOUND,
@@ -360,9 +364,11 @@ async fn admin_sql(
 /// `GET /tables/{table}?<filters>` — PostgREST SELECT (served by writer or replica).
 async fn select(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(table): Path<String>,
     RawQuery(query): RawQuery,
 ) -> Result<Json<Value>, AppError> {
+    state.authorize(&headers, authz::Scope::DataRead)?;
     let mut glue = Glue::new(state.connection().await?);
     let payloads = rest_sql::execute_query_str(&mut glue, &table, query.as_deref().unwrap_or("")).await?;
     Ok(Json(payloads_to_json(payloads)))
@@ -371,9 +377,11 @@ async fn select(
 /// `POST /tables/{table}` — INSERT (JSON object → autocommit; array → one txn batch).
 async fn insert(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(table): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, AppError> {
+    state.authorize(&headers, authz::Scope::DataWrite)?;
     state.require_active()?;
     let (req, is_batch) = build_insert(table, body)?;
     if is_batch {
@@ -397,10 +405,12 @@ async fn insert(
 /// `PATCH /tables/{table}?<filters>` — UPDATE (JSON assignments body).
 async fn update(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(table): Path<String>,
     RawQuery(query): RawQuery,
     Json(assignments): Json<Map<String, Value>>,
 ) -> Result<Json<Value>, AppError> {
+    state.authorize(&headers, authz::Scope::DataWrite)?;
     state.require_active()?;
     let filters = parse_filters(query.as_deref().unwrap_or("")).map_err(EngineError::from)?;
     let assignments = assignments
@@ -417,9 +427,11 @@ async fn update(
 /// `DELETE /tables/{table}?<filters>` — DELETE.
 async fn delete_rows(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(table): Path<String>,
     RawQuery(query): RawQuery,
 ) -> Result<Json<Value>, AppError> {
+    state.authorize(&headers, authz::Scope::DataWrite)?;
     state.require_active()?;
     let filters = parse_filters(query.as_deref().unwrap_or("")).map_err(EngineError::from)?;
     let req = DeleteRequest { table, filters };
@@ -437,13 +449,21 @@ async fn admin_status(State(state): State<AppState>) -> Json<Value> {
 }
 
 /// `POST /admin/promote` — acquire the lease + open the writer database.
-async fn admin_promote(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+async fn admin_promote(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    state.authorize(&headers, authz::Scope::Superuser)?;
     state.promote().await?;
     Ok(Json(status_json(&state.inner.writer.status())))
 }
 
 /// `POST /admin/demote` — release the lease + rebind as a read replica.
-async fn admin_demote(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+async fn admin_demote(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    state.authorize(&headers, authz::Scope::Superuser)?;
     state.demote().await?;
     Ok(Json(status_json(&state.inner.writer.status())))
 }
