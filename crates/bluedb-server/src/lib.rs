@@ -27,7 +27,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use axum::extract::{Path, RawQuery, State};
@@ -38,6 +38,7 @@ use axum::{Json, Router};
 use serde_json::{json, Map, Value};
 use tokio::sync::RwLock;
 
+pub mod authz;
 mod schema;
 
 use bluedb_engine::{rest_sql, EngineError};
@@ -90,6 +91,9 @@ struct Inner {
     /// Whether `POST /admin/sql` is enabled. Off by default; set via
     /// [`AppState::with_admin_sql_enabled`] or `BLUEDB_ENABLE_ADMIN_SQL=1`.
     admin_sql_enabled: AtomicBool,
+    /// Bearer-token → scopes map. Unset = open mode (all requests allowed).
+    /// Set once at startup via [`AppState::with_authz`].
+    authz: OnceLock<Arc<authz::Authz>>,
 }
 
 impl AppState {
@@ -109,6 +113,7 @@ impl AppState {
                 writer,
                 db: RwLock::new(None),
                 admin_sql_enabled: AtomicBool::new(false),
+                authz: OnceLock::new(),
             }),
         }
     }
@@ -124,6 +129,31 @@ impl AppState {
     /// Whether `POST /admin/sql` is enabled on this node.
     pub fn admin_sql_enabled(&self) -> bool {
         self.inner.admin_sql_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Configure bearer-token authorization. Must be called at startup (before
+    /// the `Arc<Inner>` is shared across tasks). Returns `self` for chaining.
+    /// No-op if called after the first `with_authz` (OnceLock semantics).
+    pub fn with_authz(self, authz: authz::Authz) -> Self {
+        let _ = self.inner.authz.set(Arc::new(authz));
+        self
+    }
+
+    /// Authorize `required` scope from the request's `Authorization: Bearer` token.
+    /// Open mode (no authz configured) always allows. Composes with `require_active`.
+    pub(crate) fn authorize(&self, headers: &axum::http::HeaderMap, required: authz::Scope) -> Result<(), AppError> {
+        let Some(authz) = self.inner.authz.get() else { return Ok(()); };
+        let token = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "));
+        if authz.allows(token, required) {
+            Ok(())
+        } else if token.is_none() {
+            Err(AppError { status: StatusCode::UNAUTHORIZED, message: "missing or malformed bearer token".into() })
+        } else {
+            Err(AppError { status: StatusCode::FORBIDDEN, message: "insufficient scope".into() })
+        }
     }
 
     /// The lease controller (for the HA background loop in `main`).

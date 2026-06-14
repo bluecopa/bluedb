@@ -41,7 +41,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bluedb_ha::{LeaseProvider, LocalLeaseProvider, PostgresLeaseProvider, SystemClock, WriterController};
-use bluedb_server::{build_app, AppState};
+use bluedb_server::{authz::Authz, build_app, AppState};
 use slatedb::object_store::aws::AmazonS3Builder;
 use slatedb::object_store::local::LocalFileSystem;
 use slatedb::object_store::memory::InMemory;
@@ -108,8 +108,12 @@ async fn main() -> anyhow::Result<()> {
     let admin_sql_enabled = std::env::var("BLUEDB_ENABLE_ADMIN_SQL")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    let state = AppState::new(object_store, db_path, writer)
+    let mut state = AppState::new(object_store, db_path, writer)
         .with_admin_sql_enabled(admin_sql_enabled);
+    if let Ok(raw) = std::env::var("BLUEDB_AUTHZ_TOKENS") {
+        let authz = Authz::parse_env(&raw).expect("invalid BLUEDB_AUTHZ_TOKENS");
+        state = state.with_authz(authz);
+    }
 
     // Bootstrap: become writer unless asked to start as a replica.
     if std::env::var("BLUEDB_START_PASSIVE").is_err() {
