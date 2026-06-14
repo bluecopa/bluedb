@@ -9,11 +9,6 @@
 //!   that is not a bare SQL identifier (`^[A-Za-z_][A-Za-z0-9_]*$`). Because
 //!   identifiers cannot be parameterized, this allow-list is the injection
 //!   guard for the structural parts of the query.
-//! * **Value typing (literal path)** — [`render_value`] decides how a
-//!   stringly-typed DSL value becomes a SQL literal. The rule (documented on
-//!   that function) is: `null` → `NULL`, `true`/`false` → boolean, anything
-//!   that parses as an integer or float → numeric literal, everything else →
-//!   a single-quoted string with embedded quotes doubled.
 //! * **Bound-parameter path (injection-proof)** — [`render_param`] types a
 //!   stringly-typed value into a [`Param`] variant; [`bind`] appends it to a
 //!   `Vec<Param>` and returns the corresponding `$N` placeholder.
@@ -177,8 +172,8 @@ pub struct OrderKey {
 /// One `WHERE`-clause predicate.
 ///
 /// `value` is the raw DSL value text. Its interpretation depends on `op`:
-/// scalar operators ([`Operator::Eq`], `gt`, `like`, …) feed it through
-/// [`render_value`]; [`Operator::In`] expects a `(a,b,c)` list; [`Operator::Is`]
+/// scalar operators ([`Operator::Eq`], `gt`, `like`, …) are bound as typed `$N`
+/// parameters; [`Operator::In`] expects a `(a,b,c)` list; [`Operator::Is`]
 /// expects `null` / `true` / `false`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Filter {
@@ -253,57 +248,6 @@ impl Filter {
         }
     }
 
-    /// Render this predicate to its SQL fragment (without the leading `WHERE`).
-    pub fn to_sql(&self) -> Result<String, RestError> {
-        let col = validate_ident(&self.column)?;
-        let inner = match self.op {
-            Operator::Is => {
-                // `is` does not go through render_value: only null/true/false.
-                let predicate = match self.value.to_ascii_lowercase().as_str() {
-                    "null" => "IS NULL",
-                    "true" => "IS TRUE",
-                    "false" => "IS FALSE",
-                    _ => {
-                        return Err(RestError::MalformedValue {
-                            op: "is".to_string(),
-                            value: self.value.clone(),
-                        })
-                    }
-                };
-                // `is` carries its own negated form (IS NOT …) so we handle the
-                // whole predicate here and short-circuit the generic negation.
-                let predicate = if self.negated {
-                    match predicate {
-                        "IS NULL" => "IS NOT NULL",
-                        "IS TRUE" => "IS NOT TRUE",
-                        "IS FALSE" => "IS NOT FALSE",
-                        _ => unreachable!("predicate is one of the three above"),
-                    }
-                } else {
-                    predicate
-                };
-                return Ok(format!("{col} {predicate}"));
-            }
-            Operator::In => {
-                let list = render_in_list(&self.value)?;
-                format!("{col} IN ({list})")
-            }
-            Operator::Eq => format!("{col} = {}", render_value(&self.value)),
-            Operator::Neq => format!("{col} <> {}", render_value(&self.value)),
-            Operator::Gt => format!("{col} > {}", render_value(&self.value)),
-            Operator::Gte => format!("{col} >= {}", render_value(&self.value)),
-            Operator::Lt => format!("{col} < {}", render_value(&self.value)),
-            Operator::Lte => format!("{col} <= {}", render_value(&self.value)),
-            Operator::Like => format!("{col} LIKE {}", render_value(&self.value)),
-            Operator::Ilike => format!("{col} ILIKE {}", render_value(&self.value)),
-        };
-
-        if self.negated {
-            Ok(format!("NOT ({inner})"))
-        } else {
-            Ok(inner)
-        }
-    }
 }
 
 /// A read query: `SELECT … FROM table [WHERE …] [ORDER BY …] [LIMIT …] [OFFSET …]`.
@@ -377,47 +321,6 @@ pub fn validate_ident(name: &str) -> Result<&str, RestError> {
     }
 }
 
-/// Render a stringly-typed DSL value into a SQL literal.
-///
-/// # Value-typing rule (chosen, documented)
-///
-/// PostgREST is stringly-typed on the wire; we pick a defensible, predictable
-/// mapping from the raw text to a SQL literal:
-///
-/// 1. `null` (case-insensitive) → `NULL`.
-/// 2. `true` / `false` (case-insensitive) → `TRUE` / `FALSE`.
-/// 3. A value that parses as an `i64` **or** `f64` → emitted verbatim as a
-///    numeric literal (no quotes). The original text is preserved so
-///    `10` stays `10` and `10.50` stays `10.50`.
-/// 4. Everything else → a single-quoted string literal with embedded single
-///    quotes doubled (`O'Brien` → `'O''Brien'`). This is the escaping that
-///    blocks string-literal injection.
-///
-/// Note: the only way to force a numeric-looking value to be treated as a
-/// string is out of band — this rule is intentionally simple and total so the
-/// rendered SQL is fully determined by the input text.
-pub fn render_value(value: &str) -> String {
-    let lower = value.to_ascii_lowercase();
-    if lower == "null" {
-        return "NULL".to_string();
-    }
-    if lower == "true" {
-        return "TRUE".to_string();
-    }
-    if lower == "false" {
-        return "FALSE".to_string();
-    }
-    if value.parse::<i64>().is_ok() || value.parse::<f64>().is_ok() {
-        return value.to_string();
-    }
-    quote_string(value)
-}
-
-/// Single-quote a string literal, doubling any embedded single quotes.
-fn quote_string(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
 #[cfg(test)]
 mod param_tests {
     use super::{render_param, Param};
@@ -469,34 +372,7 @@ mod param_tests {
     }
 }
 
-/// Render the comma-separated body of an `IN (…)` list.
-///
-/// Accepts both the PostgREST wire form `(a,b,c)` (parens included) and a bare
-/// `a,b,c`. Each element is run through [`render_value`], so numeric/bool/null
-/// typing and string escaping apply per element. An empty list is rejected as
-/// malformed.
-fn render_in_list(value: &str) -> Result<String, RestError> {
-    let trimmed = value.trim();
-    let body = trimmed
-        .strip_prefix('(')
-        .and_then(|s| s.strip_suffix(')'))
-        .unwrap_or(trimmed);
-    let elems: Vec<String> = body
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(render_value)
-        .collect();
-    if elems.is_empty() {
-        return Err(RestError::MalformedValue {
-            op: "in".to_string(),
-            value: value.to_string(),
-        });
-    }
-    Ok(elems.join(", "))
-}
-
-/// Like `render_in_list`, but binds each element as a `$N` parameter and returns
+/// Bind each element of an `IN (…)` list as a `$N` parameter and return
 /// the comma-separated placeholder list (`$1, $2, …`).
 fn render_in_list_params(value: &str, params: &mut Vec<Param>) -> Result<String, RestError> {
     let trimmed = value.trim();

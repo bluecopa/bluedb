@@ -7,7 +7,7 @@
 
 use bluedb_rest::{
     parse_filters, parse_query, DeleteRequest, Direction, Filter, InsertRequest, Operator,
-    OrderKey, RestError, RestQuery, UpdateRequest,
+    OrderKey, Param, RestError, RestQuery, UpdateRequest,
 };
 
 // --- SELECT: filters ---------------------------------------------------------
@@ -19,7 +19,13 @@ fn single_eq_filter() {
         filters: vec![Filter::new("col", Operator::Eq, "val")],
         ..Default::default()
     };
-    assert_eq!(q.to_sql().unwrap(), "SELECT * FROM t WHERE col = 'val';");
+    assert_eq!(
+        q.to_sql_with_params().unwrap(),
+        (
+            "SELECT * FROM t WHERE col = $1;".to_string(),
+            vec![Param::Str("val".into())]
+        )
+    );
 }
 
 #[test]
@@ -33,8 +39,11 @@ fn multiple_filters_anded() {
         ..Default::default()
     };
     assert_eq!(
-        q.to_sql().unwrap(),
-        "SELECT * FROM t WHERE col = 'val' AND age > 20;"
+        q.to_sql_with_params().unwrap(),
+        (
+            "SELECT * FROM t WHERE col = $1 AND age > $2;".to_string(),
+            vec![Param::Str("val".into()), Param::Int(20)]
+        )
     );
 }
 
@@ -49,8 +58,11 @@ fn numeric_gt_and_lte() {
         ..Default::default()
     };
     assert_eq!(
-        q.to_sql().unwrap(),
-        "SELECT * FROM t WHERE a > 20 AND b <= 3.5;"
+        q.to_sql_with_params().unwrap(),
+        (
+            "SELECT * FROM t WHERE a > $1 AND b <= $2;".to_string(),
+            vec![Param::Int(20), Param::Float(3.5)]
+        )
     );
 }
 
@@ -65,8 +77,11 @@ fn like_and_ilike() {
         ..Default::default()
     };
     assert_eq!(
-        q.to_sql().unwrap(),
-        "SELECT * FROM t WHERE name LIKE '%foo%' AND city ILIKE 'lon%';"
+        q.to_sql_with_params().unwrap(),
+        (
+            "SELECT * FROM t WHERE name LIKE $1 AND city ILIKE $2;".to_string(),
+            vec![Param::Str("%foo%".into()), Param::Str("lon%".into())]
+        )
     );
 }
 
@@ -77,7 +92,13 @@ fn in_list() {
         filters: vec![Filter::new("id", Operator::In, "(1,2,3)")],
         ..Default::default()
     };
-    assert_eq!(q.to_sql().unwrap(), "SELECT * FROM t WHERE id IN (1, 2, 3);");
+    assert_eq!(
+        q.to_sql_with_params().unwrap(),
+        (
+            "SELECT * FROM t WHERE id IN ($1, $2, $3);".to_string(),
+            vec![Param::Int(1), Param::Int(2), Param::Int(3)]
+        )
+    );
 }
 
 #[test]
@@ -88,8 +109,11 @@ fn in_list_strings() {
         ..Default::default()
     };
     assert_eq!(
-        q.to_sql().unwrap(),
-        "SELECT * FROM t WHERE status IN ('open', 'closed');"
+        q.to_sql_with_params().unwrap(),
+        (
+            "SELECT * FROM t WHERE status IN ($1, $2);".to_string(),
+            vec![Param::Str("open".into()), Param::Str("closed".into())]
+        )
     );
 }
 
@@ -101,8 +125,11 @@ fn is_null() {
         ..Default::default()
     };
     assert_eq!(
-        q.to_sql().unwrap(),
-        "SELECT * FROM t WHERE deleted_at IS NULL;"
+        q.to_sql_with_params().unwrap(),
+        (
+            "SELECT * FROM t WHERE deleted_at IS NULL;".to_string(),
+            vec![]
+        )
     );
 }
 
@@ -117,8 +144,11 @@ fn is_true_and_false() {
         ..Default::default()
     };
     assert_eq!(
-        q.to_sql().unwrap(),
-        "SELECT * FROM t WHERE active IS TRUE AND archived IS FALSE;"
+        q.to_sql_with_params().unwrap(),
+        (
+            "SELECT * FROM t WHERE active IS TRUE AND archived IS FALSE;".to_string(),
+            vec![]
+        )
     );
 }
 
@@ -135,8 +165,11 @@ fn negation_wraps_comparison() {
         ..Default::default()
     };
     assert_eq!(
-        q.to_sql().unwrap(),
-        "SELECT * FROM t WHERE NOT (col = 'val');"
+        q.to_sql_with_params().unwrap(),
+        (
+            "SELECT * FROM t WHERE NOT (col = $1);".to_string(),
+            vec![Param::Str("val".into())]
+        )
     );
 }
 
@@ -153,8 +186,11 @@ fn negation_of_is_null_uses_is_not() {
         ..Default::default()
     };
     assert_eq!(
-        q.to_sql().unwrap(),
-        "SELECT * FROM t WHERE deleted_at IS NOT NULL;"
+        q.to_sql_with_params().unwrap(),
+        (
+            "SELECT * FROM t WHERE deleted_at IS NOT NULL;".to_string(),
+            vec![]
+        )
     );
 }
 
@@ -166,7 +202,10 @@ fn default_projection_is_star() {
         table: "t".into(),
         ..Default::default()
     };
-    assert_eq!(q.to_sql().unwrap(), "SELECT * FROM t;");
+    assert_eq!(
+        q.to_sql_with_params().unwrap(),
+        ("SELECT * FROM t;".to_string(), vec![])
+    );
 }
 
 #[test]
@@ -176,7 +215,10 @@ fn select_projection() {
         select: vec!["a".into(), "b".into()],
         ..Default::default()
     };
-    assert_eq!(q.to_sql().unwrap(), "SELECT a, b FROM t;");
+    assert_eq!(
+        q.to_sql_with_params().unwrap(),
+        ("SELECT a, b FROM t;".to_string(), vec![])
+    );
 }
 
 #[test]
@@ -196,8 +238,11 @@ fn multi_key_order_asc_desc() {
         ..Default::default()
     };
     assert_eq!(
-        q.to_sql().unwrap(),
-        "SELECT * FROM t ORDER BY age DESC, name ASC;"
+        q.to_sql_with_params().unwrap(),
+        (
+            "SELECT * FROM t ORDER BY age DESC, name ASC;".to_string(),
+            vec![]
+        )
     );
 }
 
@@ -209,7 +254,10 @@ fn limit_and_offset() {
         offset: Some(5),
         ..Default::default()
     };
-    assert_eq!(q.to_sql().unwrap(), "SELECT * FROM t LIMIT 10 OFFSET 5;");
+    assert_eq!(
+        q.to_sql_with_params().unwrap(),
+        ("SELECT * FROM t LIMIT 10 OFFSET 5;".to_string(), vec![])
+    );
 }
 
 #[test]
@@ -221,9 +269,13 @@ fn full_select_from_spec_example() {
     )
     .unwrap();
     assert_eq!(
-        q.to_sql().unwrap(),
-        "SELECT a, b FROM table WHERE col = 'val' AND age > 20 \
-         ORDER BY age DESC, name ASC LIMIT 10 OFFSET 5;"
+        q.to_sql_with_params().unwrap(),
+        (
+            "SELECT a, b FROM table WHERE col = $1 AND age > $2 \
+             ORDER BY age DESC, name ASC LIMIT 10 OFFSET 5;"
+                .to_string(),
+            vec![Param::Str("val".into()), Param::Int(20)]
+        )
     );
 }
 
@@ -237,8 +289,11 @@ fn insert_single_row() {
         rows: vec![vec!["1".into(), "alice".into()]],
     };
     assert_eq!(
-        req.to_sql().unwrap(),
-        "INSERT INTO t (id, name) VALUES (1, 'alice');"
+        req.row_statements_with_params().unwrap(),
+        (
+            vec!["INSERT INTO t (id, name) VALUES ($1, $2)".to_string()],
+            vec![Param::Int(1), Param::Str("alice".into())]
+        )
     );
 }
 
@@ -253,8 +308,19 @@ fn insert_multi_row() {
         ],
     };
     assert_eq!(
-        req.to_sql().unwrap(),
-        "INSERT INTO t (id, name) VALUES (1, 'alice'), (2, 'bob');"
+        req.row_statements_with_params().unwrap(),
+        (
+            vec![
+                "INSERT INTO t (id, name) VALUES ($1, $2)".to_string(),
+                "INSERT INTO t (id, name) VALUES ($3, $4)".to_string(),
+            ],
+            vec![
+                Param::Int(1),
+                Param::Str("alice".into()),
+                Param::Int(2),
+                Param::Str("bob".into()),
+            ]
+        )
     );
 }
 
@@ -266,8 +332,15 @@ fn insert_escapes_quotes_and_types_values() {
         rows: vec![vec!["O'Brien".into(), "true".into(), "null".into()]],
     };
     assert_eq!(
-        req.to_sql().unwrap(),
-        "INSERT INTO t (name, active, note) VALUES ('O''Brien', TRUE, NULL);"
+        req.row_statements_with_params().unwrap(),
+        (
+            vec!["INSERT INTO t (name, active, note) VALUES ($1, $2, $3)".to_string()],
+            vec![
+                Param::Str("O'Brien".into()),
+                Param::Bool(true),
+                Param::Null,
+            ]
+        )
     );
 }
 
@@ -279,7 +352,7 @@ fn insert_rejects_ragged_rows() {
         rows: vec![vec!["1".into()]],
     };
     assert!(matches!(
-        req.to_sql(),
+        req.row_statements_with_params(),
         Err(RestError::BadColumnSet(_))
     ));
 }
@@ -294,8 +367,11 @@ fn update_with_filters() {
         filters: vec![Filter::new("id", Operator::Eq, "1")],
     };
     assert_eq!(
-        req.to_sql().unwrap(),
-        "UPDATE t SET name = 'bob', age = 30 WHERE id = 1;"
+        req.to_sql_with_params().unwrap(),
+        (
+            "UPDATE t SET name = $1, age = $2 WHERE id = $3;".to_string(),
+            vec![Param::Str("bob".into()), Param::Int(30), Param::Int(1)]
+        )
     );
 }
 
@@ -307,7 +383,7 @@ fn update_without_filters_is_refused() {
         filters: vec![],
     };
     assert_eq!(
-        req.to_sql(),
+        req.to_sql_with_params(),
         Err(RestError::UnfilteredMutation("UPDATE"))
     );
 }
@@ -320,7 +396,13 @@ fn delete_with_filters() {
         table: "t".into(),
         filters: vec![Filter::new("id", Operator::Eq, "1")],
     };
-    assert_eq!(req.to_sql().unwrap(), "DELETE FROM t WHERE id = 1;");
+    assert_eq!(
+        req.to_sql_with_params().unwrap(),
+        (
+            "DELETE FROM t WHERE id = $1;".to_string(),
+            vec![Param::Int(1)]
+        )
+    );
 }
 
 #[test]
@@ -330,7 +412,7 @@ fn delete_without_filters_is_refused() {
         filters: vec![],
     };
     assert_eq!(
-        req.to_sql(),
+        req.to_sql_with_params(),
         Err(RestError::UnfilteredMutation("DELETE"))
     );
 }
@@ -344,7 +426,7 @@ fn malicious_table_identifier_is_rejected() {
         ..Default::default()
     };
     assert!(matches!(
-        q.to_sql(),
+        q.to_sql_with_params(),
         Err(RestError::InvalidIdentifier(_))
     ));
 }
@@ -357,7 +439,7 @@ fn malicious_column_identifier_is_rejected() {
         ..Default::default()
     };
     assert!(matches!(
-        q.to_sql(),
+        q.to_sql_with_params(),
         Err(RestError::InvalidIdentifier(_))
     ));
 }
@@ -370,22 +452,26 @@ fn malicious_select_column_is_rejected() {
         ..Default::default()
     };
     assert!(matches!(
-        q.to_sql(),
+        q.to_sql_with_params(),
         Err(RestError::InvalidIdentifier(_))
     ));
 }
 
 #[test]
 fn string_value_with_quote_is_escaped_not_rejected() {
-    // Values are escaped (not rejected): a quote-bearing value is safe.
+    // Values are bound as params (never interpolated): the injection payload
+    // becomes plain string DATA in the params vec, never query structure.
     let q = RestQuery {
         table: "t".into(),
         filters: vec![Filter::new("name", Operator::Eq, "x' OR '1'='1")],
         ..Default::default()
     };
     assert_eq!(
-        q.to_sql().unwrap(),
-        "SELECT * FROM t WHERE name = 'x'' OR ''1''=''1';"
+        q.to_sql_with_params().unwrap(),
+        (
+            "SELECT * FROM t WHERE name = $1;".to_string(),
+            vec![Param::Str("x' OR '1'='1".into())]
+        )
     );
 }
 
@@ -421,19 +507,34 @@ fn parser_roundtrips_to_same_sql_as_builder() {
     .unwrap();
 
     assert_eq!(parsed, built);
-    assert_eq!(parsed.to_sql().unwrap(), built.to_sql().unwrap());
+    assert_eq!(
+        parsed.to_sql_with_params().unwrap(),
+        built.to_sql_with_params().unwrap()
+    );
 }
 
 #[test]
 fn parser_handles_not_prefix() {
     let q = parse_query("t", "col=not.eq.val").unwrap();
-    assert_eq!(q.to_sql().unwrap(), "SELECT * FROM t WHERE NOT (col = 'val');");
+    assert_eq!(
+        q.to_sql_with_params().unwrap(),
+        (
+            "SELECT * FROM t WHERE NOT (col = $1);".to_string(),
+            vec![Param::Str("val".into())]
+        )
+    );
 }
 
 #[test]
 fn parser_order_defaults_to_asc() {
     let q = parse_query("t", "order=name").unwrap();
-    assert_eq!(q.to_sql().unwrap(), "SELECT * FROM t ORDER BY name ASC;");
+    assert_eq!(
+        q.to_sql_with_params().unwrap(),
+        (
+            "SELECT * FROM t ORDER BY name ASC;".to_string(),
+            vec![]
+        )
+    );
 }
 
 #[test]
@@ -444,8 +545,11 @@ fn parse_filters_reused_for_delete() {
         filters,
     };
     assert_eq!(
-        req.to_sql().unwrap(),
-        "DELETE FROM t WHERE id = 1 AND NOT (status = 'closed');"
+        req.to_sql_with_params().unwrap(),
+        (
+            "DELETE FROM t WHERE id = $1 AND NOT (status = $2);".to_string(),
+            vec![Param::Int(1), Param::Str("closed".into())]
+        )
     );
 }
 

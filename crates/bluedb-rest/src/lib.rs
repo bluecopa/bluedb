@@ -3,8 +3,8 @@
 //! This crate is bluedb's **REST query surface**: it gives input-table-v2 API
 //! parity by turning PostgREST-shaped requests (a table plus
 //! `select`/filter/`order`/`limit`/`offset` parameters, or insert/update/delete
-//! payloads) into a single SQL string that bluedb's SQL engine
-//! (`bluedb-sql`, GlueSQL dialect) can execute.
+//! payloads) into a SQL string + `Vec<Param>` that bluedb's SQL engine
+//! (`bluedb-sql`, GlueSQL dialect) can execute with bound parameters.
 //!
 //! It is deliberately **self-contained**: it does *pure* DSL → SQL *string*
 //! translation and takes **no dependency on `bluedb-sql` or `gluesql-core`**.
@@ -13,7 +13,8 @@
 //!
 //! # Two entry points, one output
 //!
-//! There are two ways to describe a request, and both render via `to_sql()`:
+//! There are two ways to describe a request, and both render via
+//! `to_sql_with_params()`:
 //!
 //! * a **typed builder** — construct [`RestQuery`], [`InsertRequest`],
 //!   [`UpdateRequest`], or [`DeleteRequest`] (with [`Filter`]s and
@@ -24,19 +25,20 @@
 //!   update/delete builders.
 //!
 //! ```
-//! use bluedb_rest::{parse_query, RestQuery, Filter, Operator};
+//! use bluedb_rest::{parse_query, RestQuery, Filter, Operator, Param};
 //!
-//! // Built two ways, identical SQL:
-//! let parsed = parse_query("users", "select=id,name&age=gt.20&order=name.asc&limit=5")
+//! // Built two ways, identical SQL + params:
+//! let (sql, params) = parse_query("users", "select=id,name&age=gt.20&order=name.asc&limit=5")
 //!     .unwrap()
-//!     .to_sql()
+//!     .to_sql_with_params()
 //!     .unwrap();
 //! assert_eq!(
-//!     parsed,
-//!     "SELECT id, name FROM users WHERE age > 20 ORDER BY name ASC LIMIT 5;"
+//!     sql,
+//!     "SELECT id, name FROM users WHERE age > $1 ORDER BY name ASC LIMIT 5;"
 //! );
+//! assert_eq!(params, vec![Param::Int(20)]);
 //!
-//! let built = RestQuery {
+//! let (sql, params) = RestQuery {
 //!     table: "users".into(),
 //!     select: vec!["id".into(), "name".into()],
 //!     filters: vec![Filter::new("age", Operator::Gt, "20")],
@@ -44,9 +46,10 @@
 //!     limit: Some(5),
 //!     offset: None,
 //! }
-//! .to_sql()
+//! .to_sql_with_params()
 //! .unwrap();
-//! assert_eq!(built, "SELECT id, name FROM users WHERE age > 20 LIMIT 5;");
+//! assert_eq!(sql, "SELECT id, name FROM users WHERE age > $1 LIMIT 5;");
+//! assert_eq!(params, vec![Param::Int(20)]);
 //! ```
 //!
 //! # Safety
@@ -57,9 +60,9 @@
 //!   `^[A-Za-z_][A-Za-z0-9_]*$` — see [`validate_ident`]. Anything else is
 //!   rejected with [`RestError::InvalidIdentifier`], blocking injection through
 //!   the structural parts of the query.
-//! * **Values** are typed and escaped by [`render_value`]: `null` → `NULL`,
-//!   `true`/`false` → boolean, numeric-looking text → numeric literal, and
-//!   everything else → a single-quoted string with embedded quotes doubled.
+//! * **Values** are carried as typed [`Param`] variants and bound as `$N`
+//!   parameters by the engine — they never appear in the SQL text, so
+//!   SQL-injection via filter values is structurally impossible.
 //!
 //! See [`model`] for the full operator mapping and value-typing rule.
 
@@ -73,7 +76,7 @@ pub mod model;
 
 pub use error::RestError;
 pub use model::{
-    render_value, validate_ident, DeleteRequest, Direction, Filter, InsertRequest, Operator, Param,
+    validate_ident, DeleteRequest, Direction, Filter, InsertRequest, Operator, Param,
     OrderKey, RestQuery, UpdateRequest,
 };
 pub use parse::{parse_filters, parse_query};

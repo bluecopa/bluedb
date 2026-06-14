@@ -374,9 +374,9 @@ fn build_insert(table: String, body: Value) -> Result<(InsertRequest, bool), App
 }
 
 /// Render a JSON scalar into the DSL string form `bluedb-rest` expects. (Like
-/// PostgREST, values are stringly-typed: `render_value` re-types them — numeric
-/// text → numeric literal, `true`/`false` → bool, `null` → NULL, else a quoted
-/// string.)
+/// PostgREST, values are stringly-typed on the wire: the engine later types them
+/// into typed `$N` parameters — numeric text → Int/Float, `true`/`false` → Bool,
+/// `null` → Null, everything else → Str.)
 fn json_scalar_to_dsl(value: &Value) -> Result<String, AppError> {
     match value {
         Value::String(s) => Ok(s.clone()),
