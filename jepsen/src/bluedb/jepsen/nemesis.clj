@@ -11,7 +11,13 @@
     :partition-writer  cut the active writer off the compose network, isolating
                        it from Postgres (lease), MinIO (storage), and peers.
                        Tests clean failover with no split-brain.
-    :heal              reconnect every node to the network."
+    :heal              reconnect every node to the network.
+    :skew-clock        shift the active writer's wall clock 8s BACKWARD (via
+                       libfaketime; < TTL 10s, > margin 3s). The writer then
+                       believes its lease is valid longer than Postgres records,
+                       so a standby can acquire concurrently — tests that the
+                       SlateDB writer_epoch fence still prevents divergent writes.
+    :reset-clock       restore every node's clock."
   (:require [bluedb.jepsen.http :as h]
             [jepsen.nemesis :as nemesis]
             [clojure.java.shell :as shell]
@@ -57,10 +63,23 @@
           :heal
           (do (doseq [c (containers)] (docker "network" "connect" net c))
               (reset! partitioned nil)
-              (assoc op :value :healed))))
+              (assoc op :value :healed))
+
+          :skew-clock
+          (let [w (h/active-node)]
+            (when w
+              (docker "exec" (h/node->container w) "sh" "-c" "echo '-8s' > /faketime/offset"))
+            (info "nemesis skewed writer clock -8s" w)
+            (assoc op :value (str "skewed " w " -8s")))
+
+          :reset-clock
+          (do (doseq [c (containers)]
+                (docker "exec" c "sh" "-c" "echo '+0' > /faketime/offset"))
+              (assoc op :value :clock-reset))))
 
       (teardown! [_this _test]
         ;; best-effort: bring everything back so the cluster is usable after the run
         (doseq [c (containers)]
           (docker "start" c)
-          (docker "network" "connect" net c))))))
+          (docker "network" "connect" net c)
+          (docker "exec" c "sh" "-c" "echo '+0' > /faketime/offset"))))))

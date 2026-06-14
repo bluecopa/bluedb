@@ -13,7 +13,8 @@
     flags serializability anomalies (G0/G1/G2, write skew, lost update). Exercises
     the explicit-transaction path under concurrency.
 
-  Faults (--nemesis): none | kill | partition | mix, injected via the docker CLI.
+  Faults (--nemesis): none | kill | partition | skew | mix | chaos, injected via
+  the docker CLI (skew = wall-clock skew via libfaketime).
 
   Run against the up docker-compose cluster, e.g.:
 
@@ -83,6 +84,14 @@
                 (gen/sleep 14) {:type :info :f :start-all}
                 (gen/sleep 6)  {:type :info :f :partition-writer}
                 (gen/sleep 14) {:type :info :f :heal}]
+   "skew"      [(gen/sleep 6)  {:type :info :f :skew-clock}
+                (gen/sleep 14) {:type :info :f :reset-clock}]
+   "chaos"     [(gen/sleep 6)  {:type :info :f :kill-writer}
+                (gen/sleep 14) {:type :info :f :start-all}
+                (gen/sleep 5)  {:type :info :f :skew-clock}
+                (gen/sleep 14) {:type :info :f :reset-clock}
+                (gen/sleep 5)  {:type :info :f :partition-writer}
+                (gen/sleep 14) {:type :info :f :heal}]
    "none"      []})
 
 (defn bluedb-test
@@ -122,9 +131,10 @@
 
 (def cli-opts
   "Extra command-line options beyond Jepsen's defaults."
-  [[nil "--nemesis NAME" "Fault schedule: kill | partition | mix | none"
+  [[nil "--nemesis NAME" "Fault schedule: kill | partition | skew | mix | chaos | none"
     :default "mix"
-    :validate [#{"kill" "partition" "mix" "none"} "must be kill, partition, mix, or none"]]
+    :validate [#{"kill" "partition" "skew" "mix" "chaos" "none"}
+               "must be kill, partition, skew, mix, chaos, or none"]]
    [nil "--workload NAME" "Workload: set | list-append"
     :default "set"
     :validate [#{"set" "list-append"} "must be set or list-append"]]])

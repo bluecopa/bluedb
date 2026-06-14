@@ -29,10 +29,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cp target/debug/bluedb-server /usr/local/bin/bluedb-server
 
 FROM debian:bookworm-slim AS runtime
+# libfaketime lets the Jepsen clock-skew nemesis shift this node's wall clock at
+# runtime (see docker-entrypoint.sh).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates libfaketime \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /usr/local/bin/bluedb-server /usr/local/bin/bluedb-server
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 EXPOSE 8080
 ENV BLUEDB_ADDR=0.0.0.0:8080
-ENTRYPOINT ["bluedb-server"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

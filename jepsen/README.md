@@ -41,11 +41,15 @@ true}`):
 |---|---|---|
 | `kill` | `docker kill` the active writer (crash) | durability of acked writes through SlateDB's WAL window; a standby promotes |
 | `partition` | `docker network disconnect` the writer from Postgres + MinIO + peers | clean failover, no split-brain (the isolated writer loses its lease and storage at once) |
-| `mix` | both, alternating | combined |
+| `skew` | shift the writer's wall clock 8 s **backward** (via libfaketime) | the writer over-estimates its lease validity, so a standby can acquire concurrently — checks the SlateDB `writer_epoch` fence still blocks divergent writes |
+| `mix` | kill + partition, alternating | combined |
+| `chaos` | kill + skew + partition | everything |
 | `none` | — | baseline (no faults) |
 
 Fault windows straddle the 10 s lease TTL so failover completes inside each
-window.
+window. The clock-skew nemesis needs the image's libfaketime entrypoint
+(`docker-entrypoint.sh`); it writes the offset into each node's
+`/faketime/offset` via `docker exec`.
 
 ## Running
 
