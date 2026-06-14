@@ -7,8 +7,8 @@ use bluedb_sql::{Keyspace, TAG_EXTERNAL_BASE};
 const TAG_ACCOUNT: u8 = TAG_EXTERNAL_BASE; // 0x10
 /// Tag for native transfer records.
 const TAG_TRANSFER: u8 = TAG_EXTERNAL_BASE + 1; // 0x11
-/// Tag for the "pending transfer resolved" marker (present ⇒ posted/voided).
-const TAG_PENDING_RESOLVED: u8 = TAG_EXTERNAL_BASE + 2; // 0x12
+/// Tag for the pending-state record (present ⇒ posted/voided; holds the status).
+const TAG_PENDING_STATE: u8 = TAG_EXTERNAL_BASE + 2; // 0x12
 /// Tag for the per-tenant monotonic timestamp watermark (a single key).
 const TAG_TS_WATERMARK: u8 = TAG_EXTERNAL_BASE + 5; // 0x15
 
@@ -31,9 +31,8 @@ impl LedgerKeyspace {
         self.ks.external_key(TAG_TRANSFER, &id.to_be_bytes())
     }
 
-    #[allow(dead_code)] // reinstated in Phase B (pending-state record)
-    pub(crate) fn pending_resolved_key(&self, pending_id: u128) -> Vec<u8> {
-        self.ks.external_key(TAG_PENDING_RESOLVED, &pending_id.to_be_bytes())
+    pub(crate) fn pending_state_key(&self, pending_id: u128) -> Vec<u8> {
+        self.ks.external_key(TAG_PENDING_STATE, &pending_id.to_be_bytes())
     }
 
     /// The single per-tenant key holding the monotonic timestamp watermark.
@@ -76,16 +75,16 @@ mod tests {
     }
 
     #[test]
-    fn resolved_marker_key_is_distinct_namespace() {
+    fn pending_state_key_is_distinct_namespace() {
         let ks = LedgerKeyspace::new("_");
-        let r = ks.pending_resolved_key(5);
+        let r = ks.pending_state_key(5);
         // Distinct from account (0x10) and transfer (0x11) for the same id, and
         // sorts after both (tag 0x12).
         assert_ne!(r, ks.account_key(5));
         assert_ne!(r, ks.transfer_key(5));
         assert!(ks.transfer_key(5) < r);
         // Ordered by id within the namespace.
-        assert!(ks.pending_resolved_key(1) < ks.pending_resolved_key(2));
+        assert!(ks.pending_state_key(1) < ks.pending_state_key(2));
     }
 
     #[test]

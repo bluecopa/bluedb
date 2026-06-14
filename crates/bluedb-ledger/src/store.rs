@@ -8,7 +8,7 @@ use bluedb_storage::Substrate;
 use serde::{de::DeserializeOwned, Serialize};
 
 use crate::keyspace::LedgerKeyspace;
-use crate::model::{Account, Transfer};
+use crate::model::{Account, PendingStatus, Transfer};
 
 /// Encode a native record with `postcard` (compact, fast fixed-struct encoding).
 pub(crate) fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
@@ -39,6 +39,19 @@ pub(crate) async fn get_transfer(
     id: u128,
 ) -> Result<Option<Transfer>> {
     match substrate.get(&ks.transfer_key(id)).await? {
+        Some(bytes) => Ok(Some(decode(&bytes)?)),
+        None => Ok(None),
+    }
+}
+
+/// Read the pending-state record for a pending transfer (present ⇒ already
+/// posted or voided), or `None` if it is still outstanding.
+pub(crate) async fn get_pending_state(
+    substrate: &Substrate,
+    ks: &LedgerKeyspace,
+    pending_id: u128,
+) -> Result<Option<PendingStatus>> {
+    match substrate.get(&ks.pending_state_key(pending_id)).await? {
         Some(bytes) => Ok(Some(decode(&bytes)?)),
         None => Ok(None),
     }
@@ -109,6 +122,18 @@ mod tests {
         let bytes = encode(&a).unwrap();
         let back: Account = decode(&bytes).unwrap();
         assert_eq!(a, back);
+    }
+
+    #[tokio::test]
+    async fn pending_state_round_trips() {
+        use crate::model::PendingStatus;
+        let database = test_harness::writer_database().await;
+        let substrate = database.substrate();
+        let ks = LedgerKeyspace::new(bluedb_sql::DEFAULT_TENANT);
+        assert!(get_pending_state(&substrate, &ks, 9).await.unwrap().is_none());
+        let writer = substrate.require_writer().unwrap();
+        writer.put(&ks.pending_state_key(9), &encode(&PendingStatus::Posted).unwrap()).await.unwrap();
+        assert_eq!(get_pending_state(&substrate, &ks, 9).await.unwrap(), Some(PendingStatus::Posted));
     }
 
     #[tokio::test]

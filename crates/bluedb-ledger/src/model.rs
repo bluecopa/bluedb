@@ -4,6 +4,10 @@
 
 use serde::{Deserialize, Serialize};
 
+/// TigerBeetle's "full pending" sentinel for `post_pending_transfer.amount`
+/// (and the reserved `id`/`pending_id` value): `2^128 - 1`.
+pub const AMOUNT_MAX: u128 = u128::MAX;
+
 /// Account behavior flags (bitset). Mirrors TigerBeetle's account flags.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountFlags(pub u16);
@@ -324,6 +328,54 @@ pub enum CreateTransferResult {
     NotImplementedYet,
 }
 
+/// Resolution state of a pending transfer, recorded once it is posted or voided
+/// (Phase C adds `Expired`). Persisted under the pending-state keyspace and used
+/// to return `pending_transfer_already_posted` / `_already_voided` on a second
+/// resolution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum PendingStatus {
+    Posted,
+    Voided,
+}
+
+/// How a validated transfer is applied. `Gated` is a later-phase feature
+/// (linked, balancing, closing, imported, or a pending with a timeout).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TransferOp {
+    Regular,
+    PendingReserve,
+    Post,
+    Void,
+    Gated,
+}
+
+/// Classify a transfer that has already passed input validation.
+pub(crate) fn classify(t: &Transfer) -> TransferOp {
+    use TransferFlags as F;
+    if t.flags.contains(F::LINKED)
+        || t.flags.contains(F::BALANCING_DEBIT)
+        || t.flags.contains(F::BALANCING_CREDIT)
+        || t.flags.contains(F::CLOSING_DEBIT)
+        || t.flags.contains(F::CLOSING_CREDIT)
+        || t.flags.contains(F::IMPORTED)
+    {
+        return TransferOp::Gated;
+    }
+    if t.flags.contains(F::POST_PENDING_TRANSFER) {
+        return TransferOp::Post;
+    }
+    if t.flags.contains(F::VOID_PENDING_TRANSFER) {
+        return TransferOp::Void;
+    }
+    if t.flags.contains(F::PENDING) {
+        if t.timeout != 0 {
+            return TransferOp::Gated; // pending-with-timeout is Phase C
+        }
+        return TransferOp::PendingReserve;
+    }
+    TransferOp::Regular
+}
+
 // ---- Account input validators (mirror TB create_accounts order) ----
 
 /// Input-only checks that run *before* the existence lookup (TB codes 6, 9–12).
@@ -435,24 +487,31 @@ pub(crate) fn validate_transfer_post_existence(t: &Transfer) -> Option<CreateTra
     if t.flags.is_mutually_exclusive_violation() {
         return Some(R::FlagsAreMutuallyExclusive); // 25
     }
-    if t.debit_account_id == 0 {
-        return Some(R::DebitAccountIdMustNotBeZero); // 26
-    }
-    if t.debit_account_id == u128::MAX {
-        return Some(R::DebitAccountIdMustNotBeIntMax); // 27
-    }
-    if t.credit_account_id == 0 {
-        return Some(R::CreditAccountIdMustNotBeZero); // 28
-    }
-    if t.credit_account_id == u128::MAX {
-        return Some(R::CreditAccountIdMustNotBeIntMax); // 29
-    }
-    if t.debit_account_id == t.credit_account_id {
-        return Some(R::AccountsMustBeDifferent); // 30
-    }
 
     let is_resolution =
         t.flags.contains(F::POST_PENDING_TRANSFER) || t.flags.contains(F::VOID_PENDING_TRANSFER);
+
+    // Account-id zero/int-max + distinctness (26–30) apply only to non-resolution
+    // transfers: post/void inherit zero account ids from the pending, and a
+    // nonzero mismatch is reported later as pending_transfer_has_different_* (45/46).
+    if !is_resolution {
+        if t.debit_account_id == 0 {
+            return Some(R::DebitAccountIdMustNotBeZero); // 26
+        }
+        if t.debit_account_id == u128::MAX {
+            return Some(R::DebitAccountIdMustNotBeIntMax); // 27
+        }
+        if t.credit_account_id == 0 {
+            return Some(R::CreditAccountIdMustNotBeZero); // 28
+        }
+        if t.credit_account_id == u128::MAX {
+            return Some(R::CreditAccountIdMustNotBeIntMax); // 29
+        }
+        if t.debit_account_id == t.credit_account_id {
+            return Some(R::AccountsMustBeDifferent); // 30
+        }
+    }
+
     if is_resolution {
         if t.pending_id == 0 {
             return Some(R::PendingIdMustNotBeZero); // 32
@@ -473,11 +532,16 @@ pub(crate) fn validate_transfer_post_existence(t: &Transfer) -> Option<CreateTra
     if t.flags.is_closing() && !t.flags.contains(F::PENDING) {
         return Some(R::ClosingTransferMustBePending); // 36
     }
-    if t.ledger == 0 {
-        return Some(R::LedgerMustNotBeZero); // 37
-    }
-    if t.code == 0 {
-        return Some(R::CodeMustNotBeZero); // 38
+
+    // ledger/code zero (37/38) apply only to non-resolution transfers: post/void
+    // inherit a zero ledger/code from the pending.
+    if !is_resolution {
+        if t.ledger == 0 {
+            return Some(R::LedgerMustNotBeZero); // 37
+        }
+        if t.code == 0 {
+            return Some(R::CodeMustNotBeZero); // 38
+        }
     }
     None
 }
@@ -486,6 +550,22 @@ pub(crate) fn validate_transfer_post_existence(t: &Transfer) -> Option<CreateTra
 /// with the same id (TB codes 12–23), in TB order.
 pub(crate) fn transfer_exists_result(incoming: &Transfer, existing: &Transfer) -> CreateTransferResult {
     use CreateTransferResult as R;
+    use TransferFlags as F;
+    // For a resolution (post/void), zero inheritable fields and the amount
+    // sentinel (`AMOUNT_MAX` for post, `0` for void) were wildcards at apply time
+    // and match the stored materialized value — so an identical retry is `Exists`.
+    let resolution =
+        incoming.flags.contains(F::POST_PENDING_TRANSFER) || incoming.flags.contains(F::VOID_PENDING_TRANSFER);
+
+    /// A field differs: for a resolution a zero incoming is a wildcard (inherited).
+    fn differs<T: PartialEq + Default>(resolution: bool, inc: T, ex: T) -> bool {
+        if resolution {
+            inc != T::default() && inc != ex
+        } else {
+            inc != ex
+        }
+    }
+
     if incoming.flags != existing.flags {
         return R::ExistsWithDifferentFlags;
     }
@@ -495,38 +575,38 @@ pub(crate) fn transfer_exists_result(incoming: &Transfer, existing: &Transfer) -
     if incoming.timeout != existing.timeout {
         return R::ExistsWithDifferentTimeout;
     }
-    if incoming.debit_account_id != existing.debit_account_id {
+    if differs(resolution, incoming.debit_account_id, existing.debit_account_id) {
         return R::ExistsWithDifferentDebitAccountId;
     }
-    if incoming.credit_account_id != existing.credit_account_id {
+    if differs(resolution, incoming.credit_account_id, existing.credit_account_id) {
         return R::ExistsWithDifferentCreditAccountId;
     }
-    if incoming.amount != existing.amount {
+    // amount: the resolution wildcard is the sentinel, not zero.
+    let amount_wildcard = if incoming.flags.contains(F::POST_PENDING_TRANSFER) { AMOUNT_MAX } else { 0 };
+    let amount_differs = if resolution {
+        incoming.amount != amount_wildcard && incoming.amount != existing.amount
+    } else {
+        incoming.amount != existing.amount
+    };
+    if amount_differs {
         return R::ExistsWithDifferentAmount;
     }
-    if incoming.user_data_128 != existing.user_data_128 {
+    if differs(resolution, incoming.user_data_128, existing.user_data_128) {
         return R::ExistsWithDifferentUserData128;
     }
-    if incoming.user_data_64 != existing.user_data_64 {
+    if differs(resolution, incoming.user_data_64, existing.user_data_64) {
         return R::ExistsWithDifferentUserData64;
     }
-    if incoming.user_data_32 != existing.user_data_32 {
+    if differs(resolution, incoming.user_data_32, existing.user_data_32) {
         return R::ExistsWithDifferentUserData32;
     }
-    if incoming.ledger != existing.ledger {
+    if differs(resolution, incoming.ledger, existing.ledger) {
         return R::ExistsWithDifferentLedger;
     }
-    if incoming.code != existing.code {
+    if differs(resolution, incoming.code, existing.code) {
         return R::ExistsWithDifferentCode;
     }
     R::Exists
-}
-
-/// True if this transfer needs a feature gated to a later phase: any flag set,
-/// a nonzero timeout, or a pending reference (two-phase). Only a plain regular
-/// posted transfer is applied in Phase A.
-pub(crate) fn transfer_is_gated(t: &Transfer) -> bool {
-    t.flags != TransferFlags::NONE || t.timeout != 0 || t.pending_id != 0
 }
 
 #[cfg(test)]
@@ -599,11 +679,63 @@ mod tests {
     }
 
     #[test]
-    fn gating_predicates() {
-        assert!(!transfer_is_gated(&Transfer::new(1, 1, 2, 5, 7).with_code(1)));
-        assert!(transfer_is_gated(&Transfer::new(1, 1, 2, 5, 7).with_code(1).with_flags(TransferFlags::PENDING)));
-        assert!(transfer_is_gated(&Transfer::new(1, 1, 2, 5, 7).with_code(1).with_pending_id(2)));
+    fn classify_ops() {
+        use TransferFlags as F;
+        let t = |f: F, timeout: u32| {
+            let mut x = Transfer::new(1, 1, 2, 5, 7).with_code(1).with_flags(f);
+            x.timeout = timeout;
+            x
+        };
+        assert_eq!(classify(&Transfer::new(1, 1, 2, 5, 7).with_code(1)), TransferOp::Regular);
+        assert_eq!(classify(&t(F::PENDING, 0)), TransferOp::PendingReserve);
+        assert_eq!(classify(&t(F::PENDING, 30)), TransferOp::Gated); // pending+timeout → Phase C
+        assert_eq!(classify(&t(F::POST_PENDING_TRANSFER, 0)), TransferOp::Post);
+        assert_eq!(classify(&t(F::VOID_PENDING_TRANSFER, 0)), TransferOp::Void);
+        assert_eq!(classify(&t(F::LINKED, 0)), TransferOp::Gated);
+        assert_eq!(classify(&t(F::BALANCING_DEBIT, 0)), TransferOp::Gated);
+        assert_eq!(classify(&t(F::PENDING | F::CLOSING_DEBIT, 0)), TransferOp::Gated); // closing → Phase F
+    }
+
+    #[test]
+    fn account_gating_predicate() {
         assert!(!account_is_gated(&Account::input(1, 7).with_code(1)));
         assert!(account_is_gated(&Account::input(1, 7).with_code(1).with_flags(AccountFlags::IMPORTED)));
+    }
+
+    #[test]
+    fn resolution_validation_allows_inherited_zero_fields() {
+        // A post with zero accounts/ledger/code passes input validation (those
+        // fields inherit from the pending). pending_id rules still apply.
+        use CreateTransferResult as R;
+        let mut post = Transfer::new(5, 0, 0, AMOUNT_MAX, 0);
+        post.flags = TransferFlags::POST_PENDING_TRANSFER;
+        post.pending_id = 9;
+        assert_eq!(validate_transfer_post_existence(&post), None);
+        post.pending_id = 0;
+        assert_eq!(validate_transfer_post_existence(&post), Some(R::PendingIdMustNotBeZero));
+    }
+
+    #[test]
+    fn resolution_exists_is_inheritance_aware() {
+        use CreateTransferResult as R;
+        use TransferFlags as F;
+        // Stored materialized post: accounts 1→2, ledger 7, code 3, amount 100.
+        let mut stored = Transfer::new(5, 1, 2, 100, 7).with_code(3);
+        stored.flags = F::POST_PENDING_TRANSFER;
+        stored.pending_id = 9;
+        stored.timestamp = 42;
+        // Retry with AMOUNT_MAX + inherited zeros → Exists.
+        let mut retry = Transfer::new(5, 0, 0, AMOUNT_MAX, 0);
+        retry.flags = F::POST_PENDING_TRANSFER;
+        retry.pending_id = 9;
+        assert_eq!(transfer_exists_result(&retry, &stored), R::Exists);
+        // Retry with a differing explicit amount → ExistsWithDifferentAmount.
+        let mut retry2 = retry;
+        retry2.amount = 50;
+        assert_eq!(transfer_exists_result(&retry2, &stored), R::ExistsWithDifferentAmount);
+        // Retry with a differing explicit debit account → mismatch.
+        let mut retry3 = retry;
+        retry3.debit_account_id = 99;
+        assert_eq!(transfer_exists_result(&retry3, &stored), R::ExistsWithDifferentDebitAccountId);
     }
 }

@@ -17,12 +17,12 @@ use slatedb::WriteBatch;
 
 use crate::keyspace::LedgerKeyspace;
 use crate::model::{
-    account_exists_result, account_is_gated, transfer_exists_result, transfer_is_gated,
+    account_exists_result, account_is_gated, classify, transfer_exists_result,
     validate_account_post_existence, validate_account_pre_existence,
     validate_transfer_post_existence, validate_transfer_pre_existence, Account, AccountFlags,
-    CreateAccountResult, CreateTransferResult, Transfer,
+    CreateAccountResult, CreateTransferResult, PendingStatus, Transfer, TransferOp, AMOUNT_MAX,
 };
-use crate::store::{encode, get_account, get_transfer, get_watermark, now_ns};
+use crate::store::{encode, get_account, get_pending_state, get_transfer, get_watermark, now_ns};
 
 /// A double-entry ledger over one bluedb database.
 ///
@@ -150,15 +150,29 @@ impl Ledger {
                 results.push(code);
                 continue;
             }
-            if transfer_is_gated(t) {
-                results.push(R::NotImplementedYet);
-                continue;
-            }
 
-            match self.stage_regular(t, &mut state).await? {
-                Ok(()) => {
+            // Classify and apply. Each arm yields the record to persist (raw for
+            // regular/pending; materialized for post/void) or a rejection code.
+            let op = classify(t);
+            let staged_record: std::result::Result<Transfer, CreateTransferResult> = match op {
+                TransferOp::Regular => self.stage_regular(t, &mut state).await?.map(|()| *t),
+                TransferOp::PendingReserve => self.stage_pending(t, &mut state).await?.map(|()| *t),
+                TransferOp::Post | TransferOp::Void => {
+                    let post = matches!(op, TransferOp::Post);
+                    // The referenced pending may be committed or staged this batch.
+                    let pending = match get_transfer(&self.substrate, &self.keyspace, t.pending_id).await? {
+                        Some(p) => Some(p),
+                        None => staged.get(&t.pending_id).copied(),
+                    };
+                    self.stage_resolution(t, pending, post, &mut state).await?
+                }
+                TransferOp::Gated => Err(R::NotImplementedYet),
+            };
+
+            match staged_record {
+                Ok(record) => {
                     // Timestamp assigned only on accept (failed items don't advance it).
-                    let applied = Transfer { timestamp: ts.next(), ..*t };
+                    let applied = Transfer { timestamp: ts.next(), ..record };
                     staged.insert(applied.id, applied);
                     accepted.push(applied);
                     results.push(R::Created);
@@ -168,7 +182,7 @@ impl Ledger {
         }
 
         // One atomic batch: every mutated account + every accepted transfer +
-        // the advanced watermark.
+        // every pending-state record from this batch + the advanced watermark.
         let mut batch = WriteBatch::new();
         for id in &state.dirty {
             if let Some(account) = state.working.get(id) {
@@ -177,6 +191,9 @@ impl Ledger {
         }
         for t in &accepted {
             batch.put(self.keyspace.transfer_key(t.id), &encode(t)?);
+        }
+        for (pending_id, status) in &state.resolved {
+            batch.put(self.keyspace.pending_state_key(*pending_id), &encode(status)?);
         }
         if !accepted.is_empty() {
             batch.put(self.keyspace.watermark_key(), ts.last.to_be_bytes());
@@ -255,6 +272,189 @@ impl Ledger {
         Ok(Ok(()))
     }
 
+    /// Stage a two-phase **pending reserve**: move `amount` into the `*_pending`
+    /// buckets, with the granular pending-overflow codes (60/61), total-overflow
+    /// guards (64/65), and the same asymmetric balance constraint as a post
+    /// (the constrained side counts posted + pending). The reservation is later
+    /// settled by a post or released by a void.
+    async fn stage_pending(&self, t: &Transfer, state: &mut ApplyState) -> Result<StageOutcome> {
+        use CreateTransferResult as R;
+
+        let mut debit = match self.load_account(t.debit_account_id, state).await? {
+            Some(a) => a,
+            None => return Ok(Err(R::DebitAccountNotFound)),
+        };
+        let mut credit = match self.load_account(t.credit_account_id, state).await? {
+            Some(a) => a,
+            None => return Ok(Err(R::CreditAccountNotFound)),
+        };
+        if debit.ledger != credit.ledger {
+            return Ok(Err(R::AccountsMustHaveTheSameLedger));
+        }
+        if t.ledger != debit.ledger {
+            return Ok(Err(R::TransferMustHaveTheSameLedgerAsAccounts));
+        }
+
+        // 60 / 61: per-bucket pending overflow.
+        debit.debits_pending = match debit.debits_pending.checked_add(t.amount) {
+            Some(v) => v,
+            None => return Ok(Err(R::OverflowsDebitsPending)),
+        };
+        credit.credits_pending = match credit.credits_pending.checked_add(t.amount) {
+            Some(v) => v,
+            None => return Ok(Err(R::OverflowsCreditsPending)),
+        };
+        // 64 / 65: total (pending + posted) overflow; also guards the unchecked
+        // adds in the balance checks below.
+        if debit.debits_pending.checked_add(debit.debits_posted).is_none() {
+            return Ok(Err(R::OverflowsDebits));
+        }
+        if credit.credits_pending.checked_add(credit.credits_posted).is_none() {
+            return Ok(Err(R::OverflowsCredits));
+        }
+
+        // 67 / 68: a reserved outflow is constrained exactly like a post.
+        if debit.flags.contains(AccountFlags::DEBITS_MUST_NOT_EXCEED_CREDITS)
+            && debit.debits_posted + debit.debits_pending > debit.credits_posted
+        {
+            return Ok(Err(R::ExceedsCredits));
+        }
+        if credit.flags.contains(AccountFlags::CREDITS_MUST_NOT_EXCEED_DEBITS)
+            && credit.credits_posted + credit.credits_pending > credit.debits_posted
+        {
+            return Ok(Err(R::ExceedsDebits));
+        }
+
+        state.working.insert(debit.id, debit);
+        state.dirty.insert(debit.id);
+        state.working.insert(credit.id, credit);
+        state.dirty.insert(credit.id);
+        Ok(Ok(()))
+    }
+
+    /// Stage a **post** (`post == true`) or **void** (`false`) of the pending
+    /// transfer referenced by `t.pending_id` (`pending`: the looked-up pending,
+    /// committed or staged this batch). Runs TigerBeetle's resolution checks
+    /// 43→52 in order, then releases the full reservation and (post) moves the
+    /// effective amount into `*_posted`. Returns the **materialized** transfer
+    /// (inherited fields filled, `amount` = effective) to persist, or a rejection
+    /// code. Releasing/posting cannot breach a balance constraint that held at
+    /// reserve time, so 67/68 are not re-checked.
+    async fn stage_resolution(
+        &self,
+        t: &Transfer,
+        pending: Option<Transfer>,
+        post: bool,
+        state: &mut ApplyState,
+    ) -> Result<std::result::Result<Transfer, CreateTransferResult>> {
+        use crate::model::TransferFlags as F;
+        use CreateTransferResult as R;
+
+        // 43: the pending must exist.
+        let pending = match pending {
+            Some(p) => p,
+            None => return Ok(Err(R::PendingTransferNotFound)),
+        };
+        // 44: it must actually be a pending transfer.
+        if !pending.flags.contains(F::PENDING) {
+            return Ok(Err(R::PendingTransferNotPending));
+        }
+        // 45–48: nonzero fields on the resolution must match the pending.
+        if t.debit_account_id != 0 && t.debit_account_id != pending.debit_account_id {
+            return Ok(Err(R::PendingTransferHasDifferentDebitAccountId));
+        }
+        if t.credit_account_id != 0 && t.credit_account_id != pending.credit_account_id {
+            return Ok(Err(R::PendingTransferHasDifferentCreditAccountId));
+        }
+        if t.ledger != 0 && t.ledger != pending.ledger {
+            return Ok(Err(R::PendingTransferHasDifferentLedger));
+        }
+        if t.code != 0 && t.code != pending.code {
+            return Ok(Err(R::PendingTransferHasDifferentCode));
+        }
+        // 49 (post) / 50 (void): amount.
+        let effective = if post {
+            if t.amount == AMOUNT_MAX {
+                pending.amount
+            } else if t.amount > pending.amount {
+                return Ok(Err(R::ExceedsPendingTransferAmount));
+            } else {
+                t.amount
+            }
+        } else {
+            if t.amount != 0 && t.amount != pending.amount {
+                return Ok(Err(R::PendingTransferHasDifferentAmount));
+            }
+            pending.amount // released in full; nothing posted
+        };
+        // 51 / 52: already resolved? in-batch first, then committed.
+        let prior = match state.resolved.get(&pending.id).copied() {
+            Some(s) => Some(s),
+            None => get_pending_state(&self.substrate, &self.keyspace, pending.id).await?,
+        };
+        match prior {
+            Some(PendingStatus::Posted) => return Ok(Err(R::PendingTransferAlreadyPosted)),
+            Some(PendingStatus::Voided) => return Ok(Err(R::PendingTransferAlreadyVoided)),
+            None => {}
+        }
+
+        // Apply against the PENDING transfer's accounts.
+        let mut debit = self
+            .load_account(pending.debit_account_id, state)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("ledger invariant: pending debit account missing"))?;
+        let mut credit = self
+            .load_account(pending.credit_account_id, state)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("ledger invariant: pending credit account missing"))?;
+
+        // Release the full reservation (checked_sub guards the invariant that the
+        // reservation is still outstanding).
+        debit.debits_pending = debit
+            .debits_pending
+            .checked_sub(pending.amount)
+            .ok_or_else(|| anyhow::anyhow!("ledger invariant: debits_pending underflow on resolve"))?;
+        credit.credits_pending = credit
+            .credits_pending
+            .checked_sub(pending.amount)
+            .ok_or_else(|| anyhow::anyhow!("ledger invariant: credits_pending underflow on resolve"))?;
+        if post {
+            // 62 / 63: posting the effective amount can overflow the posted bucket.
+            debit.debits_posted = match debit.debits_posted.checked_add(effective) {
+                Some(v) => v,
+                None => return Ok(Err(R::OverflowsDebitsPosted)),
+            };
+            credit.credits_posted = match credit.credits_posted.checked_add(effective) {
+                Some(v) => v,
+                None => return Ok(Err(R::OverflowsCreditsPosted)),
+            };
+        }
+
+        state.working.insert(debit.id, debit);
+        state.dirty.insert(debit.id);
+        state.working.insert(credit.id, credit);
+        state.dirty.insert(credit.id);
+        state.resolved.insert(
+            pending.id,
+            if post { PendingStatus::Posted } else { PendingStatus::Voided },
+        );
+
+        // Materialize the stored record: inherited fields filled from the pending,
+        // `amount` set to the effective posted/voided amount.
+        let materialized = Transfer {
+            debit_account_id: pending.debit_account_id,
+            credit_account_id: pending.credit_account_id,
+            amount: effective,
+            ledger: pending.ledger,
+            code: if t.code != 0 { t.code } else { pending.code },
+            user_data_128: if t.user_data_128 != 0 { t.user_data_128 } else { pending.user_data_128 },
+            user_data_64: if t.user_data_64 != 0 { t.user_data_64 } else { pending.user_data_64 },
+            user_data_32: if t.user_data_32 != 0 { t.user_data_32 } else { pending.user_data_32 },
+            ..*t
+        };
+        Ok(Ok(materialized))
+    }
+
     /// Get an account from the working set, loading it read-through on first
     /// touch. Returns a copy; mutations are written back by the caller on accept.
     async fn load_account(&self, id: u128, state: &mut ApplyState) -> Result<Option<Account>> {
@@ -297,12 +497,15 @@ impl TimestampSource {
 type StageOutcome = std::result::Result<(), CreateTransferResult>;
 
 /// Mutable state threaded through one `create_transfers` apply: the read-through
-/// working set of touched accounts and the ids of accounts actually mutated
-/// (only these are written back).
+/// working set of touched accounts, the ids of accounts actually mutated (only
+/// these are written back), and the pending transfers resolved this batch (each
+/// gets a pending-state record, and a second resolution in the same batch is
+/// rejected).
 #[derive(Default)]
 struct ApplyState {
     working: HashMap<u128, Account>,
     dirty: HashSet<u128>,
+    resolved: HashMap<u128, PendingStatus>,
 }
 
 #[cfg(test)]
@@ -479,20 +682,229 @@ mod tests {
         let db = writer_database().await;
         let l = Ledger::new(&db);
         setup_two_accounts(&l).await;
-        for f in [TransferFlags::PENDING, TransferFlags::LINKED, TransferFlags::BALANCING_DEBIT] {
+        // Later-phase flags still gate (linked D, balancing E, closing F, imported G).
+        for f in [TransferFlags::LINKED, TransferFlags::BALANCING_DEBIT, TransferFlags::IMPORTED] {
             assert_eq!(l.create_transfers(&[xfer(1, 1, 2, 5).with_flags(f)]).await.unwrap(), vec![R::NotImplementedYet]);
         }
-        // post needs a valid pending_id; input passes validation, then gates.
-        let post = xfer(1, 1, 2, 5).with_flags(TransferFlags::POST_PENDING_TRANSFER).with_pending_id(2);
-        assert_eq!(l.create_transfers(&[post]).await.unwrap(), vec![R::NotImplementedYet]);
+        // A pending WITH a timeout is Phase C → still gated.
+        let mut timed = xfer(1, 1, 2, 5).with_flags(TransferFlags::PENDING);
+        timed.timeout = 30;
+        assert_eq!(l.create_transfers(&[timed]).await.unwrap(), vec![R::NotImplementedYet]);
         // Nothing persisted by a gated item.
         assert!(l.lookup_transfer(1).await.unwrap().is_none());
-        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_posted, 0);
+        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_pending, 0);
         // A gated account flag too.
         assert_eq!(
             l.create_accounts(&[acct(9, 7).with_flags(AccountFlags::IMPORTED)]).await.unwrap(),
             vec![CreateAccountResult::NotImplementedYet]
         );
+    }
+
+    // ---- Phase B: two-phase transfers ----
+
+    /// Reserve `amount` (1 → 2, pending) and assert it succeeds.
+    async fn reserve(l: &Ledger, id: u128, debit: u128, credit: u128, amount: u128) {
+        let p = xfer(id, debit, credit, amount).with_flags(TransferFlags::PENDING);
+        assert_eq!(l.create_transfers(&[p]).await.unwrap(), vec![CreateTransferResult::Created]);
+    }
+
+    fn post(id: u128, pending_id: u128, amount: u128) -> Transfer {
+        // zero accounts/ledger; code 0 inherits — exercises inheritance.
+        let mut t = Transfer::new(id, 0, 0, amount, 0);
+        t.flags = TransferFlags::POST_PENDING_TRANSFER;
+        t.pending_id = pending_id;
+        t
+    }
+    fn void(id: u128, pending_id: u128, amount: u128) -> Transfer {
+        let mut t = Transfer::new(id, 0, 0, amount, 0);
+        t.flags = TransferFlags::VOID_PENDING_TRANSFER;
+        t.pending_id = pending_id;
+        t
+    }
+
+    #[tokio::test]
+    async fn pending_reserve_moves_into_pending_buckets() {
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        setup_two_accounts(&l).await;
+        reserve(&l, 500, 1, 2, 100).await;
+        let d = l.lookup_account(1).await.unwrap().unwrap();
+        let c = l.lookup_account(2).await.unwrap().unwrap();
+        assert_eq!((d.debits_pending, d.debits_posted), (100, 0));
+        assert_eq!((c.credits_pending, c.credits_posted), (100, 0));
+        assert!(l.lookup_transfer(500).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn pending_respects_balance_constraint() {
+        use CreateTransferResult as R;
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        l.create_accounts(&[acct(1, 7).with_flags(AccountFlags::DEBITS_MUST_NOT_EXCEED_CREDITS), acct(2, 7)]).await.unwrap();
+        let p = xfer(1, 1, 2, 50).with_flags(TransferFlags::PENDING);
+        assert_eq!(l.create_transfers(&[p]).await.unwrap(), vec![R::ExceedsCredits]);
+        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_pending, 0);
+    }
+
+    #[tokio::test]
+    async fn post_full_via_amount_max_settles() {
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        setup_two_accounts(&l).await;
+        reserve(&l, 500, 1, 2, 100).await;
+        assert_eq!(l.create_transfers(&[post(501, 500, AMOUNT_MAX)]).await.unwrap(), vec![CreateTransferResult::Created]);
+        let d = l.lookup_account(1).await.unwrap().unwrap();
+        let c = l.lookup_account(2).await.unwrap().unwrap();
+        assert_eq!((d.debits_pending, d.debits_posted), (0, 100));
+        assert_eq!((c.credits_pending, c.credits_posted), (0, 100));
+        // Stored post is materialized: inherited accounts/ledger + effective amount.
+        let stored = l.lookup_transfer(501).await.unwrap().unwrap();
+        assert_eq!((stored.debit_account_id, stored.credit_account_id, stored.ledger, stored.amount), (1, 2, 7, 100));
+    }
+
+    #[tokio::test]
+    async fn post_partial_releases_remainder() {
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        setup_two_accounts(&l).await;
+        reserve(&l, 500, 1, 2, 100).await;
+        assert_eq!(l.create_transfers(&[post(501, 500, 60)]).await.unwrap(), vec![CreateTransferResult::Created]);
+        let d = l.lookup_account(1).await.unwrap().unwrap();
+        let c = l.lookup_account(2).await.unwrap().unwrap();
+        assert_eq!((d.debits_pending, d.debits_posted), (0, 60), "remainder released, not posted");
+        assert_eq!((c.credits_pending, c.credits_posted), (0, 60));
+        assert_eq!(l.lookup_transfer(501).await.unwrap().unwrap().amount, 60);
+    }
+
+    #[tokio::test]
+    async fn post_exceeding_pending_is_rejected() {
+        use CreateTransferResult as R;
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        setup_two_accounts(&l).await;
+        reserve(&l, 500, 1, 2, 100).await;
+        assert_eq!(l.create_transfers(&[post(501, 500, 101)]).await.unwrap(), vec![R::ExceedsPendingTransferAmount]);
+        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_pending, 100, "reservation untouched");
+        assert!(l.lookup_transfer(501).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn void_releases_reservation() {
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        setup_two_accounts(&l).await;
+        reserve(&l, 500, 1, 2, 100).await;
+        assert_eq!(l.create_transfers(&[void(501, 500, 0)]).await.unwrap(), vec![CreateTransferResult::Created]);
+        let d = l.lookup_account(1).await.unwrap().unwrap();
+        assert_eq!((d.debits_pending, d.debits_posted), (0, 0), "released, nothing posted");
+        // Void with the exact pending amount also works.
+        reserve(&l, 600, 1, 2, 40).await;
+        assert_eq!(l.create_transfers(&[void(601, 600, 40)]).await.unwrap(), vec![CreateTransferResult::Created]);
+    }
+
+    #[tokio::test]
+    async fn void_with_wrong_amount_is_rejected() {
+        use CreateTransferResult as R;
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        setup_two_accounts(&l).await;
+        reserve(&l, 500, 1, 2, 100).await;
+        assert_eq!(l.create_transfers(&[void(501, 500, 99)]).await.unwrap(), vec![R::PendingTransferHasDifferentAmount]);
+        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_pending, 100);
+    }
+
+    #[tokio::test]
+    async fn resolution_field_mismatch_codes() {
+        use CreateTransferResult as R;
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        l.create_accounts(&[acct(1, 7), acct(2, 7), acct(3, 7)]).await.unwrap();
+        reserve(&l, 500, 1, 2, 100).await;
+        // wrong (nonzero) debit account.
+        let mut t = post(501, 500, AMOUNT_MAX);
+        t.debit_account_id = 3;
+        assert_eq!(l.create_transfers(&[t]).await.unwrap(), vec![R::PendingTransferHasDifferentDebitAccountId]);
+        // wrong ledger.
+        let mut t = post(502, 500, AMOUNT_MAX);
+        t.ledger = 8;
+        assert_eq!(l.create_transfers(&[t]).await.unwrap(), vec![R::PendingTransferHasDifferentLedger]);
+        // wrong code.
+        let mut t = post(503, 500, AMOUNT_MAX);
+        t.code = 9;
+        assert_eq!(l.create_transfers(&[t]).await.unwrap(), vec![R::PendingTransferHasDifferentCode]);
+    }
+
+    #[tokio::test]
+    async fn resolution_not_found_and_not_pending() {
+        use CreateTransferResult as R;
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        setup_two_accounts(&l).await;
+        assert_eq!(l.create_transfers(&[post(501, 999, AMOUNT_MAX)]).await.unwrap(), vec![R::PendingTransferNotFound]);
+        // A regular (non-pending) transfer cannot be posted.
+        l.create_transfers(&[xfer(600, 1, 2, 5)]).await.unwrap();
+        assert_eq!(l.create_transfers(&[post(501, 600, AMOUNT_MAX)]).await.unwrap(), vec![R::PendingTransferNotPending]);
+    }
+
+    #[tokio::test]
+    async fn double_resolution_is_rejected() {
+        use CreateTransferResult as R;
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        setup_two_accounts(&l).await;
+        reserve(&l, 500, 1, 2, 100).await;
+        assert_eq!(l.create_transfers(&[post(501, 500, AMOUNT_MAX)]).await.unwrap(), vec![R::Created]);
+        // posting again → already posted; voiding → already posted (state is terminal).
+        assert_eq!(l.create_transfers(&[post(502, 500, AMOUNT_MAX)]).await.unwrap(), vec![R::PendingTransferAlreadyPosted]);
+        assert_eq!(l.create_transfers(&[void(503, 500, 0)]).await.unwrap(), vec![R::PendingTransferAlreadyPosted]);
+
+        // A voided pending reports already_voided.
+        reserve(&l, 600, 1, 2, 10).await;
+        l.create_transfers(&[void(601, 600, 0)]).await.unwrap();
+        assert_eq!(l.create_transfers(&[post(602, 600, AMOUNT_MAX)]).await.unwrap(), vec![R::PendingTransferAlreadyVoided]);
+    }
+
+    #[tokio::test]
+    async fn reserve_and_post_in_one_batch() {
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        setup_two_accounts(&l).await;
+        let mut p = xfer(500, 1, 2, 100);
+        p.flags = TransferFlags::PENDING;
+        let res = l.create_transfers(&[p, post(501, 500, AMOUNT_MAX)]).await.unwrap();
+        assert_eq!(res, vec![CreateTransferResult::Created, CreateTransferResult::Created]);
+        let d = l.lookup_account(1).await.unwrap().unwrap();
+        assert_eq!((d.debits_pending, d.debits_posted), (0, 100), "settled within the batch");
+    }
+
+    #[tokio::test]
+    async fn identical_post_retry_is_idempotent() {
+        use CreateTransferResult as R;
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        setup_two_accounts(&l).await;
+        reserve(&l, 500, 1, 2, 100).await;
+        assert_eq!(l.create_transfers(&[post(501, 500, AMOUNT_MAX)]).await.unwrap(), vec![R::Created]);
+        // Same submission (id 501, AMOUNT_MAX, inherited zeros) → Exists, not a mismatch.
+        assert_eq!(l.create_transfers(&[post(501, 500, AMOUNT_MAX)]).await.unwrap(), vec![R::Exists]);
+        // A differing explicit amount on the same id → mismatch.
+        assert_eq!(l.create_transfers(&[post(501, 500, 50)]).await.unwrap(), vec![R::ExistsWithDifferentAmount]);
+        // Balances moved exactly once.
+        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_posted, 100);
+    }
+
+    #[tokio::test]
+    async fn conservation_with_partial_post() {
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
+        reserve(&l, 500, 1, 2, 100).await;
+        l.create_transfers(&[post(501, 500, 70)]).await.unwrap(); // 70 posted, 30 released
+        let d = l.lookup_account(1).await.unwrap().unwrap();
+        let c = l.lookup_account(2).await.unwrap().unwrap();
+        assert_eq!(d.debits_posted, c.credits_posted, "Σdebits == Σcredits");
+        assert_eq!((d.debits_pending, c.credits_pending), (0, 0));
+        assert_eq!(d.debits_posted, 70);
     }
 
     #[tokio::test]
