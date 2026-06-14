@@ -32,7 +32,9 @@ use bluedb_fts::manifest::Manifest;
 use bluedb_fts::merge::Compactor;
 use bluedb_fts::open::open_split_lazy;
 use bluedb_fts::policy::CompactionPolicy;
-use bluedb_fts::search::{multi_split_search_filtered, MultiSplitHit, SplitHandle};
+use bluedb_fts::search::{
+    multi_split_search_filtered, multi_split_search_filtered_ids, MultiSplitHit, SplitHandle,
+};
 use bluedb_fts::tombstones::Tombstones;
 use bluedb_fts::writer::IndexWriter;
 use bluedb_fts::IdField;
@@ -209,6 +211,33 @@ impl FtsIndex {
             .map(|(id, generation, index)| SplitHandle::with_generation(id.clone(), *generation, index))
             .collect();
         Ok(multi_split_search_filtered(
+            &handles,
+            query,
+            fields,
+            limit,
+            self.id_field,
+            &tombstones,
+        )?)
+    }
+
+    /// Like [`FtsIndex::search`], but returns the top `limit` live hits as
+    /// `(id, score)` pairs (the stored doc-id + BM25 score) instead of
+    /// `MultiSplitHit`. Used by the union searcher, which needs each durable
+    /// hit's id (pk) to mask any pk the live tier already covers.
+    pub async fn search_ids(
+        &self,
+        query: &str,
+        fields: &[Field],
+        limit: usize,
+    ) -> Result<Vec<(String, f32)>> {
+        let manifest = self.load_manifest().await?;
+        let tombstones = self.load_tombstones().await?;
+        let opened = self.open_splits(manifest.splits.iter()).await?;
+        let handles: Vec<SplitHandle> = opened
+            .iter()
+            .map(|(id, generation, index)| SplitHandle::with_generation(id.clone(), *generation, index))
+            .collect();
+        Ok(multi_split_search_filtered_ids(
             &handles,
             query,
             fields,

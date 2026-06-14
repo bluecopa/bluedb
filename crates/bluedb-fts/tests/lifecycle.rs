@@ -13,7 +13,9 @@ use std::sync::Arc;
 use bluedb_fts::manifest::Manifest;
 use bluedb_fts::merge::Compactor;
 use bluedb_fts::open::open_split_lazy;
-use bluedb_fts::search::{multi_split_search, multi_split_search_filtered, SplitHandle};
+use bluedb_fts::search::{
+    multi_split_search, multi_split_search_filtered, multi_split_search_filtered_ids, SplitHandle,
+};
 use bluedb_fts::tombstones::Tombstones;
 use bluedb_fts::writer::IndexWriter;
 use bluedb_fts::IdField;
@@ -105,6 +107,71 @@ async fn tombstone_hides_a_doc_that_is_still_physically_present() {
         multi_split_search_filtered(&hs, "financial", &fields, 10, IdField(id_f), &tombs)
             .expect("filtered");
     assert_eq!(filtered.len(), 1, "tombstoned 'a' is hidden, only 'b' lives");
+}
+
+#[tokio::test]
+async fn filtered_ids_returns_id_score_pairs_deduped_and_tombstone_filtered() {
+    let (schema, id_f, body_f) = schema();
+    let db = open_db("fts-lifecycle-filtered-ids").await;
+
+    let mut writer = IndexWriter::new();
+    let mut manifest = Manifest::new(INDEX_ID);
+    let mut tombs = Tombstones::new(INDEX_ID);
+
+    // split gen1: a, b, c — all match "financial".
+    let s1 = writer
+        .append(
+            &mut manifest,
+            schema.clone(),
+            vec![
+                doc(id_f, "a", body_f, "alpha financial report"),
+                doc(id_f, "b", body_f, "beta financial"),
+                doc(id_f, "c", body_f, "gamma financial"),
+            ],
+        )
+        .expect("s1");
+    db.put(s1.blob_key.as_bytes(), &s1.split_bytes[..]).await.expect("put s1");
+
+    // Update "a" in a strictly newer split (still matches "financial").
+    let s2 = writer
+        .update(
+            &mut manifest,
+            &mut tombs,
+            ["a"],
+            schema.clone(),
+            vec![doc(id_f, "a", body_f, "alpha financial updated")],
+        )
+        .expect("s2");
+    db.put(s2.blob_key.as_bytes(), &s2.split_bytes[..]).await.expect("put s2");
+
+    // Delete "b" outright at the current max generation.
+    tombs.delete_doc_at("b", manifest.max_generation());
+
+    let blob = Arc::new(SlateDbBlobStore::new(db));
+    let opened = open_all(&blob, &manifest).await;
+    let hs = handles(&opened);
+    let fields = vec![body_f];
+
+    let ids: Vec<(String, f32)> =
+        multi_split_search_filtered_ids(&hs, "financial", &fields, 10, IdField(id_f), &tombs)
+            .expect("filtered ids");
+
+    // Tombstoned "b" is excluded; "a" appears exactly once (last-write-wins
+    // dedup across the original + updated split).
+    let just_ids: Vec<&str> = ids.iter().map(|(id, _)| id.as_str()).collect();
+    let mut sorted = just_ids.clone();
+    sorted.sort_unstable();
+    assert_eq!(sorted, vec!["a", "c"], "live, deduped ids only ('b' tombstoned)");
+    assert_eq!(just_ids.len(), 2, "no duplicate 'a' from the same-id update");
+
+    // Scores are positive and the result is sorted by descending score.
+    for (_, score) in &ids {
+        assert!(*score > 0.0, "BM25 score must be positive");
+    }
+    assert!(
+        ids[0].1 >= ids[1].1,
+        "results sorted by descending score: {ids:?}"
+    );
 }
 
 #[tokio::test]

@@ -289,6 +289,117 @@ pub fn multi_split_search_filtered(
     Ok(merged)
 }
 
+/// Like [`multi_split_search_filtered`], but returns the surviving hits as
+/// `(id, score)` pairs instead of `(score, DocAddress)`.
+///
+/// The union searcher (the live ∪ durable-split merge in `bluedb-engine`) needs
+/// each durable hit's **id** (the pk) to mask any pk the live segment already
+/// covers — a `DocAddress` is per-split and meaningless to the live tier. The
+/// filtered search already computes each candidate's stored id internally; this
+/// variant simply keeps it. Identical over-fetch, generation-scoped tombstone
+/// filtering, and last-write-wins dedup as [`multi_split_search_filtered`];
+/// results sorted by descending score (with the same deterministic tie-break)
+/// and truncated to `limit`.
+pub fn multi_split_search_filtered_ids(
+    splits: &[SplitHandle<'_>],
+    query_str: &str,
+    fields: &[Field],
+    limit: usize,
+    id_field: IdField,
+    tombstones: &Tombstones,
+) -> anyhow::Result<Vec<(String, f32)>> {
+    // Over-fetch so dropped (tombstoned/superseded) hits don't starve the
+    // top-`limit` (see [`multi_split_search_filtered`]).
+    let per_split_limit = limit.saturating_add(tombstones.len()).max(limit);
+
+    struct Candidate {
+        hit: MultiSplitHit,
+        id: String,
+        generation: u64,
+    }
+
+    let mut all: Vec<Candidate> = Vec::new();
+    for (split_ord, handle) in splits.iter().enumerate() {
+        let index = handle.index;
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let parser = QueryParser::for_index(index, fields.to_vec());
+        let query = parser
+            .parse_query(query_str)
+            .map_err(|err| anyhow::anyhow!("parse query for split {}: {err}", handle.split_id))?;
+
+        let hits = searcher.search(
+            &query,
+            &TopDocs::with_limit(per_split_limit).order_by_score(),
+        )?;
+        for (score, doc_address) in hits {
+            let stored: TantivyDocument = searcher.doc(doc_address)?;
+            let id = id_field.extract(&stored).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "split {} hit at {doc_address:?} has no stored value for the id field; \
+                     the id field must be STORED and present on every document",
+                    handle.split_id
+                )
+            })?;
+            // Generation-scoped delete: hide this copy only if the delete is as
+            // new as, or newer than, this split.
+            if tombstones.is_deleted_at(&id, handle.generation) {
+                continue;
+            }
+            all.push(Candidate {
+                hit: MultiSplitHit {
+                    score,
+                    split_ord,
+                    doc_address,
+                },
+                id,
+                generation: handle.generation,
+            });
+        }
+    }
+
+    // Last-write-wins dedup by id: keep the highest-generation occurrence
+    // (tie-break: higher split_ord, then higher score).
+    use std::collections::HashMap;
+    let mut best_by_id: HashMap<&str, usize> = HashMap::with_capacity(all.len());
+    for (i, cand) in all.iter().enumerate() {
+        match best_by_id.get(cand.id.as_str()) {
+            Some(&j) => {
+                let cur = &all[j];
+                let wins = cand.generation > cur.generation
+                    || (cand.generation == cur.generation
+                        && (cand.hit.split_ord > cur.hit.split_ord
+                            || (cand.hit.split_ord == cur.hit.split_ord
+                                && cand.hit.score > cur.hit.score)));
+                if wins {
+                    best_by_id.insert(cand.id.as_str(), i);
+                }
+            }
+            None => {
+                best_by_id.insert(cand.id.as_str(), i);
+            }
+        }
+    }
+
+    let keep: std::collections::BTreeSet<usize> = best_by_id.values().copied().collect();
+    // Sort the kept candidates by the same deterministic ordering as
+    // [`multi_split_search_filtered`] (descending score, then split/doc), then
+    // project to `(id, score)` and truncate.
+    let mut kept: Vec<&Candidate> = all
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| keep.contains(i))
+        .map(|(_, c)| c)
+        .collect();
+    kept.sort_by(|a, b| cmp_hits(&a.hit, &b.hit));
+    let mut out: Vec<(String, f32)> = kept
+        .into_iter()
+        .map(|c| (c.id.clone(), c.hit.score))
+        .collect();
+    out.truncate(limit);
+    Ok(out)
+}
+
 /// Tombstone-aware count: total live matches for `query_str` across all
 /// `splits`, excluding documents whose stored id is in `tombstones`.
 ///

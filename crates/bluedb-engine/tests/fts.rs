@@ -81,6 +81,32 @@ async fn append_search_delete_and_compact() {
 }
 
 #[tokio::test]
+async fn search_ids_returns_id_score_pairs_excluding_deleted() {
+    let (schema, id_f, body_f) = schema();
+    let blob = new_blob("engine-fts-search-ids").await;
+    let index = FtsIndex::new(INDEX_ID, blob, schema, IdField(id_f), CompactionPolicy::default());
+    let fields = vec![body_f];
+
+    index.append([doc(id_f, "2", body_f, "alpha financial")]).await.unwrap();
+    index.append([doc(id_f, "5", body_f, "beta financial")]).await.unwrap();
+    index.append([doc(id_f, "7", body_f, "gamma weather")]).await.unwrap();
+
+    let hits = index.search_ids("financial", &fields, 10).await.unwrap();
+    let mut ids: Vec<&str> = hits.iter().map(|(id, _)| id.as_str()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec!["2", "5"], "only the 'financial' rows, by id");
+    for (_, score) in &hits {
+        assert!(*score > 0.0, "BM25 score must be positive");
+    }
+
+    // A deleted id is absent from search_ids.
+    index.delete(["2"]).await.unwrap();
+    let after = index.search_ids("financial", &fields, 10).await.unwrap();
+    let ids_after: Vec<&str> = after.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(ids_after, vec!["5"], "deleted '2' must not appear");
+}
+
+#[tokio::test]
 async fn same_id_update_through_the_engine_is_an_in_place_replace() {
     let (schema, id_f, body_f) = schema();
     let blob = new_blob("engine-fts-update").await;
