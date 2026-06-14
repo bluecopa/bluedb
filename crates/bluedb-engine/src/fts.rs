@@ -90,6 +90,12 @@ impl FtsIndex {
         &self.index_id
     }
 
+    /// The shared tantivy schema (so callers can resolve fields to build
+    /// [`TantivyDocument`]s for [`FtsIndex::append`]/[`FtsIndex::update`]).
+    pub fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
     // --- manifest / tombstones persistence -----------------------------------
 
     async fn load_manifest(&self) -> Result<Manifest> {

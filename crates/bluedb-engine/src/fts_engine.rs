@@ -31,25 +31,43 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use bluedb_fts::mapping::IndexMapping;
+use bluedb_fts::policy::CompactionPolicy;
+use bluedb_fts::IdField;
 use bluedb_rest::Param;
 use bluedb_sql::{CommitObserver, RowChange, SlateDbStorage};
+use bluedb_storage::{SlateDbBlobStore, Substrate};
 use gluesql_core::data::{Key, Value as GValue};
 use gluesql_core::prelude::{Glue, Payload};
 use gluesql_core::store::{DataRow, Store};
+use tantivy::schema::Field;
+use tantivy::TantivyDocument;
 
 use crate::error::{EngineError, Result};
-use crate::fts_sql::{extract_fts_predicate, rewrite_fts_query};
-use crate::live_segment::LiveSegment;
+use crate::fts::FtsIndex;
+use crate::fts_sql::{extract_fts_predicate, rewrite_fts_query, FtsHit, FtsPredicate, FtsSearcher};
+use crate::live_segment::{analyzer_for_config, translate_query, LiveSegment};
 use crate::rest_sql;
 
+/// Default result cap for the union search (mirrors `live_segment`'s
+/// `DEFAULT_LIMIT`; the over-fetch window sizing per Spec B §9 is refined later).
+const UNION_LIMIT: usize = 100;
+
 /// One declared fulltext index: the indexed text column, the table's integer
-/// primary-key column, the text column's ordinal in the schema'd row, and the
-/// live segment that holds its terms.
+/// primary-key column, the text column's ordinal in the schema'd row, the live
+/// segment that holds its terms, and (when the engine has a durable backing) the
+/// durable [`FtsIndex`] tier the live segment seals into.
 struct IndexDef {
     column: String,
     pk_column: String,
     column_ordinal: usize,
     segment: Arc<LiveSegment>,
+    /// The durable tier (object-storage splits). `None` for an in-memory-only
+    /// engine ([`FtsEngine::new`]); then the union searcher is live-only.
+    durable: Option<Arc<FtsIndex>>,
+    /// The durable index's `body` field (for [`FtsIndex::search_ids`]). Only
+    /// meaningful when `durable` is `Some`.
+    durable_body_field: Option<Field>,
 }
 
 /// Maintains in-memory FTS live segments in lock-step with SQL commits and
@@ -59,17 +77,36 @@ struct IndexDef {
 pub struct FtsEngine {
     /// `table` → its fulltext indexes.
     indexes: RwLock<HashMap<String, Vec<IndexDef>>>,
+    /// Optional durable backing. When `Some`, each fulltext index gets a durable
+    /// [`FtsIndex`] tier (object-storage splits over this blob store) that the
+    /// live segment seals into; the union searcher then merges live ∪ durable.
+    /// `None` = pure in-memory (the union is live-only) — the shape existing
+    /// `ryw.rs`/`fts_engine` tests use.
+    blob: Option<Arc<SlateDbBlobStore>>,
 }
 
 impl FtsEngine {
-    /// A fresh engine with no indexes. Returns an `Arc` so the same engine can be
-    /// installed as a [`CommitObserver`] on write connections and queried for
-    /// rewrites on read connections (the shared state that makes
-    /// read-your-writes work across connections).
+    /// A fresh in-memory-only engine with no indexes. Returns an `Arc` so the
+    /// same engine can be installed as a [`CommitObserver`] on write connections
+    /// and queried for rewrites on read connections (the shared state that makes
+    /// read-your-writes work across connections). No durable tier — the union
+    /// searcher is live-only.
     #[allow(clippy::new_without_default)]
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             indexes: RwLock::new(HashMap::new()),
+            blob: None,
+        })
+    }
+
+    /// A durable engine backed by `substrate` (the same object-storage substrate
+    /// as the SQL data — `Database::substrate()`). Each fulltext index declared
+    /// on this engine gets a durable [`FtsIndex`] tier; [`Self::seal`] folds the
+    /// live segment into it, and the union searcher merges live ∪ durable.
+    pub fn new_durable(substrate: Substrate) -> Arc<Self> {
+        Arc::new(Self {
+            indexes: RwLock::new(HashMap::new()),
+            blob: Some(Arc::new(SlateDbBlobStore::from_substrate(substrate))),
         })
     }
 
@@ -100,11 +137,42 @@ impl FtsEngine {
                 EngineError::Rejected(format!("no column {text_column} on {table}"))
             })?;
         let segment = Arc::new(LiveSegment::new(analyzer)?);
+
+        // When the engine is durable, build the durable tier: a STORED keyword
+        // `id` (the pk, as a string) + a `body` text field with the SAME analyzer
+        // as the live segment, so both tiers tokenize identically. The durable
+        // index_id is stable per index (`fts/{table}/{column}`), so a re-created
+        // FtsIndex over the same id reconnects to existing splits.
+        let (durable, durable_body_field) = if let Some(blob) = &self.blob {
+            let an = analyzer_for_config(analyzer);
+            let mapping = IndexMapping::new().keyword("id").text("body", an);
+            let schema = mapping.build_schema();
+            let id_field = schema
+                .get_field("id")
+                .map_err(|e| EngineError::Other(e.into()))?;
+            let body_field = schema
+                .get_field("body")
+                .map_err(|e| EngineError::Other(e.into()))?;
+            let index_id = format!("fts/{table}/{text_column}");
+            let index = Arc::new(FtsIndex::new(
+                index_id,
+                blob.clone(),
+                schema,
+                IdField(id_field),
+                CompactionPolicy::default(),
+            ));
+            (Some(index), Some(body_field))
+        } else {
+            (None, None)
+        };
+
         let def = IndexDef {
             column: text_column.to_string(),
             pk_column: pk_column.to_string(),
             column_ordinal: ordinal,
             segment,
+            durable,
+            durable_body_field,
         };
         self.indexes
             .write()
@@ -152,21 +220,27 @@ impl FtsEngine {
             .await
     }
 
-    /// Rewrite a `@@` query against the matching live segment. `Ok(None)` when
-    /// the SQL has no `@@`.
+    /// Rewrite a `@@` query against the matching index — the **union** of its
+    /// live segment and (if durable) its durable splits, with the live tier
+    /// authoritative for any pk it covers. `Ok(None)` when the SQL has no `@@`.
     pub async fn rewrite_for(&self, sql: &str) -> Result<Option<String>> {
         let Some(pred) = extract_fts_predicate(sql)? else {
             return Ok(None);
         };
-        // Clone the segment Arc + pk_column out of the read guard and drop the
-        // guard BEFORE the await (never hold a std RwLock guard across .await).
-        let (segment, pk_column) = {
+        // Snapshot the def's handles out of the read guard and drop the guard
+        // BEFORE any await (never hold a std RwLock guard across .await).
+        let (segment, durable, durable_body_field, pk_column) = {
             let idx = self.indexes.read().unwrap();
             match idx
                 .get(&pred.table)
                 .and_then(|v| v.iter().find(|d| d.column == pred.column))
             {
-                Some(def) => (def.segment.clone(), def.pk_column.clone()),
+                Some(def) => (
+                    def.segment.clone(),
+                    def.durable.clone(),
+                    def.durable_body_field,
+                    def.pk_column.clone(),
+                ),
                 None => {
                     return Err(EngineError::Rejected(format!(
                         "no fulltext index on {}.{}",
@@ -175,7 +249,9 @@ impl FtsEngine {
                 }
             }
         };
-        rewrite_fts_query(sql, &pk_column, &*segment).await
+
+        let merged = union_hits(&segment, durable.as_deref(), durable_body_field, &pred).await?;
+        rewrite_fts_query(sql, &pk_column, &PrecomputedSearcher { hits: merged }).await
     }
 
     /// Execute `sql`: rewrite `@@`/`ts_rank` against the live segment if present,
@@ -189,6 +265,126 @@ impl FtsEngine {
         let rewritten = self.rewrite_for(sql).await?;
         let final_sql = rewritten.as_deref().unwrap_or(sql);
         rest_sql::execute_sql(glue, final_sql, params, false).await
+    }
+
+    /// Fold every durable index's live segment into its durable tier, off the
+    /// commit path.
+    ///
+    /// For each fulltext index with a durable tier: drain the live segment's
+    /// `(pk, body)` docs + tombstone set ([`LiveSegment::drain_for_seal`]),
+    /// re-add the docs to the durable index ([`FtsIndex::update`], superseding any
+    /// prior durable copy), and tombstone the deleted pks ([`FtsIndex::delete`]).
+    /// After a seal the live segment is empty; subsequent `@@` reads of the
+    /// sealed pks come from the durable tier.
+    ///
+    /// The engine read lock is held ONLY to snapshot the `Arc` handles — the
+    /// async drain/update/delete run without it (never hold a std `RwLock` guard
+    /// across `.await`).
+    pub async fn seal(&self) -> Result<()> {
+        // Snapshot (segment, durable) for every durable index out of the lock.
+        let targets: Vec<(Arc<LiveSegment>, Arc<FtsIndex>)> = {
+            let idx = self.indexes.read().unwrap();
+            idx.values()
+                .flat_map(|defs| defs.iter())
+                .filter_map(|def| def.durable.clone().map(|d| (def.segment.clone(), d)))
+                .collect()
+        };
+
+        for (segment, durable) in targets {
+            let (docs, tombs) = segment.drain_for_seal()?;
+
+            // Re-add live docs (id = pk.to_string(), body), superseding any prior
+            // durable copy of that pk.
+            if !docs.is_empty() {
+                let old_ids: Vec<String> = docs.iter().map(|(pk, _)| pk.to_string()).collect();
+                let tantivy_docs: Vec<TantivyDocument> = docs
+                    .iter()
+                    .map(|(pk, body)| durable_doc(&durable, *pk, body))
+                    .collect::<Result<Vec<_>>>()?;
+                durable.update(old_ids, tantivy_docs).await?;
+            }
+
+            // Tombstone the deleted pks in the durable tier.
+            if !tombs.is_empty() {
+                let dead: Vec<String> = tombs.iter().map(|pk| pk.to_string()).collect();
+                durable.delete(dead).await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Build a durable [`TantivyDocument`] (`id` = `pk.to_string()`, `body`) for the
+/// durable index `durable`, resolving the `id`/`body` fields from its schema.
+fn durable_doc(durable: &FtsIndex, pk: i64, body: &str) -> Result<TantivyDocument> {
+    let schema = durable.schema();
+    let id_field = schema
+        .get_field("id")
+        .map_err(|e| EngineError::Other(e.into()))?;
+    let body_field = schema
+        .get_field("body")
+        .map_err(|e| EngineError::Other(e.into()))?;
+    let mut d = TantivyDocument::default();
+    d.add_text(id_field, pk.to_string());
+    d.add_text(body_field, body);
+    Ok(d)
+}
+
+/// The merged hits for `pred` across the live segment and (if present) the
+/// durable tier: live hits ∪ (durable hits whose pk the live segment does NOT
+/// cover), sorted by descending score and truncated to [`UNION_LIMIT`].
+///
+/// Both tiers parse the SAME translated query string (Task 2's `translate_query`
+/// emits explicit operators, so neither tier needs `set_conjunction_by_default`).
+/// The live segment is authoritative: any pk it covers (the latest version, or a
+/// tombstone) masks the corresponding durable hit, so a stale durable copy never
+/// surfaces. Because the covered-mask guarantees disjoint pks, no extra dedup is
+/// needed when merging.
+async fn union_hits(
+    segment: &LiveSegment,
+    durable: Option<&FtsIndex>,
+    durable_body_field: Option<Field>,
+    pred: &FtsPredicate,
+) -> Result<Vec<FtsHit>> {
+    // Live tier (already filters its own tombstones).
+    let mut hits = LiveSegment::search(segment, &pred.query, pred.kind, UNION_LIMIT)?;
+
+    // Durable tier, masked by the live segment's covered set.
+    if let (Some(durable), Some(body_field)) = (durable, durable_body_field) {
+        let translated = translate_query(&pred.query, pred.kind);
+        let covered = segment.covered();
+        let durable_hits = durable
+            .search_ids(&translated, &[body_field], UNION_LIMIT)
+            .await?;
+        for (id, score) in durable_hits {
+            // The durable id is the pk rendered as a decimal string.
+            let Ok(pk) = id.parse::<i64>() else { continue };
+            if covered.contains(&pk) {
+                continue; // live wins for this pk
+            }
+            hits.push(FtsHit { pk, score });
+        }
+    }
+
+    // Merge by descending score, then truncate. Disjoint pks (the covered-mask),
+    // so no dedup needed.
+    hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    hits.truncate(UNION_LIMIT);
+    Ok(hits)
+}
+
+/// A trivial [`FtsSearcher`] that returns a precomputed set of hits — the
+/// already-merged live ∪ durable union. Lets [`rewrite_fts_query`] (which takes
+/// `&impl FtsSearcher`) consume the union without changing its signature (the
+/// B1/B2c tests depend on that signature).
+struct PrecomputedSearcher {
+    hits: Vec<FtsHit>,
+}
+
+#[async_trait::async_trait]
+impl FtsSearcher for PrecomputedSearcher {
+    async fn search(&self, _predicate: &FtsPredicate) -> Result<Vec<FtsHit>> {
+        Ok(self.hits.clone())
     }
 }
 
