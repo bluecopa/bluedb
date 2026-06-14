@@ -80,6 +80,24 @@ fn one_line(s: &str) -> String {
     line.chars().take(90).collect()
 }
 
+/// Strip ANSI color escapes (sqllogictest colorizes its diffs).
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for n in chars.by_ref() {
+                if n == 'm' {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn collect(root: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
@@ -160,13 +178,21 @@ async fn main() -> anyhow::Result<()> {
                             if msg.contains("hashing") {
                                 wrong_hashed += 1;
                             }
-                            if wrong_examples.len() < 10 {
-                                let detail: String =
-                                    msg.lines().take(4).collect::<Vec<_>>().join(" | ");
+                            if wrong_examples.len() < 12 {
+                                // Capture the value diff (lines after "[Diff]"),
+                                // ANSI stripped, so we can see expected (-) vs
+                                // actual (+) and tell rendering from real bugs.
+                                let diff: String = strip_ansi(&msg)
+                                    .lines()
+                                    .skip_while(|l| !l.contains("[Diff]"))
+                                    .skip(1)
+                                    .take(6)
+                                    .collect::<Vec<_>>()
+                                    .join("  ");
                                 wrong_examples.push(format!(
                                     "{}\n      {}",
                                     one_line(&sql),
-                                    detail.chars().take(220).collect::<String>()
+                                    diff.chars().take(200).collect::<String>()
                                 ));
                             }
                         }
