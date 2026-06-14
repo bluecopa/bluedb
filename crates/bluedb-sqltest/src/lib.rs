@@ -30,6 +30,10 @@ pub struct GlueError(pub String);
 /// One sqllogictest "connection": a fresh in-memory SlateDB wrapped in GlueSQL.
 pub struct GlueTester {
     glue: Glue<SlateDbStorage>,
+    /// Session `default_null_order`: `None` = engine default (NULLs largest),
+    /// `Some(true)` = NULLS FIRST, `Some(false)` = NULLS LAST. Set by
+    /// `SET default_null_order = …` and applied to every subsequent `ORDER BY`.
+    nulls_first: Option<bool>,
 }
 
 impl GlueTester {
@@ -51,6 +55,7 @@ impl GlueTester {
             .map_err(|e| GlueError(format!("open slatedb: {e}")))?;
         Ok(Self {
             glue: Glue::new(SlateDbStorage::new(Arc::new(db))),
+            nulls_first: None,
         })
     }
 }
@@ -61,6 +66,13 @@ impl AsyncDB for GlueTester {
     type ColumnType = DefaultColumnType;
 
     async fn run(&mut self, sql: &str) -> Result<DBOutput<Self::ColumnType>, Self::Error> {
+        // `SET default_null_order = …` is session state GlueSQL doesn't model;
+        // capture it and apply it to ORDER BY ourselves (see below).
+        if let Some(nulls_first) = bluedb_sql::parse_default_null_order(sql) {
+            self.nulls_first = Some(nulls_first);
+            return Ok(DBOutput::StatementComplete(0));
+        }
+
         // Reject SQL GlueSQL would silently mis-execute (window functions) with
         // a clear error rather than returning wrong rows.
         if let Some(reason) = bluedb_sql::unsupported_reason(sql) {
@@ -74,6 +86,12 @@ impl AsyncDB for GlueTester {
         let sql = bluedb_sql::inline_ctes(sql);
         let sql = bluedb_sql::rewrite_set_ops(&sql);
         let sql = bluedb_sql::rewrite_multitable(&sql);
+        // Honor an active `default_null_order` by injecting `(key IS NULL)` sort
+        // keys (GlueSQL has no NULLS FIRST/LAST).
+        let sql = match self.nulls_first {
+            Some(nulls_first) => bluedb_sql::rewrite_null_order(&sql, nulls_first),
+            None => sql,
+        };
         let mut payloads = self
             .glue
             .execute(&sql)

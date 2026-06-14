@@ -55,6 +55,10 @@ between a numeric operand and a numeric string literal compares *numerically*
 - **Comma-joins** `FROM a, b WHERE a.x = b.y` — **only with an equi-join key** (rewritten to a hash join). See gotchas.
 - **Set operations** `UNION` / `UNION ALL` / `INTERSECT` / `EXCEPT` — **single-column branches only** (rewritten to joins/subqueries).
 - **Non-recursive CTEs** (`WITH c AS (…) SELECT … FROM c`) — inlined as derived tables.
+- **`SET default_null_order`** (`'nulls_first'` / `'nulls_last'`) — a session
+  setting GlueSQL lacks; honored by rewriting each `ORDER BY e` to
+  `ORDER BY (e IS NULL) [DESC], e`, which GlueSQL sorts natively. (GlueSQL's own
+  default is NULLs-largest: last when ascending, first when descending.)
 - Subqueries — `IN` / `NOT IN`, `EXISTS`, scalar subqueries, derived tables (`FROM (…) AS x`).
 - **Implicit text↔number coercion in comparisons** — `num_col = '5'`, `price < '9.99'`,
   `'1' = 1`. A comparison between a numeric operand and a *numeric string literal*
@@ -103,6 +107,9 @@ they will not be flagged at runtime, so know them:
   integer where other engines return a decimal/float.
 - **Default row order.** Without `ORDER BY`, rows come back in **storage-key
   (primary-key) order**, not insertion order.
+- **Default NULL ordering.** With `ORDER BY` but no `SET default_null_order`,
+  NULLs sort as the **largest** value (last ascending, first descending). Set
+  `default_null_order` to choose explicitly.
 - **Set-op / comma-join rewrites are not order-preserving.** The correct *rows*
   are returned, but not necessarily in source order — add `ORDER BY` if order
   matters.
