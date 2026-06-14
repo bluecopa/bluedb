@@ -4,7 +4,7 @@
 //! bluedb's serialized writer and committed as one atomic SlateDB
 //! [`WriteBatch`](slatedb::WriteBatch), reusing the lease + epoch fencing +
 //! durable-before-ack that the rest of bluedb already provides. See
-//! `docs/superpowers/specs/2026-06-14-bluedb-ledger-design.md`.
+//! `docs/superpowers/specs/2026-06-14-bluedb-ledger-tigerbeetle-parity.md`.
 
 mod keyspace;
 mod ledger;

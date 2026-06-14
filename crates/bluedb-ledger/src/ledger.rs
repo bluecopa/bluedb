@@ -185,15 +185,12 @@ impl Ledger {
         Ok(results)
     }
 
-    /// Apply one plain posted transfer into `state`. Returns `Err(code)` on the
-    /// first failing TigerBeetle check (account resolution → ledger agreement →
-    /// overflow → balance constraint). On success the debit/credit accounts are
-    /// folded into `state` (not yet persisted).
-    async fn stage_regular(
-        &self,
-        t: &Transfer,
-        state: &mut ApplyState,
-    ) -> Result<std::result::Result<(), CreateTransferResult>> {
+    /// Apply one plain posted transfer into `state`. The outer `Result` is I/O;
+    /// the inner [`StageOutcome`] is the per-item validation result — `Err(code)`
+    /// on the first failing TigerBeetle check (account resolution → ledger
+    /// agreement → overflow → balance constraint). On success the debit/credit
+    /// accounts are folded into `state` (not yet persisted).
+    async fn stage_regular(&self, t: &Transfer, state: &mut ApplyState) -> Result<StageOutcome> {
         use CreateTransferResult as R;
 
         // 39 / 40: account resolution.
@@ -223,6 +220,8 @@ impl Ledger {
             None => return Ok(Err(R::OverflowsCreditsPosted)),
         };
         // 64 / 65: total (pending + posted) overflow on each constrained side.
+        // These also guard the unchecked `posted + pending` in the balance checks
+        // below, making those adds panic-free.
         if debit.debits_pending.checked_add(debit.debits_posted).is_none() {
             return Ok(Err(R::OverflowsDebits));
         }
@@ -287,10 +286,15 @@ impl TimestampSource {
     }
 
     fn next(&mut self) -> u64 {
-        self.last = now_ns().max(self.last + 1);
+        self.last = now_ns().max(self.last.saturating_add(1));
         self.last
     }
 }
+
+/// The per-item validation result of staging one transfer: `Ok(())` accepted,
+/// `Err(code)` rejected with a TigerBeetle result code. Distinct from the I/O
+/// `anyhow::Result` that wraps it.
+type StageOutcome = std::result::Result<(), CreateTransferResult>;
 
 /// Mutable state threaded through one `create_transfers` apply: the read-through
 /// working set of touched accounts and the ids of accounts actually mutated
@@ -644,11 +648,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_credits_do_not_grant_debit_headroom() {
-        // TigerBeetle's asymmetry for DEBITS_MUST_NOT_EXCEED_CREDITS: the limit is
-        // credits_POSTED only. We can't create pending credits in Phase A (gated),
-        // so assert the formula directly: with zero credits_posted, any posted
-        // debit on the constrained account is rejected.
+    async fn debits_limited_to_posted_credits_boundary() {
+        // DEBITS_MUST_NOT_EXCEED_CREDITS limit is credits_POSTED. Establish real
+        // posted credits, then prove the boundary: a debit of exactly
+        // credits_posted is allowed, one unit over is ExceedsCredits.
         use CreateTransferResult as R;
         let db = writer_database().await;
         let l = Ledger::new(&db);
@@ -658,6 +661,54 @@ mod tests {
         ])
         .await
         .unwrap();
-        assert_eq!(l.create_transfers(&[xfer(11, 1, 2, 1)]).await.unwrap(), vec![R::ExceedsCredits]);
+        // Give account 1 credits_posted = 100 (2 → 1).
+        assert_eq!(l.create_transfers(&[xfer(1, 2, 1, 100)]).await.unwrap(), vec![R::Created]);
+        // Debit exactly to the ceiling succeeds.
+        assert_eq!(l.create_transfers(&[xfer(2, 1, 2, 100)]).await.unwrap(), vec![R::Created]);
+        // One unit over is rejected; no mutation.
+        assert_eq!(l.create_transfers(&[xfer(3, 1, 2, 1)]).await.unwrap(), vec![R::ExceedsCredits]);
+        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_posted, 100);
+    }
+
+    #[tokio::test]
+    async fn credit_side_posted_overflow_is_rejected() {
+        use CreateTransferResult as R;
+        let db = writer_database().await;
+        let l = Ledger::new(&db);
+        setup_two_accounts(&l).await;
+        // Seed credits_posted on account 2, then overflow it from a third account.
+        l.create_accounts(&[acct(3, 7)]).await.unwrap();
+        l.create_transfers(&[xfer(1, 1, 2, 10)]).await.unwrap(); // account 2 credits_posted = 10
+        let r = l.create_transfers(&[xfer(2, 3, 2, u128::MAX)]).await.unwrap();
+        assert_eq!(r, vec![R::OverflowsCreditsPosted]);
+        assert_eq!(l.lookup_account(2).await.unwrap().unwrap().credits_posted, 10);
+        assert!(l.lookup_transfer(2).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn watermark_is_durable_across_reopen() {
+        use std::sync::Arc;
+        use slatedb::object_store::memory::InMemory;
+        use slatedb::Db;
+
+        // Same object store, two separate Db opens — the timestamp watermark must
+        // survive a restart so timestamps stay strictly monotonic across it.
+        let store = Arc::new(InMemory::new());
+        let ts_before;
+        {
+            let db = Arc::new(Db::open("ledger-reopen", store.clone()).await.unwrap());
+            let database = Database::new(db);
+            let l = Ledger::new(&database);
+            l.create_accounts(&[acct(1, 7)]).await.unwrap();
+            ts_before = l.lookup_account(1).await.unwrap().unwrap().timestamp;
+            database.flush().await.unwrap(); // durable before we drop it
+        }
+        let db2 = Arc::new(Db::open("ledger-reopen", store.clone()).await.unwrap());
+        let database2 = Database::new(db2);
+        let l2 = Ledger::new(&database2);
+        assert_eq!(l2.lookup_account(1).await.unwrap().unwrap().timestamp, ts_before, "record survived reopen");
+        l2.create_accounts(&[acct(2, 7)]).await.unwrap();
+        let ts_after = l2.lookup_account(2).await.unwrap().unwrap().timestamp;
+        assert!(ts_after > ts_before, "watermark survived reopen → still monotonic");
     }
 }
