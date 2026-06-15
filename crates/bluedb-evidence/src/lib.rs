@@ -8,6 +8,7 @@ mod graph;
 mod keyspace;
 mod merkle;
 mod model;
+mod proof;
 mod store;
 mod traverse;
 pub mod chain;

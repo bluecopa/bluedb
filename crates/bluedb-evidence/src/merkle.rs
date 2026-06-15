@@ -63,7 +63,7 @@ pub(crate) fn leaf_hash(etype: &str, payload: &[u8], at: &str, edges: &[EdgeDelt
 }
 
 /// Largest power of two strictly less than `n`. Requires `n >= 2`.
-fn largest_pow2_lt(n: usize) -> usize {
+pub(crate) fn largest_pow2_lt(n: usize) -> usize {
     debug_assert!(n >= 2);
     let mut k = 1;
     while k << 1 < n {
@@ -73,7 +73,10 @@ fn largest_pow2_lt(n: usize) -> usize {
 }
 
 /// RFC 6962 Merkle Tree Hash over a slice of leaf hashes (the from-scratch
-/// reference; O(N)). Empty → `empty_root`; single → that leaf.
+/// reference; O(N)). Empty → `empty_root`; single → that leaf. Kept as the
+/// in-crate test reference for the storage-backed proofs (test-only since the
+/// production proof path now assembles from persisted nodes).
+#[cfg(test)]
 pub(crate) fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
     match leaves.len() {
         0 => empty_root(),
@@ -112,6 +115,9 @@ impl crate::model::Frontier {
     /// Fold one new leaf into the frontier (RFC 6962 incremental append): push
     /// it as a height-0 peak, then carry-merge equal-height peaks. The number of
     /// merges equals the count of trailing 1-bits in the old size. O(log N).
+    /// Delegates to [`push_emit`]; kept for the in-crate frontier tests (the
+    /// append path uses `push_emit` directly to persist the merged nodes).
+    #[cfg(test)]
     pub(crate) fn push(&mut self, leaf: [u8; 32]) {
         let _ = self.push_emit(leaf);
     }
@@ -134,7 +140,9 @@ impl crate::model::Frontier {
 
 /// RFC 6962 inclusion proof (PATH(m, D[n])) for the 0-based `index` into
 /// `leaves`. The audit path lists sibling subtree roots bottom-up. O(N).
-/// Panics if `index >= leaves.len()`.
+/// Panics if `index >= leaves.len()`. Test-only reference for the storage-backed
+/// `proof::inclusion`.
+#[cfg(test)]
 pub(crate) fn inclusion_proof(leaves: &[[u8; 32]], index: usize) -> Vec<[u8; 32]> {
     let n = leaves.len();
     assert!(index < n, "inclusion index out of range");
@@ -156,6 +164,8 @@ pub(crate) fn inclusion_proof(leaves: &[[u8; 32]], index: usize) -> Vec<[u8; 32]
 /// RFC 6962 consistency proof that the tree at size `first` is a prefix of the
 /// tree formed by all of `leaves` (size = `leaves.len()`). `first` is a leaf
 /// count, `1 <= first <= leaves.len()`. O(N). `first == 0` → empty proof.
+/// Test-only reference for the storage-backed `proof::consistency`.
+#[cfg(test)]
 pub(crate) fn consistency_proof(leaves: &[[u8; 32]], first: usize) -> Vec<[u8; 32]> {
     if first == 0 {
         return Vec::new();
@@ -163,6 +173,7 @@ pub(crate) fn consistency_proof(leaves: &[[u8; 32]], first: usize) -> Vec<[u8; 3
     subproof(first, leaves, true)
 }
 
+#[cfg(test)]
 fn subproof(m: usize, leaves: &[[u8; 32]], b: bool) -> Vec<[u8; 32]> {
     let n = leaves.len();
     if m == n {

@@ -255,7 +255,7 @@ impl Evidence {
                 .unwrap_or_default();
             for lh in leaves {
                 for (level, index, hash) in frontier.push_emit(lh) {
-                    batch.put(self.keyspace.merkle_node_key(chain, level, index), &hash);
+                    batch.put(self.keyspace.merkle_node_key(chain, level, index), hash);
                 }
             }
             batch.put(self.keyspace.merkle_key(chain), &store::encode(&frontier)?);
@@ -349,27 +349,6 @@ impl Evidence {
         }
     }
 
-    /// Read the dense leaf hashes for seqs `1..=upto` on a verified chain.
-    /// Errors if a slot is missing or lacks a `leaf_hash` (would indicate a
-    /// non-verified or corrupted chain).
-    async fn leaf_hashes(&self, chain: &str, upto: i64) -> Result<Vec<[u8; 32]>, EvidenceError> {
-        let rows = self.read_range(chain, 1, upto).await?;
-        if rows.len() as i64 != upto {
-            return Err(Self::storage_err(format!(
-                "expected {upto} dense entries for proof, found {}",
-                rows.len()
-            )));
-        }
-        let mut out = Vec::with_capacity(rows.len());
-        for (seq, rec) in rows {
-            let lh = rec
-                .leaf_hash
-                .ok_or_else(|| Self::storage_err(format!("entry {seq} has no leaf_hash")))?;
-            out.push(lh);
-        }
-        Ok(out)
-    }
-
     /// Merkle digest `{ size, root }` for a verified chain. O(log N) — folds the
     /// persisted frontier. Empty/never-appended verified chain → size 0,
     /// `empty_root`.
@@ -382,7 +361,7 @@ impl Evidence {
     }
 
     /// Inclusion proof for `seq` (1-based) against tree size `size` (defaults to
-    /// `head`). O(N) — reads leaf hashes for `1..=size`.
+    /// `head`). O(log N) — assembled from persisted complete-subtree nodes.
     pub async fn inclusion(
         &self,
         chain: &str,
@@ -402,13 +381,19 @@ impl Evidence {
                 "seq {seq} out of range (size={size})"
             )));
         }
-        let leaves = self.leaf_hashes(chain, size).await?;
-        let audit_path = crate::merkle::inclusion_proof(&leaves, (seq - 1) as usize);
+        let audit_path = crate::proof::inclusion(
+            &self.substrate,
+            &self.keyspace,
+            chain,
+            (seq - 1) as u64,
+            size as u64,
+        )
+        .await?;
         Ok(InclusionProof { seq, size, audit_path })
     }
 
     /// Consistency proof between sizes `first` and `second` (second defaults to
-    /// `head`). O(N).
+    /// `head`). O(log N) — assembled from persisted complete-subtree nodes.
     pub async fn consistency(
         &self,
         chain: &str,
@@ -423,8 +408,14 @@ impl Evidence {
                 "require 1 <= first <= second <= head ({first}, {second}, head={head})"
             )));
         }
-        let leaves = self.leaf_hashes(chain, second).await?;
-        let proof = crate::merkle::consistency_proof(&leaves, first as usize);
+        let proof = crate::proof::consistency(
+            &self.substrate,
+            &self.keyspace,
+            chain,
+            first as u64,
+            second as u64,
+        )
+        .await?;
         Ok(ConsistencyProof { first, second, proof })
     }
 
