@@ -1,13 +1,20 @@
 //! Read-only graph traversal over the `out`/`in` adjacency indexes (Plan 3).
 //! A node's edges are a bounded prefix range scan with the weight folded
 //! order-preserving into the key. No write lease — works on a read replica.
-//! v1 caveat: there is no cross-scan snapshot, so a traversal sees read-committed
-//! state across its scans; output is sorted (`reachable`) / maximin-unique
-//! (`widest_path`), so it is deterministic for a fixed graph.
+//!
+//! Every traversal reads through a single pinned [`ReadView`] (see
+//! [`bluedb_storage::Substrate::read_view`]). On the writer that is a true MVCC
+//! snapshot, so all of a traversal's scans — including the concurrent
+//! per-node scans of one BFS level — observe one consistent cut: an edge
+//! written (as an atomic 3-key batch) after the view is pinned is invisible,
+//! and one written before is fully visible. On a replica the view is the live
+//! reader (consistent within a scan, may advance between scans). Output is
+//! sorted (`reachable`) / maximin-unique (`widest_path`), so it is
+//! deterministic for a fixed cut.
 
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
-use bluedb_storage::Substrate;
+use bluedb_storage::ReadView;
 
 use crate::error::EvidenceError;
 use crate::keyspace::{weight_from_obe, EvidenceKeyspace};
@@ -16,14 +23,14 @@ use crate::keyspace::{weight_from_obe, EvidenceKeyspace};
 /// edges with `weight >= floor`. `prefix` is an out/in adjacency scan prefix;
 /// the bytes after it are `weight_obe(8) ‖ neighbor_lp ‖ type_lp`.
 async fn scan_adjacency(
-    substrate: &Substrate,
+    view: &ReadView,
     prefix: &[u8],
     floor: i64,
 ) -> Result<Vec<(String, i64, String)>, EvidenceError> {
     let mut start = prefix.to_vec();
     start.extend_from_slice(&crate::keyspace::weight_obe(floor));
     let end = bluedb_sql::prefix_upper_bound(prefix);
-    let mut iter = substrate.scan_range(&start, end.as_deref()).await?;
+    let mut iter = view.scan_range(&start, end.as_deref()).await?;
     let mut out = Vec::new();
     let plen = prefix.len();
     while let Some(kv) = iter.next().await.map_err(|e| EvidenceError::Storage(anyhow::anyhow!("{e}")))? {
@@ -60,24 +67,24 @@ fn read_lp(buf: &[u8], pos: &mut usize) -> Result<String, EvidenceError> {
 
 /// Out-neighbors `(dst, weight, type)` of `src` with `weight >= floor`, ascending.
 pub(crate) async fn out_neighbors(
-    substrate: &Substrate,
+    view: &ReadView,
     ks: &EvidenceKeyspace,
     graph: &str,
     src: &str,
     floor: i64,
 ) -> Result<Vec<(String, i64, String)>, EvidenceError> {
-    scan_adjacency(substrate, &ks.graph_out_prefix(graph, src), floor).await
+    scan_adjacency(view, &ks.graph_out_prefix(graph, src), floor).await
 }
 
 /// In-neighbors `(src, weight, type)` of `dst` with `weight >= floor`, ascending.
 pub(crate) async fn in_neighbors(
-    substrate: &Substrate,
+    view: &ReadView,
     ks: &EvidenceKeyspace,
     graph: &str,
     dst: &str,
     floor: i64,
 ) -> Result<Vec<(String, i64, String)>, EvidenceError> {
-    scan_adjacency(substrate, &ks.graph_in_prefix(graph, dst), floor).await
+    scan_adjacency(view, &ks.graph_in_prefix(graph, dst), floor).await
 }
 
 /// Concurrency cap for level expansion (in-flight neighbor scans).
@@ -88,7 +95,7 @@ const REACHABLE_FANOUT: usize = 16;
 /// discovered neighbor ids (with duplicates; the caller dedups). Order is
 /// unspecified — the caller sorts, so the final result is deterministic.
 async fn expand_level(
-    substrate: &Substrate,
+    view: &ReadView,
     ks: &EvidenceKeyspace,
     graph: &str,
     nodes: &[String],
@@ -99,18 +106,20 @@ async fn expand_level(
     let mut iter = nodes.iter();
 
     let spawn_one = |set: &mut tokio::task::JoinSet<Result<Vec<String>, EvidenceError>>, node: &str| {
-        let sub = substrate.clone();
+        // Each task clones the pinned view (an Arc bump); every clone shares the
+        // same snapshot seq, so the whole level reads one consistent cut.
+        let view = view.clone();
         let ks = ks.clone();
         let g = graph.to_string();
         let n = node.to_string();
         set.spawn(async move {
-            let mut ns: Vec<String> = out_neighbors(&sub, &ks, &g, &n, floor)
+            let mut ns: Vec<String> = out_neighbors(&view, &ks, &g, &n, floor)
                 .await?
                 .into_iter()
                 .map(|(v, _, _)| v)
                 .collect();
             if !directed {
-                ns.extend(in_neighbors(&sub, &ks, &g, &n, floor).await?.into_iter().map(|(v, _, _)| v));
+                ns.extend(in_neighbors(&view, &ks, &g, &n, floor).await?.into_iter().map(|(v, _, _)| v));
             }
             Ok(ns)
         });
@@ -141,7 +150,7 @@ async fn expand_level(
 /// concurrently (bounded fan-out); the `visited` set keeps the result
 /// identical and deterministic regardless of completion order.
 pub(crate) async fn reachable(
-    substrate: &Substrate,
+    view: &ReadView,
     ks: &EvidenceKeyspace,
     graph: &str,
     from: &[String],
@@ -156,7 +165,7 @@ pub(crate) async fn reachable(
         }
     }
     while !frontier.is_empty() {
-        let neighbors = expand_level(substrate, ks, graph, &frontier, floor, directed).await?;
+        let neighbors = expand_level(view, ks, graph, &frontier, floor, directed).await?;
         let mut next: Vec<String> = Vec::new();
         for v in neighbors {
             if visited.insert(v.clone()) {
@@ -181,7 +190,7 @@ pub struct WidestPath {
 
 /// Max-bottleneck path from `from` to `to` (maximin Dijkstra with a max-heap).
 pub(crate) async fn widest_path(
-    substrate: &Substrate,
+    view: &ReadView,
     ks: &EvidenceKeyspace,
     graph: &str,
     from: &str,
@@ -205,9 +214,9 @@ pub(crate) async fn widest_path(
         if u == to {
             return Ok(WidestPath { connected: true, bottleneck: Some(bw) });
         }
-        let mut edges = out_neighbors(substrate, ks, graph, &u, i64::MIN).await?;
+        let mut edges = out_neighbors(view, ks, graph, &u, i64::MIN).await?;
         if !directed {
-            edges.extend(in_neighbors(substrate, ks, graph, &u, i64::MIN).await?);
+            edges.extend(in_neighbors(view, ks, graph, &u, i64::MIN).await?);
         }
         for (v, w, _t) in edges {
             let nb = bw.min(w);
@@ -244,23 +253,56 @@ mod tests {
             EdgeUpsert { src: "A".into(), dst: "C".into(), weight: 5, etype: String::new() },
         ], Merge::Set).await.unwrap();
 
-        let substrate = database.substrate();
+        let view = database.substrate().read_view().await.unwrap();
         let ks = EvidenceKeyspace::new("_");
-        let all = out_neighbors(&substrate, &ks, "g", "A", i64::MIN).await.unwrap();
+        let all = out_neighbors(&view, &ks, "g", "A", i64::MIN).await.unwrap();
         assert_eq!(all, vec![
             ("B".to_string(), 2, "x".to_string()),
             ("C".to_string(), 5, "".to_string()),
             ("B".to_string(), 9, "y".to_string()),
         ]);
-        let hi = out_neighbors(&substrate, &ks, "g", "A", 5).await.unwrap();
+        let hi = out_neighbors(&view, &ks, "g", "A", 5).await.unwrap();
         assert_eq!(hi, vec![
             ("C".to_string(), 5, "".to_string()),
             ("B".to_string(), 9, "y".to_string()),
         ]);
-        let inb = in_neighbors(&substrate, &ks, "g", "B", i64::MIN).await.unwrap();
+        let inb = in_neighbors(&view, &ks, "g", "B", i64::MIN).await.unwrap();
         assert_eq!(inb, vec![
             ("A".to_string(), 2, "x".to_string()),
             ("A".to_string(), 9, "y".to_string()),
         ]);
+    }
+
+    /// A `ReadView` pinned before a write must not observe that write across any
+    /// of the traversal's scans — the snapshot-isolation guarantee Phase 2 adds.
+    /// We pin the view, then extend the graph (A→B already exists; add B→C), and
+    /// run `reachable` through the *pinned* view: it must see {A, B} (the cut at
+    /// pin time), never C. A fresh view taken after the write sees {A, B, C}.
+    #[tokio::test]
+    async fn pinned_view_is_isolated_from_later_writes() {
+        let database = db().await;
+        let g = Graph::new(&database, "_");
+        let ks = EvidenceKeyspace::new("_");
+        g.upsert("g", &[
+            EdgeUpsert { src: "A".into(), dst: "B".into(), weight: 1, etype: String::new() },
+        ], Merge::Set).await.unwrap();
+
+        // Pin the cut: {A→B}.
+        let pinned = database.substrate().read_view().await.unwrap();
+        assert!(pinned.snapshot_seq().is_some(), "writer view must be a true snapshot");
+
+        // Mutate after pinning.
+        g.upsert("g", &[
+            EdgeUpsert { src: "B".into(), dst: "C".into(), weight: 1, etype: String::new() },
+        ], Merge::Set).await.unwrap();
+
+        // The pinned view never sees B→C, so C is unreachable through it.
+        let seen = reachable(&pinned, &ks, "g", &["A".to_string()], i64::MIN, true).await.unwrap();
+        assert_eq!(seen, vec!["A".to_string(), "B".to_string()]);
+
+        // A fresh view (taken now) sees the new edge.
+        let fresh = database.substrate().read_view().await.unwrap();
+        let seen_now = reachable(&fresh, &ks, "g", &["A".to_string()], i64::MIN, true).await.unwrap();
+        assert_eq!(seen_now, vec!["A".to_string(), "B".to_string(), "C".to_string()]);
     }
 }
