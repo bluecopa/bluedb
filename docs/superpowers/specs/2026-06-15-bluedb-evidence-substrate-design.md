@@ -3,7 +3,7 @@
 **Status:** approved design (spec), pre-implementation. Not a task plan.
 **Date:** 2026-06-15.
 **Audience:** a coding agent implementing this in the bluedb repo.
-**Source requirements:** `fx-runtime/docs/plans/2026-06-15-bluedb-evidence-substrate-requirements.md` (R1–R8, M1–M4). This spec realizes those requirements **and deliberately extends them** in two places (cryptographic verification + erasure) — both flagged below as intentional decisions, not over-reach.
+**Source requirements:** `fx-runtime/docs/plans/2026-06-15-bluedb-evidence-substrate-requirements.md` (R1–R8, M1–M4). This spec realizes those requirements **and deliberately extends them** in three places (cryptographic verification, erasure, and a native graph store) — all flagged below as intentional decisions, not over-reach.
 
 ---
 
@@ -14,7 +14,7 @@ Add a new native subsystem, the crate **`bluedb-evidence`**, that turns bluedb i
 - an **append-only, densely-sequenced, byte-exact event log** ("evidence chain"), per `(tenant, chain)`;
 - **cryptographic verifiability** of that chain (RFC 6962 Merkle tree: digest + inclusion + consistency proofs) — *irrepudiability*;
 - a per-chain **`verified` mode** and **redaction-in-place**, so the same substrate also serves *repudiability* and **GDPR/CCPA right-to-erasure**;
-- a native **graph traversal** primitive (`reachable`, `widest_path`) over the consumer's projection tables, replacing the SQL engine's missing `WITH RECURSIVE`;
+- a native **graph store + traversal** — adjacency-indexed weighted edges (HelixDB-style out/in edge indexes) with `reachable` and `widest_path`, replacing the SQL engine's missing `WITH RECURSIVE`;
 - **as-of scratch** namespacing for horizon/as-of replay;
 - a native **axum HTTP surface** for all of the above, tenant-scoped.
 
@@ -22,19 +22,20 @@ It mirrors the **`bluedb-ledger`** subsystem's shape: native records via postcar
 
 ## 2. Relationship to the requirements doc — honored vs. deliberately extended
 
-**Honored as written:** R1 dense server-assigned seq; R2 ordered/horizon/paged reads; R3 byte-exact opaque payloads; R4 native traversal; R5 as-of scratch (SHOULD); R6 determinism; R7 native HTTP; R8 tenancy.
+**Honored as written:** R1 dense server-assigned seq; R2 ordered/horizon/paged reads; R3 byte-exact opaque payloads; R4 native traversal semantics (`reachable`/`widest_path`, weighted, deterministic — but over a native graph store, see extension 3); R5 as-of scratch (SHOULD); R6 determinism; R7 native HTTP; R8 tenancy.
 
 **Deliberately extended (explicit user decisions, 2026-06-15):**
 
 1. **Cryptographic verification in bluedb** — the requirements §5 said "no hashing in bluedb" and R3 put hashing entirely in the consumer. We **override** that: bluedb maintains an RFC 6962 Merkle tree over entries and serves digest/inclusion/consistency proofs. Byte-exactness is preserved — bluedb hashes a *length-framed copy* of the exact bytes and never alters what is stored or returned. The consumer's own content hashing (if any) still works, independently.
 2. **Erasure / deletion** — the requirements §5 said "no event mutation or deletion APIs." We **override** that with **redaction-in-place** (below): a payload can be erased while the seq slot and (on verified chains) the entry's leaf hash are retained, so dense sequencing, replay determinism, and proofs all survive.
+3. **Native graph store** — R4 described traversal as reading the *consumer's* projection rows via a full row-scan. We **override** that: `bluedb-evidence` owns an **adjacency-indexed edge store** (out-edge + in-edge indexes keyed by source/target node, HelixDB-style), so neighbor lookup is a bounded prefix range scan, not an O(E) table scan. The consumer writes edges through a native edges API (or folds the log into it); traversal walks only the subgraph it touches. This trades R4's "traverse any table" for real traversal performance (§8).
 
-These two are the whole reason the primitive is more than "an append log": it is an *irrepudiable-by-default, erasure-capable* evidence chain.
+These three are the whole reason the primitive is more than "an append log": it is an *irrepudiable-by-default, erasure-capable* evidence chain with a *traversable* graph beside it.
 
 ## 3. Scope
 
 - **M1 — Evidence chain core + Merkle** (R1, R2, R3, R6, R8 + HTTP slice): append, reads, per-chain mode, redaction, the Merkle tree and proof endpoints.
-- **M2 — Graph traversal** (R4): `reachable`, `widest_path`.
+- **M2 — Native graph store + traversal** (R4): adjacency-indexed edges (edges API), `reachable`, `widest_path`.
 - **M3 — As-of scratch** (R5).
 - **M4 — out of scope** (absorbing domain semantics). Do not start.
 
@@ -59,8 +60,8 @@ New crate **`bluedb-evidence`** with focused modules:
 |---|---|
 | `chain` | append, reads, per-chain seq counter, idempotency, per-chain mode, redaction (R1, R2, R3, R6) |
 | `merkle` | RFC 6962 leaf/node hashing, incremental frontier, digest, inclusion + consistency proofs |
-| `graph` | `reachable`, `widest_path` over projection tables (R4) |
-| `scratch` | as-of table-name-prefix namespacing (R5) |
+| `graph` | native adjacency store (out/in edge indexes), edges API, `reachable`, `widest_path` (R4) |
+| `scratch` | as-of name-prefix namespacing for chains/graphs/tables (R5) |
 | `keyspace` | evidence key encoding (mirrors `bluedb-ledger/src/keyspace.rs`) |
 | `store` | postcard encode/decode + point/range reads (mirrors `bluedb-ledger/src/store.rs`) |
 
@@ -178,25 +179,58 @@ Persist the `Frontier` — the ≤ log N **perfect-subtree roots ("peaks")** cov
 
 A digest from the same server is not proof against a **malicious operator** by itself. Full irrepudiability requires the consumer to **externally anchor digests** (periodically record a `{size, root_hash}` elsewhere) and/or bluedb to **sign** digests. v1 ships **unsigned digests + anchoring guidance**; **digest signing is an opt-in documented extension** (server keypair, signed `{size, root_hash, ts?}`), not in v1 unless requested.
 
-## 8. Component — graph traversal (R4)
+## 8. Component — native graph store + traversal (R4)
 
-A read-only compute primitive over the consumer's own projection tables. It **bypasses the SQL query-guardrail** (it needs a full edge scan, which the guardrail rejects — this is exactly why R4 is native, not SQL). All edge/node rows are read through the internal row-scan (`scan_data`/`collect_rows`, `crates/bluedb-sql/src/storage.rs:520`) under **one snapshot** for determinism, via the tenant's connection.
+`bluedb-evidence` **owns the edges** (it does not scan a consumer SQL table). A **graph** is a first-class object per `(tenant, graph)`: a set of directed, weighted, optionally-typed edges with **adjacency indexes** so neighbor lookup is a bounded prefix range scan — the HelixDB model (separate `out_edges`/`in_edges` keyed by node), realized on SlateDB's ordered keyspace.
 
-Inputs: `{ edges_table, src_col, dst_col, weight_col, nodes_table?, node_col? }`. Node ids are `TEXT`; weights are 64-bit `INTEGER`. If `nodes_table` is omitted, the node set is the union of `src`/`dst` values.
+### 8.1 Edge model
 
-- **`reachable(from_set, floor, directed)` → sorted `[node_id]`:** label propagation with a monotonic worklist; only edges with `weight ≥ floor`; for parallel edges, any qualifying edge suffices; undirected = each stored edge usable both ways. Terminates on cyclic graphs (visited set).
-- **`widest_path(from, to, directed)` → `{ connected, bottleneck? }`:** maximin via a max-bottleneck Dijkstra; parallel edges combine by **max** weight; `bottleneck` absent when `connected:false`; **no path is not an error**. The maximin value is unique → order-independent, deterministic.
+An edge is `(src: TEXT, dst: TEXT, weight: i64, type: TEXT = "")`. Edge **identity** is `(graph, src, dst, type)` — at most one weight per identity (a re-upsert updates it). Parallel edges between the same ordered pair are modeled with distinct `type` values; for an untyped graph, `(src, dst)` is unique and a re-upsert combines by the chosen `merge` mode (honoring R4's "parallel edges combine by max"). Node ids are `TEXT`; weights are 64-bit `INTEGER`.
 
-v1 holds the working graph in memory (O(edges + nodes)); acceptable because traversal is tenant/scratch-scoped. Noted as a future bound.
+### 8.2 Keyspace & tags
 
-## 9. Component — as-of scratch (R5) — ⚠ table-name-prefix model
+Continuing the evidence tags (chains used `0x17–0x1B`):
 
-The requirements imagined a `scratch_id`-scoped key-prefix passed to ops. With no per-request multi-tenant routing for arbitrary SQL writes, v1 implements scratch as a **reserved table-name prefix** (this is the §7-q3 confirmation, signed off):
+| Tag | Const | Key suffix (after tenant+tag) | Value |
+|---|---|---|---|
+| `0x1C` | `TAG_GRAPH_EDGE` | `len(graph)‖graph ‖ len(src)‖src ‖ len(dst)‖dst ‖ len(type)‖type` | `weight::i64-obe` (canonical edge, for upsert/delete) |
+| `0x1D` | `TAG_GRAPH_OUT` | `len(graph)‖graph ‖ len(src)‖src ‖ weight::i64-obe ‖ len(dst)‖dst ‖ len(type)‖type` | empty |
+| `0x1E` | `TAG_GRAPH_IN` | `len(graph)‖graph ‖ len(dst)‖dst ‖ weight::i64-obe ‖ len(src)‖src ‖ len(type)‖type` | empty |
+
+`i64-obe` = order-preserving big-endian: `((w ^ i64::MIN) as u64).to_be_bytes()`, so signed weights sort numerically. Node ids are length-prefixed so a `src` prefix range is unambiguous (`"ab"` never matches `"abc"`). The `out` index orders a node's edges by **weight ascending** → `reachable(floor)` is a range scan from `weight = floor`, and `widest_path` best-first is the same index iterated in reverse.
+
+### 8.3 Edges API (the consumer writes edges)
+
+- **upsert** — `PUT /graph/{graph}/edges` `{ edges: [{src, dst, weight, type?}], merge?: "set"|"max" }` (default `"set"`). For each edge, in one `WriteBatch`: read the canonical `(graph,src,dst,type)`; if it exists, **delete its old `out`/`in` entries** (old weight) before writing the new canonical + `out` + `in`. `merge:"max"` keeps `max(old, new)`. Atomic, durable-before-ack.
+- **delete** — `DELETE /graph/{graph}/edges` `{ edges: [{src, dst, type?}] }` — read canonical, delete canonical + `out` + `in`, one `WriteBatch`. (The graph is a rebuildable projection, so this is ordinary maintenance, not log erasure → `data:write`, not `schema:admin`.)
+
+Nodes are implicit (the union of `src`/`dst`); an explicit isolated-node set is a documented future option, not v1.
+
+### 8.4 Traversal (read-only, one snapshot)
+
+Both ops run under a single read snapshot for determinism, walking only the reached subgraph. `directed:true` follows `out` only; `directed:false` follows `out` and `in` (each stored edge usable both ways at its weight).
+
+- **`reachable(from_set, floor, directed)` → sorted `[node_id]`:** BFS with a monotonic worklist. For each dequeued node `u`, prefix-scan `TAG_GRAPH_OUT` on `(graph, u)` from `weight = floor` upward (and `TAG_GRAPH_IN` if undirected); enqueue unseen `dst`. O(reached nodes + reached edges); terminates on cycles (visited set). Sorted output → order-independent.
+- **`widest_path(from, to, directed)` → `{ connected, bottleneck? }`:** max-bottleneck Dijkstra. A max-heap keyed by best-known bottleneck-to-node; for each settled `u`, scan its `out` index **descending by weight**, relaxing `bottleneck(v) = max(bottleneck(v), min(bottleneck(u), w))`; settle `to` and stop. `connected:false` with no `bottleneck` when `to` is unreachable — no path is **not** an error. The maximin value is unique → deterministic.
+
+### 8.5 Efficiency techniques
+
+- **Adjacency by prefix scan** (never an edge-set scan) — the whole point of the native store.
+- **Weight folded into the key** → floor pruning and best-first are range bounds, and the scan is **covering** (weight + neighbor read straight from the key, no row fetch).
+- **Subgraph-only expansion** → memory and work ∝ nodes/edges reached, not graph size.
+- **Parallel frontier expansion** → issue a BFS level's neighbor scans concurrently so latency rounds ≈ graph *diameter*, not |V| (important on object storage).
+- **One snapshot + deterministic tie-break**; an optional per-snapshot adjacency cache amortizes repeated traversals.
+
+*Attribution:* the out/in adjacency layout follows **HelixDB** (`out_edges`/`in_edges` keyed by `node_id + label`, big-endian for prefix scans); we additionally fold the **weight** into the key so floor/best-first are range operations.
+
+## 9. Component — as-of scratch (R5) — ⚠ name-prefix model
+
+The requirements imagined a `scratch_id`-scoped key-prefix passed to ops. With no per-request multi-tenant routing for arbitrary SQL writes, v1 implements scratch as a **reserved name prefix** applied to graphs and tables (this is the §7-q3 confirmation, signed off):
 
 - `create_scratch()` → allocates a unique prefix (e.g. `_scratch_<n>` via a per-tenant counter) and returns it as `scratch_id`. Copies **zero** bytes of existing data (R5 invariant holds trivially).
-- The consumer folds `read_range(1, N)` and writes its as-of projection rows into tables named with that prefix, using the **existing `/sql` and `/tables` surface unchanged**.
-- `graph.*` is called with those prefixed table names (the prefix *is* the scoping — no extra param).
-- `drop_scratch(scratch_id)` → drops every table whose name starts with the prefix (each `DROP TABLE` range-deletes its keys).
+- The consumer folds `read_range(1, N)` and writes its as-of projection into objects named with that prefix — a **scratch graph** (`PUT /graph/{prefix}_g/edges`, §8) and/or scratch SQL tables via the existing `/sql`+`/tables` surface.
+- `graph.*` targets the prefixed graph name; the prefix *is* the scoping (no extra param).
+- `drop_scratch(scratch_id)` → drops every graph and table whose name starts with the prefix (range-deletes the graph's `0x1C/0x1D/0x1E` keys and each `DROP TABLE`'s keys, batched).
 
 Satisfies R5's intent (isolated as-of replay + cheap teardown, live chain untouched) while touching only the new endpoints. `drop_scratch` is O(rows) (scan-prefix + per-key delete batched into one `WriteBatch`; there is no native range-delete in SlateDB).
 
@@ -215,8 +249,10 @@ Native axum routes in `evidence_api.rs`, alongside `/ledger/*`. **Wire format: b
 | (digest) | `GET /evidence/{chain}/digest` → `{size, root_hash}` | `data:read` + `tenant:` |
 | (inclusion proof) | `GET /evidence/{chain}/proof?seq&size` | `data:read` + `tenant:` |
 | (consistency proof) | `GET /evidence/{chain}/consistency?from&to` | `data:read` + `tenant:` |
-| `graph.reachable` | `POST /graph/reachable` → `{nodes:[…]}` | `data:read` + `tenant:` |
-| `graph.widest_path` | `POST /graph/widest-path` → `{connected, bottleneck?}` | `data:read` + `tenant:` |
+| (upsert edges) | `PUT /graph/{graph}/edges` `{edges:[{src,dst,weight,type?}], merge?}` | `data:write` + `tenant:` |
+| (delete edges) | `DELETE /graph/{graph}/edges` `{edges:[{src,dst,type?}]}` | `data:write` + `tenant:` |
+| `graph.reachable` | `POST /graph/{graph}/reachable` `{from:[…], floor, directed}` → `{nodes:[…]}` | `data:read` + `tenant:` |
+| `graph.widest_path` | `POST /graph/{graph}/widest-path` `{from, to, directed}` → `{connected, bottleneck?}` | `data:read` + `tenant:` |
 | `create_scratch` | `POST /scratch` → `{scratch_id}` | `data:write` + `tenant:` |
 | `drop_scratch` | `DELETE /scratch/{scratch_id}` | `data:write` + `tenant:` |
 
@@ -228,6 +264,8 @@ Native axum routes in `evidence_api.rs`, alongside `/ledger/*`. **Wire format: b
 - **No payload canonicalization.** bluedb frames the exact bytes for hashing but never normalizes them (R3).
 - **No digest signing in v1** (documented extension; see §7.4).
 - **No persisted Merkle internal-node store in v1** (proofs are O(N) on demand; §7.3).
+- **No vector / HNSW index.** HelixDB is graph+vector; here R4 is a pure weighted graph. Vector search is out of scope (a possible future module, not now).
+- **No explicit node set / node properties** in the graph store v1 (nodes are the union of edge endpoints; §8.3).
 - **No M4** (absorbing domain semantics).
 
 ## 12. Testing & acceptance
@@ -243,7 +281,8 @@ In the new crate (unit/integration) + HTTP e2e in `bluedb-server`. Each requirem
 - **Merkle:** golden vectors for leaf/node/root hashes vs. an RFC 6962 reference; inclusion + consistency proofs verify with an independent verifier; digest matches a from-scratch recomputation; **redaction keeps proofs valid** (redact an entry → its inclusion proof and the chain's consistency proof still verify against the unchanged digest).
 - **Mode:** plain chain does no Merkle work and returns `E_NOT_VERIFIED` on proof endpoints; re-`PUT` with a conflicting mode → `E_CHAIN_MODE_CONFLICT`.
 - **Redaction:** redacted entry returns no payload, keeps seq/type/at; `head` and dense seq unchanged; replay over the chain is still gap-free.
-- **Graph:** golden vectors (the requirements' 4-node cyclic graph: `reachable(from={A}, floor=3) → [A,B,D]`; `widest_path(A,D) → {connected:true, bottleneck:3}`; `widest_path(A,C)`/unreachable → `{connected:false}`); then property tests vs. reference BFS-at-floor and reference maximin on random graphs (cycles, multi-edges, ties), deterministic across runs and insertion orders.
+- **Graph store:** edge upsert writes canonical + out + in; re-upsert updates the weight (and `merge:max` keeps the larger), deleting the stale-weight out/in entries first; delete removes all three; out/in prefix scans return a node's neighbors ordered by weight **without scanning the edge set** (assert via a scan-count or that an unrelated node's edges are never read).
+- **Graph traversal:** golden vectors (the requirements' 4-node cyclic graph `A→B(5) B→D(3) A→C(2) D→A(4)`: `reachable(from={A}, floor=3) → [A,B,D]`; `widest_path(A,D) → {connected:true, bottleneck:3}`; `widest_path(A,C)`/unreachable → `{connected:false}`); then property tests vs. reference BFS-at-floor and reference maximin on random graphs (cycles, parallel edges via distinct types, ties), deterministic across runs and edge-insertion orders.
 - **Scratch:** projections folded into a scratch from `read_range(1, N)` match the live projections truncated at `N`; create+drop leaves `head` and live state unchanged.
 - **Determinism (R6):** two in-process read/fold passes over the same chain are byte-identical (and across a replica + writer-restart if fixtures exist).
 - **Tenancy (R8):** two tenants, same `chain` name → independent sequences from 1; cross-tenant reads/traversal impossible.
@@ -256,3 +295,5 @@ In the new crate (unit/integration) + HTTP e2e in `bluedb-server`. Each requirem
 - **Operator trust:** unsigned digests need external anchoring for true irrepudiability (§7.4); documented, signing deferred.
 - **Crash-durability fixture:** may not exist in the harness → durability acceptance becomes an integration gate (§12).
 - **Body-size limit:** confirm the server's existing request-body limit and its over-limit error; add an explicit cap only if absent.
+- **Graph adjacency consistency:** every edge upsert/delete must keep the canonical edge and its `out`/`in` entries in lock-step within one `WriteBatch` — a re-upsert must delete the old-weight `out`/`in` before writing the new, or stale adjacency leaks. Cover in tests (§12 graph store).
+- **Edges-through-us coupling:** the consumer now writes edges via the evidence edges API (not an arbitrary SQL table) — a deliberate departure from R4 (§2, extension 3). A bulk import from an existing edge table is a possible convenience, deferred.
