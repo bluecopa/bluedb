@@ -1,5 +1,8 @@
 site_name: bluedb
 site_description: An object-storage-native OLTP database — SQL, full-text search, and a ledger on S3/GCS/Azure.
+# Canonical site root. Also the target of the header logo link and the search
+# plugin's base_url — without it the shadcn theme renders the logo href as "None".
+site_url: https://bluecopa.github.io/bluedb/
 repo_url: https://github.com/bluecopa/bluedb
 repo_name: bluecopa/bluedb
 edit_uri: edit/dev/docs/
