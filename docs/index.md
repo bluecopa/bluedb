@@ -29,9 +29,11 @@ flowchart TD
     ENG --> SQL["SQL<br/>(bluedb-sql)"]
     ENG --> FTS["Full-text search<br/>(bluedb-fts)"]
     ENG --> LED["Ledger<br/>(bluedb-ledger)"]
+    ENG --> LAKE["Lakehouse mirror<br/>(bluedb-lakehouse)"]
     SQL --> STO["bluedb-storage<br/>(SlateDB substrate)"]
     FTS --> STO
     LED --> STO
+    LAKE --> OS
     STO --> OS["Object storage<br/>S3 · GCS · Azure"]
     HA["bluedb-ha<br/>lease election + fencing"] -.governs writer.-> SRV
 ```
@@ -48,6 +50,10 @@ flowchart TD
   cluster.
 - **[`bluedb-ledger`](api/ledger.md)** — a TigerBeetle-style double-entry ledger:
   typed accounts/transfers, two-phase transfers, balances queryable over SQL.
+- **[`bluedb-lakehouse`](lakehouse/iceberg-mirror.md)** — continuously mirrors
+  tables to **Apache Iceberg** in the same bucket (full CRUD, seconds-fresh,
+  exactly-once) so warehouses (BigQuery/Databricks/Snowflake) join bluedb data
+  with **no ETL**; served through a read-only Iceberg REST catalog.
 - **`bluedb-engine`** — composes the pillars behind one facade.
 - **`bluedb-server`** — the HTTP/REST service (axum): CRUD, `/sql`, admin.
 - **[`bluedb-ha`](ha/active-passive.md)** — single-writer high availability:
