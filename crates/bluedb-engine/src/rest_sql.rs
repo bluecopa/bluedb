@@ -49,10 +49,40 @@ fn literals(params: &[Param]) -> Vec<ParamLiteral> {
     params.iter().map(param_to_literal).collect()
 }
 
+/// Map a [`Param`] to a gluesql [`Value`] for the composite-PK rewrite (which
+/// resolves `$N` PK components from the bound params). Keeps `bluedb-sql` free of
+/// any `bluedb-rest` dependency — the bridge lives here.
+fn param_values(params: &[Param]) -> Vec<gluesql_core::data::Value> {
+    use gluesql_core::data::Value;
+    params
+        .iter()
+        .map(|p| match p {
+            Param::Null => Value::Null,
+            Param::Bool(b) => Value::Bool(*b),
+            Param::Int(n) => Value::I64(*n),
+            Param::Float(f) => Value::F64(*f),
+            Param::Str(s) => Value::Str(s.clone()),
+        })
+        .collect()
+}
+
+/// Apply the composite-PK rewrite, then execute with the bound params. The one
+/// path every statement (data plane + `/sql` + `/admin/sql`) funnels through.
+async fn prepare_and_run(
+    glue: &mut Glue<SlateDbStorage>,
+    sql: &str,
+    params: &[Param],
+) -> Result<Vec<Payload>> {
+    let rewritten = bluedb_sql::prepare_composite_pk(&mut glue.storage, sql, &param_values(params))
+        .await
+        .map_err(|e| EngineError::Sql(e.into()))?;
+    Ok(glue.execute_with_params(&rewritten, literals(params)).await?)
+}
+
 /// Execute a typed [`RestQuery`] (`SELECT`) with bound parameters.
 pub async fn execute_query(glue: &mut Glue<SlateDbStorage>, query: &RestQuery) -> Result<Vec<Payload>> {
     let (sql, params) = query.to_sql_with_params()?;
-    Ok(glue.execute_with_params(&sql, literals(&params)).await?)
+    prepare_and_run(glue, &sql, &params).await
 }
 
 /// Parse a PostgREST query string for `table` and execute it.
@@ -72,7 +102,7 @@ pub async fn execute_query_str(
 pub async fn execute_insert(glue: &mut Glue<SlateDbStorage>, req: &InsertRequest) -> Result<Vec<Payload>> {
     let (stmts, params) = req.row_statements_with_params()?;
     let sql = format!("{};", stmts.join("; "));
-    Ok(glue.execute_with_params(&sql, literals(&params)).await?)
+    prepare_and_run(glue, &sql, &params).await
 }
 
 /// Execute a multi-row [`InsertRequest`] atomically: the server-side
@@ -84,19 +114,19 @@ pub async fn execute_insert_batch(
 ) -> Result<Vec<Payload>> {
     let (stmts, params) = req.row_statements_with_params()?;
     let sql = format!("BEGIN; {}; COMMIT;", stmts.join("; "));
-    Ok(glue.execute_with_params(&sql, literals(&params)).await?)
+    prepare_and_run(glue, &sql, &params).await
 }
 
 /// Execute an [`UpdateRequest`] with bound parameters.
 pub async fn execute_update(glue: &mut Glue<SlateDbStorage>, req: &UpdateRequest) -> Result<Vec<Payload>> {
     let (sql, params) = req.to_sql_with_params()?;
-    Ok(glue.execute_with_params(&sql, literals(&params)).await?)
+    prepare_and_run(glue, &sql, &params).await
 }
 
 /// Execute a [`DeleteRequest`] with bound parameters.
 pub async fn execute_delete(glue: &mut Glue<SlateDbStorage>, req: &DeleteRequest) -> Result<Vec<Payload>> {
     let (sql, params) = req.to_sql_with_params()?;
-    Ok(glue.execute_with_params(&sql, literals(&params)).await?)
+    prepare_and_run(glue, &sql, &params).await
 }
 
 /// Execute a `{sql, params}` request. Values bind as `$N` (never interpolated).
@@ -135,10 +165,6 @@ pub async fn execute_sql(
     }
     // Composite-primary-key rewrite (DDL surrogate, INSERT key injection, and
     // component-predicate → __bluedb_pk bounds). A no-op for single-column-PK
-    // tables. Component values must be inline literals here — a parameterized PK
-    // column is rejected (v1 limitation).
-    let sql = bluedb_sql::prepare_composite_pk(&mut glue.storage, sql)
-        .await
-        .map_err(|e| EngineError::Sql(e.into()))?;
-    Ok(glue.execute_with_params(&sql, literals(params)).await?)
+    // tables; PK components may be inline literals or bound `$N` params.
+    prepare_and_run(glue, sql, params).await
 }

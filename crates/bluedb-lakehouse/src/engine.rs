@@ -335,6 +335,7 @@ impl LakehouseEngine {
         sample_rows: &[&[gluesql_core::data::Value]],
     ) -> Result<LakehouseWriter> {
         let (iceberg_schema, pk_field_id) = table_to_iceberg(schema, sample_rows)?;
+        let sort_field_ids = self.sort_field_ids(table, schema, pk_field_id).await?;
         LakehouseWriter::open(
             self.file_io.clone(),
             &self.root,
@@ -342,8 +343,39 @@ impl LakehouseEngine {
             table,
             iceberg_schema,
             pk_field_id,
+            &sort_field_ids,
         )
         .await
+    }
+
+    /// The Iceberg field-ids the table's data is sorted by (declared as the sort
+    /// order at creation). For a composite-PK table these are the user component
+    /// columns (resolved from the Pk catalog); otherwise the single PK. Field-ids
+    /// are positional in gluesql schema order (matching [`table_to_iceberg`]).
+    async fn sort_field_ids(
+        &self,
+        table: &str,
+        schema: &gluesql_core::data::Schema,
+        pk_field_id: i32,
+    ) -> Result<Vec<i32>> {
+        let components = self
+            .db
+            .connection_for_tenant(&self.tenant)
+            .pk_columns(table)
+            .await
+            .map_err(LakehouseError::Sql)?;
+        let Some(components) = components else {
+            return Ok(vec![pk_field_id]); // single-column PK
+        };
+        let names: Vec<&str> = schema
+            .column_defs
+            .as_ref()
+            .map(|defs| defs.iter().map(|c| c.name.as_str()).collect())
+            .unwrap_or_default();
+        Ok(components
+            .iter()
+            .filter_map(|c| names.iter().position(|n| n == c).map(|i| i as i32 + 1))
+            .collect())
     }
 
     /// Compact a mirrored table's Iceberg files (memory-bounded streaming

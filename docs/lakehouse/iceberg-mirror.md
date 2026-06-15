@@ -60,7 +60,9 @@ of the order-preserving component encoding) that keys the merge-on-read deletes.
 The component columns `a`, `b`, … are mirrored as ordinary, warehouse-visible
 columns — join and filter on them directly. Because each seal writes rows in
 surrogate (= tuple) order, the data files cluster by `(a, b)` and carry column
-statistics, so warehouses can prune files on the component columns.
+statistics, and the mirror declares an Iceberg **sort order** on the component
+columns — so warehouses can prune files on them. (A single-column-PK table is
+sorted by its primary key.)
 
 ## Enabling the mirror
 
@@ -190,11 +192,6 @@ All optional; sensible defaults shown.
 
 ## Limitations (v1)
 
-- **Composite-key writes need inline literals.** Composite primary keys are
-  mirrored (see above), but a row's key-column values must be inline literals on
-  the write path — a parameterized PK component, and the PostgREST-style
-  `/tables` data plane (which always parameterizes), don't support composite-PK
-  tables yet. Use `/sql` with inline values or `/admin/sql`.
 - **Schema evolution on a mirrored table** (ADD/DROP/RENAME column) is not yet
   reconciled into Iceberg — the mirror keeps the schema the table had at first
   seal. Field-id reconciliation (emitting an Iceberg schema update before the

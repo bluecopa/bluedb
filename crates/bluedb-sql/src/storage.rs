@@ -639,6 +639,13 @@ impl SlateDbStorage {
         }
     }
 
+    /// The user primary-key column names of a composite-key table (in key
+    /// order), or `None` for a single-column-PK table. Public so the lakehouse
+    /// mirror can declare an Iceberg sort order on the component columns.
+    pub async fn pk_columns(&self, table_name: &str) -> Result<Option<Vec<String>>, SqlError> {
+        Ok(self.read_pk_catalog(table_name).await?.map(|c| c.columns))
+    }
+
     /// Persist a table's composite-primary-key catalog (written at CREATE TABLE,
     /// before the rewritten DDL runs). A durable, immediate write (no open txn).
     pub(crate) async fn write_pk_catalog(

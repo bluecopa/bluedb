@@ -29,7 +29,7 @@ async fn engine(root: &str, db: Database, cdc: CdcConfig) -> LakehouseEngine {
 
 /// Apply the composite-PK rewrite, then execute, on a CDC-tapped connection.
 async fn exec(glue: &mut Glue<bluedb_sql::SlateDbStorage>, sql: &str) {
-    let prepared = bluedb_sql::prepare_composite_pk(&mut glue.storage, sql)
+    let prepared = bluedb_sql::prepare_composite_pk(&mut glue.storage, sql, &[])
         .await
         .unwrap();
     glue.execute(&prepared).await.unwrap();
@@ -95,4 +95,22 @@ async fn composite_table_mirrors_with_full_crud() {
     assert_eq!(rows.get(&(1, "x".into())).map(String::as_str), Some("p1b"), "updated");
     assert_eq!(rows.get(&(2, "x".into())).map(String::as_str), Some("p3"));
     assert_eq!(rows.get(&(1, "y".into())), None, "deleted");
+
+    // The mirror declares an Iceberg sort order on the component columns
+    // (a = field-id 1, b = field-id 2) — so warehouses know files cluster by (a,b).
+    let (_, meta) = eng.table_metadata_json("t").await.unwrap().unwrap();
+    let default_id = meta["default-sort-order-id"].as_i64().unwrap();
+    let order = meta["sort-orders"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["order-id"].as_i64() == Some(default_id))
+        .unwrap();
+    let source_ids: Vec<i64> = order["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["source-id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(source_ids, vec![1, 2], "sort order should be on the (a, b) components");
 }

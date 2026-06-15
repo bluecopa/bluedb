@@ -25,7 +25,7 @@ async fn new_guarded_glue() -> Glue<SlateDbStorage> {
 
 /// Apply the composite-PK rewrite, then execute — returning the single payload.
 async fn exec(glue: &mut Glue<SlateDbStorage>, sql: &str) -> Result<Payload, String> {
-    let prepared = bluedb_sql::prepare_composite_pk(&mut glue.storage, sql)
+    let prepared = bluedb_sql::prepare_composite_pk(&mut glue.storage, sql, &[])
         .await
         .map_err(|e| e.to_string())?;
     let mut payloads = glue.execute(&prepared).await.map_err(|e| e.to_string())?;
@@ -124,6 +124,24 @@ async fn point_prefix_and_range_lookups() {
     // Prefix + trailing range.
     let got = rows(exec(&mut glue, "SELECT b FROM t WHERE a = 1 AND b > 'm' ORDER BY a, b").await.unwrap());
     assert_eq!(got, vec![vec![Value::Str("x".into())], vec![Value::Str("z".into())]]);
+}
+
+#[tokio::test]
+async fn row_value_keyset_pagination() {
+    // (a,b) > (1,'m') — cross-partition keyset, the canonical pagination idiom.
+    let mut glue = new_guarded_glue().await;
+    seed(&mut glue).await;
+    let got = rows(
+        exec(&mut glue, "SELECT a, b FROM t WHERE (a, b) > (1, 'm') ORDER BY a, b").await.unwrap(),
+    );
+    assert_eq!(
+        got,
+        vec![
+            vec![Value::I64(1), Value::Str("x".into())],
+            vec![Value::I64(1), Value::Str("z".into())],
+            vec![Value::I64(2), Value::Str("a".into())],
+        ]
+    );
 }
 
 #[tokio::test]

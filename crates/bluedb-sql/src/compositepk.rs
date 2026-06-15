@@ -19,7 +19,8 @@
 //! Statements on non-composite tables are returned **unchanged** (the original
 //! string, never a re-serialized one) so the shim can never make a query worse.
 
-use gluesql_core::data::Key;
+use gluesql_core::ast::DataType as GlueDataType;
+use gluesql_core::data::{Key, Value};
 use gluesql_core::store::Store;
 use serde::{Deserialize, Serialize};
 use sqlparser::ast::{
@@ -53,25 +54,42 @@ pub struct PkCatalog {
 /// per-table [`PkCatalog`] through `storage`. Returns the SQL to execute —
 /// unchanged (the original string) for anything that isn't a composite-PK
 /// statement.
-pub async fn prepare(storage: &mut SlateDbStorage, sql: &str) -> Result<String, SqlError> {
+///
+/// `params` are the bound `$N` values (in `$1`-first order); a PK component
+/// written as a placeholder is resolved from them to build `__bluedb_pk`. A
+/// multi-statement string (e.g. the data plane's `BEGIN; INSERT…; COMMIT;`) is
+/// handled statement-by-statement.
+pub async fn prepare(
+    storage: &mut SlateDbStorage,
+    sql: &str,
+    params: &[Value],
+) -> Result<String, SqlError> {
     let dialect = GenericDialect {};
     let Ok(mut statements) = Parser::parse_sql(&dialect, sql) else {
         return Ok(sql.to_string()); // not parseable here → let gluesql handle it
     };
-    if statements.len() != 1 {
-        return Ok(sql.to_string());
+    let mut changed = false;
+    for stmt in &mut statements {
+        changed |= apply(storage, stmt, params).await?;
     }
     // Re-serialize only when we actually rewrote a composite-PK statement; every
     // other statement returns the original string untouched.
-    if apply(storage, &mut statements[0]).await? {
-        Ok(statements[0].to_string())
-    } else {
-        Ok(sql.to_string())
+    if !changed {
+        return Ok(sql.to_string());
     }
+    Ok(statements
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>()
+        .join("; "))
 }
 
 /// Rewrite `stmt` in place for composite-PK support. Returns whether it changed.
-async fn apply(storage: &mut SlateDbStorage, stmt: &mut Statement) -> Result<bool, SqlError> {
+async fn apply(
+    storage: &mut SlateDbStorage,
+    stmt: &mut Statement,
+    params: &[Value],
+) -> Result<bool, SqlError> {
     if let Statement::CreateTable(create) = stmt {
         let Some(catalog) = strip_composite_pk(create)? else {
             return Ok(false);
@@ -88,10 +106,12 @@ async fn apply(storage: &mut SlateDbStorage, stmt: &mut Statement) -> Result<boo
     let Some(catalog) = storage.read_pk_catalog(&table).await? else {
         return Ok(false);
     };
-    let user_cols = user_columns(storage, &table).await?;
+    let columns = fetch_columns(storage, &table).await?;
+    let user_cols: Vec<String> = columns.iter().map(|(n, _)| n.clone()).collect();
+    let types: std::collections::HashMap<String, GlueDataType> = columns.into_iter().collect();
     match stmt {
-        Statement::Insert(insert) => rewrite_insert(insert, &catalog, &user_cols)?,
-        _ => dml::rewrite(stmt, &catalog, &user_cols)?,
+        Statement::Insert(insert) => rewrite_insert(insert, &catalog, &user_cols, &types, params)?,
+        _ => dml::rewrite(stmt, &catalog, &user_cols, &types, params)?,
     }
     Ok(true)
 }
@@ -104,10 +124,15 @@ fn statement_table(stmt: &Statement) -> Option<String> {
     }
 }
 
-/// The user-facing columns of `table` in declaration order (schema order minus
-/// the hidden `__bluedb_pk`). Used to make positional INSERTs explicit and to
-/// expand `SELECT *`.
-async fn user_columns(storage: &SlateDbStorage, table: &str) -> Result<Vec<String>, SqlError> {
+/// The user-facing columns of `table` as `(name, type)` in declaration order
+/// (schema order minus the hidden `__bluedb_pk`). The names make positional
+/// INSERTs explicit and expand `SELECT *`; the types coerce component values to a
+/// canonical, surface-independent key encoding (so `a = 1` and `a = '1'` from the
+/// data plane agree with inline SQL).
+async fn fetch_columns(
+    storage: &SlateDbStorage,
+    table: &str,
+) -> Result<Vec<(String, GlueDataType)>, SqlError> {
     let schema = Store::fetch_schema(storage, table)
         .await
         .map_err(|e| SqlError::CompositePk(e.to_string()))?
@@ -116,8 +141,8 @@ async fn user_columns(storage: &SlateDbStorage, table: &str) -> Result<Vec<Strin
         .column_defs
         .map(|defs| {
             defs.into_iter()
-                .map(|c| c.name)
-                .filter(|n| n != PK_COL)
+                .filter(|c| c.name != PK_COL)
+                .map(|c| (c.name, c.data_type))
                 .collect()
         })
         .unwrap_or_default();
@@ -223,6 +248,8 @@ fn rewrite_insert(
     insert: &mut sqlparser::ast::Insert,
     catalog: &PkCatalog,
     user_cols: &[String],
+    types: &std::collections::HashMap<String, GlueDataType>,
+    params: &[Value],
 ) -> Result<(), SqlError> {
     // The columns each VALUES row supplies, in order: explicit list if given,
     // else the table's user columns (positional insert).
@@ -236,13 +263,13 @@ fn rewrite_insert(
             "column '{PK_COL}' is reserved and cannot be set directly"
         )));
     }
-    // Every PK component must be supplied by the insert.
+    // Each PK component: its position in the row + its declared type (for coercion).
     let mut component_idx = Vec::with_capacity(catalog.columns.len());
     for pk in &catalog.columns {
         let idx = row_cols.iter().position(|c| c == pk).ok_or_else(|| {
             SqlError::CompositePk(format!("INSERT omits primary-key column '{pk}'"))
         })?;
-        component_idx.push(idx);
+        component_idx.push((idx, types.get(pk)));
     }
 
     let Some(source) = insert.source.as_mut() else {
@@ -264,7 +291,7 @@ fn rewrite_insert(
         }
         let components: Vec<Key> = component_idx
             .iter()
-            .map(|&i| literal_to_key(&row[i]))
+            .map(|&(i, ty)| value_to_key(&row[i], params, ty))
             .collect::<Result<_, _>>()?;
         let encoded = encode_composite_key(&components)?;
         row.push(Expr::Value(SqlValue::HexStringLiteral(to_hex(&encoded))));
@@ -276,39 +303,84 @@ fn rewrite_insert(
     Ok(())
 }
 
-/// Convert a SQL literal expression to the [`Key`] used to build `__bluedb_pk`.
-/// INSERT and predicate rewrites share this so the encoding is consistent. v1
-/// supports integers, strings, and booleans (the common composite-key types).
-pub(crate) fn literal_to_key(expr: &Expr) -> Result<Key, SqlError> {
+/// Convert a SQL literal (or bound `$N` placeholder) to the [`Key`] used to build
+/// `__bluedb_pk`. The value is **coerced to the component's declared column type**
+/// (`target`) before keying, so the same logical key encodes identically whether
+/// it arrives inline, as a typed param, or as a data-plane string. INSERT and
+/// predicate rewrites share this so encodings always agree.
+pub(crate) fn value_to_key(
+    expr: &Expr,
+    params: &[Value],
+    target: Option<&GlueDataType>,
+) -> Result<Key, SqlError> {
+    let value = expr_to_value(expr, params)?;
+    let value = match target {
+        Some(ty) => value
+            .cast(ty)
+            .map_err(|e| SqlError::CompositePk(format!("primary-key component: {e}")))?,
+        None => value,
+    };
+    Key::try_from(value).map_err(|e| SqlError::CompositePk(format!("primary-key component: {e}")))
+}
+
+/// Turn a literal/placeholder expression into a gluesql [`Value`] (pre-coercion).
+fn expr_to_value(expr: &Expr, params: &[Value]) -> Result<Value, SqlError> {
     match expr {
-        Expr::Value(SqlValue::Number(n, _)) => parse_int_key(&n.to_string(), false),
-        Expr::Value(SqlValue::SingleQuotedString(s)) => Ok(Key::Str(s.clone())),
-        Expr::Value(SqlValue::Boolean(b)) => Ok(Key::Bool(*b)),
+        Expr::Value(SqlValue::Number(n, _)) => number_value(&n.to_string(), false),
+        Expr::Value(SqlValue::SingleQuotedString(s)) => Ok(Value::Str(s.clone())),
+        Expr::Value(SqlValue::Boolean(b)) => Ok(Value::Bool(*b)),
         Expr::Value(SqlValue::Null) => Err(SqlError::CompositePk(
             "a primary-key column cannot be NULL".into(),
         )),
+        Expr::Value(SqlValue::Placeholder(p)) => resolve_placeholder(p, params),
         Expr::UnaryOp {
             op: UnaryOperator::Minus,
             expr,
         } => match expr.as_ref() {
-            Expr::Value(SqlValue::Number(n, _)) => parse_int_key(&n.to_string(), true),
+            Expr::Value(SqlValue::Number(n, _)) => number_value(&n.to_string(), true),
             other => Err(unsupported_component(other)),
         },
         other => Err(unsupported_component(other)),
     }
 }
 
-fn parse_int_key(digits: &str, negative: bool) -> Result<Key, SqlError> {
+/// A numeric literal as a gluesql [`Value`] (`i64` if it fits, else `f64`).
+fn number_value(digits: &str, negative: bool) -> Result<Value, SqlError> {
     let text = if negative {
         format!("-{digits}")
     } else {
         digits.to_string()
     };
-    text.parse::<i64>().map(Key::I64).map_err(|_| {
+    if let Ok(i) = text.parse::<i64>() {
+        Ok(Value::I64(i))
+    } else if let Ok(f) = text.parse::<f64>() {
+        Ok(Value::F64(f))
+    } else {
+        Err(SqlError::CompositePk(format!(
+            "primary-key component '{text}' is not a valid number"
+        )))
+    }
+}
+
+/// Resolve a `$N` placeholder to its bound parameter value.
+fn resolve_placeholder(placeholder: &str, params: &[Value]) -> Result<Value, SqlError> {
+    let index: usize = placeholder
+        .strip_prefix('$')
+        .and_then(|n| n.parse().ok())
+        .filter(|&n| n >= 1)
+        .ok_or_else(|| SqlError::CompositePk(format!("invalid placeholder '{placeholder}'")))?;
+    let value = params.get(index - 1).ok_or_else(|| {
         SqlError::CompositePk(format!(
-            "composite primary-key component '{text}' must be an integer, string, or boolean literal"
+            "placeholder '{placeholder}' has no bound parameter (only {} given)",
+            params.len()
         ))
-    })
+    })?;
+    if matches!(value, Value::Null) {
+        return Err(SqlError::CompositePk(
+            "a primary-key column cannot be NULL".into(),
+        ));
+    }
+    Ok(value.clone())
 }
 
 fn unsupported_component(expr: &Expr) -> SqlError {
@@ -382,18 +454,22 @@ pub(crate) mod dml {
         stmt: &mut Statement,
         catalog: &PkCatalog,
         user_cols: &[String],
+        types: &HashMap<String, GlueDataType>,
+        params: &[Value],
     ) -> Result<(), SqlError> {
         match stmt {
-            Statement::Query(query) => rewrite_query(query, catalog, user_cols)?,
+            Statement::Query(query) => rewrite_query(query, catalog, user_cols, types, params)?,
             Statement::Update {
                 assignments,
                 selection,
                 ..
             } => {
                 reject_pk_assignment(assignments, catalog)?;
-                rewrite_selection(selection, catalog)?;
+                rewrite_selection(selection, catalog, types, params)?;
             }
-            Statement::Delete(delete) => rewrite_selection(&mut delete.selection, catalog)?,
+            Statement::Delete(delete) => {
+                rewrite_selection(&mut delete.selection, catalog, types, params)?
+            }
             _ => {}
         }
         Ok(())
@@ -403,10 +479,12 @@ pub(crate) mod dml {
         query: &mut Query,
         catalog: &PkCatalog,
         user_cols: &[String],
+        types: &HashMap<String, GlueDataType>,
+        params: &[Value],
     ) -> Result<(), SqlError> {
         if let SetExpr::Select(select) = query.body.as_mut() {
             hide_surrogate(&mut select.projection, user_cols);
-            rewrite_selection(&mut select.selection, catalog)?;
+            rewrite_selection(&mut select.selection, catalog, types, params)?;
         }
         if let Some(order) = query.order_by.as_mut() {
             rewrite_order_by(&mut order.exprs, catalog);
@@ -442,9 +520,11 @@ pub(crate) mod dml {
     fn rewrite_selection(
         selection: &mut Option<Expr>,
         catalog: &PkCatalog,
+        types: &HashMap<String, GlueDataType>,
+        params: &[Value],
     ) -> Result<(), SqlError> {
         if let Some(expr) = selection.take() {
-            selection.replace(rewrite_predicate(expr, catalog)?);
+            selection.replace(rewrite_predicate(expr, catalog, types, params)?);
         }
         Ok(())
     }
@@ -472,7 +552,12 @@ pub(crate) mod dml {
     }
 
     /// Rewrite a leading-prefix of component predicates into `__bluedb_pk` bounds.
-    fn rewrite_predicate(selection: Expr, catalog: &PkCatalog) -> Result<Expr, SqlError> {
+    fn rewrite_predicate(
+        selection: Expr,
+        catalog: &PkCatalog,
+        types: &HashMap<String, GlueDataType>,
+        params: &[Value],
+    ) -> Result<Expr, SqlError> {
         let pk_index: HashMap<&str, usize> = catalog
             .columns
             .iter()
@@ -484,9 +569,16 @@ pub(crate) mod dml {
         // component comparison (keeping the original expr to restore if unused).
         let mut eqs: HashMap<usize, (Key, Expr)> = HashMap::new();
         let mut ranges: Vec<(usize, BinaryOperator, Key, Expr)> = Vec::new();
+        // Row-value comparisons `(a,b) <op> (x,y)` (keyset) → direct __bluedb_pk
+        // bounds, AND-combined with the rest.
+        let mut row_value_preds: Vec<Expr> = Vec::new();
         let mut residual: Vec<Expr> = Vec::new();
         for conjunct in split_and(selection) {
-            match component_compare(&conjunct, &pk_index) {
+            if let Some(pred) = row_value_predicate(&conjunct, catalog, types, params)? {
+                row_value_preds.push(pred);
+                continue;
+            }
+            match component_compare(&conjunct, &pk_index, catalog, types, params) {
                 Some((idx, BinaryOperator::Eq, key)) if !eqs.contains_key(&idx) => {
                     eqs.insert(idx, (key, conjunct));
                 }
@@ -519,15 +611,68 @@ pub(crate) mod dml {
             }
         }
 
-        if prefix_keys.is_empty() && chosen_range.is_none() {
-            return Ok(rebuild_and(residual)); // nothing rewritten
+        let mut all: Vec<Expr> = Vec::new();
+        if !(prefix_keys.is_empty() && chosen_range.is_none()) {
+            all.push(build_pk_predicate(&prefix_keys, chosen_range, n)?);
         }
-
-        let pk_predicate = build_pk_predicate(&prefix_keys, chosen_range, n)?;
-        let mut all = Vec::with_capacity(residual.len() + 1);
-        all.push(pk_predicate);
+        all.extend(row_value_preds);
         all.extend(residual);
         Ok(rebuild_and(all))
+    }
+
+    /// Translate a row-value comparison `(a, b, …) <op> (x, y, …)` on a leading
+    /// PK prefix into a single `__bluedb_pk` bound (keyset pagination). Returns
+    /// `None` if `expr` isn't such a comparison.
+    fn row_value_predicate(
+        expr: &Expr,
+        catalog: &PkCatalog,
+        types: &HashMap<String, GlueDataType>,
+        params: &[Value],
+    ) -> Result<Option<Expr>, SqlError> {
+        let Expr::BinaryOp { left, op, right } = expr else {
+            return Ok(None);
+        };
+        if !is_range(op) {
+            return Ok(None);
+        }
+        let (Expr::Tuple(cols), Expr::Tuple(vals)) = (left.as_ref(), right.as_ref()) else {
+            return Ok(None);
+        };
+        let n = catalog.columns.len();
+        if cols.is_empty() || cols.len() != vals.len() || cols.len() > n {
+            return Ok(None);
+        }
+        // The left tuple must be a leading prefix of the key columns, in order.
+        for (i, col) in cols.iter().enumerate() {
+            if ident_name(col).as_deref() != Some(catalog.columns[i].as_str()) {
+                return Ok(None);
+            }
+        }
+        let keys: Vec<Key> = vals
+            .iter()
+            .enumerate()
+            .map(|(i, v)| value_to_key(v, params, types.get(&catalog.columns[i])))
+            .collect::<Result<_, _>>()?;
+        let enc = encode_composite_key(&keys)?;
+        let pred = if cols.len() == n {
+            // Full key: byte comparison == tuple comparison exactly.
+            pk_cmp(op.clone(), &enc)
+        } else {
+            // Partial prefix: bound past/through the whole `(x, y, …, *)` range.
+            match op {
+                BinaryOperator::Gt => {
+                    pk_cmp(BinaryOperator::GtEq, &prefix_upper_bound(&enc).unwrap_or(enc))
+                }
+                BinaryOperator::GtEq => pk_cmp(BinaryOperator::GtEq, &enc),
+                BinaryOperator::Lt => pk_cmp(BinaryOperator::Lt, &enc),
+                BinaryOperator::LtEq => match prefix_upper_bound(&enc) {
+                    Some(upper) => pk_cmp(BinaryOperator::Lt, &upper),
+                    None => pk_cmp(BinaryOperator::LtEq, &enc),
+                },
+                _ => unreachable!("is_range gated the operator"),
+            }
+        };
+        Ok(Some(pred))
     }
 
     /// Construct the `__bluedb_pk` predicate for an equality prefix + optional
@@ -598,17 +743,21 @@ pub(crate) mod dml {
         acc
     }
 
-    /// If `expr` is `<pk-component> <cmp> <literal>`, return `(index, op, key)`.
+    /// If `expr` is `<pk-component> <cmp> <literal-or-$param>`, return
+    /// `(index, op, key)` with the value coerced to the component's column type.
     fn component_compare(
         expr: &Expr,
         pk_index: &HashMap<&str, usize>,
+        catalog: &PkCatalog,
+        types: &HashMap<String, GlueDataType>,
+        params: &[Value],
     ) -> Option<(usize, BinaryOperator, Key)> {
         match expr {
-            Expr::Nested(inner) => component_compare(inner, pk_index),
+            Expr::Nested(inner) => component_compare(inner, pk_index, catalog, types, params),
             Expr::BinaryOp { left, op, right } if is_cmp(op) => {
                 let col = ident_name(left)?;
                 let idx = *pk_index.get(col.as_str())?;
-                let key = literal_to_key(right).ok()?;
+                let key = value_to_key(right, params, types.get(&catalog.columns[idx])).ok()?;
                 Some((idx, op.clone(), key))
             }
             _ => None,
@@ -736,7 +885,7 @@ mod tests {
     fn insert_injects_surrogate_for_explicit_columns() {
         let (_, catalog) = create_with_composite();
         let mut insert = insert_of("INSERT INTO t (a, b, payload) VALUES (1, 'x', 'p')");
-        rewrite_insert(&mut insert, &catalog, &["a".into(), "b".into(), "payload".into()]).unwrap();
+        rewrite_insert(&mut insert, &catalog, &["a".into(), "b".into(), "payload".into()], &std::collections::HashMap::new(), &[]).unwrap();
         let sql = Statement::Insert(insert).to_string();
         assert!(sql.contains("__bluedb_pk"), "surrogate column not added: {sql}");
         assert!(sql.contains("X'"), "surrogate value not a bytea literal: {sql}");
@@ -746,7 +895,7 @@ mod tests {
     fn insert_makes_positional_explicit() {
         let (_, catalog) = create_with_composite();
         let mut insert = insert_of("INSERT INTO t VALUES (1, 'x', 'p')");
-        rewrite_insert(&mut insert, &catalog, &["a".into(), "b".into(), "payload".into()]).unwrap();
+        rewrite_insert(&mut insert, &catalog, &["a".into(), "b".into(), "payload".into()], &std::collections::HashMap::new(), &[]).unwrap();
         let sql = Statement::Insert(insert).to_string();
         assert!(sql.contains("(a, b, payload, __bluedb_pk)"), "columns not made explicit: {sql}");
     }
@@ -755,7 +904,7 @@ mod tests {
     fn insert_rejects_missing_pk_component() {
         let (_, catalog) = create_with_composite();
         let mut insert = insert_of("INSERT INTO t (a, payload) VALUES (1, 'p')");
-        let err = rewrite_insert(&mut insert, &catalog, &["a".into(), "b".into(), "payload".into()]);
+        let err = rewrite_insert(&mut insert, &catalog, &["a".into(), "b".into(), "payload".into()], &std::collections::HashMap::new(), &[]);
         assert!(err.is_err(), "missing PK component should be rejected");
     }
 
@@ -772,11 +921,11 @@ mod tests {
 
     #[test]
     fn literal_to_key_handles_ints_strings_bools_and_negatives() {
-        assert_eq!(literal_to_key(&lit("5")).unwrap(), Key::I64(5));
-        assert_eq!(literal_to_key(&lit("-7")).unwrap(), Key::I64(-7));
-        assert_eq!(literal_to_key(&lit("'x'")).unwrap(), Key::Str("x".into()));
-        assert_eq!(literal_to_key(&lit("true")).unwrap(), Key::Bool(true));
-        assert!(literal_to_key(&lit("NULL")).is_err());
+        assert_eq!(value_to_key(&lit("5"), &[], None).unwrap(), Key::I64(5));
+        assert_eq!(value_to_key(&lit("-7"), &[], None).unwrap(), Key::I64(-7));
+        assert_eq!(value_to_key(&lit("'x'"), &[], None).unwrap(), Key::Str("x".into()));
+        assert_eq!(value_to_key(&lit("true"), &[], None).unwrap(), Key::Bool(true));
+        assert!(value_to_key(&lit("NULL"), &[], None).is_err());
     }
 
     fn rewrite_query_sql(sql: &str) -> String {
@@ -785,7 +934,7 @@ mod tests {
         };
         let user_cols = vec!["a".to_string(), "b".to_string(), "payload".to_string()];
         let mut stmt = parse_one(sql);
-        dml::rewrite(&mut stmt, &catalog, &user_cols).unwrap();
+        dml::rewrite(&mut stmt, &catalog, &user_cols, &std::collections::HashMap::new(), &[]).unwrap();
         stmt.to_string()
     }
 
@@ -820,8 +969,8 @@ mod tests {
     #[test]
     fn same_components_encode_identically() {
         // INSERT and predicate rewrites must agree on the encoding.
-        let k1 = literal_to_key(&lit("5")).unwrap();
-        let k2 = literal_to_key(&lit("5")).unwrap();
+        let k1 = value_to_key(&lit("5"), &[], None).unwrap();
+        let k2 = value_to_key(&lit("5"), &[], None).unwrap();
         assert_eq!(
             encode_composite_key(&[k1, Key::Str("x".into())]).unwrap(),
             encode_composite_key(&[k2, Key::Str("x".into())]).unwrap()

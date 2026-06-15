@@ -248,9 +248,18 @@ left as a future signal-only enhancement.
 6. ✅ **Docs + e2e** — engine `execute_sql` wiring + e2e; SQL reference and
    lakehouse-mirror docs updated.
 
-Deferred follow-ups: parameterized PK components + `/tables` data plane;
-row-value `(a,b) > (?,?)` keyset; `UPDATE` of a key column; explicit Iceberg
-sort order.
+### Follow-ups (done in a second pass)
+
+- ✅ **Parameterized PK components + `/tables` data plane.** `prepare` takes the
+  bound params; `$N` PK components resolve from them, and each value is coerced
+  to its column type so the key encodes identically across surfaces. Wired into
+  every `rest_sql` execution path (data plane + `/sql` + `/admin/sql`).
+- ✅ **Row-value keyset** `(a,b) > (?,?)` → `__bluedb_pk` bounds (full key →
+  direct comparison; partial prefix → prefix bounds).
+- ✅ **Explicit Iceberg sort order** on the component columns (single-PK tables
+  sort by their PK), declared at table creation.
+
+Still deferred: `UPDATE` of a key column (delete+reinsert; not yet auto-rewritten).
 
 ## 11. Risks / spike
 

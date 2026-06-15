@@ -32,8 +32,9 @@ use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::io::FileIO;
 use iceberg::spec::{
     DataContentType, DataFile, DataFileFormat, ManifestFile, ManifestListWriter,
-    ManifestWriterBuilder, Operation, Schema as IcebergSchema, SchemaRef, Snapshot,
-    SnapshotReference, SnapshotRetention, Summary, TableMetadata, MAIN_BRANCH,
+    ManifestWriterBuilder, NullOrder, Operation, Schema as IcebergSchema, SchemaRef, Snapshot,
+    SnapshotReference, SnapshotRetention, SortDirection, SortField, SortOrder, Summary,
+    TableMetadata, Transform, MAIN_BRANCH,
 };
 use iceberg::table::Table;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
@@ -88,11 +89,18 @@ impl LakehouseWriter {
         pk_field_id: i32,
     ) -> Result<Self> {
         let file_io = FileIO::new_with_fs();
-        Self::open(file_io, root, namespace, table, schema, pk_field_id).await
+        Self::open(file_io, root, namespace, table, schema, pk_field_id, &[pk_field_id]).await
     }
 
     /// Open the table at `<root>/<namespace>/<table>`: load it from
     /// `version-hint.text` if present, else create it (writing `v0.metadata.json`).
+    ///
+    /// On creation the table declares an Iceberg **sort order** on
+    /// `sort_field_ids` (ascending). The seal writes rows in primary-key order
+    /// (the `BTreeMap` collapse), so the data genuinely is sorted by these
+    /// columns — for a composite key, the user component columns; otherwise the
+    /// single PK. This lets warehouses prune files on those columns. An empty
+    /// slice declares no sort order.
     pub async fn open(
         file_io: FileIO,
         root: &str,
@@ -100,6 +108,7 @@ impl LakehouseWriter {
         table: &str,
         schema: IcebergSchema,
         pk_field_id: i32,
+        sort_field_ids: &[i32],
     ) -> Result<Self> {
         let table_root = format!("{root}/{namespace}/{table}");
         let table_ident = TableIdent::from_strs([namespace, table])?;
@@ -131,6 +140,7 @@ impl LakehouseWriter {
                 .name(table.to_string())
                 .location(table_root.clone())
                 .schema(schema)
+                .sort_order(sort_order_on(sort_field_ids)?)
                 .build();
             let metadata = iceberg::spec::TableMetadataBuilder::from_table_creation(creation)?
                 .build()?
@@ -560,6 +570,26 @@ impl LakehouseWriter {
                 .unwrap_or(0)
         )
     }
+}
+
+/// An ascending Iceberg sort order over `field_ids` (identity transform,
+/// nulls-first). Empty → the unsorted order.
+fn sort_order_on(field_ids: &[i32]) -> Result<SortOrder> {
+    if field_ids.is_empty() {
+        return Ok(SortOrder::unsorted_order());
+    }
+    let mut builder = SortOrder::builder();
+    for &id in field_ids {
+        builder.with_sort_field(SortField {
+            source_id: id,
+            transform: Transform::Identity,
+            direction: SortDirection::Ascending,
+            null_order: NullOrder::First,
+        });
+    }
+    builder
+        .build_unbound()
+        .map_err(|e| LakehouseError::Iceberg(format!("building sort order: {e}")))
 }
 
 /// Wall-clock milliseconds since the Unix epoch.
