@@ -385,3 +385,129 @@ async fn http_append_edge_parse_errors() {
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "edge unknown op: {s} {body}");
 }
+
+/// Traversal contract: `reachable` (with/without a weight floor) and
+/// `widest-path` (connected with bottleneck, disconnected omits bottleneck).
+#[tokio::test]
+async fn http_reachable_and_widest_path() {
+    let (_, app) = promoted(None).await;
+    let (s, _b) = call(
+        &app,
+        "PUT",
+        "/graph/g/edges",
+        Some("acme"),
+        None,
+        Some(json!({
+            "edges": [
+                {"src":"A","dst":"B","weight":5},
+                {"src":"B","dst":"C","weight":3},
+                {"src":"A","dst":"C","weight":1},
+                {"src":"C","dst":"D","weight":10}
+            ]
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/graph/g/reachable",
+        Some("acme"),
+        None,
+        Some(json!({ "from": ["A"] })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    assert_eq!(body["nodes"], json!(["A", "B", "C", "D"]));
+
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/graph/g/reachable",
+        Some("acme"),
+        None,
+        Some(json!({ "from": ["A"], "floor": 4 })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    assert_eq!(body["nodes"], json!(["A", "B"]));
+
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/graph/g/widest-path",
+        Some("acme"),
+        None,
+        Some(json!({ "from": "A", "to": "D" })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    assert_eq!(body["connected"], true);
+    assert_eq!(body["bottleneck"], 3);
+
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/graph/g/widest-path",
+        Some("acme"),
+        None,
+        Some(json!({ "from": "D", "to": "A" })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    assert_eq!(body["connected"], false);
+    assert!(body.get("bottleneck").is_none(), "no bottleneck when disconnected: {body}");
+}
+
+/// Traversal reads require `data:read`; tenant scope must match the header.
+#[tokio::test]
+async fn http_traversal_requires_read_scope() {
+    // acmero: read-only on acme; acmerw: write on acme; root: superuser.
+    let authz = Authz::parse_env(
+        "acmero=data:read,tenant:acme;acmerw=data:write,tenant:acme;root=superuser",
+    )
+    .unwrap();
+    let (_, app) = promoted(Some(authz)).await;
+
+    let reach_body = json!({ "from": ["A"] });
+
+    // A token with NO scopes at all → 403 on the read route.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/graph/g/reachable",
+        Some("acme"),
+        Some("nobody"),
+        Some(reach_body.clone()),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "no-scope token on reachable: {s} {body}");
+
+    // A token whose tenant scope doesn't match the header → 403 (mirrors the
+    // edge auth test). acmero CAN read, but only on acme — not globex.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/graph/g/reachable",
+        Some("globex"),
+        Some("acmero"),
+        Some(reach_body.clone()),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "acme read token on globex tenant: {s} {body}");
+
+    // Sanity: the read token DOES work on its own tenant.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/graph/g/reachable",
+        Some("acme"),
+        Some("acmero"),
+        Some(reach_body),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "acme read token on acme tenant: {s} {body}");
+    // No edges upserted in authz mode → seed only.
+    assert_eq!(body["nodes"], json!(["A"]), "seed-only reachable: {body}");
+}

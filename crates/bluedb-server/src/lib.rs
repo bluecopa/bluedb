@@ -647,11 +647,13 @@ pub fn build_app(state: AppState) -> Router {
         .route("/evidence/{chain}/digest", get(evidence_api::digest))
         .route("/evidence/{chain}/proof", get(evidence_api::inclusion))
         .route("/evidence/{chain}/consistency", get(evidence_api::consistency))
-        // Native graph store (edge maintenance; traversal is a later plan).
+        // Native graph store (edge maintenance + read-only traversal).
         .route(
             "/graph/{graph}/edges",
             put(graph_api::upsert_edges).delete(graph_api::delete_edges),
         )
+        .route("/graph/{graph}/reachable", post(graph_api::reachable))
+        .route("/graph/{graph}/widest-path", post(graph_api::widest_path))
         // Read-only Iceberg REST Catalog for warehouse discovery (Phase 5).
         .route("/catalog/v1/config", get(catalog::config))
         .route("/catalog/v1/namespaces", get(catalog::list_namespaces))

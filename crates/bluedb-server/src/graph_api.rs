@@ -1,5 +1,6 @@
-//! `/graph/*` — HTTP surface for the native graph store (edge maintenance).
-//! Traversal endpoints (`reachable`, `widest-path`) are a later plan.
+//! `/graph/*` — HTTP surface for the native graph store: edge maintenance
+//! (`PUT`/`DELETE /graph/{graph}/edges`) plus read-only traversal
+//! (`POST /graph/{graph}/reachable`, `POST /graph/{graph}/widest-path`).
 
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
@@ -88,4 +89,64 @@ pub async fn delete_edges(
     let n = edges.len();
     state.graph(&tenant).await?.delete(&graph, &edges).await.map_err(map_evidence_err)?;
     Ok(Json(json!({ "graph": graph, "deleted": n })))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ReachableBody {
+    from: Vec<String>,
+    #[serde(default)]
+    floor: Option<i64>,
+    #[serde(default)]
+    directed: Option<bool>,
+}
+
+/// `POST /graph/{graph}/reachable` → `{ graph, nodes: [...] }`.
+pub async fn reachable(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(graph): Path<String>,
+    Json(body): Json<ReachableBody>,
+) -> Result<Json<Value>, AppError> {
+    state.authorize(&headers, Scope::DataRead)?;
+    let tenant = state.tenant(&headers)?;
+    let floor = body.floor.unwrap_or(i64::MIN);
+    let directed = body.directed.unwrap_or(true);
+    let nodes = state
+        .graph(&tenant)
+        .await?
+        .reachable(&graph, &body.from, floor, directed)
+        .await
+        .map_err(map_evidence_err)?;
+    Ok(Json(json!({ "graph": graph, "nodes": nodes })))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct WidestPathBody {
+    from: String,
+    to: String,
+    #[serde(default)]
+    directed: Option<bool>,
+}
+
+/// `POST /graph/{graph}/widest-path` → `{ connected, bottleneck? }`.
+pub async fn widest_path(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(graph): Path<String>,
+    Json(body): Json<WidestPathBody>,
+) -> Result<Json<Value>, AppError> {
+    state.authorize(&headers, Scope::DataRead)?;
+    let tenant = state.tenant(&headers)?;
+    let directed = body.directed.unwrap_or(true);
+    let wp = state
+        .graph(&tenant)
+        .await?
+        .widest_path(&graph, &body.from, &body.to, directed)
+        .await
+        .map_err(map_evidence_err)?;
+    let mut out = json!({ "connected": wp.connected });
+    if let Some(b) = wp.bottleneck {
+        out["bottleneck"] = json!(b);
+    }
+    Ok(Json(out))
 }
