@@ -29,7 +29,15 @@
   Example:
 
     lein run test --workload ledger --nemesis mix --time-limit 120 \\
-      --concurrency 10 --node node1 --node node2 --node node3"
+      --concurrency 10 --node node1 --node node2 --node node3
+
+  ⚠ VALIDATION STATUS (2026-06-15): NOT DONE on a real cluster.
+  This workload compiles (`lein check`) and its in-process counterparts pass
+  (durable-before-ack across reopen, conservation/no-double-apply unit tests),
+  but it has NOT been run against a live 3-node cluster since the group-commit
+  write-path change (commit 2c512a9, \"release lease before durable flush\").
+  Until the command above is run under nemesis faults and reported green, the
+  ledger is NOT Jepsen-validated for the current write path."
   (:require [bluedb.jepsen.http :as h]
             [jepsen.client :as client]
             [jepsen.checker :as checker]
