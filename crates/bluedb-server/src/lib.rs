@@ -135,13 +135,23 @@ fn lakehouse_compaction_interval() -> Duration {
     )
 }
 
-/// Compact a table once its live data-file count exceeds this.
+/// Minor-compact (bin-pack) a table once its live data-file count exceeds this.
 /// `BLUEDB_LAKEHOUSE_MAX_DATA_FILES`, default 8.
 fn lakehouse_max_data_files() -> usize {
     std::env::var("BLUEDB_LAKEHOUSE_MAX_DATA_FILES")
         .ok()
         .and_then(|s| s.trim().parse::<usize>().ok())
         .unwrap_or(8)
+}
+
+/// Major-compact (whole-table rewrite, reclaiming delete files) a table once its
+/// live delete-file count exceeds this. `BLUEDB_LAKEHOUSE_MAX_DELETE_FILES`,
+/// default 16.
+fn lakehouse_max_delete_files() -> usize {
+    std::env::var("BLUEDB_LAKEHOUSE_MAX_DELETE_FILES")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(16)
 }
 
 /// The lakehouse seal + compaction tunables for this node, from the
@@ -152,6 +162,7 @@ fn lakehouse_config() -> LakehouseConfig {
         seal_max_interval: lakehouse_seal_max_interval(),
         compaction_interval: lakehouse_compaction_interval(),
         max_data_files: lakehouse_max_data_files(),
+        max_delete_files: lakehouse_max_delete_files(),
     }
 }
 

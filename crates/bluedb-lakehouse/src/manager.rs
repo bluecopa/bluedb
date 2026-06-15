@@ -36,8 +36,36 @@ pub struct LakehouseConfig {
     pub seal_max_interval: Duration,
     /// How often the compaction loop runs.
     pub compaction_interval: Duration,
-    /// Compact a table once it exceeds this many data files.
+    /// Minor-compact (bin-pack small data files) once a table exceeds this many
+    /// data files.
     pub max_data_files: usize,
+    /// Major-compact (whole-table rewrite, which reclaims equality-delete files)
+    /// once a table exceeds this many delete files. Checked first, since only the
+    /// major pass clears deletes.
+    pub max_delete_files: usize,
+}
+
+/// Which compaction (if any) a table needs this round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Compaction {
+    None,
+    /// Incremental bin-pack of small data files.
+    Minor,
+    /// Whole-table rewrite that also reclaims delete files.
+    Major,
+}
+
+/// Decide the compaction for a table from its live file counts. Major (which is
+/// the only pass that reclaims delete files) wins when deletes have piled up;
+/// otherwise a minor bin-pack runs once data files exceed the threshold.
+fn choose_compaction(data_files: usize, delete_files: usize, cfg: &LakehouseConfig) -> Compaction {
+    if delete_files > cfg.max_delete_files {
+        Compaction::Major
+    } else if data_files > cfg.max_data_files {
+        Compaction::Minor
+    } else {
+        Compaction::None
+    }
 }
 
 /// Owns one [`LakehouseEngine`] per tenant plus the shared background loops.
@@ -138,24 +166,33 @@ impl LakehouseManager {
         Ok(())
     }
 
-    /// Compact every tenant's tables that exceed the file-count threshold.
+    /// Compact every tenant's tables: a major (delete-reclaiming) rewrite when
+    /// delete files have piled up, else a minor bin-pack when data files exceed
+    /// the threshold (see [`choose_compaction`]).
     async fn compact_all(&self) {
         for engine in self.snapshot_engines().await {
             for table in engine.mirrored_tables() {
-                match engine.data_file_count(&table).await {
-                    Ok(n) if n > self.cfg.max_data_files => {
-                        if let Err(err) = engine.compact(&table).await {
-                            eprintln!(
-                                "lakehouse: compaction of '{}/{table}' failed: {err}",
-                                engine.namespace()
-                            );
-                        }
+                let data_files = match engine.data_file_count(&table).await {
+                    Ok(n) => n,
+                    Err(err) => {
+                        eprintln!(
+                            "lakehouse: data_file_count('{}/{table}') failed: {err}",
+                            engine.namespace()
+                        );
+                        continue;
                     }
-                    Ok(_) => {}
-                    Err(err) => eprintln!(
-                        "lakehouse: data_file_count('{}/{table}') failed: {err}",
+                };
+                let delete_files = engine.delete_file_count(&table).await.unwrap_or(0);
+                let result = match choose_compaction(data_files, delete_files, &self.cfg) {
+                    Compaction::Major => engine.compact(&table).await,
+                    Compaction::Minor => engine.compact_incremental(&table).await,
+                    Compaction::None => Ok(()),
+                };
+                if let Err(err) = result {
+                    eprintln!(
+                        "lakehouse: compaction of '{}/{table}' failed: {err}",
                         engine.namespace()
-                    ),
+                    );
                 }
             }
         }
@@ -253,5 +290,42 @@ impl LakehouseManager {
             .write(bytes.into())
             .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(max_data_files: usize, max_delete_files: usize) -> LakehouseConfig {
+        LakehouseConfig {
+            seal_debounce: Duration::from_millis(1),
+            seal_max_interval: Duration::from_millis(1),
+            compaction_interval: Duration::from_millis(1),
+            max_data_files,
+            max_delete_files,
+        }
+    }
+
+    #[test]
+    fn chooses_major_when_delete_files_pile_up() {
+        // Deletes over threshold → major, even with few data files.
+        assert_eq!(choose_compaction(1, 5, &cfg(8, 4)), Compaction::Major);
+    }
+
+    #[test]
+    fn chooses_minor_when_only_data_files_exceed() {
+        assert_eq!(choose_compaction(10, 0, &cfg(8, 4)), Compaction::Minor);
+    }
+
+    #[test]
+    fn major_takes_precedence_over_minor() {
+        // Both thresholds exceeded → major (it also reclaims deletes).
+        assert_eq!(choose_compaction(20, 9, &cfg(8, 4)), Compaction::Major);
+    }
+
+    #[test]
+    fn no_compaction_under_both_thresholds() {
+        assert_eq!(choose_compaction(8, 4, &cfg(8, 4)), Compaction::None);
     }
 }
