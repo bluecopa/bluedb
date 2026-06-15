@@ -260,7 +260,7 @@ pub async fn hard_delete(
     state.require_active()?;
     state.authorize(&headers, Scope::SchemaAdmin)?;
     let tenant = state.tenant(&headers)?;
-    state.evidence(&tenant).await?.hard_delete(&chain, seq).await.map_err(map_evidence_err)?;
+    state.evidence(&tenant).await?.hard_delete(&chain, seq, true).await.map_err(map_evidence_err)?;
     Ok(Json(json!({ "chain": chain, "seq": seq, "deleted": true })))
 }
 

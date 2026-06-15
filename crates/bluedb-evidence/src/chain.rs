@@ -455,9 +455,17 @@ impl Evidence {
     /// break the consistency proof). 404 if the entry is absent. Caller must
     /// hold `schema:admin`.
     ///
-    /// Note: retracting the entry's `edges[]` from the graph store is deferred
-    /// to Plan 3 (the graph store does not exist yet).
-    pub async fn hard_delete(&self, chain: &str, seq: i64) -> Result<(), EvidenceError> {
+    /// When `retract_edges` is true, the entry's `edges[]` are also retracted
+    /// from the graph projection in the same batch — each edge identity the
+    /// entry referenced (canonical + out + in) is deleted, so replaying the
+    /// chain no longer reproduces this event's edges. This does NOT restore a
+    /// prior weight: the graph is a rebuildable projection.
+    pub async fn hard_delete(
+        &self,
+        chain: &str,
+        seq: i64,
+        retract_edges: bool,
+    ) -> Result<(), EvidenceError> {
         let _lease = self.write_lease.lock().await;
         let writer = self.substrate.require_writer().map_err(|_| EvidenceError::NotWriter)?;
         let verified = store::get_chain_meta(&self.substrate, &self.keyspace, chain)
@@ -467,11 +475,29 @@ impl Evidence {
         if verified {
             return Err(EvidenceError::VerifiedNoDelete(chain.to_string()));
         }
-        if store::get_entry(&self.substrate, &self.keyspace, chain, seq).await?.is_none() {
-            return Err(EvidenceError::EntryNotFound { chain: chain.to_string(), seq });
-        }
+        let rec = store::get_entry(&self.substrate, &self.keyspace, chain, seq)
+            .await?
+            .ok_or(EvidenceError::EntryNotFound { chain: chain.to_string(), seq })?;
+
         let mut batch = WriteBatch::new();
         batch.delete(self.keyspace.entry_key(chain, seq));
+
+        // Retract the entry's edges from the graph projection (default on).
+        if retract_edges && !rec.edges.is_empty() {
+            let mut overlay: HashMap<Vec<u8>, Option<i64>> = HashMap::new();
+            for e in &rec.edges {
+                let d = EdgeDelta {
+                    graph: e.graph.clone(),
+                    src: e.src.clone(),
+                    dst: e.dst.clone(),
+                    weight: 0,
+                    etype: e.etype.clone(),
+                    op: crate::model::EdgeOp::Delete,
+                };
+                apply_edge_delta(&self.substrate, &self.keyspace, &mut batch, &mut overlay, &d).await?;
+            }
+        }
+
         writer
             .write_with_options(batch, &WriteOptions { await_durable: false, ..Default::default() })
             .await

@@ -91,3 +91,26 @@ async fn standalone_delete_removes_append_created_edge() {
     g.delete("lin", &[EdgeRef { src: "A".into(), dst: "B".into(), etype: String::new() }]).await.unwrap();
     assert_eq!(count_graph_keys(&database).await, (0, 0, 0));
 }
+
+#[tokio::test]
+async fn hard_delete_retracts_edges_by_default() {
+    let database = db().await;
+    let ev = Evidence::new(&database, "_");
+    ev.create_chain("c", false).await.unwrap(); // plain chain (deletable)
+    let entry = EntryInput { etype: "e".into(), payload: vec![], at: String::new(), edges: vec![upsert_edge("lin", "A", "B", 5)] };
+    let r = ev.append("c", vec![entry], None).await.unwrap();
+    assert_eq!(count_graph_keys(&database).await, (1, 1, 1));
+    ev.hard_delete("c", r.seqs[0], true).await.unwrap();
+    assert_eq!(count_graph_keys(&database).await, (0, 0, 0));
+}
+
+#[tokio::test]
+async fn hard_delete_keeps_edges_when_retract_false() {
+    let database = db().await;
+    let ev = Evidence::new(&database, "_");
+    ev.create_chain("c", false).await.unwrap();
+    let entry = EntryInput { etype: "e".into(), payload: vec![], at: String::new(), edges: vec![upsert_edge("lin", "A", "B", 5)] };
+    let r = ev.append("c", vec![entry], None).await.unwrap();
+    ev.hard_delete("c", r.seqs[0], false).await.unwrap();
+    assert_eq!(count_graph_keys(&database).await, (1, 1, 1));
+}

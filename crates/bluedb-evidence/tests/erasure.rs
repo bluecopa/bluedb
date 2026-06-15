@@ -43,7 +43,7 @@ async fn hard_delete_plain_leaves_gap_but_keeps_head() {
     for i in 0..3 {
         ev.append("p", vec![entry(&format!("e{i}"))], None).await.unwrap();
     }
-    ev.hard_delete("p", 2).await.unwrap();
+    ev.hard_delete("p", 2, true).await.unwrap();
     let rows = ev.read_range("p", 1, 3).await.unwrap();
     let seqs: Vec<i64> = rows.iter().map(|(s, _)| *s).collect();
     assert_eq!(seqs, vec![1, 3], "seq 2 is a gap");
@@ -55,7 +55,7 @@ async fn hard_delete_rejected_on_verified_chain() {
     let db = harness::memory_db().await;
     let ev = Evidence::new(&db, "_");
     ev.append("v", vec![entry("a")], None).await.unwrap(); // verified by default
-    let err = ev.hard_delete("v", 1).await.unwrap_err();
+    let err = ev.hard_delete("v", 1, true).await.unwrap_err();
     assert!(matches!(err, bluedb_evidence::EvidenceError::VerifiedNoDelete(_)));
     // Entry remains.
     assert_eq!(ev.read_range("v", 1, 1).await.unwrap().len(), 1);
@@ -71,7 +71,7 @@ async fn redact_and_delete_missing_entry_is_not_found() {
         bluedb_evidence::EvidenceError::EntryNotFound { .. }
     ));
     assert!(matches!(
-        ev.hard_delete("p", 99).await.unwrap_err(),
+        ev.hard_delete("p", 99, true).await.unwrap_err(),
         bluedb_evidence::EvidenceError::EntryNotFound { .. }
     ));
 }
