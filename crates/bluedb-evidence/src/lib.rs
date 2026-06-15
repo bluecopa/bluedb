@@ -9,6 +9,7 @@ mod keyspace;
 mod merkle;
 mod model;
 mod store;
+mod traverse;
 pub mod chain;
 
 pub use chain::{Appended, ConsistencyProof, Digest, EntryInput, Evidence, InclusionProof};
