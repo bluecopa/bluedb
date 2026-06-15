@@ -41,3 +41,48 @@ async fn admin_allows_ddl_when_arbitrary() {
     let mut g = glue().await;
     rest_sql::execute_sql(&mut g, "CREATE TABLE x (a INTEGER)", &[], true).await.unwrap();
 }
+
+#[tokio::test]
+async fn composite_primary_key_through_the_execute_sql_chokepoint() {
+    // Proves the wiring: execute_sql applies the composite-PK rewrite for DDL
+    // (admin), INSERT, and SELECT — the real server path.
+    let db = Db::open("composite", Arc::new(InMemory::new())).await.unwrap();
+    let mut g = Glue::new(SlateDbStorage::new(Arc::new(db)));
+
+    // Composite DDL goes through the arbitrary (admin) surface.
+    rest_sql::execute_sql(
+        &mut g,
+        "CREATE TABLE t (a INTEGER, b TEXT, payload TEXT, PRIMARY KEY (a, b))",
+        &[],
+        true,
+    )
+    .await
+    .unwrap();
+
+    // INSERT + SELECT go through the /sql (non-arbitrary) surface, inline literals.
+    rest_sql::execute_sql(&mut g, "INSERT INTO t (a, b, payload) VALUES (1, 'x', 'p1')", &[], false)
+        .await
+        .unwrap();
+    rest_sql::execute_sql(&mut g, "INSERT INTO t (a, b, payload) VALUES (1, 'y', 'p2')", &[], false)
+        .await
+        .unwrap();
+
+    let out = rest_sql::execute_sql(&mut g, "SELECT payload FROM t WHERE a = 1 AND b = 'x'", &[], false)
+        .await
+        .unwrap();
+    match out.into_iter().next().unwrap() {
+        Payload::Select { rows, .. } => assert_eq!(rows[0][0], Value::Str("p1".into())),
+        other => panic!("{other:?}"),
+    }
+
+    // SELECT * hides the surrogate (three user columns).
+    let out = rest_sql::execute_sql(&mut g, "SELECT * FROM t WHERE a = 1 AND b = 'y'", &[], false)
+        .await
+        .unwrap();
+    match out.into_iter().next().unwrap() {
+        Payload::Select { rows, .. } => {
+            assert_eq!(rows[0].len(), 3, "__bluedb_pk must be hidden from SELECT *");
+        }
+        other => panic!("{other:?}"),
+    }
+}

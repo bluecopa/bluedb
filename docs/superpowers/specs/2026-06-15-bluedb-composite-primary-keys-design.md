@@ -197,8 +197,10 @@ Driven by the presence of a `PkCatalog` for the target table.
     columns into a `__bluedb_pk` predicate that rides §4 pushdown:
     - full key `a = ? AND b = ?` → `__bluedb_pk = enc(a,b)` (point lookup),
     - leading prefix `a = ?` (optionally `AND b <op> ?`) → `__bluedb_pk`
-      range `[lo, hi)`,
-    - row-value `(a,b) > (?,?)` (keyset pagination) → `__bluedb_pk > enc(?,?)`.
+      range `[lo, hi)`.
+    - (Deferred to a follow-up: the SQL row-value form `(a,b) > (?,?)` for
+      cross-partition keyset pagination. The conjunctive within-partition form
+      `a = ? AND b > ?` above is supported.)
   - Predicates not expressible as a key prefix are left as-is (the component
     columns still exist in the row; gluesql filters on them).
   - `ORDER BY a, b` (or a leading prefix) → `ORDER BY __bluedb_pk`.
@@ -214,32 +216,41 @@ The mirror sees a normal single-column PK (`__bluedb_pk`). Two variants:
   data files carry `__bluedb_pk` **plus** the component columns `a, b, …` as
   ordinary columns. Warehouses join/filter on `a, b` (real columns with min/max
   stats → file pruning); `__bluedb_pk` is an internal binary column they ignore.
-- **Variant B (optional, gated):** identifier = `(a, b)` (multi-column equality
-  deletes); `__bluedb_pk` not mirrored. Cleaner Iceberg schema, but depends on
-  iceberg-rust 0.9.1's reader applying **multi-column** equality deletes — the
-  gating spike. Adopt only if that spike is green.
+- **Variant B (evaluated, not adopted):** identifier = `(a, b)` (multi-column
+  equality deletes); `__bluedb_pk` not mirrored. **Dropped:** with the
+  surrogate-key design a CDC *delete* entry carries only the row `Key`
+  (`Bytea(__bluedb_pk)`), not the `a,b` values, so emitting `(a,b)` equality
+  deletes would require decoding the components back out of the surrogate on
+  every delete — real cost for a cosmetic gain (Iceberg declaring `(a,b)` the
+  identifier). Variant A's delete-on-`__bluedb_pk` *is* the delete key, so it is
+  the natural, correct fit. The multi-column-equality-delete gating question is
+  therefore off the critical path.
 
-Either way, emit an Iceberg **sort order on the component columns** so seal-time
-data files cluster by `(a, b)` → strong warehouse file-pruning for
-`a = ? AND b > ?`. We control the sort at seal time (sort collapsed rows before
-writing). Warehouse range-pruning on `a, b` works in **both** variants because
-`a, b` are real columns regardless of the identifier choice.
+File clustering by `(a, b)` falls out **for free**: the seal collapses changes
+into a `BTreeMap` keyed by the row `Key` (`Bytea(__bluedb_pk)`), whose byte order
+equals the tuple order, so each data file is written in `(a, b)` order and its
+Parquet column statistics give warehouses file-pruning on the components. An
+explicit Iceberg `SortOrder` declaration would be redundant clustering and is
+left as a future signal-only enhancement.
 
-The lakehouse derives the PK column set from the `PkCatalog` via a thin
-`bluedb-sql` connection accessor.
+## 10. Phases — status
 
-## 10. Phases
+1. ✅ **PK range pushdown** (§4) — clustered-PK pseudo-index → bounded scan; also
+   fixes single-column PK ranges. *(Spike, commit `146cd15`.)*
+2. ✅ **Encoding + catalog + DDL + INSERT** (§5–7) — `pkcodec`, `PkCatalog`
+   (TAG_PKCAT), CREATE strip/append, INSERT surrogate injection.
+3. ✅ **SELECT/UPDATE/DELETE predicate rewrite + projection hiding** (§8).
+4. ✅ **Lakehouse variant A** (§9) — mirrors via `__bluedb_pk` identity; two
+   writer fixes (Arrow `LargeBinary`; nullable delete-batch fields).
+5. ✅ **Variant B evaluated, not adopted** (§9) — deletes carry only the
+   surrogate, so `(a,b)` equality deletes would need component decoding; variant
+   A is the natural fit. Gating spike off the critical path.
+6. ✅ **Docs + e2e** — engine `execute_sql` wiring + e2e; SQL reference and
+   lakehouse-mirror docs updated.
 
-1. **PK range pushdown** (§4) — `pkcodec` not needed; pure planner+storage.
-   Independently shippable; fixes single-column PK ranges. *(Spike target.)*
-2. **Encoding + catalog + DDL + INSERT** (§5–7, §8 INSERT) — composite create &
-   write; rows land and round-trip; point lookup by full key works.
-3. **SELECT/UPDATE/DELETE predicate rewrite + projection hiding** (§8).
-4. **Lakehouse variant A + sort order** (§9).
-5. **Gating spike + variant B** (§9) — multi-column equality deletes; adopt if
-   green.
-6. **Docs + e2e** (REST, SQL reference, lakehouse page; remove the
-   "single-column primary key" limitation).
+Deferred follow-ups: parameterized PK components + `/tables` data plane;
+row-value `(a,b) > (?,?)` keyset; `UPDATE` of a key column; explicit Iceberg
+sort order.
 
 ## 11. Risks / spike
 

@@ -54,7 +54,13 @@ manage and pay for.
 
 A **primary key is required** on every mirrored table (it keys the merge-on-read
 deletes) — which bluedb's [schema regime](../sql/query-guardrail.md) already
-guarantees.
+guarantees. **Composite primary keys** (`PRIMARY KEY (a, b)`) are mirrored too:
+internally they are backed by a single hidden surrogate (`__bluedb_pk`, a `BYTEA`
+of the order-preserving component encoding) that keys the merge-on-read deletes.
+The component columns `a`, `b`, … are mirrored as ordinary, warehouse-visible
+columns — join and filter on them directly. Because each seal writes rows in
+surrogate (= tuple) order, the data files cluster by `(a, b)` and carry column
+statistics, so warehouses can prune files on the component columns.
 
 ## Enabling the mirror
 
@@ -184,7 +190,11 @@ All optional; sensible defaults shown.
 
 ## Limitations (v1)
 
-- **Single-column primary key.** Composite keys aren't mirrored yet.
+- **Composite-key writes need inline literals.** Composite primary keys are
+  mirrored (see above), but a row's key-column values must be inline literals on
+  the write path — a parameterized PK component, and the PostgREST-style
+  `/tables` data plane (which always parameterizes), don't support composite-PK
+  tables yet. Use `/sql` with inline values or `/admin/sql`.
 - **Schema evolution on a mirrored table** (ADD/DROP/RENAME column) is not yet
   reconciled into Iceberg — the mirror keeps the schema the table had at first
   seal. Field-id reconciliation (emitting an Iceberg schema update before the
