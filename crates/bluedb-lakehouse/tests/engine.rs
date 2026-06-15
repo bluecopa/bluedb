@@ -317,3 +317,65 @@ async fn seals_into_the_same_object_store_as_slatedb() {
     assert!(keys.iter().any(|k| k.ends_with(".metadata.json")), "metadata present: {keys:?}");
     assert!(keys.iter().any(|k| k.contains("/data/") && k.ends_with(".parquet")), "data present");
 }
+
+#[tokio::test]
+async fn failover_resumes_mirror_exactly_once() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+    // --- Writer A: create + insert 1,2, seal, then "fail over". ---
+    let db_a = Database::new(Arc::new(Db::open("bluedb", store.clone()).await.unwrap()));
+    let cdc_a = CdcConfig::default();
+    let eng_a = LakehouseEngine::reopen(
+        object_store_file_io(store.clone()),
+        "lakehouse",
+        "default",
+        db_a.clone(),
+        cdc_a.clone(),
+    )
+    .await
+    .unwrap();
+    eng_a.enable_table("docs").await.unwrap();
+    {
+        let mut g = Glue::new(db_a.connection_serialized());
+        g.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT);")
+            .await
+            .unwrap();
+    }
+    {
+        let mut g = Glue::new(db_a.connection_with_cdc(cdc_a.clone()));
+        g.execute("INSERT INTO docs VALUES (1,'a'),(2,'b');").await.unwrap();
+    }
+    eng_a.seal().await.unwrap();
+    db_a.flush().await.unwrap(); // make A's state durable before handoff
+
+    // --- Writer B: a fresh DB + engine over the SAME store (failover). ---
+    let db_b = Database::new(Arc::new(Db::open("bluedb", store.clone()).await.unwrap()));
+    let cdc_b = CdcConfig::default();
+    let eng_b = LakehouseEngine::reopen(
+        object_store_file_io(store.clone()),
+        "lakehouse",
+        "default",
+        db_b.clone(),
+        cdc_b.clone(),
+    )
+    .await
+    .unwrap();
+    // The opt-out registry persisted → docs is still mirrored on B.
+    assert!(eng_b.is_mirrored("docs"), "registry resumed on failover");
+
+    // Replay more writes on B, then seal.
+    {
+        let mut g = Glue::new(db_b.connection_with_cdc(cdc_b.clone()));
+        g.execute("UPDATE docs SET body='x' WHERE id=1;").await.unwrap();
+        g.execute("INSERT INTO docs VALUES (3,'c');").await.unwrap();
+    }
+    eng_b.seal().await.unwrap();
+
+    // Exactly-once: id=1 updated, id=2 carried over from A's snapshot, id=3 new —
+    // no rows lost, none duplicated across the failover.
+    let rows = read_table(&eng_b, "docs").await;
+    assert_eq!(rows.len(), 3, "no loss/dup across failover: {rows:?}");
+    assert_eq!(rows.get(&1).map(String::as_str), Some("x"));
+    assert_eq!(rows.get(&2).map(String::as_str), Some("b"));
+    assert_eq!(rows.get(&3).map(String::as_str), Some("c"));
+}
