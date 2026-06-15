@@ -9,11 +9,31 @@
   (:require [clj-http.client :as http]
             [cheshire.core :as json]))
 
+(def project
+  "Compose project name = container/network prefix. Override to drive a second,
+  isolated cluster in parallel (e.g. BLUEDB_JEPSEN_PROJECT=bluedb2) so two test
+  sessions don't fight over one stack. Defaults to the `docker compose` default."
+  (or (System/getenv "BLUEDB_JEPSEN_PROJECT") "bluedb"))
+
+(def ^:private base-port
+  "Host port of node1; node2/node3 are the next two. Override with
+  BLUEDB_JEPSEN_BASE_PORT to point at a second cluster (e.g. 8091)."
+  (or (some-> (System/getenv "BLUEDB_JEPSEN_BASE_PORT") Integer/parseInt) 8081))
+
 (def ports
   "Logical node name -> host port for the compose stack."
-  {"node1" 8081 "node2" 8082 "node3" 8083})
+  {"node1" base-port "node2" (+ base-port 1) "node3" (+ base-port 2)})
 
-(defn node->container [n] (str "bluedb-" n "-1"))
+(defn container
+  "Container name compose assigns service `svc` in this project (`<project>-svc-1`)."
+  [svc]
+  (str project "-" svc "-1"))
+
+(def network
+  "The default bridge network compose creates for this project (`<project>_default`)."
+  (str project "_default"))
+
+(defn node->container [n] (container n))
 
 (defn base [node] (str "http://localhost:" (get ports node)))
 
@@ -83,6 +103,38 @@
   (when-let [node (active-node)]
     (drop-table! node)
     (create-table! node)
+    node))
+
+(defn drop-table-named!
+  "DELETE /schema/tables/{table} on `node` (structured DDL). Tolerates a missing
+  table; returns the ring response or nil on connection error."
+  [node table]
+  (try
+    (http/delete (str (base node) "/schema/tables/" table) short-opts)
+    (catch Exception _ nil)))
+
+(defn reset-la-table!
+  "Drop + recreate the list-append table on the active writer:
+  `la (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)`. One row per appended
+  element. `id` is a surrogate that encodes (key, position) as `k * KEY-STRIDE +
+  position`, so it is **globally unique** (Elle's appended values are only unique
+  *within* a key, so `v` alone can't be the PK) and, crucially, clusters a key's
+  rows into one contiguous primary-key range *in append order*. That makes the
+  read a PK-range scan ordered by the PK — no secondary index and no in-memory
+  sort, which the guardrail would otherwise reject. No-op if no writer found."
+  []
+  (when-let [node (active-node)]
+    (drop-table-named! node "la")
+    (try
+      (http/post (str (base node) "/schema/tables")
+                 (assoc short-opts
+                        :content-type :json
+                        :body (json/generate-string
+                               {:name "la"
+                                :columns [{:name "id" :type "INTEGER" :primary_key true}
+                                          {:name "k" :type "INTEGER"}
+                                          {:name "v" :type "INTEGER"}]})))
+      (catch Exception _ nil))
     node))
 
 (defn add!

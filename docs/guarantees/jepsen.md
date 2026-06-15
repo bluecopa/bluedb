@@ -25,16 +25,23 @@ across promotions.
     The merged [schema regime](../sql/query-guardrail.md) (required `PRIMARY KEY`,
     no schemaless auto-create, bounded reads) made the original Jepsen client
     stale — it assumed a table auto-creates on first insert and that one read
-    returns the whole set. The **`set`** workload has been ported (it now creates
-    `jset (v INTEGER PRIMARY KEY)` up front and keyset-paginates the final read)
-    and **re-verified on the live cluster against the post-group-commit write
-    path** (see Results). The **`list-append`**, **`counter`**, **`unique`**, and
-    **`ledger`** workloads still need the same port before they can be re-run —
-    `list-append` additionally needs a redesign, since it assumed
-    `SELECT … WHERE k = ?` returns *insertion* order, which no longer holds under
-    [index-organized](../concepts/architecture.md#storage-model-index-organized-tables)
-    (PK-clustered) storage. Their earlier green results predate the schema regime;
-    treat them as pending re-validation.
+    returns the whole set. Two workloads have been ported and **re-verified on the
+    live cluster against the post-group-commit write path** (see Results):
+
+    - **`set`** — creates `jset (v INTEGER PRIMARY KEY)` up front and
+      keyset-paginates the final read.
+    - **`list-append`** — redesigned for
+      [index-organized](../concepts/architecture.md#storage-model-index-organized-tables)
+      (PK-clustered) storage, where `SELECT … WHERE k = ?` no longer returns
+      *insertion* order. Each element is one row keyed by a surrogate
+      `id = k·stride + position` (the appended values are unique only within a
+      key, so they can't be the key, and the encoding clusters a key's rows into
+      one PK range *in append order*); the read is a PK-range scan. Its explicit
+      `BEGIN…COMMIT` transactions run through `POST /admin/sql`.
+
+    The **`counter`**, **`unique`**, and **`ledger`** workloads still need the same
+    port (a PK'd table created up front) before they can be re-run; their earlier
+    green results predate the schema regime — treat them as pending re-validation.
 
 ## Faults (nemesis)
 
@@ -65,12 +72,17 @@ Injected against the Compose stack via the `docker` CLI:
   are **`:valid? true`** with **`lost-count 0`** — bluedb stays **consistent**
   (no split-brain, no lost acked writes) while losing **availability** when a
   dependency is down. This is the **CP** behavior, demonstrated.
-- `list-append` passes the Elle checker up to **strict-serializable** for the
-  explicit-transaction path.
+- **`list-append` re-verification (2026-06-16):** ported to the schema regime and
+  **`:valid? true`** on the live 3-node cluster — a clean baseline (`none`, every
+  transaction commits), **`mix`** (kill + partition) serializable through
+  failover, and **`strict-serializable`** under `kill` (adds real-time order,
+  through crashes). Elle finds no G0/G1/G2, lost update, write skew, or
+  incompatible-order anomaly on the explicit-transaction (`/admin/sql`) path.
 
-The dependency-fault and `list-append` results above were established before the
-schema regime landed; they are being re-run as the remaining workloads are ported
-(see the warning above). The `set` re-verification is current.
+The dependency-fault results (`arbiter` / `storage` / `disk-full`) above were
+established before the schema regime landed; they are being re-run as the
+remaining workloads are ported (see the warning above). The `set` and
+`list-append` re-verifications are current.
 
 !!! note "Methodology"
     Fault windows straddle the lease TTL so failover completes inside each

@@ -43,9 +43,11 @@
             [clojure.string :as str]
             [clojure.tools.logging :refer [info]]))
 
-(def ^:private net "bluedb_default")
-(def ^:private pg-container "bluedb-postgres-1")
-(def ^:private minio-container "bluedb-minio-1")
+;; Derived from the compose project (h/project) so a second, alternately-named
+;; cluster (BLUEDB_JEPSEN_PROJECT=bluedb2) is targeted correctly.
+(def ^:private net h/network)
+(def ^:private pg-container (h/container "postgres"))
+(def ^:private minio-container (h/container "minio"))
 (def ^:private filler "/data/.jepsen-filler")
 
 (defn- docker [& args]

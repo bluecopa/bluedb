@@ -1,11 +1,20 @@
-# A local bluedb cluster for failover testing / Jepsen: a shared MinIO object
-# store, a Postgres lease arbiter, and three bluedb-server nodes. All three
-# bootstrap; the Postgres lease elects exactly one writer, the others follow as
-# read replicas. Kill the writer and a standby takes over within ~TTL seconds.
+# A SECOND, isolated bluedb cluster for running Jepsen in parallel with the
+# primary `docker-compose.yml` stack (e.g. two test sessions at once). Identical
+# topology, but a distinct project name (`bluedb2` → containers `bluedb2-*`,
+# network `bluedb2_default`) and node host ports 8091/8092/8093 so nothing
+# collides with the primary stack's 8081-8083 / 9000-9001. Reuses the already
+# built `bluedb-server:dev` image (no build section), so it starts in seconds.
 #
-#   docker compose up -d --build
-#   curl localhost:8081/admin/status   # (8081/8082/8083 = node1/2/3)
-name: bluedb
+#   docker compose -f docker-compose.bluedb2.yml up -d
+#   # then point Jepsen at it:
+#   BLUEDB_JEPSEN_PROJECT=bluedb2 BLUEDB_JEPSEN_BASE_PORT=8091 \
+#     bin/lein run test --workload list-append --nemesis none --time-limit 60 \
+#     --concurrency 10 --node node1 --node node2 --node node3
+#
+# MinIO is internal-only here (no host port) — Jepsen never talks to it directly;
+# the nodes reach it over the project network and the nemesis acts via the docker
+# CLI by container name (`bluedb2-minio-1`).
+name: bluedb2
 
 x-node-env: &node-env
   BLUEDB_S3_BUCKET: bluedb
@@ -17,9 +26,6 @@ x-node-env: &node-env
   BLUEDB_LEASE_PG_URL: postgresql://postgres:bluedb@postgres:5432/bluedb
   BLUEDB_LEASE_TTL_SECS: "10"
   BLUEDB_LEASE_MARGIN_SECS: "3"
-  # Enable POST /admin/sql so the Jepsen list-append workload can run multi-
-  # statement explicit transactions (BEGIN; …; COMMIT;) — /sql takes exactly one
-  # statement. No authz is configured here, so the superuser scope is open.
   BLUEDB_ENABLE_ADMIN_SQL: "1"
 
 x-node-deps: &node-deps
@@ -35,15 +41,9 @@ services:
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
-    ports:
-      - "9000:9000"
-      - "9001:9001"
-    # Size-bounded RAM-backed data dir: ample for the small test data, but lets
-    # the disk-full nemesis fill it to trigger ENOSPC without filling the VM disk.
     tmpfs:
       - /data:size=512m
 
-  # One-shot: wait for MinIO, create the bucket, exit.
   createbucket:
     image: minio/mc:latest
     depends_on:
@@ -71,15 +71,12 @@ services:
 
   node1:
     image: bluedb-server:dev
-    build:
-      context: .
-      dockerfile: Dockerfile
     depends_on: *node-deps
     environment:
       <<: *node-env
       BLUEDB_NODE_ID: node1
     ports:
-      - "8081:8080"
+      - "8091:8080"
 
   node2:
     image: bluedb-server:dev
@@ -88,7 +85,7 @@ services:
       <<: *node-env
       BLUEDB_NODE_ID: node2
     ports:
-      - "8082:8080"
+      - "8092:8080"
 
   node3:
     image: bluedb-server:dev
@@ -97,4 +94,4 @@ services:
       <<: *node-env
       BLUEDB_NODE_ID: node3
     ports:
-      - "8083:8080"
+      - "8093:8080"
