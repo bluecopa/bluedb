@@ -14,6 +14,7 @@ pub(crate) const TAG_GRAPH_OUT: u8 = TAG_EXTERNAL_BASE + 13; // 0x1D  out-adjace
 pub(crate) const TAG_GRAPH_IN: u8 = TAG_EXTERNAL_BASE + 14; // 0x1E  in-adjacency (by weight asc)
 
 /// Builds storage keys for evidence records within one tenant.
+#[derive(Clone)]
 pub(crate) struct EvidenceKeyspace {
     ks: Keyspace,
 }
