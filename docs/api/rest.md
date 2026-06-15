@@ -36,8 +36,23 @@ Per-route scopes:
 | `POST /sql` | `data:query` |
 | `POST /admin/sql` | `superuser` |
 | `POST` / `DELETE /schema/*` | `schema:admin` |
+| `GET /catalog/v1/*` | `data:read` |
 | `POST /admin/promote`, `POST /admin/demote` | `superuser` |
 | `GET /health`, `GET /admin/status` | public (no token) |
+
+### Tenant selection
+
+Every data, schema, and catalog request is scoped to a **tenant** chosen by the
+`X-Bluedb-Tenant` header (absent ⇒ the default tenant `_`):
+
+```
+X-Bluedb-Tenant: acme
+```
+
+Tenants are fully isolated (separate keyspace and Iceberg namespace). A token may
+be bound to specific tenants with a `tenant:<name>` scope; it can then act only
+on those tenants (a `superuser` reaches any, an unbound token only the default
+tenant). See [Multi-tenancy](../deployment/configuration.md#multi-tenancy).
 
 ## `POST /sql` — run one parameterized statement
 
@@ -216,8 +231,11 @@ warehouses use to discover and load the mirrored tables:
 - `GET /catalog/v1/namespaces/{ns}/tables` — list mirrored tables
 - `GET /catalog/v1/namespaces/{ns}/tables/{table}` — `loadTable` (metadata location + schema)
 
-Requires `data:read` when authorization is enabled. Control which tables are
-mirrored with `PRAGMA lakehouse_mirror` over [`POST /sql`](#post-sql-run-one-parameterized-statement).
+Requires `data:read` when authorization is enabled. Each **tenant** publishes its
+own namespace (`namespace == tenant`; the default tenant maps to `default`), and a
+token only sees the namespaces for tenants it is bound to. Control which tables are
+mirrored with `PRAGMA lakehouse_mirror` over [`POST /sql`](#post-sql-run-one-parameterized-statement)
+(per tenant, selected by the `X-Bluedb-Tenant` header).
 
 ## Health & admin
 

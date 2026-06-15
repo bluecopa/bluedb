@@ -71,6 +71,27 @@ per-route scopes.
 BLUEDB_AUTHZ_TOKENS='reader=data:read;writer=data:read,data:write,data:query;admin=superuser'
 ```
 
+## Multi-tenancy
+
+Every request is scoped to a **tenant** via the `X-Bluedb-Tenant` request header
+(absent ⇒ the default tenant `_`). Tenants have fully isolated keyspaces — and,
+for the [lakehouse mirror](../lakehouse/iceberg-mirror.md#multi-tenancy), a
+separate Iceberg namespace each. Tenant names allow letters, digits, `_`, and
+`-`. No env var is needed to enable multi-tenancy; it is always on.
+
+Bind a token to one or more tenants with a `tenant:<name>` entry in
+`BLUEDB_AUTHZ_TOKENS` (alongside its scopes). The request's `X-Bluedb-Tenant`
+must then match one of the token's tenants — a `superuser` token reaches any
+tenant, and a token with **no** `tenant:` entry may reach only the default
+tenant (so single-tenant configs keep working). In open mode (no
+`BLUEDB_AUTHZ_TOKENS`) the header is trusted.
+
+```bash
+# acme-scoped writer; globex-scoped reader; an admin that spans all tenants
+BLUEDB_AUTHZ_TOKENS='acme=data:read,data:write,data:query,tenant:acme;\
+globex=data:read,tenant:globex;admin=superuser'
+```
+
 ## Example: one node against MinIO + Postgres
 
 ```bash

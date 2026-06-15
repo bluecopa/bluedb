@@ -203,6 +203,9 @@ pub struct SlateDbStorage {
     /// require the writer.
     substrate: Substrate,
     keyspace: Keyspace,
+    /// The tenant this connection is scoped to (matches `keyspace`'s prefix).
+    /// Used to scope the CDC log's enablement check and sequence space.
+    tenant: String,
     /// Shared write lease serializing explicit write transactions over this `Db`.
     write_lease: WriteLease,
     /// Shared lock held *briefly* at commit while a fresh keyed insert
@@ -263,7 +266,7 @@ impl SlateDbStorage {
             Arc::new(Mutex::new(())),
             Arc::new(Mutex::new(())),
             Arc::new(Mutex::new(HashMap::new())),
-            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(HashMap::new())),
         )
     }
 
@@ -282,6 +285,7 @@ impl SlateDbStorage {
         Self {
             substrate,
             keyspace: Keyspace::new(tenant),
+            tenant: tenant.to_string(),
             write_lease,
             insert_lock,
             seq,
@@ -337,7 +341,7 @@ impl SlateDbStorage {
     /// unobserved, non-mirrored commit pays nothing.
     fn wants_changes(&self, table: &str) -> bool {
         self.commit_observer.is_some()
-            || self.cdc.as_ref().is_some_and(|c| c.is_enabled(table))
+            || self.cdc.as_ref().is_some_and(|c| c.is_enabled(&self.tenant, table))
     }
 
     /// Buffer a row change for the commit observer and/or the CDC log, when one
@@ -1034,18 +1038,20 @@ impl Transaction for SlateDbStorage {
                     }
                 }
                 // Lakehouse CDC: append one entry per mirror-enabled change into
-                // the SAME batch as the data, stamped with a global monotonic
+                // the SAME batch as the data, stamped with a per-tenant monotonic
                 // sequence. Because it rides the one atomic `WriteBatch`, a CDC
                 // entry is durable iff its data row is — exactly-once capture for
-                // the seal loop. Default-tenant only for v1 (see `crate::cdc`).
+                // the seal loop. The log and its sequence space are scoped to this
+                // connection's tenant (see `crate::cdc`).
                 let mut cdc_to_signal = None;
                 if let Some(cdc) = self.cdc.clone() {
                     let mut wrote_cdc = false;
                     for ch in &txn.changes {
-                        if !cdc.is_enabled(&ch.table) {
+                        if !cdc.is_enabled(&self.tenant, &ch.table) {
                             continue;
                         }
-                        let seq = next_cdc_seq(&self.cdc_seq, &self.substrate).await?;
+                        let seq =
+                            next_cdc_seq(&self.cdc_seq, &self.substrate, &self.tenant).await?;
                         let entry = CdcEntry {
                             table: ch.table.clone(),
                             key: ch.key.clone(),

@@ -48,9 +48,9 @@ use bluedb_ha::{HaError, Status, WriterController};
 use bluedb_ledger::Ledger;
 
 mod ledger_api;
-use bluedb_lakehouse::{object_store_file_io, LakehouseEngine};
+use bluedb_lakehouse::{object_store_file_io, LakehouseConfig, LakehouseManager};
 use bluedb_rest::{parse_filters, DeleteRequest, InsertRequest, UpdateRequest};
-use bluedb_sql::{parse_lakehouse_pragma, CdcConfig, Database, SlateDbStorage};
+use bluedb_sql::{parse_lakehouse_pragma, CdcConfig, Database, SlateDbStorage, DEFAULT_TENANT};
 use gluesql_core::prelude::{Glue, Payload, Value as SqlValue};
 use slatedb::object_store::ObjectStore;
 use slatedb::{Db, DbReader, Settings};
@@ -90,10 +90,6 @@ fn parse_fts_seal_interval_ms(raw: Option<&str>) -> Duration {
 fn fts_seal_interval() -> Duration {
     parse_fts_seal_interval_ms(std::env::var("BLUEDB_FTS_SEAL_INTERVAL_MS").ok().as_deref())
 }
-
-/// The Iceberg namespace the mirror publishes under (what the warehouse sees in
-/// the REST catalog). Single-tenant v1.
-const LAKEHOUSE_NAMESPACE: &str = "default";
 
 /// Object-storage key prefix under which the Iceberg mirror lives (alongside the
 /// SlateDB data in the same bucket). `BLUEDB_LAKEHOUSE_ROOT`, default `lakehouse`.
@@ -146,6 +142,17 @@ fn lakehouse_max_data_files() -> usize {
         .ok()
         .and_then(|s| s.trim().parse::<usize>().ok())
         .unwrap_or(8)
+}
+
+/// The lakehouse seal + compaction tunables for this node, from the
+/// `BLUEDB_LAKEHOUSE_*` env vars (see the individual helpers for defaults).
+fn lakehouse_config() -> LakehouseConfig {
+    LakehouseConfig {
+        seal_debounce: lakehouse_seal_debounce(),
+        seal_max_interval: lakehouse_seal_max_interval(),
+        compaction_interval: lakehouse_compaction_interval(),
+        max_data_files: lakehouse_max_data_files(),
+    }
 }
 
 /// SlateDB `Settings` for the writer `Db`: bluedb's `flush_interval` default,
@@ -202,13 +209,12 @@ struct Inner {
     /// `metadata.json` a warehouse loads contain resolvable locations. Set at
     /// startup via [`AppState::with_lakehouse_base`].
     lakehouse_base: String,
-    /// The active lakehouse mirror engine: `Some` only while this node is the
-    /// active writer (reopened on promote over the writer's `Database` + the
-    /// object store, dropped on demote). A passive node mirrors nothing.
-    lakehouse: RwLock<Option<Arc<LakehouseEngine>>>,
-    /// The lakehouse seal loop + compaction worker handles, spawned on promote and
-    /// aborted on demote / re-promote.
-    lakehouse_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// The active lakehouse mirror manager (one engine per tenant): `Some` only
+    /// while this node is the active writer (opened on promote over the writer's
+    /// `Database` + the object store, shut down on demote). A passive node
+    /// mirrors nothing. The manager owns the per-tenant engines and the shared
+    /// seal/compaction loops.
+    lakehouse: RwLock<Option<Arc<LakehouseManager>>>,
 }
 
 impl AppState {
@@ -234,7 +240,6 @@ impl AppState {
                 cdc: CdcConfig::default(),
                 lakehouse_base: String::new(),
                 lakehouse: RwLock::new(None),
-                lakehouse_handles: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -276,10 +281,7 @@ impl AppState {
     /// Open mode (no authz configured) always allows. Composes with `require_active`.
     pub(crate) fn authorize(&self, headers: &axum::http::HeaderMap, required: authz::Scope) -> Result<(), AppError> {
         let Some(authz) = self.inner.authz.get() else { return Ok(()); };
-        let token = headers
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "));
+        let token = bearer_token(headers);
         if authz.allows(token, required) {
             Ok(())
         } else if token.is_none() {
@@ -287,6 +289,45 @@ impl AppState {
         } else {
             Err(AppError { status: StatusCode::FORBIDDEN, message: "insufficient scope".into() })
         }
+    }
+
+    /// Authorize the request's token to act on `tenant`. Open mode allows; with
+    /// authz on, the token must be bound to the tenant (or be `superuser`). See
+    /// [`authz::Authz::allows_tenant`].
+    pub(crate) fn authorize_tenant(&self, headers: &axum::http::HeaderMap, tenant: &str) -> Result<(), AppError> {
+        let Some(authz) = self.inner.authz.get() else { return Ok(()); };
+        if authz.allows_tenant(bearer_token(headers), tenant) {
+            Ok(())
+        } else {
+            Err(AppError {
+                status: StatusCode::FORBIDDEN,
+                message: format!("token not authorized for tenant '{tenant}'"),
+            })
+        }
+    }
+
+    /// Resolve and authorize the request's tenant from `X-Bluedb-Tenant`
+    /// (default `"_"` when absent). Rejects names outside `[A-Za-z0-9_-]` (they
+    /// flow into object-store paths) and tenants the token may not access.
+    pub(crate) fn tenant(&self, headers: &axum::http::HeaderMap) -> Result<String, AppError> {
+        let tenant = headers
+            .get("x-bluedb-tenant")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(DEFAULT_TENANT)
+            .to_string();
+        let valid = tenant == DEFAULT_TENANT
+            || tenant
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        if !valid {
+            return Err(AppError::bad_request(format!(
+                "invalid tenant '{tenant}' (allowed: letters, digits, '_', '-')"
+            )));
+        }
+        self.authorize_tenant(headers, &tenant)?;
+        Ok(tenant)
     }
 
     /// The lease controller (for the HA background loop in `main`).
@@ -344,27 +385,19 @@ impl AppState {
             format!("{base}/{}", lakehouse_root())
         };
         let file_io = object_store_file_io(self.inner.object_store.clone(), base);
-        let lakehouse = LakehouseEngine::reopen(
+        // Stop a prior manager (re-promote) before opening a fresh one.
+        if let Some(old) = self.inner.lakehouse.write().await.take() {
+            old.shutdown();
+        }
+        let lakehouse = LakehouseManager::open(
             file_io,
             root,
-            LAKEHOUSE_NAMESPACE,
             database.clone(),
             self.inner.cdc.clone(),
+            lakehouse_config(),
         )
         .await
-        .map_err(|e| AppError::internal(format!("reopen lakehouse: {e}")))?;
-        let lakehouse = Arc::new(lakehouse);
-        // Stop prior lakehouse handles (re-promote) before spawning fresh ones.
-        for h in self.inner.lakehouse_handles.lock().unwrap().drain(..) {
-            h.abort();
-        }
-        let seal = lakehouse
-            .clone()
-            .spawn_seal_loop(lakehouse_seal_debounce(), lakehouse_seal_max_interval());
-        let compact = lakehouse
-            .clone()
-            .spawn_compaction_worker(lakehouse_compaction_interval(), lakehouse_max_data_files());
-        *self.inner.lakehouse_handles.lock().unwrap() = vec![seal, compact];
+        .map_err(|e| AppError::internal(format!("open lakehouse: {e}")))?;
         *self.inner.lakehouse.write().await = Some(lakehouse);
         Ok(())
     }
@@ -389,13 +422,12 @@ impl AppState {
             h.abort();
         }
         *self.inner.fts.write().await = FtsEngine::new();
-        // Stop the lakehouse seal loop + compaction worker and drop the engine —
-        // a passive node mirrors nothing (the next promote reopens from the
-        // registry).
-        for h in self.inner.lakehouse_handles.lock().unwrap().drain(..) {
-            h.abort();
+        // Stop the lakehouse seal/compaction loops and drop the manager — a
+        // passive node mirrors nothing (the next promote reopens from the tenant
+        // index + registries).
+        if let Some(m) = self.inner.lakehouse.write().await.take() {
+            m.shutdown();
         }
-        *self.inner.lakehouse.write().await = None;
         self.attach_reader().await;
         Ok(())
     }
@@ -454,11 +486,12 @@ impl AppState {
     /// is no client bypass — a bare `SELECT` is auto-bounded, a non-indexed
     /// filter/sort is rejected. Engine-internal work (the ledger projection, FTS
     /// maintenance) uses the `Database` directly and is unaffected.
-    async fn connection(&self) -> Result<SlateDbStorage, AppError> {
+    async fn connection(&self, tenant: &str) -> Result<SlateDbStorage, AppError> {
         let fts = self.inner.fts.read().await.clone();
         match self.inner.db.read().await.as_ref() {
             Some(db) => Ok(db
-                .connection_guarded()
+                .connection_for_tenant(tenant)
+                .strict()
                 .with_cdc(self.inner.cdc.clone())
                 .with_commit_observer(fts)),
             None => Err(AppError {
@@ -468,18 +501,19 @@ impl AppState {
         }
     }
 
-    /// The active lakehouse engine, or `None` if this node isn't the writer.
-    pub(crate) async fn lakehouse(&self) -> Option<Arc<LakehouseEngine>> {
+    /// The active lakehouse manager, or `None` if this node isn't the writer.
+    pub(crate) async fn lakehouse(&self) -> Option<Arc<LakehouseManager>> {
         self.inner.lakehouse.read().await.clone()
     }
 
-    /// Force the lakehouse mirror to seal pending changes into Iceberg now (a
-    /// no-op on a passive node). Useful before a graceful step-down and for
-    /// deterministic tests; the background loop seals on its own otherwise.
+    /// Force the lakehouse mirror to seal every tenant's pending changes into
+    /// Iceberg now (a no-op on a passive node). Useful before a graceful
+    /// step-down and for deterministic tests; the background loop seals on its
+    /// own otherwise.
     pub async fn seal_now(&self) -> Result<(), AppError> {
-        if let Some(engine) = self.inner.lakehouse.read().await.clone() {
-            engine
-                .seal()
+        if let Some(manager) = self.inner.lakehouse.read().await.clone() {
+            manager
+                .seal_all()
                 .await
                 .map_err(|e| AppError::internal(format!("seal: {e}")))?;
         }
@@ -487,15 +521,17 @@ impl AppState {
     }
 
     /// Like [`Self::connection`] but the connection also serializes autocommit
-    /// writes (see [`bluedb_sql::Database::connection_serialized_guarded`]). Used
-    /// by the routes that can run a single-statement read-modify-write (`/sql`,
+    /// writes (see [`bluedb_sql::SlateDbStorage::serialize_writes`]). Used by the
+    /// routes that can run a single-statement read-modify-write (`/sql`,
     /// `/admin/sql`, `PATCH`, `DELETE`) so concurrent RMWs can't lose an update.
     /// Guarded for the same reason as [`Self::connection`].
-    pub(crate) async fn connection_serialized(&self) -> Result<SlateDbStorage, AppError> {
+    pub(crate) async fn connection_serialized(&self, tenant: &str) -> Result<SlateDbStorage, AppError> {
         let fts = self.inner.fts.read().await.clone();
         match self.inner.db.read().await.as_ref() {
             Some(db) => Ok(db
-                .connection_serialized_guarded()
+                .connection_for_tenant(tenant)
+                .serialize_writes()
+                .strict()
                 .with_cdc(self.inner.cdc.clone())
                 .with_commit_observer(fts)),
             None => Err(AppError {
@@ -608,6 +644,14 @@ fn json_to_param(v: &Value) -> Result<bluedb_rest::Param, AppError> {
 
 // --- handlers ---------------------------------------------------------------
 
+/// Extract the `Authorization: Bearer <token>` value, if present and well-formed.
+fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+}
+
 async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
 }
@@ -619,23 +663,24 @@ async fn exec_sql(
     Json(req): Json<SqlRequest>,
 ) -> Result<Json<Value>, AppError> {
     state.authorize(&headers, authz::Scope::DataQuery)?;
+    let tenant = state.tenant(&headers)?;
     state.require_active()?;
     // Intercept `PRAGMA lakehouse_mirror[...]` before gluesql (which would reject
-    // it): apply the opt-out/opt-in to the live engine and ack.
+    // it): apply the opt-out/opt-in to this tenant's mirror engine and ack.
     if let Some(pragma) = parse_lakehouse_pragma(&req.sql) {
         match state.lakehouse().await {
-            Some(engine) => {
-                engine
-                    .apply_pragma(pragma)
+            Some(manager) => {
+                manager
+                    .apply_pragma(&tenant, pragma)
                     .await
                     .map_err(|e| AppError::internal(format!("lakehouse pragma: {e}")))?;
                 return Ok(Json(json!({ "ok": true, "pragma": "lakehouse_mirror" })));
             }
-            None => return Err(AppError::internal("lakehouse engine not bound")),
+            None => return Err(AppError::internal("lakehouse manager not bound")),
         }
     }
     let params = req.params.iter().map(json_to_param).collect::<Result<Vec<_>, _>>()?;
-    let mut glue = Glue::new(state.connection_serialized().await?);
+    let mut glue = Glue::new(state.connection_serialized(&tenant).await?);
     // Route through the FTS engine: it rewrites `@@`/`ts_rank` against the live
     // segment when a fulltext index is declared, else runs the SQL unchanged.
     let payloads = state.fts().await.execute_fts(&mut glue, &req.sql, &params).await?;
@@ -655,10 +700,11 @@ async fn admin_sql(
             message: "admin SQL endpoint is disabled".to_string(),
         });
     }
+    let tenant = state.tenant(&headers)?;
     state.require_active()?;
     eprintln!("bluedb-audit: /admin/sql executed: {}", req.sql);
     let params = req.params.iter().map(json_to_param).collect::<Result<Vec<_>, _>>()?;
-    let mut glue = Glue::new(state.connection_serialized().await?);
+    let mut glue = Glue::new(state.connection_serialized(&tenant).await?);
     let payloads = rest_sql::execute_sql(&mut glue, &req.sql, &params, true).await?;
     Ok(Json(payloads_to_json(payloads)))
 }
@@ -671,7 +717,8 @@ async fn select(
     RawQuery(query): RawQuery,
 ) -> Result<Json<Value>, AppError> {
     state.authorize(&headers, authz::Scope::DataRead)?;
-    let mut glue = Glue::new(state.connection().await?);
+    let tenant = state.tenant(&headers)?;
+    let mut glue = Glue::new(state.connection(&tenant).await?);
     let payloads = rest_sql::execute_query_str(&mut glue, &table, query.as_deref().unwrap_or("")).await?;
     Ok(Json(payloads_to_json(payloads)))
 }
@@ -684,11 +731,12 @@ async fn insert(
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, AppError> {
     state.authorize(&headers, authz::Scope::DataWrite)?;
+    let tenant = state.tenant(&headers)?;
     state.require_active()?;
     let (req, is_batch) = build_insert(table, body)?;
     if is_batch {
         // Multi-row: atomic BEGIN..COMMIT on the serialized (lease-holding) connection.
-        let mut glue = Glue::new(state.connection_serialized().await?);
+        let mut glue = Glue::new(state.connection_serialized(&tenant).await?);
         let payloads = rest_sql::execute_insert_batch(&mut glue, &req).await?;
         // Fold all per-row Insert(n) payloads from the transaction into one count.
         let total: usize = payloads
@@ -698,7 +746,7 @@ async fn insert(
         Ok(Json(json!({ "inserted": total })))
     } else {
         // Single row: autocommit on the group-commit connection (concurrent fast path).
-        let mut glue = Glue::new(state.connection().await?);
+        let mut glue = Glue::new(state.connection(&tenant).await?);
         let payloads = rest_sql::execute_insert(&mut glue, &req).await?;
         Ok(Json(payloads_to_json(payloads)))
     }
@@ -713,6 +761,7 @@ async fn update(
     Json(assignments): Json<Map<String, Value>>,
 ) -> Result<Json<Value>, AppError> {
     state.authorize(&headers, authz::Scope::DataWrite)?;
+    let tenant = state.tenant(&headers)?;
     state.require_active()?;
     let filters = parse_filters(query.as_deref().unwrap_or("")).map_err(EngineError::from)?;
     let assignments = assignments
@@ -721,7 +770,7 @@ async fn update(
         .collect::<Result<Vec<_>, AppError>>()?;
     let req = UpdateRequest { table, assignments, filters };
     // UPDATE is a read-modify-write; serialize so concurrent ones can't lose.
-    let mut glue = Glue::new(state.connection_serialized().await?);
+    let mut glue = Glue::new(state.connection_serialized(&tenant).await?);
     let payloads = rest_sql::execute_update(&mut glue, &req).await?;
     Ok(Json(payloads_to_json(payloads)))
 }
@@ -734,11 +783,12 @@ async fn delete_rows(
     RawQuery(query): RawQuery,
 ) -> Result<Json<Value>, AppError> {
     state.authorize(&headers, authz::Scope::DataWrite)?;
+    let tenant = state.tenant(&headers)?;
     state.require_active()?;
     let filters = parse_filters(query.as_deref().unwrap_or("")).map_err(EngineError::from)?;
     let req = DeleteRequest { table, filters };
     // DELETE reads the rows it removes; serialize for the same reason as UPDATE.
-    let mut glue = Glue::new(state.connection_serialized().await?);
+    let mut glue = Glue::new(state.connection_serialized(&tenant).await?);
     let payloads = rest_sql::execute_delete(&mut glue, &req).await?;
     Ok(Json(payloads_to_json(payloads)))
 }

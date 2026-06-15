@@ -67,9 +67,9 @@ pub struct Database {
     write_lease: WriteLease,
     insert_lock: WriteLease,
     seq: SeqAllocator,
-    /// Global, lazily-seeded CDC sequence counter, shared by every connection
-    /// vended from this handle so the lakehouse CDC log stays totally ordered
-    /// across them (see [`crate::cdc`]).
+    /// Lazily-seeded **per-tenant** CDC sequence counters, shared by every
+    /// connection vended from this handle so each tenant's lakehouse CDC log
+    /// stays totally ordered across them (see [`crate::cdc`]).
     cdc_seq: CdcSeq,
 }
 
@@ -94,15 +94,16 @@ impl Database {
             write_lease: Arc::new(Mutex::new(())),
             insert_lock: Arc::new(Mutex::new(())),
             seq: Arc::new(Mutex::new(HashMap::new())),
-            cdc_seq: Arc::new(Mutex::new(None)),
+            cdc_seq: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    /// Allocate the next global CDC sequence (1-based, monotonic). Seeds lazily
-    /// from the persisted max on first use, so a freshly promoted writer
-    /// re-derives the counter from object storage after a failover.
-    pub async fn next_cdc_seq(&self) -> Result<i64, SqlError> {
-        next_cdc_seq(&self.cdc_seq, &self.substrate).await
+    /// Allocate `tenant`'s next CDC sequence (1-based, monotonic within the
+    /// tenant). Seeds lazily from the persisted max on first use, so a freshly
+    /// promoted writer re-derives the counter from object storage after a
+    /// failover.
+    pub async fn next_cdc_seq(&self, tenant: &str) -> Result<i64, SqlError> {
+        next_cdc_seq(&self.cdc_seq, &self.substrate, tenant).await
     }
 
     /// Is this a writer handle (vs. a read replica)?
@@ -205,10 +206,10 @@ impl Database {
         self.connection_serialized().with_cdc(cdc)
     }
 
-    /// Read CDC log entries with sequence `> after`, in sequence (commit) order,
-    /// each paired with its sequence. Default tenant only (v1).
-    pub async fn scan_cdc(&self, after: i64) -> Result<Vec<(i64, CdcEntry)>, SqlError> {
-        let ks = Keyspace::new(DEFAULT_TENANT);
+    /// Read `tenant`'s CDC log entries with sequence `> after`, in sequence
+    /// (commit) order, each paired with its sequence.
+    pub async fn scan_cdc(&self, tenant: &str, after: i64) -> Result<Vec<(i64, CdcEntry)>, SqlError> {
+        let ks = Keyspace::new(tenant);
         let start = ks.external_key(TAG_CDC, &after.saturating_add(1).to_be_bytes());
         let end = prefix_upper_bound(&ks.external_prefix(TAG_CDC));
         let mut out = Vec::new();
@@ -222,14 +223,14 @@ impl Database {
         Ok(out)
     }
 
-    /// Delete CDC log entries with sequence `<= through`, after the seal loop has
-    /// durably published them to Iceberg. Default tenant only (v1).
-    pub async fn gc_cdc(&self, through: i64) -> Result<(), SqlError> {
-        let ks = Keyspace::new(DEFAULT_TENANT);
+    /// Delete `tenant`'s CDC log entries with sequence `<= through`, after the
+    /// seal loop has durably published them to Iceberg.
+    pub async fn gc_cdc(&self, tenant: &str, through: i64) -> Result<(), SqlError> {
+        let ks = Keyspace::new(tenant);
         let mut batch = slatedb::WriteBatch::new();
-        for (seq, _) in self.scan_cdc(0).await? {
+        for (seq, _) in self.scan_cdc(tenant, 0).await? {
             if seq <= through {
-                batch.delete(&ks.external_key(TAG_CDC, &seq.to_be_bytes()));
+                batch.delete(ks.external_key(TAG_CDC, &seq.to_be_bytes()));
             }
         }
         self.substrate

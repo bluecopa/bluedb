@@ -121,9 +121,9 @@ fn ident(name: &str) -> Result<&str, AppError> {
 // DDL execution helper
 // ---------------------------------------------------------------------------
 
-async fn run_ddl(state: &AppState, sql: String) -> Result<(), AppError> {
+async fn run_ddl(state: &AppState, tenant: &str, sql: String) -> Result<(), AppError> {
     state.require_active()?;
-    let mut glue = Glue::new(state.connection_serialized().await?);
+    let mut glue = Glue::new(state.connection_serialized(tenant).await?);
     rest_sql::execute_sql(&mut glue, &sql, &[], true).await?;
     Ok(())
 }
@@ -139,6 +139,7 @@ pub(crate) async fn create_table(
     Json(req): Json<CreateTableRequest>,
 ) -> Result<Json<Value>, AppError> {
     state.authorize(&headers, Scope::SchemaAdmin)?;
+    let tenant = state.tenant(&headers)?;
     let table = ident(&req.name)?.to_string();
 
     if req.columns.is_empty() {
@@ -164,7 +165,7 @@ pub(crate) async fn create_table(
     }
 
     let sql = format!("CREATE TABLE {table} ({});", col_defs.join(", "));
-    run_ddl(&state, sql).await?;
+    run_ddl(&state, &tenant, sql).await?;
     Ok(Json(json!({ "created": true, "table": table })))
 }
 
@@ -175,9 +176,10 @@ pub(crate) async fn drop_table(
     Path(table): Path<String>,
 ) -> Result<Json<Value>, AppError> {
     state.authorize(&headers, Scope::SchemaAdmin)?;
+    let tenant = state.tenant(&headers)?;
     let table = ident(&table)?.to_string();
     let sql = format!("DROP TABLE {table};");
-    run_ddl(&state, sql).await?;
+    run_ddl(&state, &tenant, sql).await?;
     Ok(Json(json!({ "dropped": true, "table": table })))
 }
 
@@ -189,6 +191,7 @@ pub(crate) async fn create_index(
     Json(req): Json<CreateIndexRequest>,
 ) -> Result<Json<Value>, AppError> {
     state.authorize(&headers, Scope::SchemaAdmin)?;
+    let tenant = state.tenant(&headers)?;
     let table = ident(&table)?.to_string();
     let index_name = ident(&req.name)?.to_string();
 
@@ -202,7 +205,7 @@ pub(crate) async fn create_index(
         .collect::<Result<Vec<_>, _>>()?;
 
     let sql = format!("CREATE INDEX {index_name} ON {table} ({});", cols.join(", "));
-    run_ddl(&state, sql).await?;
+    run_ddl(&state, &tenant, sql).await?;
     Ok(Json(json!({ "created_index": true, "name": index_name, "table": table })))
 }
 
@@ -216,10 +219,11 @@ pub(crate) async fn create_fulltext_index(
     Json(req): Json<CreateFulltextIndexRequest>,
 ) -> Result<Json<Value>, AppError> {
     state.authorize(&headers, Scope::SchemaAdmin)?;
+    let tenant = state.tenant(&headers)?;
     state.require_active()?;
     let table = ident(&table)?.to_string();
     let column = ident(&req.column)?.to_string();
-    let conn = state.connection().await?;
+    let conn = state.connection(&tenant).await?;
     state
         .fts()
         .await
@@ -243,10 +247,11 @@ pub(crate) async fn create_trigram_index(
     Json(req): Json<CreateTrigramIndexRequest>,
 ) -> Result<Json<Value>, AppError> {
     state.authorize(&headers, Scope::SchemaAdmin)?;
+    let tenant = state.tenant(&headers)?;
     state.require_active()?;
     let table = ident(&table)?.to_string();
     let column = ident(&req.column)?.to_string();
-    let conn = state.connection().await?;
+    let conn = state.connection(&tenant).await?;
     state
         .fts()
         .await
@@ -265,10 +270,11 @@ pub(crate) async fn drop_index(
     Path((table, name)): Path<(String, String)>,
 ) -> Result<Json<Value>, AppError> {
     state.authorize(&headers, Scope::SchemaAdmin)?;
+    let tenant = state.tenant(&headers)?;
     let table = ident(&table)?.to_string();
     let index_name = ident(&name)?.to_string();
     // GlueSQL DROP INDEX uses the table-qualified form: DROP INDEX table.index_name
     let sql = format!("DROP INDEX {table}.{index_name};");
-    run_ddl(&state, sql).await?;
+    run_ddl(&state, &tenant, sql).await?;
     Ok(Json(json!({ "dropped_index": true, "name": index_name, "table": table })))
 }

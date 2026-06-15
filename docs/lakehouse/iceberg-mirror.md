@@ -94,13 +94,44 @@ curl -s localhost:8081/catalog/v1/namespaces/default/tables/orders
 ```
 
 Point your warehouse's Iceberg REST catalog integration at
-`http://<bluedb-host>:<port>/catalog` (namespace `default`) and give it read
-access to the bucket. Catalog routes require a `data:read` token when
-[authorization](../operations/admin.md) is enabled.
+`http://<bluedb-host>:<port>/catalog` and give it read access to the bucket. Use
+the namespace for the tenant you want (`default` for the default tenant — see
+[Multi-tenancy](#multi-tenancy)). Catalog routes require a `data:read` token when
+[authorization](../operations/admin.md) is enabled, and a token only sees the
+namespaces for the tenants it is bound to.
 
 The mirror is **read-only from the warehouse side**: writes always go through
 bluedb's SQL/REST surface and flow to Iceberg automatically. Don't write to the
 Iceberg tables directly.
+
+## Multi-tenancy
+
+bluedb is **multi-tenant**: every request is scoped to a tenant via the
+`X-Bluedb-Tenant` header (absent ⇒ the default tenant `_`). Each tenant has its
+own isolated keyspace, its own CDC log, and — in the mirror — its own **Iceberg
+namespace** (`namespace == tenant`; the default tenant maps to `default`). Two
+tenants can mirror identically-named tables with zero overlap.
+
+```bash
+# Mirror + write under tenant "acme"
+curl -s localhost:8081/sql -H 'X-Bluedb-Tenant: acme' \
+  -d '{"sql":"PRAGMA lakehouse_mirror = on"}'
+curl -s localhost:8081/sql -H 'X-Bluedb-Tenant: acme' \
+  -d '{"sql":"INSERT INTO orders VALUES (1, 99)"}'
+
+# acme's tables live under the "acme" Iceberg namespace
+curl -s localhost:8081/catalog/v1/namespaces/acme/tables
+```
+
+`PRAGMA lakehouse_mirror` is **per tenant** — enabling it for `acme` doesn't
+affect any other tenant. The mirror set for each tenant is restored on
+promote/failover from a durable tenant index, so no PRAGMA replay is needed.
+
+When [authorization](../operations/admin.md) is enabled, bind a token to one or
+more tenants with a `tenant:<name>` scope; the token can then act only on those
+tenants (a `superuser` token reaches any). A token with no `tenant:` binding may
+reach only the default tenant — so existing single-tenant token configs keep
+working unchanged. See [Configuration](../deployment/configuration.md#api-surface--authorization).
 
 ### Cross-engine compatibility
 
@@ -153,8 +184,6 @@ All optional; sensible defaults shown.
 
 ## Limitations (v1)
 
-- **Single namespace / default tenant.** The mirror publishes one Iceberg
-  namespace (`default`).
 - **Single-column primary key.** Composite keys aren't mirrored yet.
 - **Schema evolution on a mirrored table** (ADD/DROP/RENAME column) is not yet
   reconciled into Iceberg — the mirror keeps the schema the table had at first

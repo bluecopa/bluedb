@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use bluedb_sql::{collapse_lww, CdcConfig, Database, LhPragma};
+use bluedb_sql::{collapse_lww, CdcConfig, Database, LhPragma, DEFAULT_TENANT};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use gluesql_core::store::{DataRow, Store};
@@ -23,6 +23,27 @@ use serde::{Deserialize, Serialize};
 use crate::schema::table_to_iceberg;
 use crate::writer::LakehouseWriter;
 use crate::{LakehouseError, Result};
+
+/// The Iceberg namespace a tenant publishes under. The default tenant (`"_"`)
+/// maps to the conventional `default` namespace; any other tenant uses its own
+/// id verbatim, giving each tenant an isolated namespace in the shared catalog.
+pub fn namespace_for_tenant(tenant: &str) -> String {
+    if tenant == DEFAULT_TENANT {
+        "default".to_string()
+    } else {
+        tenant.to_string()
+    }
+}
+
+/// Inverse of [`namespace_for_tenant`]: the tenant that owns Iceberg namespace
+/// `ns`. Used to authorize catalog access against the namespace's tenant.
+pub fn tenant_for_namespace(ns: &str) -> String {
+    if ns == "default" {
+        DEFAULT_TENANT.to_string()
+    } else {
+        ns.to_string()
+    }
+}
 
 /// On-disk mirror registry (JSON at `<root>/lakehouse/_registry.json`).
 #[derive(Default, Serialize, Deserialize)]
@@ -38,14 +59,18 @@ struct Registry {
     materialized: std::collections::BTreeSet<String>,
 }
 
-/// The lakehouse mirror engine.
+/// The lakehouse mirror engine — **one per tenant**. Its `tenant` scopes which
+/// CDC log it drains and which connection it reads through; its `namespace`
+/// scopes where the Iceberg tables and registry live.
 pub struct LakehouseEngine {
     file_io: FileIO,
-    /// Object-storage root under which both the registry and the Iceberg tables
-    /// live (`<root>/lakehouse/_registry.json`, `<root>/<namespace>/<table>/…`).
+    /// Object-storage root under which every tenant's registry and Iceberg
+    /// tables live (`<root>/<namespace>/_registry.json`,
+    /// `<root>/<namespace>/<table>/…`).
     root: String,
-    /// Iceberg namespace for the mirrored tables (one per tenant; default tenant
-    /// for v1).
+    /// The tenant whose CDC log this engine drains (its keyspace prefix).
+    tenant: String,
+    /// Iceberg namespace for this tenant's mirrored tables (one per tenant).
     namespace: String,
     db: Database,
     /// Shared CDC control (also consulted by the bluedb-sql commit path).
@@ -55,38 +80,40 @@ pub struct LakehouseEngine {
 }
 
 impl LakehouseEngine {
-    fn registry_path(root: &str) -> String {
-        format!("{root}/lakehouse/_registry.json")
+    fn registry_path(root: &str, namespace: &str) -> String {
+        format!("{root}/{namespace}/_registry.json")
     }
 
-    /// Reopen the engine over `root`, restoring the persisted registry and
-    /// applying it to `cdc` so the commit path mirrors the same tables. Creates
-    /// an empty registry if none exists.
+    /// Reopen the engine for `tenant` over `root`, restoring that tenant's
+    /// persisted registry and applying it to `cdc` so the commit path mirrors
+    /// the same tables. Creates an empty registry if none exists.
     pub async fn reopen(
         file_io: FileIO,
         root: impl Into<String>,
-        namespace: impl Into<String>,
+        tenant: impl Into<String>,
         db: Database,
         cdc: CdcConfig,
     ) -> Result<Self> {
         let root = root.into();
-        let path = Self::registry_path(&root);
+        let tenant = tenant.into();
+        let namespace = namespace_for_tenant(&tenant);
+        let path = Self::registry_path(&root, &namespace);
         let registry: Registry = if file_io.exists(&path).await? {
             let bytes = file_io.new_input(&path)?.read().await?;
             serde_json::from_slice(&bytes)?
         } else {
             Registry::default()
         };
-        // Mirror the registry into the shared CDC control.
-        cdc.default_on
-            .store(registry.default_on, std::sync::atomic::Ordering::Relaxed);
+        // Mirror the registry into the shared CDC control, scoped to this tenant.
+        cdc.set_default(&tenant, registry.default_on);
         for (table, on) in &registry.tables {
-            cdc.set_table(table, *on);
+            cdc.set_table(&tenant, table, *on);
         }
         Ok(Self {
             file_io,
             root,
-            namespace: namespace.into(),
+            tenant,
+            namespace,
             db,
             cdc,
             state: RwLock::new(registry),
@@ -99,7 +126,7 @@ impl LakehouseEngine {
             let state = self.state.read().unwrap();
             serde_json::to_vec(&*state)?
         };
-        let path = Self::registry_path(&self.root);
+        let path = Self::registry_path(&self.root, &self.namespace);
         self.file_io
             .new_output(&path)?
             .write(bytes.into())
@@ -111,7 +138,7 @@ impl LakehouseEngine {
     /// already exist (committed before CDC was on) into Iceberg as one snapshot,
     /// so the mirror starts complete and subsequent CDC layers on top.
     pub async fn enable_table(&self, table: &str) -> Result<()> {
-        self.cdc.set_table(table, true);
+        self.cdc.set_table(&self.tenant, table, true);
         self.state
             .write()
             .unwrap()
@@ -142,7 +169,7 @@ impl LakehouseEngine {
         // to now and later seals (higher sequences) layer on cleanly.
         let watermark = self
             .db
-            .scan_cdc(0)
+            .scan_cdc(&self.tenant, 0)
             .await?
             .last()
             .map(|(seq, _)| *seq)
@@ -156,7 +183,7 @@ impl LakehouseEngine {
 
     /// Disable mirroring for `table` (persisted).
     pub async fn disable_table(&self, table: &str) -> Result<()> {
-        self.cdc.set_table(table, false);
+        self.cdc.set_table(&self.tenant, table, false);
         self.state
             .write()
             .unwrap()
@@ -171,15 +198,13 @@ impl LakehouseEngine {
     pub async fn apply_pragma(&self, pragma: LhPragma) -> Result<()> {
         match pragma {
             LhPragma::GlobalDefault(on) => {
-                self.cdc
-                    .default_on
-                    .store(on, std::sync::atomic::Ordering::Relaxed);
+                self.cdc.set_default(&self.tenant, on);
                 {
                     let mut st = self.state.write().unwrap();
                     st.default_on = on;
                     // Re-apply explicit per-table flags relative to the new default.
                     for (table, flag) in &st.tables {
-                        self.cdc.set_table(table, *flag);
+                        self.cdc.set_table(&self.tenant, table, *flag);
                     }
                 }
                 self.persist_registry().await
@@ -191,7 +216,7 @@ impl LakehouseEngine {
 
     /// Is `table` currently mirrored (effective `default_on XOR override`)?
     pub fn is_mirrored(&self, table: &str) -> bool {
-        self.cdc.is_enabled(table)
+        self.cdc.is_enabled(&self.tenant, table)
     }
 
     /// Tables explicitly enabled in the registry.
@@ -243,7 +268,7 @@ impl LakehouseEngine {
     /// table, publish each table's final state as one snapshot, then GC the log
     /// through the sealed watermark. A no-op when the log is empty.
     pub async fn seal(&self) -> Result<()> {
-        let entries = self.db.scan_cdc(0).await?;
+        let entries = self.db.scan_cdc(&self.tenant, 0).await?;
         let Some(watermark) = entries.iter().map(|(seq, _)| *seq).max() else {
             return Ok(()); // nothing to seal
         };
@@ -254,7 +279,7 @@ impl LakehouseEngine {
         }
 
         // Every entry up to `watermark` is now durably published.
-        self.db.gc_cdc(watermark).await?;
+        self.db.gc_cdc(&self.tenant, watermark).await?;
         Ok(())
     }
 
@@ -370,6 +395,11 @@ impl LakehouseEngine {
         &self.namespace
     }
 
+    /// The tenant this engine mirrors (its CDC-log / keyspace prefix).
+    pub fn tenant(&self) -> &str {
+        &self.tenant
+    }
+
     /// The current `metadata.json` location for a sealed table, or `None` if the
     /// table has no Iceberg table yet. Read-only — creates nothing.
     pub async fn table_metadata_location(&self, table: &str) -> Result<Option<String>> {
@@ -440,7 +470,7 @@ impl LakehouseEngine {
     /// Fetch a table's schema, or `None` if it doesn't exist.
     async fn try_fetch_schema(&self, table: &str) -> Result<Option<gluesql_core::data::Schema>> {
         self.db
-            .connection()
+            .connection_for_tenant(&self.tenant)
             .fetch_schema(table)
             .await
             .map_err(glue_err)
@@ -453,7 +483,7 @@ impl LakehouseEngine {
         table: &str,
     ) -> Result<Vec<(gluesql_core::data::Key, DataRow)>> {
         use futures::TryStreamExt;
-        let conn = self.db.connection();
+        let conn = self.db.connection_for_tenant(&self.tenant);
         let iter = conn.scan_data(table).await.map_err(glue_err)?;
         iter.try_collect::<Vec<_>>().await.map_err(glue_err)
     }
