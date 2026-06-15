@@ -9,11 +9,13 @@ theme:
   name: shadcn
 
 # shadcn has no built-in mermaid (Material rendered it automatically). The
-# pymdownx `mermaid` superfence below emits `<pre class="mermaid">`; load
-# mermaid.js and render those ourselves.
-extra_javascript:
-  - https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js
-  - assets/mermaid-init.js
+# mkdocs-mermaid2 plugin loads mermaid.js and renders the `mermaid` superfence
+# (declared below) as a clean `<div class="mermaid">` — avoiding the
+# `<pre><code>`/HTML-escaping that breaks mermaid's parser. `search` is listed
+# so the default search plugin stays enabled alongside it.
+plugins:
+  - search
+  - mermaid2
 
 markdown_extensions:
   - admonition
@@ -31,7 +33,7 @@ markdown_extensions:
       custom_fences:
         - name: mermaid
           class: mermaid
-          format: !!python/name:pymdownx.superfences.fence_code_format
+          format: !!python/name:mermaid2.fence_mermaid
   - pymdownx.tabbed:
       alternate_style: true
 

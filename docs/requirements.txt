@@ -2,4 +2,5 @@
 #   pip install -r docs/requirements.txt && mkdocs build --strict   (or: mkdocs serve)
 # Active theme is mkdocs-shadcn; mkdocs-material is kept installed for easy switch-back.
 mkdocs-shadcn==0.10.7
+mkdocs-mermaid2-plugin==1.2.3
 mkdocs-material==9.5.39
