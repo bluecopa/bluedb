@@ -1,0 +1,17 @@
+[package]
+name = "bluedb-lakehouse"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bluedb-sql = { workspace = true }
+arrow-array = "57"
+arrow-schema = "57"
+iceberg = "0.9.1"
+parquet = "57"
+tokio = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

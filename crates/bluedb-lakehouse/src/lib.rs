@@ -1,0 +1,34 @@
+//! bluedb lakehouse — Iceberg CDC mirror.
+//!
+//! Mirrors bluedb tables into object storage as Apache Iceberg tables (full CRUD via
+//! equality deletes), driven by the SQL commit tap's durable CDC log. The Iceberg commit is
+//! **self-authored** (manifests + snapshot + `metadata.json`) and published through bluedb's
+//! own catalog — see `docs/superpowers/specs/2026-06-15-bluedb-lakehouse-iceberg-mirror-design.md` §5.2.
+pub mod catalog;
+pub mod cdc;
+pub mod compaction;
+pub mod engine;
+pub mod schema;
+pub mod writer;
+
+/// Errors raised by the lakehouse mirror.
+#[derive(Debug, thiserror::Error)]
+pub enum LakehouseError {
+    /// An Iceberg-layer failure (manifest/snapshot/metadata authoring or read-back).
+    #[error("iceberg: {0}")]
+    Iceberg(String),
+    /// A schema/type-mapping failure (gluesql → Iceberg).
+    #[error("schema: {0}")]
+    Schema(String),
+    /// A bluedb-sql failure (CDC log scan, substrate I/O).
+    #[error("sql: {0}")]
+    Sql(#[from] bluedb_sql::SqlError),
+    /// Any other error.
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
+/// Convenience result type for the crate.
+pub type Result<T> = std::result::Result<T, LakehouseError>;
+
+pub use engine::LakehouseEngine;
