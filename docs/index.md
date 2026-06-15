@@ -53,12 +53,8 @@ flowchart TD
 
 ## Start here
 
-<div class="grid cards" markdown>
-
-- :material-rocket-launch: **[Quickstart](quickstart.md)** — run a local cluster and your first query.
-- :material-database: **[SQL reference](sql/README.md)** — the dialect bluedb accepts.
-- :material-shield-check: **[Guarantees](guarantees/consistency.md)** — the consistency model and what Jepsen proves.
-- :material-server-network: **[High availability](ha/active-passive.md)** — active-passive failover, with diagrams.
-- :material-ship-wheel: **[Deployment](deployment/local.md)** — local, Docker, and Kubernetes.
-
-</div>
+- **[Quickstart](quickstart.md)** — run a local cluster and your first query.
+- **[SQL reference](sql/README.md)** — the dialect bluedb accepts.
+- **[Guarantees](guarantees/consistency.md)** — the consistency model and what Jepsen proves.
+- **[High availability](ha/active-passive.md)** — active-passive failover, with diagrams.
+- **[Deployment](deployment/local.md)** — local, Docker, and Kubernetes.
