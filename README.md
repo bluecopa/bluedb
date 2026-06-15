@@ -73,3 +73,6 @@ copy of Quickwit's `quickwit-directories` read path, copied from
 [`quickwit-oss/quickwit@main`](https://github.com/quickwit-oss/quickwit)
 (**Apache-2.0**); per-file headers are preserved (see `crates/bluedb-fts/vendor/NOTICE`).
 Do **not** depend on the crates.io `quickwit-*` packages — they are stale, AGPL `v0.3.0`.
+This is enforced by [`cargo-deny`](deny.toml) in CI: a license **allowlist** (any
+non-permissive license, including AGPL, fails the build) plus an explicit ban on
+the crates.io `quickwit-*` packages. Run it locally with `cargo deny check`.

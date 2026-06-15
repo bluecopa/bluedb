@@ -1,0 +1,34 @@
+name: cargo-deny
+
+# License + dependency-ban gate. Fails any PR (or push to dev) that pulls a
+# license outside the deny.toml allowlist — e.g. AGPL — or one of the banned
+# crates.io `quickwit-*` packages. This is the machine enforcement behind the
+# README "Licensing" note: bluedb ships Apache-2.0 and vendors the Apache-2.0
+# `quickwit-directories` read path rather than the AGPL crates.io packages.
+on:
+  pull_request:
+    paths:
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - ".github/workflows/deny.yml"
+  push:
+    branches: [dev]
+    paths:
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - ".github/workflows/deny.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check bans licenses
