@@ -43,6 +43,9 @@ mod schema;
 
 use bluedb_engine::{rest_sql, EngineError, FtsEngine};
 use bluedb_ha::{HaError, Status, WriterController};
+use bluedb_ledger::Ledger;
+
+mod ledger_api;
 use bluedb_rest::{parse_filters, DeleteRequest, InsertRequest, UpdateRequest};
 use bluedb_sql::{Database, SlateDbStorage};
 use gluesql_core::prelude::{Glue, Payload, Value as SqlValue};
@@ -212,6 +215,14 @@ impl AppState {
         let database = Database::new(Arc::new(db));
         *self.inner.db.write().await = Some(database.clone());
 
+        // Best-effort: ensure the ledger's SQL projection tables exist so
+        // `/ledger/*` reads (and `SELECT ... FROM ledger_accounts`) work. A
+        // failure here doesn't block promotion — the native ledger API still
+        // works (lookups read canonical records, not the projection).
+        if let Err(err) = bluedb_ledger::ensure_schema(&database).await {
+            eprintln!("bluedb-server: ensure ledger schema: {err}");
+        }
+
         // Reopen a durable FTS engine over the writer's substrate: this reconnects
         // any persisted index defs to their existing splits (restart durability).
         let fts = FtsEngine::reopen(database.substrate())
@@ -327,6 +338,20 @@ impl AppState {
         }
     }
 
+    /// Build a [`Ledger`] over the currently-bound database, or `503` if the
+    /// node has no database yet. The `Database` is cheap to clone (`Arc`-based)
+    /// and [`Ledger::new`] captures owned handles, so the returned ledger
+    /// outlives the role lock — like the SQL connection path.
+    async fn ledger(&self) -> Result<Ledger, AppError> {
+        match self.inner.db.read().await.as_ref() {
+            Some(db) => Ok(Ledger::new(db)),
+            None => Err(AppError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                message: "node has no database yet (no writer has been promoted)".to_string(),
+            }),
+        }
+    }
+
     /// Reject a mutating request unless this node is the active writer.
     pub(crate) fn require_active(&self) -> Result<(), AppError> {
         if self.inner.writer.is_active() {
@@ -368,6 +393,10 @@ pub fn build_app(state: AppState) -> Router {
             "/schema/tables/{table}/trigram-indexes",
             post(schema::create_trigram_index),
         )
+        .route("/ledger/accounts", post(ledger_api::create_accounts))
+        .route("/ledger/transfers", post(ledger_api::create_transfers))
+        .route("/ledger/accounts/{id}", get(ledger_api::get_account))
+        .route("/ledger/transfers/{id}", get(ledger_api::get_transfer))
         .with_state(state)
 }
 
@@ -687,6 +716,11 @@ fn sql_value_to_json(value: &SqlValue) -> Value {
         SqlValue::U64(n) => json!(*n),
         SqlValue::F32(x) => serde_json::Number::from_f64(*x as f64).map(Value::Number).unwrap_or(Value::Null),
         SqlValue::F64(x) => serde_json::Number::from_f64(*x).map(Value::Number).unwrap_or(Value::Null),
+        // 128-bit ints exceed JSON's safe integer range, so emit them as
+        // decimal strings (precision-preserving, like the `/ledger` API). This
+        // is what makes the ledger's U128 projection columns usable over HTTP.
+        SqlValue::U128(n) => Value::String(n.to_string()),
+        SqlValue::I128(n) => Value::String(n.to_string()),
         SqlValue::Str(s) => Value::String(s.clone()),
         other => Value::String(format!("{other:?}")),
     }
@@ -772,9 +806,16 @@ impl AppError {
         }
     }
 
-    fn internal(message: impl Into<String>) -> Self {
+    pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
             message: message.into(),
         }
     }

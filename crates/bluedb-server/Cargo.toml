@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 bluedb-engine = { workspace = true }
 bluedb-sql    = { workspace = true }
+bluedb-ledger = { workspace = true }
 bluedb-rest   = { workspace = true }
 # `postgres` feature so the deployable binary can use the Postgres lease arbiter
 # for real multi-node election (BLUEDB_LEASE_PG_URL).

@@ -299,3 +299,134 @@ async fn admin_sql_enabled_runs_ddl() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, json!([{ "id": 1, "label": "hello" }]));
 }
+
+// --- /ledger/* --------------------------------------------------------------
+
+#[tokio::test]
+async fn ledger_create_accounts_transfer_and_lookup() {
+    let app = app().await;
+
+    // Two accounts (u128 ids/values as strings).
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/ledger/accounts",
+        Some(json!([
+            { "id": "1", "ledger": 700, "code": 1 },
+            { "id": "2", "ledger": 700, "code": 1 }
+        ])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["results"][0]["result"], json!("created"));
+    assert_eq!(body["results"][1]["result"], json!("created"));
+    assert_eq!(body["results"][0]["id"], json!("1"));
+
+    // A transfer of 100 from 1 -> 2.
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/ledger/transfers",
+        Some(json!([
+            { "id": "10", "debit_account_id": "1", "credit_account_id": "2", "amount": "100", "ledger": 700, "code": 1 }
+        ])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["results"][0]["result"], json!("created"));
+
+    // Canonical lookups reflect the transfer.
+    let (status, body) = call(&app, "GET", "/ledger/accounts/1", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["debits_posted"], json!("100"));
+    assert_eq!(body["credits_posted"], json!("0"));
+
+    let (status, body) = call(&app, "GET", "/ledger/accounts/2", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["credits_posted"], json!("100"));
+
+    let (status, body) = call(&app, "GET", "/ledger/transfers/10", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["amount"], json!("100"));
+    assert_eq!(body["debit_account_id"], json!("1"));
+}
+
+#[tokio::test]
+async fn ledger_idempotent_and_error_result_codes() {
+    let app = app().await;
+    call(
+        &app,
+        "POST",
+        "/ledger/accounts",
+        Some(json!([{ "id": "1", "ledger": 700, "code": 1 }, { "id": "2", "ledger": 700, "code": 1 }])),
+    )
+    .await;
+
+    // First transfer created; an identical retry is idempotent (`exists`).
+    let xfer = json!([{ "id": "10", "debit_account_id": "1", "credit_account_id": "2", "amount": "100", "ledger": 700, "code": 1 }]);
+    let (_, body) = call(&app, "POST", "/ledger/transfers", Some(xfer.clone())).await;
+    assert_eq!(body["results"][0]["result"], json!("created"));
+    let (_, body) = call(&app, "POST", "/ledger/transfers", Some(xfer)).await;
+    assert_eq!(body["results"][0]["result"], json!("exists"));
+
+    // A transfer to a non-existent credit account → the TB result code.
+    let (_, body) = call(
+        &app,
+        "POST",
+        "/ledger/transfers",
+        Some(json!([{ "id": "11", "debit_account_id": "1", "credit_account_id": "999", "amount": "5", "ledger": 700, "code": 1 }])),
+    )
+    .await;
+    assert_eq!(body["results"][0]["result"], json!("credit_account_not_found"));
+
+    // Unknown account → 404.
+    let (status, _) = call(&app, "GET", "/ledger/accounts/12345", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn ledger_projection_is_visible_through_sql_and_conserves() {
+    let app = app().await;
+    call(
+        &app,
+        "POST",
+        "/ledger/accounts",
+        Some(json!([{ "id": "1", "ledger": 700, "code": 1 }, { "id": "2", "ledger": 700, "code": 1 }])),
+    )
+    .await;
+    call(
+        &app,
+        "POST",
+        "/ledger/transfers",
+        Some(json!([{ "id": "10", "debit_account_id": "1", "credit_account_id": "2", "amount": "100", "ledger": 700, "code": 1 }])),
+    )
+    .await;
+
+    // The projection is queryable over /sql; u128 columns come back as strings.
+    let (status, body) =
+        sql_dml(&app, "SELECT debits_posted FROM ledger_accounts WHERE id = 1", json!([])).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body, json!([{ "debits_posted": "100" }]));
+
+    // Conservation: total debits == total credits across the ledger.
+    let (_, body) = sql_dml(
+        &app,
+        "SELECT SUM(debits_posted) AS d, SUM(credits_posted) AS c FROM ledger_accounts",
+        json!([]),
+    )
+    .await;
+    assert_eq!(body[0]["d"], body[0]["c"], "debits and credits must balance: {body}");
+}
+
+#[tokio::test]
+async fn ledger_writes_refused_on_passive_node() {
+    let app = make_app(false).await; // not promoted → unbound
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/ledger/transfers",
+        Some(json!([{ "id": "1", "debit_account_id": "1", "credit_account_id": "2", "amount": "1", "ledger": 700 }])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}

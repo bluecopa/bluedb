@@ -4,13 +4,16 @@
 //! bluedb's serialized writer and committed as one atomic SlateDB
 //! [`WriteBatch`](slatedb::WriteBatch), reusing the lease + epoch fencing +
 //! durable-before-ack that the rest of bluedb already provides. See
-//! `docs/superpowers/specs/2026-06-14-bluedb-ledger-design.md`.
+//! `docs/superpowers/specs/2026-06-14-bluedb-ledger-tigerbeetle-parity.md`.
 
 mod keyspace;
 mod ledger;
 mod model;
+mod projection;
 mod store;
 
-// Re-exports are enabled as each module gains content (Tasks 4 and 7):
-pub use ledger::Ledger;
-pub use model::{Account, AccountFlags, CreateResult, LedgerError, NewAccount, Transfer, TransferFlags};
+pub use ledger::{Clock, Ledger};
+pub use model::{
+    Account, AccountFlags, CreateAccountResult, CreateTransferResult, Transfer, TransferFlags,
+};
+pub use projection::ensure_schema;
