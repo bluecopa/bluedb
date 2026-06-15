@@ -12,6 +12,7 @@ pub(crate) const TAG_EVIDENCE_CHAIN: u8 = TAG_EXTERNAL_BASE + 11; // 0x1B
 pub(crate) const TAG_GRAPH_EDGE: u8 = TAG_EXTERNAL_BASE + 12; // 0x1C  canonical edge
 pub(crate) const TAG_GRAPH_OUT: u8 = TAG_EXTERNAL_BASE + 13; // 0x1D  out-adjacency (by weight asc)
 pub(crate) const TAG_GRAPH_IN: u8 = TAG_EXTERNAL_BASE + 14; // 0x1E  in-adjacency (by weight asc)
+pub(crate) const TAG_EVIDENCE_MERKLE_NODE: u8 = TAG_EXTERNAL_BASE + 15; // 0x1F  complete-subtree node
 
 /// Builds storage keys for evidence records within one tenant.
 #[derive(Clone)]
@@ -72,6 +73,16 @@ impl EvidenceKeyspace {
     /// Key for the per-chain Merkle frontier (verified chains only).
     pub(crate) fn merkle_key(&self, chain: &str) -> Vec<u8> {
         self.ks.external_key(TAG_EVIDENCE_MERKLE, &Self::chain_suffix(chain))
+    }
+
+    /// Key for a persisted complete-subtree Merkle node at `(level, index)`:
+    /// `TAG_EVIDENCE_MERKLE_NODE <chain_suffix> level::u8 index::u64-be`. The node
+    /// is the Merkle root over leaves `[index·2^level, (index+1)·2^level)`.
+    pub(crate) fn merkle_node_key(&self, chain: &str, level: u8, index: u64) -> Vec<u8> {
+        let mut s = Self::chain_suffix(chain);
+        s.push(level);
+        s.extend_from_slice(&index.to_be_bytes());
+        self.ks.external_key(TAG_EVIDENCE_MERKLE_NODE, &s)
     }
 
     /// Canonical edge key: identity `(graph, src, dst, type)`. Value = `weight_obe`.
@@ -283,6 +294,16 @@ mod tests {
         assert!(ks.graph_in_key("g", "b", 1, "a", "").starts_with(&pi));
         // "g" must not be a prefix of "gg"'s keys.
         assert!(!ks.graph_edge_key("gg", "a", "b", "").starts_with(&pe));
+    }
+
+    #[test]
+    fn merkle_node_keys_are_distinct_and_tenant_scoped() {
+        let ks = EvidenceKeyspace::new("acme");
+        assert_ne!(ks.merkle_node_key("c", 1, 0), ks.merkle_node_key("c", 1, 1));
+        assert_ne!(ks.merkle_node_key("c", 1, 0), ks.merkle_node_key("c", 2, 0));
+        assert_ne!(ks.merkle_node_key("c", 1, 0), EvidenceKeyspace::new("globex").merkle_node_key("c", 1, 0));
+        // Distinct namespace from the frontier (0x1A) and chains.
+        assert_ne!(ks.merkle_node_key("c", 1, 0), ks.merkle_key("c"));
     }
 
     #[test]
