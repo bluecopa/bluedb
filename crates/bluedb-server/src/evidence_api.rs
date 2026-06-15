@@ -81,7 +81,8 @@ pub async fn create_chain(
 // --- POST /evidence/{chain}/entries -----------------------------------------
 
 /// `POST /evidence/{chain}/entries` — append events to a chain.
-/// Body: `{ "events": [{ "type", "payload_b64", "at"? }], "idem_key"? }`.
+/// Body: `{ "events": [{ "type", "payload_b64", "at"?, "edges"? }], "idem_key"? }`,
+/// where each edge is `{ "graph", "src", "dst", "weight"?, "type"?, "op"?, "merge"? }`.
 pub async fn append(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -117,12 +118,58 @@ pub async fn append(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        entries.push(bluedb_evidence::EntryInput {
-            etype,
-            payload,
-            at,
-            edges: Vec::new(), // Plan 3 wires edges
-        });
+        // Optional per-event `edges`: each materializes into the native graph
+        // store atomically with the entry, and (on verified chains) is framed
+        // into the entry's Merkle `leaf_hash`.
+        let edges = match ev.get("edges").and_then(|v| v.as_array()) {
+            None => Vec::new(),
+            Some(arr) => {
+                let mut out = Vec::with_capacity(arr.len());
+                for (j, e) in arr.iter().enumerate() {
+                    let getstr = |k: &str| e.get(k).and_then(|v| v.as_str());
+                    let graph = getstr("graph")
+                        .ok_or_else(|| {
+                            AppError::bad_request(format!("events[{i}].edges[{j}]: missing 'graph'"))
+                        })?
+                        .to_string();
+                    let src = getstr("src")
+                        .ok_or_else(|| {
+                            AppError::bad_request(format!("events[{i}].edges[{j}]: missing 'src'"))
+                        })?
+                        .to_string();
+                    let dst = getstr("dst")
+                        .ok_or_else(|| {
+                            AppError::bad_request(format!("events[{i}].edges[{j}]: missing 'dst'"))
+                        })?
+                        .to_string();
+                    let weight = e.get("weight").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let etype = getstr("type").unwrap_or("").to_string();
+                    let op = match getstr("op") {
+                        None | Some("upsert") => {
+                            let merge = match getstr("merge") {
+                                None | Some("set") => bluedb_evidence::Merge::Set,
+                                Some("max") => bluedb_evidence::Merge::Max,
+                                Some(m) => {
+                                    return Err(AppError::bad_request(format!(
+                                        "events[{i}].edges[{j}]: unknown merge '{m}' (want 'set' or 'max')"
+                                    )))
+                                }
+                            };
+                            bluedb_evidence::EdgeOp::Upsert { merge }
+                        }
+                        Some("delete") => bluedb_evidence::EdgeOp::Delete,
+                        Some(o) => {
+                            return Err(AppError::bad_request(format!(
+                                "events[{i}].edges[{j}]: unknown op '{o}' (want 'upsert' or 'delete')"
+                            )))
+                        }
+                    };
+                    out.push(bluedb_evidence::EdgeDelta { graph, src, dst, weight, etype, op });
+                }
+                out
+            }
+        };
+        entries.push(bluedb_evidence::EntryInput { etype, payload, at, edges });
     }
 
     let idem_key = body

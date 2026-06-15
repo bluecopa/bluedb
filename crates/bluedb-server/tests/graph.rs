@@ -211,12 +211,11 @@ async fn hard_delete_retract_edges_flag_over_http() {
     .await;
     assert_eq!(s, StatusCode::OK, "create plain chain: {s} {body}");
 
-    // Append TWO entries so each delete targets a real seq. Note: the append
-    // HTTP handler does NOT parse `edges` from the body (it builds
-    // `EntryInput { edges: Vec::new(), .. }`), so these entries carry no edges.
-    // This test therefore asserts the `retract_edges` FLAG PLUMBING only
-    // (status + echoed JSON field); actual edge retraction is covered by the
-    // crate-level integration test `hard_delete_retracts_edges_by_default`.
+    // Append TWO entries so each delete targets a real seq. These entries omit
+    // the optional `edges` field, so they carry no edges. This test therefore
+    // asserts the `retract_edges` FLAG PLUMBING only (status + echoed JSON
+    // field); actual edge retraction is covered by the crate-level integration
+    // test `hard_delete_retracts_edges_by_default`.
     for i in 0..2u32 {
         let (s, body) = call(
             &app,
@@ -259,4 +258,130 @@ async fn hard_delete_retract_edges_flag_over_http() {
     assert_eq!(s, StatusCode::OK, "hard-delete default: {s} {body}");
     assert_eq!(body["deleted"], true, "deleted: {body}");
     assert_eq!(body["retract_edges"], true, "retract_edges echoed true: {body}");
+}
+
+/// append-with-edges over HTTP: edges are framed into the verified `leaf_hash`,
+/// so the digest reflects them. A chain appended WITH an edge has a different
+/// `root_hash` than the same event appended WITHOUT, and matches a third chain
+/// given the SAME edge. (Verified chains auto-create on first append.)
+#[tokio::test]
+async fn http_append_with_edges_affects_digest() {
+    // Open mode; tenant header drives isolation only.
+    let (_, app) = promoted(None).await;
+
+    // Same base64 payload for all three so ONLY the edge differs.
+    let payload_b64 = B64.encode(b"p");
+    let edge = json!({ "graph": "lin", "src": "A", "dst": "B", "weight": 5 });
+
+    // chain "with" — one event carrying an edge.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/evidence/with/entries",
+        Some("acme"),
+        None,
+        Some(json!({
+            "events": [{ "type": "t", "payload_b64": payload_b64, "edges": [edge.clone()] }]
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "append with-edge: {s} {body}");
+
+    // chain "without" — identical event, NO edges.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/evidence/without/entries",
+        Some("acme"),
+        None,
+        Some(json!({
+            "events": [{ "type": "t", "payload_b64": payload_b64 }]
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "append without-edge: {s} {body}");
+
+    // chain "same" — identical event WITH the same edge as "with".
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/evidence/same/entries",
+        Some("acme"),
+        None,
+        Some(json!({
+            "events": [{ "type": "t", "payload_b64": payload_b64, "edges": [edge.clone()] }]
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "append same-edge: {s} {body}");
+
+    // GET each digest → {size:1, root_hash:"<64-hex>"}.
+    let digest = |chain: &'static str| {
+        let app = app.clone();
+        async move {
+            let (s, body) = call(
+                &app,
+                "GET",
+                &format!("/evidence/{chain}/digest"),
+                Some("acme"),
+                None,
+                None,
+            )
+            .await;
+            assert_eq!(s, StatusCode::OK, "digest {chain}: {s} {body}");
+            assert_eq!(body["size"], 1, "digest {chain} size: {body}");
+            body["root_hash"].as_str().unwrap().to_string()
+        }
+    };
+    let with = digest("with").await;
+    let without = digest("without").await;
+    let same = digest("same").await;
+
+    // edge changed the leaf hash ⇒ different root.
+    assert_ne!(with, without, "edge must change root_hash: with={with} without={without}");
+    // same edge ⇒ same hash.
+    assert_eq!(with, same, "same edge must yield same root_hash: with={with} same={same}");
+}
+
+/// append edge parse-error negatives → 400.
+#[tokio::test]
+async fn http_append_edge_parse_errors() {
+    let (_, app) = promoted(None).await;
+    let payload_b64 = B64.encode(b"p");
+
+    // Edge missing 'graph' → 400.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/evidence/c/entries",
+        Some("acme"),
+        None,
+        Some(json!({
+            "events": [{
+                "type": "t",
+                "payload_b64": payload_b64,
+                "edges": [{ "src": "A", "dst": "B", "weight": 5 }]
+            }]
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "edge missing graph: {s} {body}");
+
+    // Edge with unknown 'op' → 400.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/evidence/c/entries",
+        Some("acme"),
+        None,
+        Some(json!({
+            "events": [{
+                "type": "t",
+                "payload_b64": payload_b64,
+                "edges": [{ "graph": "lin", "src": "A", "dst": "B", "op": "bogus" }]
+            }]
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "edge unknown op: {s} {body}");
 }
