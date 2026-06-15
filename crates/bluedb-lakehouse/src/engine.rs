@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use bluedb_sql::{collapse_lww, CdcConfig, Database};
+use bluedb_sql::{collapse_lww, CdcConfig, Database, LhPragma};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use gluesql_core::store::{DataRow, Store};
@@ -157,6 +157,30 @@ impl LakehouseEngine {
             .tables
             .insert(table.to_string(), false);
         self.persist_registry().await
+    }
+
+    /// Apply a parsed `PRAGMA lakehouse_mirror` directive (the runtime opt-out
+    /// control, spec §8): flip the global default or override one table. Persisted
+    /// to the registry; flipping a table on backfills it.
+    pub async fn apply_pragma(&self, pragma: LhPragma) -> Result<()> {
+        match pragma {
+            LhPragma::GlobalDefault(on) => {
+                self.cdc
+                    .default_on
+                    .store(on, std::sync::atomic::Ordering::Relaxed);
+                {
+                    let mut st = self.state.write().unwrap();
+                    st.default_on = on;
+                    // Re-apply explicit per-table flags relative to the new default.
+                    for (table, flag) in &st.tables {
+                        self.cdc.set_table(table, *flag);
+                    }
+                }
+                self.persist_registry().await
+            }
+            LhPragma::Table(table, true) => self.enable_table(&table).await,
+            LhPragma::Table(table, false) => self.disable_table(&table).await,
+        }
     }
 
     /// Is `table` currently mirrored (effective `default_on XOR override`)?

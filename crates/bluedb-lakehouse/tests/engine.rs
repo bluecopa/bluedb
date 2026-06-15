@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use bluedb_lakehouse::LakehouseEngine;
-use bluedb_sql::{CdcConfig, Database};
+use bluedb_sql::{CdcConfig, Database, LhPragma};
 use futures::TryStreamExt;
 use gluesql_core::prelude::Glue;
 use iceberg::io::FileIO;
@@ -239,4 +239,36 @@ async fn compaction_reduces_files_and_preserves_state() {
     assert_eq!(rows.get(&1).map(String::as_str), Some("updated"));
     assert_eq!(rows.get(&2), None);
     assert_eq!(rows.get(&7).map(String::as_str), Some("v7"));
+}
+
+#[tokio::test]
+async fn pragma_controls_default_and_per_table_and_persists() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    let db = make_db("pragma").await;
+    let cdc = CdcConfig::default();
+    let eng = engine(root, db.clone(), cdc.clone()).await;
+
+    // Opt-in default (off): an arbitrary table is not mirrored.
+    eng.apply_pragma(LhPragma::GlobalDefault(false)).await.unwrap();
+    assert!(!eng.is_mirrored("docs"));
+
+    // Per-table override on.
+    eng.apply_pragma(LhPragma::Table("docs".into(), true)).await.unwrap();
+    assert!(eng.is_mirrored("docs"));
+
+    // Opt-out default (on): a different, un-overridden table is mirrored.
+    eng.apply_pragma(LhPragma::GlobalDefault(true)).await.unwrap();
+    assert!(eng.is_mirrored("anything_else"));
+    assert!(eng.is_mirrored("docs")); // still on
+
+    // Per-table override off under opt-out default.
+    eng.apply_pragma(LhPragma::Table("secret".into(), false)).await.unwrap();
+    assert!(!eng.is_mirrored("secret"));
+
+    // All of it survives a reopen with a fresh CDC control.
+    let cdc2 = CdcConfig::default();
+    let eng2 = engine(root, db.clone(), cdc2.clone()).await;
+    assert!(eng2.is_mirrored("anything_else"));
+    assert!(!eng2.is_mirrored("secret"));
 }
