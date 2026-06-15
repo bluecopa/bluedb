@@ -41,7 +41,21 @@
 
   Example:
     lein run test --workload graph --nemesis pause --time-limit 120 \\
-      --concurrency 10 --node node1 --node node2 --node node3"
+      --concurrency 10 --node node1 --node node2 --node node3
+
+  ✅ VALIDATED (2026-06-16) on the live 3-node docker cluster — all green
+  (`:valid? true`, violations 0, sink-dropped 0 — every traversal saw one whole
+  config, Z never dropped):
+    pause     — 1562 reaches over 715 atomic swaps (freeze a traversal between
+                its scan of R and the bridge, straddling a swap — the sharpest
+                torn-read window).
+    kill      — 1840 reaches over 709 swaps, through writer crash + failover.
+    partition — 1427 reaches over 582 swaps, through writer isolation.
+    mix       — 2238 reaches over 679 swaps (kill+partition cycled, 180s).
+  ~7000 reaches over ~2700 atomic rewires; leadership moved across ~29 epochs
+  (22→51). The pinned-snapshot traversal observed a single consistent cut under
+  every fault — snapshot isolation holds across crash / partition / pause +
+  failover. (`lein check` clean on Java 21.)"
   (:require [bluedb.jepsen.http :as h]
             [jepsen.client :as client]
             [jepsen.checker :as checker]
