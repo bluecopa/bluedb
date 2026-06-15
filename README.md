@@ -55,7 +55,11 @@ Start with the [Quickstart](docs/quickstart.md) and the
 M1–M4 core complete (FTS, SQL, engine + HTTP service, single-writer HA), plus the
 HTTP/write-path hardening, SQL-integrated FTS, the double-entry ledger, the
 schema regime (required PK + online ALTER + scan guardrail), and the Iceberg
-lakehouse mirror. See [ROADMAP.md](ROADMAP.md). Remaining is the deployment layer
+lakehouse mirror (all four v1 spike items shipped: multi-tenancy, composite PKs,
+schema-evolution reconciliation, incremental compaction). Consistency is
+Jepsen-verified on the live cluster against the post-group-commit write path, and
+the tri-cloud object store is exercised end-to-end (S3/Azure via emulators, GCS
+against real GCS). See [ROADMAP.md](ROADMAP.md). Remaining is the deployment layer
 (concrete shared lease store + cross-region orchestration).
 
 ## Licensing

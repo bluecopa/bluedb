@@ -1,6 +1,13 @@
-//! Live round-trip tests against the three object-store emulators.
+//! Live round-trip tests for the object-store backends.
 //!
-//! Ignored by default — they need the emulator stack running:
+//! Each test proves bluedb's actual substrate — a SlateDB `Db` — can open on the
+//! backend, write durably, reopen, and read the value back. That exercises the
+//! real read/write/list/conditional-put paths (the conditional put is what backs
+//! single-writer safety), not just client construction, so a pass means the
+//! cloud genuinely works end-to-end through
+//! [`bluedb_server::objstore::build_object_store`].
+//!
+//! **S3 (MinIO) + Azure (Azurite)** run against the local emulator stack:
 //!
 //! ```text
 //! docker compose -f crates/bluedb-server/tests/emulators/docker-compose.yml up -d
@@ -8,11 +15,13 @@
 //! docker compose -f crates/bluedb-server/tests/emulators/docker-compose.yml down -v
 //! ```
 //!
-//! Each test proves bluedb's actual substrate — a SlateDB `Db` — can open on the
-//! backend, write durably, reopen, and read the value back. That exercises the
-//! real read/write/list/conditional-put paths, not just client construction, so
-//! a pass means the cloud genuinely works end-to-end through
-//! [`bluedb_server::objstore::build_object_store`].
+//! **GCS is verified against real GCS, not an emulator.** object_store's GCS
+//! client speaks the GCS *XML* API, which the common local emulators do not
+//! fully serve — `fake-gcs-server` is JSON-only (400 on the XML PUT), and
+//! Google's `storage-testbench` does XML PUT/GET + conditional-put CAS but not
+//! XML list/delete. So `gcs_fake_round_trip` is left `#[ignore]` (it hangs on
+//! fake-gcs), and `gcs_real_round_trip` is the real verification — env-gated, no
+//! creds committed (see that test's docs).
 
 use std::sync::Arc;
 
@@ -70,11 +79,49 @@ async fn azure_azurite_round_trip() {
     slatedb_round_trip(store, "emul-roundtrip-azure").await;
 }
 
+/// GCS round-trip against `fake-gcs-server`.
+///
+/// NOTE: `fake-gcs-server` does not faithfully implement the operations SlateDB
+/// performs (notably the conditional/manifest writes), so this round-trip
+/// **hangs** against it — object_store retries the unsupported response with
+/// backoff. This is an emulator-fidelity limitation, not a bluedb bug: the GCS
+/// bridge ([`build_object_store`]) uses the same `object_store` GCS client that
+/// real GCS serves, and the S3 (MinIO) and Azure (Azurite) round-trips above
+/// exercise the identical bridge end-to-end. The emulator endpoint is supplied
+/// via the service-account JSON's `gcs_base_url` + `disable_oauth`
+/// (`tests/emulators/gcs-fake-sa.json`) — object_store's idiomatic GCS-emulator
+/// hook — and the `bluedb` bucket is created by the compose `fake-gcs-init`.
+/// Re-enable once a higher-fidelity GCS emulator (or real GCS) is wired up.
 #[tokio::test]
-#[ignore = "needs the emulator stack (see module docs)"]
+#[ignore = "fake-gcs-server can't service SlateDB's round-trip (hangs); see fn docs"]
 async fn gcs_fake_round_trip() {
     let sa = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/emulators/gcs-fake-sa.json");
     let cfg = ObjectStoreConfig::Gcs { bucket: "bluedb".into(), service_account: Some(sa.into()) };
     let store = build_object_store(&cfg).expect("build gcs store");
     slatedb_round_trip(store, "emul-roundtrip-gcs").await;
+}
+
+/// Real-GCS round-trip — the definitive verification of the GCS target, since no
+/// local emulator faithfully serves object_store's GCS *XML* API (fake-gcs is
+/// JSON-only; storage-testbench lacks XML list/delete). Env-gated; **no creds are
+/// committed** — supply a real bucket, a service-account JSON path, and a unique
+/// throwaway prefix:
+///
+/// ```text
+/// BLUEDB_GCS_TEST_BUCKET=my-bucket \
+/// BLUEDB_GCS_TEST_SA=/path/to/sa.json \
+/// BLUEDB_GCS_TEST_PREFIX=bluedb-gcs-roundtrip-test/run1 \
+///   cargo test -p bluedb-server --test objstore_emulators gcs_real_round_trip -- --ignored --nocapture
+/// ```
+///
+/// Delete the prefix afterward (e.g. `gcloud storage rm -r gs://$BUCKET/$PREFIX`).
+#[tokio::test]
+#[ignore = "real GCS — set BLUEDB_GCS_TEST_{BUCKET,SA,PREFIX}"]
+async fn gcs_real_round_trip() {
+    let bucket = std::env::var("BLUEDB_GCS_TEST_BUCKET").expect("set BLUEDB_GCS_TEST_BUCKET");
+    let sa = std::env::var("BLUEDB_GCS_TEST_SA").expect("set BLUEDB_GCS_TEST_SA (service-account JSON path)");
+    let prefix = std::env::var("BLUEDB_GCS_TEST_PREFIX").expect("set BLUEDB_GCS_TEST_PREFIX (unique throwaway prefix)");
+    let cfg = ObjectStoreConfig::Gcs { bucket, service_account: Some(sa) };
+    let store = build_object_store(&cfg).expect("build gcs store");
+    slatedb_round_trip(store, &prefix).await;
 }

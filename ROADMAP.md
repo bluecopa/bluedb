@@ -1,6 +1,6 @@
 # bluedb — Production Readiness Roadmap
 
-Current state: **M1 (FTS), M2 (SQL), M3 (engine + HTTP service), and the M4 single-writer core are complete**, and five follow-on tracks have merged to `dev`: **HTTP surface & write-path hardening (Spec A)**, **SQL-integrated full-text search (Spec B)**, the **double-entry ledger** (`bluedb-ledger`), the **Apache Iceberg lakehouse mirror** (`bluedb-lakehouse`), and the **evidence substrate** (`bluedb-evidence` — verifiable chains + native graph) — see the dedicated sections below. `cargo test --workspace` is green (~900 tests); `cargo clippy --workspace --all-targets` clean; the docs site builds `--strict` clean. Remaining is the **M4 deployment layer** (concrete lease store + cross-region replication/orchestration) plus the scoped follow-ups flagged per section (FTS regex `~`, ledger cluster-Jepsen, evidence external anchoring). Foundations working today:
+Current state: **M1 (FTS), M2 (SQL), M3 (engine + HTTP service), and the M4 single-writer core are complete**, and five follow-on tracks have merged to `dev`: **HTTP surface & write-path hardening (Spec A)**, **SQL-integrated full-text search (Spec B)**, the **double-entry ledger** (`bluedb-ledger`), the **Apache Iceberg lakehouse mirror** (`bluedb-lakehouse` — all four v1 spike items shipped), and the **evidence substrate** (`bluedb-evidence` — verifiable chains + native graph) — see the dedicated sections below. `cargo test --workspace` is green (~900 tests); `cargo clippy --workspace --all-targets` clean; the docs site builds `--strict` clean. **Verification (2026-06-16):** Jepsen re-run on the live 3-node cluster against the **post-group-commit** write path — `set` workload × {none, kill, partition, mix, skew} all `:valid? true`, lost-count 0; and the **tri-cloud object store** is exercised end-to-end (S3/Azure via emulators, **GCS against real GCS**). Remaining is the **M4 deployment layer** (concrete lease store + cross-region replication/orchestration) plus the scoped follow-ups flagged per section (FTS regex `~`, the ledger-specific cluster-Jepsen workload, evidence external anchoring). Foundations working today:
 - ✅ `BlobStore` seam + `SlateDbBlobStore` (slatedb 0.13); durability proven across `Db` reopen; `BlobStoreMut` write seam; `ChunkedBlobStore` large-value layer.
 - ✅ Vendored Quickwit read path (Bundle/Storage/Hot/Caching directories) on the tantivy fork, bridged to `BlobStore`.
 - ✅ FTS: real indexer, lazy hotcache open, split manifest, multi-split BM25 search; **logical deletes (generation-scoped tombstones), incremental append, same-id update, and merge/compaction** (re-index live docs, physically drop the dead).
@@ -87,15 +87,18 @@ deployment layer behind the `LeaseProvider` seam.
 
 - [x] **A–G** — TigerBeetle data-plane parity: typed `Account`/`Transfer` (u128), all flags, the full named result-code set in TB's exact validation order, two-phase transfers (pending/post/void) + apply-time timeout expiry, linked chains, balancing, closing, imported events, `id_already_failed` semantics. 107 engine tests.
 - [x] **H** — atomic **SQL projection** (rows dual-written into the SAME `WriteBatch` as the canonical postcard records, via `bluedb_sql::ProjectedTable`) + `/ledger/{accounts,transfers}` batched create (per-item result codes, u128 as JSON strings) + lookups + a Jepsen `ledger` workload (conservation Σdebits=Σcredits + accounting bounds).
-- [ ] Run the Jepsen `ledger` workload on a **live 3-node cluster** against the current group-commit write path *(today: in-process tests + `lein check` only; needs a `docker compose up -d --build` rebuild)*.
+- [ ] Run the Jepsen `ledger` workload on a **live 3-node cluster** against the current group-commit write path. *(The generic write path is now cluster-verified post-group-commit via the `set` workload — see Verification below; the ledger-specific conservation workload still needs the schema-regime harness port: it must create its tables with a PK, and `list-append`/`ledger` reads must not assume insertion order under IOT clustering.)*
 
----
+## Lakehouse mirror (`bluedb-lakehouse`) — Iceberg CDC mirror — **v1 complete**
 
-## Apache Iceberg lakehouse mirror (`bluedb-lakehouse`) — **complete** (merged)
+Continuously mirrors bluedb tables into Apache **Iceberg** in the same bucket so external warehouses (BigQuery/Databricks/Snowflake/Trino/DuckDB) can join them — self-authored commit on published `iceberg-rust` 0.9.1 (no fork, no `unsafe`), full CRUD via equality deletes, event-driven seal. Core merged PR #3; the four v1-limitation spike items are all shipped:
 
-- [x] Continuous CDC mirror of tables into **Apache Iceberg** in the same bucket — exactly-once (CDC entry in the SAME `WriteBatch` as the row), full CRUD via merge-on-read equality deletes, event-driven seal (seconds-fresh), self-authored Iceberg metadata on the published `iceberg-rust` (no fork/`unsafe`), read-only **Iceberg REST catalog** (`/catalog/v1/*`), PRAGMA opt-in/opt-out. Cross-engine read verified by DuckDB.
-- [x] Per-tenant Iceberg namespaces; **composite-PK** mirroring (surrogate key); online **schema-evolution** reconciliation (ADD/DROP/RENAME via stable field-ids); incremental minor + periodic major **compaction**. (PRs #3/#4/#5/#7.)
-- [ ] Follow-ups (per the lakehouse spec): column **type-change** reconciliation, partition-aware bin-packing.
+- [x] **Core mirror** — durable CDC log (exactly-once into the data `WriteBatch`), gluesql→Iceberg type mapping, self-authored data/delete manifests → snapshot → `metadata.json`, event-driven debounced seal, read-only Iceberg **REST catalog** (`/catalog/v1/*`), `PRAGMA lakehouse_mirror` opt-out, server-wired over object-store FileIO. Cross-engine read verified by DuckDB's Iceberg extension.
+- [x] **#1 Multiple namespaces / multi-tenancy** (PR #4) — per-`(tenant,table)` CDC + one engine per tenant + `LakehouseManager`; `X-Bluedb-Tenant` header → per-tenant Iceberg namespace + `tenant:<name>` authz.
+- [x] **#2 Composite primary keys** (PR #5) — surrogate `__bluedb_pk` (order-preserving component encoding) over the bluedb-sql rewrite seam; PK-range pushdown; components mirrored as ordinary prunable columns with an Iceberg sort order.
+- [x] **#3 Schema-evolution reconciliation** (PR #6) — Iceberg field-ids derived from stable colcat slots; `ALTER` ADD/DROP/RENAME self-authors an `add_current_schema` commit before the next snapshot; DROP of a key column rejected.
+- [x] **#4 Incremental bin-packed compaction** (PR #7) — minor pass bin-packs small data files via a scoped merge-on-read snapshot (reuses iceberg-rust's reader, materializes deletes, preserves survivor sequence numbers); periodic major pass reclaims delete files; target size via `PRAGMA lakehouse_target_file_bytes`.
+- [ ] Not yet reconciled into the mirror: column **type** changes and adding a `LIST`/`MAP` column to a materialized table.
 
 ---
 
@@ -128,10 +131,10 @@ deployment layer behind the `LeaseProvider` seam.
 
 ### Testing & quality
 - [ ] Restore property tests + edge cases (empty index, huge split, concurrent read/write, corrupt data, reopen-durability).
-- [ ] Integration tests against real S3/GCS/Azure (not just `InMemory`).
+- [x] Integration tests against real S3/GCS/Azure (not just `InMemory`) — `objstore_emulators.rs`: a real SlateDB round-trip (write → close → reopen → read, incl. conditional-put) per backend. **S3** (MinIO) + **Azure** (Azurite) via the emulator stack; **GCS** against **real GCS** (`gcs_real_round_trip`, env-gated — object_store's GCS XML API isn't fully served by local emulators).
 - [ ] Benchmarks: index throughput, query latency, rebuild time, memory — validate the ~100M-rows/year + rebuild-budget assumptions.
 - [ ] Fuzz the split parser.
-- [ ] HA chaos/failover tests; load/soak tests.
+- [x] HA chaos/failover tests — real Jepsen suite (`jepsen/`): leader-aware client + docker-CLI nemesis; `set` workload × {none, kill, partition, mix, skew} all `:valid? true` / lost-count 0 on the live 3-node cluster, **re-verified on the post-group-commit write path** (2026-06-16). *(Remaining: port `list-append`/`counter`/`unique`/`ledger` to the schema regime; load/soak tests.)*
 - [ ] CI: build + test + `clippy -D warnings` + `fmt --check` + `cargo deny`.
 
 ### Security & multi-tenancy

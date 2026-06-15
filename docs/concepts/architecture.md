@@ -135,4 +135,6 @@ database). Writes are accepted only by the **active writer**; a replica returns
   keeps every read served by the primary key or an index; whole-table analytics
   goes to the warehouse via the Iceberg mirror, off the OLTP hot path.
 - **Portable.** The substrate targets any S3-compatible store, GCS, or Azure
-  Blob.
+  Blob — all three verified end-to-end with a real SlateDB round-trip (S3/Azure
+  via emulators, GCS against real GCS). See
+  [Configuration → Object store](../deployment/configuration.md#object-store).

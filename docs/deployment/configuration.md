@@ -15,7 +15,11 @@
 
 ## Object store
 
-Select **one** backend:
+bluedb runs on any of three clouds (plus local disk). Select **one** backend —
+the first family whose selector variable is present wins, in the order
+**S3 → Azure → GCS → local → in-memory**.
+
+**S3 / MinIO / any S3-compatible store:**
 
 | Variable | Meaning |
 |----------|---------|
@@ -24,10 +28,41 @@ Select **one** backend:
 | `BLUEDB_S3_REGION` | Region (default `us-east-1`) |
 | `BLUEDB_S3_ACCESS_KEY_ID` | Access key |
 | `BLUEDB_S3_SECRET_ACCESS_KEY` | Secret key |
+
+**Azure Blob Storage:**
+
+| Variable | Meaning |
+|----------|---------|
+| `BLUEDB_AZURE_CONTAINER` | Use Azure Blob (presence selects this backend) |
+| `BLUEDB_AZURE_ACCOUNT` | Storage account name |
+| `BLUEDB_AZURE_ACCESS_KEY` | Account access key |
+| `BLUEDB_AZURE_ENDPOINT` | Override the blob endpoint (full account URL) — for Azurite or any Azure-compatible store; implies plain HTTP |
+
+**Google Cloud Storage:**
+
+| Variable | Meaning |
+|----------|---------|
+| `BLUEDB_GCS_BUCKET` | Use GCS (presence selects this backend) |
+| `BLUEDB_GCS_SERVICE_ACCOUNT` | Path to a service-account JSON key |
+
+**Local / in-memory:**
+
+| Variable | Meaning |
+|----------|---------|
 | `BLUEDB_DATA_DIR` | Use a local filesystem object store instead (single-node) |
 
 With none of the above set, the node uses an **in-memory** store (ephemeral,
 single node only).
+
+!!! note "Cloud verification"
+    All three clouds are exercised end-to-end (a real SlateDB `Db`
+    write → close → reopen → read, including the conditional-put used for
+    single-writer safety). **S3** and **Azure** are covered by emulator
+    round-trip tests (MinIO, Azurite). **GCS** is verified against **real GCS**
+    — its backend uses the GCS *XML* API, which the common local emulators
+    (fake-gcs, storage-testbench) don't fully serve, so the round-trip test
+    (`gcs_real_round_trip`) is env-gated against an actual bucket. See
+    `crates/bluedb-server/tests/objstore_emulators.rs`.
 
 ## Lease / high availability
 
