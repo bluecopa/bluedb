@@ -40,8 +40,12 @@ flowchart TD
 - **[`bluedb-sql`](sql/README.md)** — a SQL engine (GlueSQL + a compatibility
   layer) over the substrate: typed *and* schemaless tables, transactions,
   secondary indexes, views.
-- **`bluedb-fts`** — BM25 full-text search (tantivy) over object storage.
-- **`bluedb-ledger`** — a TigerBeetle-style double-entry ledger *(in progress)*.
+- **[`bluedb-fts`](sql/full-text-search.md)** — **SQL-integrated** BM25 full-text
+  search (tantivy) over object storage: declare a full-text index and query it
+  through SQL (Postgres `@@`/`ts_rank`), read-your-writes, no separate search
+  cluster.
+- **[`bluedb-ledger`](api/ledger.md)** — a TigerBeetle-style double-entry ledger:
+  typed accounts/transfers, two-phase transfers, balances queryable over SQL.
 - **`bluedb-engine`** — composes the pillars behind one facade.
 - **`bluedb-server`** — the HTTP/REST service (axum): CRUD, `/sql`, admin.
 - **[`bluedb-ha`](ha/active-passive.md)** — single-writer high availability:

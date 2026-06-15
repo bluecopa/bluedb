@@ -10,6 +10,8 @@
 | `BLUEDB_DB_PATH` | `bluedb` | SlateDB path/prefix inside the object store |
 | `BLUEDB_NODE_ID` | `node-0` | This node's identity (use the pod name in K8s) |
 | `BLUEDB_START_PASSIVE` | unset | Start as a read replica and wait to be promoted (default bootstraps to writer) |
+| `BLUEDB_FLUSH_INTERVAL_MS` | `25` | WAL flush interval (ms), set at writer open. Lower = lower write latency but more object-store PUTs under load |
+| `BLUEDB_FTS_SEAL_INTERVAL_MS` | `30000` | Interval (ms) for the background [full-text](../sql/full-text-search.md) seal/compaction scheduler — folds the in-memory live segment into durable splits |
 
 ## Object store
 
@@ -37,6 +39,24 @@ single node only).
 
 See [Active-passive HA](../ha/active-passive.md) for how TTL and margin govern
 failover timing and safety.
+
+## API surface & authorization
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `BLUEDB_ENABLE_ADMIN_SQL` | unset (off) | Set to `1`/`true` to enable [`POST /admin/sql`](../api/rest.md#post-adminsql-arbitrary-sql-off-by-default) — arbitrary, audited SQL (DDL/txn/multi). Off by default |
+| `BLUEDB_AUTHZ_TOKENS` | unset (open mode) | Bearer-token → scope map. When unset the server runs in **open mode** (all requests allowed) — production should always set this |
+
+`BLUEDB_AUTHZ_TOKENS` uses the format `tok1=scope,scope;tok2=scope` —
+semicolon-separated token entries, each a token followed by `=` and a
+comma-separated scope list. Recognized scopes: `data:read`, `data:write`,
+`data:query`, `schema:admin`, `superuser` (which satisfies any required scope).
+See the [REST API authorization table](../api/rest.md#authorization) for the
+per-route scopes.
+
+```bash
+BLUEDB_AUTHZ_TOKENS='reader=data:read;writer=data:read,data:write,data:query;admin=superuser'
+```
 
 ## Example: one node against MinIO + Postgres
 

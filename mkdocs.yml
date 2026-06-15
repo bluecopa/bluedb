@@ -69,6 +69,7 @@ nav:
   - SQL:
       - Overview: sql/README.md
       - Statements: sql/statements.md
+      - Full-text search: sql/full-text-search.md
       - Query syntax: sql/query-syntax.md
       - Data types: sql/data-types.md
       - Expressions: sql/expressions.md
@@ -92,3 +93,4 @@ nav:
       - Administration: operations/admin.md
   - API:
       - REST: api/rest.md
+      - Ledger: api/ledger.md

@@ -21,6 +21,14 @@ writer whose identity moves on failover; the client discovers the active writer
 via `/admin/status` and re-discovers on a `503` — it **follows the leader**
 across promotions.
 
+!!! warning "Ledger workload not yet validated on a live cluster"
+    A `ledger` workload (double-entry transfers against [`bluedb-ledger`](../api/ledger.md))
+    exists in the suite, but it is **not yet validated on a live cluster against
+    the current group-commit write path** — it has only been exercised in-process
+    and via `lein check`. The results below cover the `set`/`list-append`/
+    `counter`/`unique` workloads; treat the ledger workload's cluster-level
+    guarantees as unproven until that validation lands.
+
 ## Faults (nemesis)
 
 Injected against the Compose stack via the `docker` CLI:
