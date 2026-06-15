@@ -53,6 +53,41 @@ use crate::fts_sql::{extract_fts_predicate, rewrite_fts_query, FtsHit, FtsPredic
 use crate::live_segment::{analyzer_for_config, translate_query, LiveSegment};
 use crate::rest_sql;
 
+/// Which kind of index a [`IndexDef`] is: a BM25 fulltext index (`@@`/`ts_rank`)
+/// or a trigram index (substring `LIKE '%lit%'` acceleration, Spec B §4.6). They
+/// share the entire live/durable/seal/registry machinery; the kind only controls
+/// the analyzer, the durable `index_id` prefix, and whether [`on_commit`] indexes
+/// the raw text or its [`trigramize`]d form.
+///
+/// `#[serde(default)]`-friendly: a registry blob persisted before this field
+/// existed has no `kind`, so it deserializes to the default `Fulltext`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+enum IndexKind {
+    #[default]
+    Fulltext,
+    Trigram,
+}
+
+/// Produce the space-joined contiguous lowercased 3-grams of `s` — the form a
+/// trigram index stores (in `on_commit`) and queries against (in the `LIKE`
+/// rewrite). A string shorter than 3 chars has no trigrams and yields `""`; such
+/// values aren't trigram-searchable and fall back to a full scan.
+///
+/// No custom tantivy tokenizer: the engine pre-trigramizes and indexes through the
+/// built-in `whitespace` analyzer, so opened durable splits tokenize identically.
+/// (e.g. `trigramize("overdue")` = `"ove ver erd rdu due"`.)
+pub(crate) fn trigramize(s: &str) -> String {
+    let chars: Vec<char> = s.to_lowercase().chars().collect();
+    if chars.len() < 3 {
+        return String::new();
+    }
+    chars
+        .windows(3)
+        .map(|w| w.iter().collect::<String>())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Default result cap for the union search (mirrors `live_segment`'s
 /// `DEFAULT_LIMIT`; the over-fetch window sizing per Spec B §9 is refined later).
 const UNION_LIMIT: usize = 100;
@@ -72,6 +107,10 @@ struct PersistedDef {
     column_ordinal: usize,
     pk_column: String,
     analyzer: String,
+    /// The index kind. `#[serde(default)]` so a registry blob persisted before
+    /// this field existed deserializes to `IndexKind::Fulltext`.
+    #[serde(default)]
+    kind: IndexKind,
 }
 
 /// One declared fulltext index: the indexed text column, the table's integer
@@ -82,6 +121,9 @@ struct IndexDef {
     column: String,
     pk_column: String,
     column_ordinal: usize,
+    /// Whether this is a BM25 fulltext index or a trigram (substring) index. A
+    /// column may carry one of each; they're disambiguated by `(column, kind)`.
+    kind: IndexKind,
     /// The `to_tsvector` config string this index was declared with. Stored so
     /// the def can round-trip through the durable registry (reopen rebuilds the
     /// live segment + durable mapping from it without a schema fetch).
@@ -162,10 +204,13 @@ impl FtsEngine {
                 &pd.pk_column,
                 pd.column_ordinal,
                 &pd.analyzer,
+                pd.kind,
             )?;
             let mut idx = engine.indexes.write().unwrap();
             let defs = idx.entry(pd.table.clone()).or_default();
-            defs.retain(|d| d.column != pd.column);
+            // Supersede only a prior def of the SAME (column, kind) — a column may
+            // carry both a fulltext and a trigram def.
+            defs.retain(|d| !(d.column == pd.column && d.kind == pd.kind));
             defs.push(def);
         }
 
@@ -202,6 +247,7 @@ impl FtsEngine {
                         column_ordinal: d.column_ordinal,
                         pk_column: d.pk_column.clone(),
                         analyzer: d.analyzer.clone(),
+                        kind: d.kind,
                     })
                 })
                 .collect()
@@ -238,18 +284,22 @@ impl FtsEngine {
                 EngineError::Rejected(format!("no column {text_column} on {table}"))
             })?;
 
-        let def = self.build_index_def(table, text_column, pk_column, ordinal, analyzer)?;
-        // Replace any prior def for this (table, column) — a re-create supersedes
-        // rather than duplicating, keeping the in-memory map (and thus the durable
-        // registry derived from it) deduped.
+        let def =
+            self.build_index_def(table, text_column, pk_column, ordinal, analyzer, IndexKind::Fulltext)?;
+        self.install_def(table, def).await
+    }
+
+    /// Install (or supersede) `def` on `table`: replace any prior def of the SAME
+    /// `(column, kind)` — a re-create supersedes rather than duplicating, while a
+    /// column may still carry one fulltext and one trigram def — then persist the
+    /// registry (durable mode only; a no-op without a blob).
+    async fn install_def(&self, table: &str, def: IndexDef) -> Result<()> {
         {
             let mut idx = self.indexes.write().unwrap();
             let defs = idx.entry(table.to_string()).or_default();
-            defs.retain(|d| d.column != text_column);
+            defs.retain(|d| !(d.column == def.column && d.kind == def.kind));
             defs.push(def);
         }
-        // Durable mode only: rewrite the registry blob so the def survives a
-        // restart. A no-op without a blob (`FtsEngine::new`).
         self.persist_registry().await?;
         Ok(())
     }
@@ -266,16 +316,25 @@ impl FtsEngine {
         pk_column: &str,
         ordinal: usize,
         analyzer: &str,
+        kind: IndexKind,
     ) -> Result<IndexDef> {
-        let segment = Arc::new(LiveSegment::new(analyzer)?);
+        // A trigram index always tokenizes through the built-in `whitespace`
+        // analyzer (it stores pre-trigramized text); a fulltext index uses the
+        // declared analyzer. The durable `index_id` prefix differs by kind
+        // (`trgm/` vs `fts/`) so a column can carry BOTH without split collision.
+        let (effective_analyzer, id_prefix) = match kind {
+            IndexKind::Fulltext => (analyzer, "fts"),
+            IndexKind::Trigram => ("whitespace", "trgm"),
+        };
+        let segment = Arc::new(LiveSegment::new(effective_analyzer)?);
 
         // When the engine is durable, build the durable tier: a STORED keyword
         // `id` (the pk, as a string) + a `body` text field with the SAME analyzer
         // as the live segment, so both tiers tokenize identically. The durable
-        // index_id is stable per index (`fts/{table}/{column}`), so a re-created
-        // FtsIndex over the same id reconnects to existing splits.
+        // index_id is stable per index (`{prefix}/{table}/{column}`), so a
+        // re-created FtsIndex over the same id reconnects to existing splits.
         let (durable, durable_body_field) = if let Some(blob) = &self.blob {
-            let an = analyzer_for_config(analyzer);
+            let an = analyzer_for_config(effective_analyzer);
             let mapping = IndexMapping::new().keyword("id").text("body", an);
             let schema = mapping.build_schema();
             let id_field = schema
@@ -284,7 +343,7 @@ impl FtsEngine {
             let body_field = schema
                 .get_field("body")
                 .map_err(|e| EngineError::Other(e.into()))?;
-            let index_id = format!("fts/{table}/{text_column}");
+            let index_id = format!("{id_prefix}/{table}/{text_column}");
             let index = Arc::new(FtsIndex::new(
                 index_id,
                 blob.clone(),
@@ -301,6 +360,10 @@ impl FtsEngine {
             column: text_column.to_string(),
             pk_column: pk_column.to_string(),
             column_ordinal: ordinal,
+            kind,
+            // Persist the DECLARED analyzer (for a fulltext index); a trigram index
+            // ignores it and always uses `whitespace`, but storing the declared
+            // value keeps the registry round-trip a faithful echo of the request.
             analyzer: analyzer.to_string(),
             segment,
             durable,
@@ -345,6 +408,86 @@ impl FtsEngine {
             .await
     }
 
+    /// Declare a **trigram** index on `table.text_column` (`pk_column` the
+    /// integer primary key) — the substring-search analog of
+    /// [`Self::create_fulltext_index`] (Spec B §4.6). It stores the
+    /// [`trigramize`]d column value through the `whitespace` analyzer, so the
+    /// `LIKE '%lit%'` rewrite can prefilter by the literal's trigrams. Resolves the
+    /// text column's ordinal from the live schema; persists a `Trigram` def to the
+    /// registry. A column may carry both a fulltext and a trigram index.
+    pub async fn create_trigram_index(
+        &self,
+        storage: &SlateDbStorage,
+        table: &str,
+        text_column: &str,
+        pk_column: &str,
+    ) -> Result<()> {
+        let schema = Store::fetch_schema(storage, table)
+            .await
+            .map_err(EngineError::from)?
+            .ok_or_else(|| EngineError::Rejected(format!("no such table: {table}")))?;
+        let cols = schema.column_defs.ok_or_else(|| {
+            EngineError::Rejected(format!(
+                "table {table} is schemaless; FTS needs a column schema"
+            ))
+        })?;
+        let ordinal = cols
+            .iter()
+            .position(|c| c.name == text_column)
+            .ok_or_else(|| {
+                EngineError::Rejected(format!("no column {text_column} on {table}"))
+            })?;
+
+        // The analyzer is forced to `whitespace` inside `build_index_def` for a
+        // Trigram kind; pass it through so the persisted echo records it.
+        let def = self.build_index_def(
+            table,
+            text_column,
+            pk_column,
+            ordinal,
+            "whitespace",
+            IndexKind::Trigram,
+        )?;
+        self.install_def(table, def).await
+    }
+
+    /// Like [`Self::create_trigram_index`] but resolves the table's primary-key
+    /// column from its schema (the column flagged `is_primary`). Errors if the
+    /// table is missing, schemaless, or has no single primary-key column. Mirrors
+    /// [`Self::create_fulltext_index_auto`] — the form the server endpoint uses.
+    pub async fn create_trigram_index_auto(
+        &self,
+        storage: &SlateDbStorage,
+        table: &str,
+        text_column: &str,
+    ) -> Result<()> {
+        let schema = Store::fetch_schema(storage, table)
+            .await
+            .map_err(EngineError::from)?
+            .ok_or_else(|| EngineError::Rejected(format!("no such table: {table}")))?;
+        let cols = schema.column_defs.as_ref().ok_or_else(|| {
+            EngineError::Rejected(format!(
+                "table {table} is schemaless; FTS needs a column schema"
+            ))
+        })?;
+        let pk_column = cols
+            .iter()
+            .find(|c| {
+                matches!(
+                    c.unique,
+                    Some(gluesql_core::ast::ColumnUniqueOption { is_primary: true })
+                )
+            })
+            .map(|c| c.name.clone())
+            .ok_or_else(|| {
+                EngineError::Rejected(format!(
+                    "table {table} has no primary key; trigram index requires an integer primary key"
+                ))
+            })?;
+        self.create_trigram_index(storage, table, text_column, &pk_column)
+            .await
+    }
+
     /// Rewrite a `@@` query against the matching index — the **union** of its
     /// live segment and (if durable) its durable splits, with the live tier
     /// authoritative for any pk it covers. `Ok(None)` when the SQL has no `@@`.
@@ -356,9 +499,12 @@ impl FtsEngine {
         // BEFORE any await (never hold a std RwLock guard across .await).
         let (segment, durable, durable_body_field, pk_column) = {
             let idx = self.indexes.read().unwrap();
+            // The `@@` path resolves the FULLTEXT def for the column — a column may
+            // also carry a Trigram def (used by the `LIKE` rewrite), which must not
+            // answer a `@@` query.
             match idx
                 .get(&pred.table)
-                .and_then(|v| v.iter().find(|d| d.column == pred.column))
+                .and_then(|v| v.iter().find(|d| d.column == pred.column && d.kind == IndexKind::Fulltext))
             {
                 Some(def) => (
                     def.segment.clone(),
@@ -574,6 +720,7 @@ impl FtsSearcher for PrecomputedSearcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fts_sql::TsQueryKind;
     use bluedb_sql::Database;
     use slatedb::object_store::memory::InMemory;
     use slatedb::Db;
@@ -662,6 +809,105 @@ mod tests {
         assert!(
             matches!(err, EngineError::Rejected(_)),
             "missing table must be Rejected, got {err:?}"
+        );
+    }
+
+    /// Trigram-search the `Trigram`-kind def for `(table, column)` with the
+    /// trigrams of `literal`, returning the matched pks. A private-field reach used
+    /// by the trigram engine tests to observe substring matches before the Task-2
+    /// `LIKE` rewrite exists. Searches the union of the trigram def's live segment
+    /// and (if durable) its durable tier — so it sees matches across a seal.
+    async fn trigram_search(engine: &FtsEngine, table: &str, column: &str, literal: &str) -> Vec<i64> {
+        let (segment, durable, durable_body_field) = {
+            let idx = engine.indexes.read().unwrap();
+            let def = idx
+                .get(table)
+                .and_then(|v| v.iter().find(|d| d.column == column && d.kind == IndexKind::Trigram))
+                .expect("trigram def present");
+            (def.segment.clone(), def.durable.clone(), def.durable_body_field)
+        };
+        // A synthetic predicate carrying the trigramized query: Plain conjoins the
+        // trigram tokens with AND, so every trigram must match (a substring superset).
+        let pred = FtsPredicate {
+            table: table.into(),
+            column: column.into(),
+            config: "whitespace".into(),
+            query: trigramize(literal),
+            kind: TsQueryKind::Plain,
+        };
+        let hits = union_hits(&segment, durable.as_deref(), durable_body_field, &pred)
+            .await
+            .expect("trigram union search");
+        let mut pks: Vec<i64> = hits.iter().map(|h| h.pk).collect();
+        pks.sort_unstable();
+        pks
+    }
+
+    /// `trigramize` produces all contiguous lowercased 3-grams space-joined; a
+    /// string shorter than 3 chars has no trigrams.
+    #[test]
+    fn trigramize_produces_lowercased_3grams() {
+        assert_eq!(trigramize("overdue"), "ove ver erd rdu due");
+        assert_eq!(trigramize("OverDue"), "ove ver erd rdu due", "lowercased");
+        assert_eq!(trigramize("abc"), "abc");
+        assert_eq!(trigramize("ab"), "", "< 3 chars → no trigrams");
+        assert_eq!(trigramize(""), "");
+    }
+
+    /// End-to-end engine trigram support: create a trigram index, index rows on an
+    /// observed connection, and a substring search (`verd` ⊂ `overdue`) finds the
+    /// row by pk. The match survives a `seal()` (durable trigram tier) and a
+    /// `reopen()` (the registry round-trips the `Trigram` kind + `trgm/` durable id).
+    #[tokio::test]
+    async fn trigram_index_matches_substring_across_seal_and_reopen() {
+        let store = Arc::new(InMemory::new());
+        let db = Arc::new(Db::open("trgm-engine", store).await.unwrap());
+        let database = Database::new(db);
+        let fts = FtsEngine::new_durable(database.substrate());
+
+        {
+            let mut g = Glue::new(database.connection_serialized());
+            g.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT);")
+                .await
+                .unwrap();
+        }
+        // Resolves pk=id from the schema; persists a Trigram def to the registry.
+        fts.create_trigram_index_auto(&database.connection(), "docs", "body")
+            .await
+            .unwrap();
+
+        {
+            let mut g = Glue::new(database.connection().with_commit_observer(fts.clone()));
+            g.execute(
+                "INSERT INTO docs (id, body) VALUES (1, 'quarterly invoice overdue'), (2, 'weather sunny skies'), (3, 'overdue notice');",
+            )
+            .await
+            .unwrap();
+        }
+
+        // Live: 'verd' is a substring of 'overdue' (rows 1 and 3), not of row 2.
+        assert_eq!(
+            trigram_search(&fts, "docs", "body", "verd").await,
+            vec![1, 3],
+            "pre-seal live: substring 'verd' matches the overdue rows"
+        );
+
+        // Seal: fold the live trigram segment into a durable `trgm/...` split.
+        fts.seal().await.unwrap();
+        assert_eq!(
+            trigram_search(&fts, "docs", "body", "verd").await,
+            vec![1, 3],
+            "post-seal: durable trigram tier serves the substring match"
+        );
+
+        // Reopen over the same substrate: the registry rebuilds the Trigram def and
+        // reconnects the `trgm/` durable splits.
+        drop(fts);
+        let fts2 = FtsEngine::reopen(database.substrate()).await.unwrap();
+        assert_eq!(
+            trigram_search(&fts2, "docs", "body", "verd").await,
+            vec![1, 3],
+            "reopen: the registry round-tripped the Trigram kind + trgm/ durable id"
         );
     }
 
@@ -758,7 +1004,14 @@ impl CommitObserver for FtsEngine {
                 match &ch.row {
                     Some(DataRow::Vec(values)) => {
                         if let Some(GValue::Str(text)) = values.get(def.column_ordinal) {
-                            if let Err(e) = def.segment.index(pk, text) {
+                            // A trigram def stores the pre-trigramized text (matched
+                            // through the whitespace analyzer); a fulltext def stores
+                            // the raw text. Both feed the same column value.
+                            let indexed = match def.kind {
+                                IndexKind::Fulltext => text.clone(),
+                                IndexKind::Trigram => trigramize(text),
+                            };
+                            if let Err(e) = def.segment.index(pk, &indexed) {
                                 eprintln!(
                                     "bluedb-fts: live index failed for {}.{} pk={pk}: {e}",
                                     ch.table, def.column
