@@ -10,6 +10,10 @@ pub enum EvidenceError {
     EntryNotFound { chain: String, seq: i64 },
     #[error("node is a read-only replica (no writer)")]
     NotWriter,
+    #[error("chain '{0}' is not verified; Merkle proofs are unavailable")]
+    NotVerified(String),
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
     #[error(transparent)]
     Storage(#[from] anyhow::Error),
 }
