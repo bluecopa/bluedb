@@ -133,5 +133,12 @@ pub async fn execute_sql(
             ));
         }
     }
-    Ok(glue.execute_with_params(sql, literals(params)).await?)
+    // Composite-primary-key rewrite (DDL surrogate, INSERT key injection, and
+    // component-predicate → __bluedb_pk bounds). A no-op for single-column-PK
+    // tables. Component values must be inline literals here — a parameterized PK
+    // column is rejected (v1 limitation).
+    let sql = bluedb_sql::prepare_composite_pk(&mut glue.storage, sql)
+        .await
+        .map_err(|e| EngineError::Sql(e.into()))?;
+    Ok(glue.execute_with_params(&sql, literals(params)).await?)
 }
