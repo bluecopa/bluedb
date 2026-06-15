@@ -71,6 +71,7 @@ mod guardrail;
 mod keyspace;
 mod lakehouse;
 mod nullorder;
+mod pkcodec;
 mod precheck;
 mod projection;
 mod pushdown;

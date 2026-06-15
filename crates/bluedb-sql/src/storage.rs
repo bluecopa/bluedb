@@ -93,7 +93,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::stream;
-use gluesql_core::ast::{IndexOperator, OrderByExpr};
+use gluesql_core::ast::{Expr, IndexOperator, OrderByExpr};
 use gluesql_core::data::{Key, Schema, SchemaIndex, SchemaIndexOrd, Value};
 use gluesql_core::error::Result as GlueResult;
 use gluesql_core::executor::evaluate_stateless;
@@ -537,6 +537,62 @@ impl SlateDbStorage {
             rows.push((stored.key, row));
         }
         Ok(rows)
+    }
+
+    /// Bounded scan over a table's data keyspace for a primary-key range
+    /// predicate, routed here via [`PK_PSEUDO_INDEX`]. The data keys are already
+    /// pk-ordered (`data_prefix ‖ pk.to_cmp_be_bytes()`), so the range maps to a
+    /// half-open `[start, end)` byte range — no index entries, no pk→row hop.
+    /// Rows come back in pk order (reversed for DESC), catalog applied, exactly
+    /// like a bounded [`Self::collect_rows`].
+    async fn scan_pk_range<'a>(
+        &'a self,
+        table_name: &str,
+        asc: Option<bool>,
+        cmp_value: Option<(&IndexOperator, Value)>,
+    ) -> GlueResult<RowIter<'a>> {
+        let table_id = self.table_id(table_name).await?;
+        let full_prefix = self.keyspace.data_prefix(table_id);
+        let full_end = prefix_upper_bound(&full_prefix);
+
+        let (start, end) = match cmp_value {
+            None => (full_prefix.clone(), full_end),
+            Some((op, value)) => {
+                let key =
+                    Key::try_from(value).map_err(|e| SqlError::IndexEval(e.to_string()))?;
+                let kbytes = key
+                    .to_cmp_be_bytes()
+                    .map_err(|e| SqlError::KeyEncode(e.to_string()))?;
+                let mut kv = full_prefix.clone();
+                kv.extend_from_slice(&kbytes);
+                let kv_succ = key_successor(&kv);
+                match op {
+                    // Equality normally goes through `plan_primary_key`'s point
+                    // `fetch_data`; handled here defensively as a single-key range.
+                    IndexOperator::Eq => (kv, Some(kv_succ)),
+                    IndexOperator::GtEq => (kv, full_end),
+                    IndexOperator::Gt => (kv_succ, full_end),
+                    IndexOperator::LtEq => (full_prefix, Some(kv_succ)),
+                    IndexOperator::Lt => (full_prefix, Some(kv)),
+                }
+            }
+        };
+
+        let pairs = self.scan_range(start, end).await?;
+        let catalog = self.read_catalog(table_name).await?;
+        let mut rows: Vec<(Key, DataRow)> = Vec::with_capacity(pairs.len());
+        for (_, value) in pairs {
+            let stored: StoredRow = decode(&value)?;
+            let row = match &catalog {
+                Some(cat) => cat.to_logical(stored.row),
+                None => stored.row,
+            };
+            rows.push((stored.key, row));
+        }
+        if asc == Some(false) {
+            rows.reverse();
+        }
+        Ok(Box::pin(stream::iter(rows.into_iter().map(Ok))))
     }
 
     /// Read a table's schema honoring the overlay (used by index maintenance,
@@ -1093,6 +1149,12 @@ impl Index for SlateDbStorage {
         asc: Option<bool>,
         cmp_value: Option<(&IndexOperator, Value)>,
     ) -> GlueResult<RowIter<'a>> {
+        // The clustered primary-key pseudo-index (see `PK_PSEUDO_INDEX`): the
+        // data keyspace is already pk-ordered, so a PK range is a direct bounded
+        // scan over the table's data prefix — no index entries, no pk→row hop.
+        if index_name == PK_PSEUDO_INDEX {
+            return self.scan_pk_range(table_name, asc, cmp_value).await;
+        }
         let table_id = self.table_id(table_name).await?;
         // Resolve the scan byte range from the optional comparison.
         let full_prefix = self.keyspace.index_prefix(table_id, index_name);
@@ -1445,6 +1507,56 @@ impl AlterTable for SlateDbStorage {
 //      text/number mismatch. See `crate::coerce`.
 // Everything else is gluesql's own public plan helpers; this is the default
 // `plan()` pipeline with our two passes inserted.
+
+/// Reserved index name for the **clustered primary-key pseudo-index**. It is
+/// never persisted in any table's `Schema::indexes`; `Planner::plan` injects it
+/// into the in-memory schema map so gluesql's `plan_index` routes primary-key
+/// *range* predicates (which `plan_primary_key` leaves alone — it handles only
+/// equality, as a point `fetch_data`) to a bounded scan. `scan_indexed_data`
+/// special-cases this name to scan the data keyspace directly, since the data is
+/// already pk-ordered. `CREATE INDEX` rejects this name (see `create_index`).
+pub(crate) const PK_PSEUDO_INDEX: &str = "__bluedb_pk";
+
+/// The smallest byte key strictly greater than `key` (append `0x00`): used to
+/// turn `>`/`<=` PK bounds into half-open `[start, end)` data ranges.
+fn key_successor(key: &[u8]) -> Vec<u8> {
+    let mut next = Vec::with_capacity(key.len() + 1);
+    next.extend_from_slice(key);
+    next.push(0x00);
+    next
+}
+
+/// Add the clustered-PK pseudo-index to every table that has a single-column
+/// primary key (unless a real index already targets that column). In-memory
+/// only — used by `plan_index` to make PK ranges index-served (see
+/// [`PK_PSEUDO_INDEX`]).
+fn augment_with_pk_pseudo_index(schema_map: &mut HashMap<String, Schema>) {
+    let created = chrono::DateTime::from_timestamp(0, 0)
+        .expect("epoch is a valid timestamp")
+        .naive_utc();
+    for schema in schema_map.values_mut() {
+        let Some(columns) = schema.column_defs.as_ref() else {
+            continue;
+        };
+        let Some(pk) = columns
+            .iter()
+            .find(|c| c.unique.as_ref().is_some_and(|u| u.is_primary))
+        else {
+            continue;
+        };
+        let pk_expr = Expr::Identifier(pk.name.clone());
+        if schema.indexes.iter().any(|i| i.expr == pk_expr) {
+            continue; // a real index already covers the PK column
+        }
+        schema.indexes.push(SchemaIndex {
+            name: PK_PSEUDO_INDEX.to_string(),
+            expr: pk_expr,
+            order: SchemaIndexOrd::Both,
+            created,
+        });
+    }
+}
+
 #[async_trait]
 impl Planner for SlateDbStorage {
     async fn plan(
@@ -1455,7 +1567,7 @@ impl Planner for SlateDbStorage {
             fetch_schema_map, plan_index, plan_join, plan_primary_key, validate,
         };
 
-        let schema_map = fetch_schema_map(self, &statement).await?;
+        let mut schema_map = fetch_schema_map(self, &statement).await?;
         validate(&schema_map, &statement)?;
         let statement = crate::pushdown::pushdown_equijoins(&schema_map, statement);
         crate::pushdown::reject_cross_products(&statement)?;
@@ -1469,6 +1581,11 @@ impl Planner for SlateDbStorage {
             statement
         };
         let statement = plan_primary_key(&schema_map, statement);
+        // Primary-key range pushdown: `plan_primary_key` above handles only PK
+        // *equality* (a point `fetch_data`); inject a clustered-PK pseudo-index
+        // so the `plan_index` pass below routes PK *ranges* to the bounded
+        // `scan_indexed_data` instead of a full scan + filter.
+        augment_with_pk_pseudo_index(&mut schema_map);
         // Secondary-index selection: route eligible `WHERE` predicates to
         // `Index::scan_indexed_data`. The default `Planner::plan` omits this, so
         // overriding `plan()` dropped it — without this pass our `CREATE INDEX`es
