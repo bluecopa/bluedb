@@ -202,7 +202,7 @@ The signed bytes are the canonical, domain-separated, length-delimited framing
 of `(tenant, chain, size, root_hash, timestamp_ms)` — see
 `bluedb_evidence::sth_payload`. The `signature` is a base64-encoded ASN.1-DER
 ECDSA signature. A consumer fetches the public key
-([`/evidence/signing-key`](#get-evidencesigning-key--public-key)), rebuilds the
+([`/evidence/signing-key`](#get-evidencesigning-key-public-key)), rebuilds the
 same payload bytes, and verifies. Because the framing binds `tenant` + `chain`,
 a signature for one chain never verifies as another's STH (no cross-chain
 replay).
