@@ -109,11 +109,15 @@ be rebuilt from a full scan if ever needed.
 New crate **`bluedb-lakehouse`** (separate dir for Cargo build isolation; **no `#[cfg(feature)]`**):
 - `cdc` — read/decode the durable CDC log, LWW collapse per `(table, pk)` per batch.
 - `schema` — bluedb (SchemaRegistry) → Iceberg schema; scalar + complex/nested type mapping (§7).
-- `writer` — Parquet data-file + equality-delete-file writers; Iceberg snapshot commit
-  (via `iceberg-rust`); watermark in snapshot summary.
-- `compaction` — merge-on-read → copy-on-write, dead-file GC; policy thresholds (port the
-  FTS `policy` shape).
-- `catalog` — in-process Iceberg table metadata model the REST routes serve.
+- `writer` — Parquet data-file + **equality-delete-file** writers; **self-authors the Iceberg
+  commit** (data/delete manifests via `ManifestWriterBuilder::build_v2_data`/`build_v2_deletes`
+  → `ManifestListWriter` → `Snapshot` → `TableMetadata::into_builder()` apply `AddSnapshot`/
+  `SetSnapshotRef` → serialize `metadata.json`); watermark in the snapshot summary. **Published
+  iceberg-rust 0.9.1 only — no `Catalog::update_table`, no fork, no `unsafe`** (see §5.2).
+- `compaction` — manifest-rewrite dropping superseded data/delete files (copy-on-write),
+  dead-file GC; policy thresholds (port the FTS `policy` shape).
+- `catalog` — owns the Iceberg table-metadata model + the **atomic metadata-pointer publish**
+  the seal commits through, and serves the REST routes.
 - `engine` — `LakehouseEngine`: owns the registry, the seal + compaction schedulers,
   watermark recovery; the type `bluedb-server` binds on promote.
 
@@ -133,6 +137,25 @@ Per seal batch, for each `(table, pk)` keep only the **last** change (LWW), then
 Equality deletes are keyed on the table's PK column(s). Readers (warehouses) apply deletes
 at query time (merge-on-read); compaction later materializes copy-on-write so steady-state
 read cost stays low.
+
+### 5.2 Commit mechanism (LOCKED)
+
+iceberg-rust's high-level transaction API is append-only, and its `TableCommit` is **not
+externally constructible**, so the seal **self-authors the Iceberg commit** from public `spec`
+types and publishes it through **bluedb's own hosted catalog** — never `Catalog::update_table`:
+
+1. write the data + equality-delete Parquet files (`ParquetWriter` + the equality-delete writer);
+2. data manifest via `ManifestWriterBuilder::build_v2_data`, delete manifest via `build_v2_deletes`;
+3. `ManifestListWriter` → a `Snapshot` whose summary carries `bluedb.cdc_watermark`;
+4. `TableMetadata::into_builder()` + apply `TableUpdate::AddSnapshot` / `SetSnapshotRef` → `build()`;
+5. serialize `metadata.json` to the bucket; the **catalog atomically swaps the metadata pointer**.
+
+This is the clean path the spike confirmed: **published iceberg-rust 0.9.1, no fork, no git-pin,
+no `unsafe`** (moonlink needed an `unsafe` `TableCommit` transmute only because it commits
+through *external* catalogs — we host ours). Compaction removals use the same flow with the
+superseded files omitted from the new manifest list. Residual risk = hand-assembled metadata
+correctness (sequence numbers, manifest-entry statuses, snapshot lineage); `TableMetadataBuilder`
+does most of the bookkeeping and the round-trip + external-reader tests (§12) are the guard.
 
 ### 5.1 Freshness (event-driven seal) & memory-bounded compaction
 
@@ -308,11 +331,12 @@ double-publish, no gap.
 
 ## 13. Risks & mitigations
 
-- **`iceberg-rust` equality-delete writer maturity** — the main risk for full CRUD. First
-  implementation step verifies the writer's delete support; if not ready, the seal uses
-  **copy-on-write** (rewrite changed data files per seal) — identical external behavior,
-  heavier writes — and upgrades to equality-deletes when available. Full CRUD ships either
-  way.
+- **Self-authored Iceberg commit (RESOLVED by spike → now the locked mechanism, §5.2).**
+  iceberg-rust can't commit deletes/removals via its public high-level API (`TableCommit`
+  isn't constructible). We sidestep it entirely: self-author manifests + snapshot via public
+  `spec` writers and publish via our own catalog — no `update_table`, no fork, no `unsafe`,
+  on published 0.9.1. Residual risk = hand-assembled metadata correctness, guarded by the
+  round-trip + external-reader tests.
 - **Build cost** — `iceberg-rust` + `arrow` + `parquet` are heavy on a tree that already
   OOMs Docker on `--release` (the documented gotcha). No gate per directive; mitigate via
   the existing debug-build dev image + cargo cache mounts, build with the cluster stopped.

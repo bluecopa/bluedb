@@ -397,11 +397,11 @@ git commit -am "feat(bluedb-sql): scan_cdc + gc_cdc for the lakehouse seal loop"
 - [ ] **Step 1:** Add to root `Cargo.toml` `[workspace.dependencies]` (pin to current releases at implementation time; check `cargo search`):
 
 ```toml
-iceberg      = "0.7"          # apache/iceberg-rust (confirm latest in Task 2.2)
-arrow-array  = "55"
-arrow-schema = "55"
-parquet      = "55"
-object_store = "0.11"
+iceberg      = "0.9.1"        # apache/iceberg-rust (confirmed in the spike)
+arrow-array  = "57"
+arrow-schema = "57"
+parquet      = "57"
+object_store = "=0.12.5"      # MUST match the server's pin (single version in the tree)
 bluedb-lakehouse = { path = "crates/bluedb-lakehouse" }
 ```
 
@@ -466,19 +466,19 @@ git add crates/bluedb-lakehouse Cargo.toml
 git commit -m "feat(bluedb-lakehouse): crate skeleton + Iceberg/arrow/parquet deps"
 ```
 
-### Task 2.2: SPIKE — confirm the `iceberg` writer + table API
+### Task 2.2: SPIKE — DONE (outcome locked)
 
-**Files:** Test `crates/bluedb-lakehouse/tests/spike_iceberg.rs` (deleted after).
+Findings (from reading iceberg 0.9.1 source + the moonlink reference + web):
 
-- [ ] **Step 1:** Write a throwaway test that, against a `tempfile::tempdir()` + an `object_store::local::LocalFileSystem` (or `MemoryCatalog` + `FileIO`), creates an Iceberg table with schema `(id long, body string)`, appends one row via the Arrow record-batch writer, commits a snapshot, then loads the table and scans it back asserting one row.
-- [ ] **Step 2: Run** `cargo test -p bluedb-lakehouse --test spike_iceberg 2>&1`. Resolve the exact API names (catalog type, `TableCreation`, `transaction`/`fast_append`, equality-delete writer availability) from compile errors + `cargo doc -p iceberg --open`.
-- [ ] **Step 3: Record findings** as a doc-comment block at the top of `src/writer.rs`: the exact types/methods to use for (a) create table, (b) append data file, (c) **equality-delete file** (CONFIRM it exists; if the writer cannot emit equality deletes in this version, set `WRITER_MODE = CopyOnWrite` and note it — Task 2.6 branches on this), (d) commit snapshot + set a snapshot **summary property**.
-- [ ] **Step 4:** Delete the spike test.
-- [ ] **Step 5: Commit**
+- **Append works; deletes/removals don't via the high-level API.** `Transaction` only exposes
+  `fast_append` (data files, `Operation::Append`). `TableCommit` is **not externally
+  constructible** (`pub(crate)` build, private fields), so `Catalog::update_table` is unusable
+  from our crate. RewriteFiles/row-delta is unimplemented upstream (apache/iceberg-rust#1607).
+- **The public `spec` writers ARE enough to self-author commits:** `ManifestWriterBuilder::{build_v2_data, build_v2_deletes}`, `ManifestListWriter`, `Snapshot` builder, `TableMetadata::into_builder()` + `TableUpdate::{AddSnapshot, SetSnapshotRef}`, `DataContentType::EqualityDeletes` — all public. Equality-delete writer: `EqualityDeleteWriterConfig::new(equality_ids, schema)`.
+- **LOCKED mechanism (spec §5.2):** self-author manifests + snapshot + `metadata.json` and publish via **bluedb's own catalog** (we never call `update_table`). Equality deletes keyed by PK. Published iceberg-rust 0.9.1 — **no fork, no git-pin, no `unsafe`** (moonlink needed the `unsafe` `TableCommit` transmute only because it commits through external catalogs; we host ours).
+- **Writer pipeline confirmed (from `data_file_writer.rs` tests):** `ParquetWriterBuilder::new(WriterProperties, Arc<Schema>)` → `RollingFileWriterBuilder::new_with_default_file_size(pw, file_io, DefaultLocationGenerator::new(table_metadata)?, DefaultFileNameGenerator::new(prefix, None, DataFileFormat::Parquet))` → `DataFileWriterBuilder::new(rolling).build(None)` → `write(batch)` / `close() -> Vec<DataFile>`. Arrow fields must carry `parquet::arrow::PARQUET_FIELD_ID_META_KEY` matching the Iceberg field ids.
 
-```bash
-git commit -am "docs(bluedb-lakehouse): record confirmed iceberg-rust writer API (spike)"
-```
+No code artifact from this task — findings drive Tasks 2.5–2.7.
 
 ### Task 2.3: Scalar type mapping
 
