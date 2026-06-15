@@ -49,6 +49,7 @@ use bluedb_ledger::Ledger;
 
 mod ledger_api;
 mod evidence_api;
+mod graph_api;
 
 use bluedb_lakehouse::{object_store_file_io, LakehouseConfig, LakehouseManager};
 use bluedb_rest::{parse_filters, DeleteRequest, InsertRequest, UpdateRequest};
@@ -579,6 +580,16 @@ impl AppState {
         }
     }
 
+    /// Build a [`Graph`] handle over the currently-bound database for `tenant`.
+    pub(crate) async fn graph(&self, tenant: &str) -> Result<bluedb_evidence::Graph, AppError> {
+        match self.inner.db.read().await.as_ref() {
+            Some(db) => Ok(bluedb_evidence::Graph::new(db, tenant)),
+            None => Err(AppError::service_unavailable(
+                "node has no database yet (no writer has been promoted)",
+            )),
+        }
+    }
+
     /// Reject a mutating request unless this node is the active writer.
     pub(crate) fn require_active(&self) -> Result<(), AppError> {
         if self.inner.writer.is_active() {
@@ -636,6 +647,11 @@ pub fn build_app(state: AppState) -> Router {
         .route("/evidence/{chain}/digest", get(evidence_api::digest))
         .route("/evidence/{chain}/proof", get(evidence_api::inclusion))
         .route("/evidence/{chain}/consistency", get(evidence_api::consistency))
+        // Native graph store (edge maintenance; traversal is a later plan).
+        .route(
+            "/graph/{graph}/edges",
+            put(graph_api::upsert_edges).delete(graph_api::delete_edges),
+        )
         // Read-only Iceberg REST Catalog for warehouse discovery (Phase 5).
         .route("/catalog/v1/config", get(catalog::config))
         .route("/catalog/v1/namespaces", get(catalog::list_namespaces))

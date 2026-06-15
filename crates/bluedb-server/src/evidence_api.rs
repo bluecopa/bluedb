@@ -17,7 +17,7 @@ use crate::{authz::Scope, AppError, AppState};
 
 // --- error mapping ----------------------------------------------------------
 
-fn map_evidence_err(e: EvidenceError) -> AppError {
+pub(crate) fn map_evidence_err(e: EvidenceError) -> AppError {
     match e {
         EvidenceError::IdemConflict => {
             AppError::conflict("E_IDEM_CONFLICT: idempotency key reused with a different payload")
@@ -251,17 +251,28 @@ pub async fn redact(
 
 // --- DELETE /evidence/{chain}/entries/{seq} ---------------------------------
 
+#[derive(Deserialize)]
+pub(crate) struct HardDeleteQuery {
+    #[serde(default = "default_true")]
+    retract_edges: bool,
+}
+fn default_true() -> bool {
+    true
+}
+
 /// Hard-delete one entry (plain chains only). Requires `schema:admin`.
+/// `?retract_edges=` (default true) also removes the entry's materialized edges.
 pub async fn hard_delete(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((chain, seq)): Path<(String, i64)>,
+    Query(q): Query<HardDeleteQuery>,
 ) -> Result<Json<Value>, AppError> {
     state.require_active()?;
     state.authorize(&headers, Scope::SchemaAdmin)?;
     let tenant = state.tenant(&headers)?;
-    state.evidence(&tenant).await?.hard_delete(&chain, seq, true).await.map_err(map_evidence_err)?;
-    Ok(Json(json!({ "chain": chain, "seq": seq, "deleted": true })))
+    state.evidence(&tenant).await?.hard_delete(&chain, seq, q.retract_edges).await.map_err(map_evidence_err)?;
+    Ok(Json(json!({ "chain": chain, "seq": seq, "deleted": true, "retract_edges": q.retract_edges })))
 }
 
 // --- GET /evidence/{chain}/digest -------------------------------------------
