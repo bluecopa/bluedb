@@ -281,7 +281,9 @@ async fn trigram_like_over_http_read_your_writes() {
     assert!(s.is_success(), "LIKE select: {s} {body}");
     assert_eq!(body, json!([{ "id": 1 }, { "id": 3 }]), "matching rows 1 and 3");
 
-    // 5. a column with NO trigram index still works (pass-through to the exact scan).
+    // 5. a column with NO trigram index: the engine passes the LIKE through
+    //    unchanged, so it would be a full scan — which the guardrail now rejects.
+    //    (Trigram-accelerate the column, or filter on the PK / an index, to read.)
     let (s, _) = call(
         &app,
         "POST",
@@ -311,8 +313,11 @@ async fn trigram_like_over_http_read_your_writes() {
         Some(json!({"sql": "SELECT id FROM notes WHERE memo LIKE '%overdue%'"})),
     )
     .await;
-    assert!(s.is_success(), "LIKE on un-indexed column: {s} {body}");
-    assert_eq!(body, json!([{ "id": 1 }]), "pass-through scan still correct");
+    assert_eq!(
+        s,
+        StatusCode::BAD_REQUEST,
+        "LIKE on an un-indexed column is a full scan and must be rejected: {body}"
+    );
 }
 
 #[tokio::test]

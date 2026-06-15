@@ -11,6 +11,7 @@
 //! atomic batch as its canonical records, so the SQL view can never lag or
 //! disagree after a crash.
 
+use bluedb_storage::Substrate;
 use gluesql_core::data::{Key, Value};
 use gluesql_core::prelude::Glue;
 use gluesql_core::store::DataRow;
@@ -18,7 +19,7 @@ use gluesql_core::store::DataRow;
 use crate::connection::Database;
 use crate::error::SqlError;
 use crate::keyspace::Keyspace;
-use crate::storage::{encode, StoredRow};
+use crate::storage::{decode_table_id, encode, StoredRow};
 
 /// A scalar projected into a SQL column. Maps 1:1 onto a GlueSQL [`Value`]; the
 /// primary-key column additionally maps onto a GlueSQL [`Key`].
@@ -124,6 +125,26 @@ impl ProjectedTable {
         Ok(())
     }
 
+    /// Resolve the stable table id this projection's rows are keyed under (the
+    /// id GlueSQL assigned at CREATE), reading it from `substrate` exactly the
+    /// way the engine does. An external row-writer resolves this **once per write
+    /// batch** and threads it to [`encode_row`](Self::encode_row).
+    ///
+    /// Returns `None` if the projection table has not been created yet (no
+    /// [`ensure`](Self::ensure) / [`ensure_schema`](crate::projection) has run) —
+    /// the caller should then skip the SQL mirror for this batch rather than
+    /// guess an id. `Err` is reserved for an actual read/decode failure.
+    pub async fn resolve_id(
+        &self,
+        substrate: &Substrate,
+        ks: &Keyspace,
+    ) -> Result<Option<u64>, SqlError> {
+        match substrate.get(&ks.tableid_key(&self.table)).await? {
+            Some(bytes) => Ok(Some(decode_table_id(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
     /// Encode one row into the `(storage_key, value_bytes)` GlueSQL's own store
     /// would have produced, so a raw `WriteBatch::put` of these bytes is read
     /// back by `SELECT`. `values` must match `columns` in length and order.
@@ -132,6 +153,7 @@ impl ProjectedTable {
     pub fn encode_row(
         &self,
         ks: &Keyspace,
+        table_id: u64,
         values: &[ProjValue],
     ) -> Result<(Vec<u8>, Vec<u8>), SqlError> {
         assert_eq!(
@@ -142,7 +164,7 @@ impl ProjectedTable {
         );
         let key = values[self.pk].to_key();
         let row = DataRow::Vec(values.iter().map(ProjValue::to_value).collect());
-        let storage_key = ks.row_key(&self.table, &key)?;
+        let storage_key = ks.row_key(table_id, &key)?;
         let stored = StoredRow { key, row };
         Ok((storage_key, encode(&stored)?))
     }
@@ -196,6 +218,11 @@ mod tests {
         let database = database().await;
         let table = accounts();
         table.ensure(&database).await.unwrap();
+        let table_id = database
+            .table_id("ledger_accounts")
+            .await
+            .unwrap()
+            .expect("table id assigned at create");
 
         // Hand-write two rows into one atomic batch, exactly as the ledger will.
         let ks = Keyspace::new(DEFAULT_TENANT);
@@ -204,6 +231,7 @@ mod tests {
             let (k, v) = table
                 .encode_row(
                     &ks,
+                    table_id,
                     &[
                         ProjValue::U128(id),
                         ProjValue::U32(700),
@@ -266,12 +294,14 @@ mod tests {
         let table = accounts();
         table.ensure(&database).await.unwrap();
         let ks = Keyspace::new(DEFAULT_TENANT);
+        let table_id = database.table_id("ledger_accounts").await.unwrap().unwrap();
 
         for posted in [10u128, 25u128] {
             let mut batch = WriteBatch::new();
             let (k, v) = table
                 .encode_row(
                     &ks,
+                    table_id,
                     &[
                         ProjValue::U128(1),
                         ProjValue::U32(700),

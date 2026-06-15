@@ -52,6 +52,7 @@ use bluedb_storage::Substrate;
 use slatedb::{Db, DbReader};
 use tokio::sync::Mutex;
 
+use crate::error::SqlError;
 use crate::keyspace::DEFAULT_TENANT;
 use crate::storage::{SeqAllocator, SlateDbStorage, WriteLease};
 
@@ -140,6 +141,31 @@ impl Database {
     /// should use [`Self::connection`] to keep group-committing.
     pub fn connection_serialized(&self) -> SlateDbStorage {
         self.connection_for_tenant(DEFAULT_TENANT).serialize_writes()
+    }
+
+    /// A new connection that rejects queries requiring a full table scan or an
+    /// in-memory sort (see [`SlateDbStorage::guard_scans`]). This is the
+    /// user-facing surface — the server vends these for `/sql` and `/tables`;
+    /// the unguarded [`Self::connection`] is for internal/admin use that may
+    /// legitimately scan.
+    pub fn connection_guarded(&self) -> SlateDbStorage {
+        self.connection_for_tenant(DEFAULT_TENANT).strict()
+    }
+
+    /// A guarded connection (see [`Self::connection_guarded`]) that *also*
+    /// serializes autocommit writes (see [`Self::connection_serialized`]). The
+    /// server vends this for the user routes that run a single-statement
+    /// read-modify-write (`/sql`, `PATCH`, `DELETE`): they get both the scan/sort
+    /// guardrail and serializable RMW.
+    pub fn connection_serialized_guarded(&self) -> SlateDbStorage {
+        self.connection_for_tenant(DEFAULT_TENANT).serialize_writes().strict()
+    }
+
+    /// Resolve a table's stable id (name→id), if it exists. For layers that
+    /// hand-write SQL-projection rows keyed by the table id (e.g. `bluedb-ledger`
+    /// dual-writing into the same `WriteBatch`).
+    pub async fn table_id(&self, table_name: &str) -> Result<Option<u64>, SqlError> {
+        self.connection().resolve_table_id(table_name).await
     }
 
     /// A new connection scoped to `tenant` (its keyspace is namespaced; see

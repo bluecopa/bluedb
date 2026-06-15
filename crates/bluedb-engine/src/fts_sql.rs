@@ -351,8 +351,8 @@ pub(crate) fn extract_like_predicate(sql: &str) -> Result<Option<LikePredicate>>
 
 /// Add a `pk IN (candidates)` conjunct to `sql`'s WHERE clause, keeping the
 /// original `Expr::Like` intact (gluesql's authoritative exact verify). Empty
-/// candidates → a `1 = 0` never-match conjunct (reusing the `@@` empty-hit
-/// approach). Re-emits via Display.
+/// candidates → an index-served `pk IN (NULL)` never-match conjunct (reusing the
+/// `@@` empty-hit approach). Re-emits via Display.
 ///
 /// The caller guarantees `sql` matched [`extract_like_predicate`], so the WHERE
 /// clause is present; if the shape changed unexpectedly, returns `Ok(None)`.
@@ -375,16 +375,13 @@ pub(crate) fn rewrite_like_query(
         return Ok(None);
     };
 
-    let pk_ident = Expr::Identifier(Ident::new(pk_column));
     let prefilter: Expr = if candidates.is_empty() {
-        Expr::BinaryOp {
-            left: Box::new(int_literal(1)),
-            op: BinaryOperator::Eq,
-            right: Box::new(int_literal(0)),
-        }
+        // Index-served never-match (see `never_match`) — keeps the empty case
+        // within the scan guardrail, unlike a constant `1 = 0`.
+        never_match(pk_column)
     } else {
         Expr::InList {
-            expr: Box::new(pk_ident),
+            expr: Box::new(Expr::Identifier(Ident::new(pk_column))),
             list: candidates.iter().map(|pk| int_literal(*pk)).collect(),
             negated: false,
         }
@@ -407,6 +404,20 @@ pub(crate) fn rewrite_like_query(
 /// Helper: build an integer literal `Expr`.
 fn int_literal(n: i64) -> Expr {
     Expr::Value(Value::Number(BigDecimal::from(n), false))
+}
+
+/// An **index-served** never-match prefilter: `<pk> IN (NULL)`. It matches no
+/// row (a `NULL` membership test is never true) and is planned off the
+/// primary-key index — no table scan. We use this instead of a constant `1 = 0`
+/// so an empty FTS / trigram hit set still satisfies the scan guardrail
+/// (`bluedb_sql::guardrail`), which rejects a WHERE that touches no indexed
+/// column. Both are never-matches; only this one is bounded.
+fn never_match(pk_column: &str) -> Expr {
+    Expr::InList {
+        expr: Box::new(Expr::Identifier(Ident::new(pk_column))),
+        list: vec![Expr::Value(Value::Null)],
+        negated: false,
+    }
 }
 
 /// Replace the first `@@` expr found in `expr` (in-place) with `replacement`.
@@ -439,7 +450,7 @@ fn is_ts_rank(expr: &Expr) -> bool {
 ///
 /// 1. Calling `searcher` to get the matching primary-key values.
 /// 2. Replacing `to_tsvector(...) @@ *_tsquery(...)` with `pk_column IN (...)`.
-///    Empty result set → `1 = 0` (never-match, safe with gluesql).
+///    Empty result set → an index-served `pk_column IN (NULL)` never-match.
 /// 3. Replacing any `ORDER BY ts_rank(...)` with a `CASE pk WHEN v THEN pos …
 ///    ELSE len END` expression that preserves BM25 rank order.
 ///
@@ -471,15 +482,11 @@ pub async fn rewrite_fts_query(
         _ => return Ok(None),
     };
 
-    // Build the replacement for @@: pk IN (...) or 1 = 0.
+    // Build the replacement for @@: pk IN (hits), or an index-served never-match
+    // (pk IN (NULL)) when there are no hits.
     let pk_ident = Expr::Identifier(Ident::new(pk_column));
     let replacement: Expr = if hits.is_empty() {
-        // 1 = 0 — universally safe never-match.
-        Expr::BinaryOp {
-            left: Box::new(int_literal(1)),
-            op: BinaryOperator::Eq,
-            right: Box::new(int_literal(0)),
-        }
+        never_match(pk_column)
     } else {
         Expr::InList {
             expr: Box::new(pk_ident.clone()),
@@ -603,7 +610,7 @@ mod tests {
         let out = rewrite_like_query(sql, "id", &[]).unwrap().unwrap();
         assert_eq!(
             out,
-            "SELECT id FROM docs WHERE 1 = 0 AND (body LIKE '%overdue%')"
+            "SELECT id FROM docs WHERE id IN (NULL) AND (body LIKE '%overdue%')"
         );
     }
 
@@ -705,10 +712,11 @@ mod tests {
         let sql = "SELECT id FROM docs WHERE to_tsvector('english', body) @@ plainto_tsquery('q')";
         let out = rewrite_fts_query(sql, "id", &EmptySearcher).await.unwrap().unwrap();
         let low = out.to_lowercase();
-        // Must be a never-match: either "1 = 0" or "false"
+        // Must be an index-served never-match (`pk IN (NULL)`), so the empty case
+        // still satisfies the scan guardrail.
         assert!(
-            low.contains("1 = 0") || low.contains("false"),
-            "expected never-match expression, got: {out}"
+            low.contains("in (null)"),
+            "expected index-served never-match, got: {out}"
         );
         assert!(!out.contains("@@"), "@@ should be gone: {out}");
     }

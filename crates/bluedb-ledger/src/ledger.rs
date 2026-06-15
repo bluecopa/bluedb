@@ -197,11 +197,22 @@ impl Ledger {
         let mut batch = WriteBatch::new();
         let sql_ks = bluedb_sql::Keyspace::new(DEFAULT_TENANT);
         let accounts_tbl = crate::projection::accounts_table();
+        // Resolve the projection table's stable id once for the whole batch (its
+        // rows are keyed by id, not name). `None` ⇒ the table was never created
+        // (`ensure_schema` not called); the apply still commits, we just skip the
+        // SQL mirror for this batch.
+        let accounts_id = if accepted.is_empty() {
+            None
+        } else {
+            accounts_tbl.resolve_id(&self.substrate, &sql_ks).await?
+        };
         for a in &accepted {
             batch.put(self.keyspace.account_key(a.id), &encode(a)?);
-            // Atomic SQL projection: mirror the account row in the same batch.
-            let (k, v) = accounts_tbl.encode_row(&sql_ks, &crate::projection::project_account(a))?;
-            batch.put(k, &v);
+            if let Some(id) = accounts_id {
+                // Atomic SQL projection: mirror the account row in the same batch.
+                let (k, v) = accounts_tbl.encode_row(&sql_ks, id, &crate::projection::project_account(a))?;
+                batch.put(k, &v);
+            }
         }
         if !accepted.is_empty() {
             batch.put(self.keyspace.watermark_key(), ts.last.to_be_bytes());
@@ -375,19 +386,39 @@ impl Ledger {
         let sql_ks = bluedb_sql::Keyspace::new(DEFAULT_TENANT);
         let accounts_tbl = crate::projection::accounts_table();
         let transfers_tbl = crate::projection::transfers_table();
+        // Resolve each projection table's stable id once for the whole batch (its
+        // rows are keyed by id, not name), and only when that table is actually
+        // written so an apply that touches neither needs no extra read. `None` ⇒
+        // the table was never created (`ensure_schema` not called); the apply
+        // still commits, we just skip that mirror.
+        let accounts_id = if state.dirty.is_empty() {
+            None
+        } else {
+            accounts_tbl.resolve_id(&self.substrate, &sql_ks).await?
+        };
+        let transfers_id = if accepted.is_empty() {
+            None
+        } else {
+            transfers_tbl.resolve_id(&self.substrate, &sql_ks).await?
+        };
         for id in &state.dirty {
             if let Some(account) = state.working.get(id) {
                 batch.put(self.keyspace.account_key(*id), &encode(account)?);
-                // Atomic SQL projection: re-mirror the post-mutation account.
-                let (k, v) = accounts_tbl.encode_row(&sql_ks, &crate::projection::project_account(account))?;
-                batch.put(k, &v);
+                if let Some(tid) = accounts_id {
+                    // Atomic SQL projection: re-mirror the post-mutation account.
+                    let (k, v) =
+                        accounts_tbl.encode_row(&sql_ks, tid, &crate::projection::project_account(account))?;
+                    batch.put(k, &v);
+                }
             }
         }
         for t in &accepted {
             batch.put(self.keyspace.transfer_key(t.id), &encode(t)?);
-            // Atomic SQL projection: mirror the transfer row in the same batch.
-            let (k, v) = transfers_tbl.encode_row(&sql_ks, &crate::projection::project_transfer(t))?;
-            batch.put(k, &v);
+            if let Some(tid) = transfers_id {
+                // Atomic SQL projection: mirror the transfer row in the same batch.
+                let (k, v) = transfers_tbl.encode_row(&sql_ks, tid, &crate::projection::project_transfer(t))?;
+                batch.put(k, &v);
+            }
             // A new timed pending gets an expiry-index entry for the sweep.
             if t.flags.contains(TransferFlags::PENDING) && t.timeout != 0 {
                 let expires_at = expiry_of(t.timestamp, t.timeout);

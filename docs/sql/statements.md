@@ -15,19 +15,21 @@ CREATE TABLE users (
 );
 ```
 
-Create a **schemaless** table — no column list; each row is a free-form record:
-
-```sql
-CREATE TABLE events;
-INSERT INTO events VALUES ('{"kind": "click", "x": 10}');
-```
+!!! warning
+    **Every table needs a column list and a `PRIMARY KEY`.** bluedb has no
+    schemaless tables — a column-less `CREATE TABLE`, or one without a primary
+    key, is rejected. The primary key is the clustered row key (so it must be
+    unique and is the default scan order) and the identity column for the
+    warehouse Iceberg mirror, and it guarantees every table has at least one
+    index-served access path for the [query guardrail](query-guardrail.md).
 
 Options:
 
 - `IF NOT EXISTS` — `CREATE TABLE IF NOT EXISTS users (…)`.
 - `PRIMARY KEY` on a column makes it the clustered key; rows scan back in
   primary-key order without an explicit `ORDER BY` (see the [Note](#default-row-order) below).
-- `CREATE TABLE … AS SELECT …` (CTAS) is supported, including a leading `WITH`.
+- `CREATE TABLE … AS SELECT …` (CTAS) is supported, including a leading `WITH` —
+  the new table still requires a `PRIMARY KEY`.
 
 ```sql
 CREATE TABLE adults AS SELECT * FROM users WHERE age >= 18;
@@ -44,6 +46,31 @@ CREATE TABLE adults AS SELECT * FROM users WHERE age >= 18;
 DROP TABLE users;
 DROP TABLE IF EXISTS users;
 ```
+
+## `ALTER TABLE`
+
+Schema evolution is **online** — these are O(1) metadata changes (stable
+field-ids and table-ids under the hood), never a row rewrite, so they don't block
+reads or writes:
+
+```sql
+ALTER TABLE users ADD COLUMN nickname TEXT;     -- old rows read back the default/NULL
+ALTER TABLE users RENAME COLUMN nickname TO handle;
+ALTER TABLE users DROP COLUMN handle;
+ALTER TABLE users RENAME TO members;            -- O(1): no row/index re-key
+```
+
+!!! note
+    `ADD COLUMN` with `NOT NULL` needs a `DEFAULT` (existing rows must have a
+    value to read back).
+
+!!! warning
+    **Changing the primary key or a column's type is not an in-place operation.**
+    The primary key is the physical row key and the type fixes the on-disk
+    encoding, so both require a rebuild: `CREATE` the new table, `INSERT … SELECT`
+    into it, `DROP` the old one, and `RENAME` the new one into place (the rename
+    is O(1)). Dropping the primary-key column is rejected — a table can't be left
+    without one.
 
 ## `INSERT`
 
@@ -77,14 +104,20 @@ DELETE FROM users;                     -- no WHERE deletes every row
 
 ## `CREATE INDEX` / `DROP INDEX`
 
-Single-column secondary indexes. The planner will use an index automatically
-when a `WHERE` predicate matches it.
+Single-column secondary indexes. The planner uses an index automatically when a
+`WHERE` predicate (or `ORDER BY`) matches it.
 
 ```sql
 CREATE INDEX users_email ON users (email);
 SELECT * FROM users WHERE email = 'ada@x.io';   -- uses users_email
 DROP INDEX users_email ON users;
 ```
+
+!!! note
+    Indexes aren't just an optimization here — they're what makes a query
+    *runnable*. The [query guardrail](query-guardrail.md) rejects a filter or
+    `ORDER BY` on a non-indexed column (it would be a full scan / in-memory
+    sort), and the rejection tells you the exact `CREATE INDEX` to add.
 
 !!! warning
     Indexes are **single-column** only. Composite (multi-column)

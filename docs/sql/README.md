@@ -21,8 +21,13 @@ substrate as the rest of bluedb — no separate database server.
 - Core **SQL-92**: `CREATE TABLE` / `INSERT` / `UPDATE` / `DELETE` / `SELECT`
   with `WHERE`, `GROUP BY` / `HAVING`, `ORDER BY`, `LIMIT` / `OFFSET`,
   `DISTINCT`, joins, subqueries, aggregates.
-- **Schemaless tables** — create a table with no column list and insert
-  arbitrary rows, alongside fully typed tables.
+- **Schema'd tables** — every table has a typed column list and a `PRIMARY KEY`;
+  schema evolution (ADD/DROP/RENAME column, RENAME TABLE) is **online** (O(1)
+  metadata, no row rewrite). There are no schemaless tables.
+- **Bounded reads** — a plan-time [query guardrail](query-guardrail.md) keeps
+  every read served by the primary key or an index (an unfiltered `SELECT` is
+  capped to the first 100 rows in PK order; a non-indexed filter/sort is
+  rejected with the exact `CREATE INDEX` to run).
 - **Transactions** with snapshot isolation (`BEGIN` / `COMMIT` / `ROLLBACK`).
 - **Secondary indexes**, **views**, **non-recursive CTEs**, **set operations**.
 - Closest in feel to **PostgreSQL**; this guide calls out every place the
@@ -32,7 +37,8 @@ substrate as the rest of bluedb — no separate database server.
 
 | Page | Covers |
 |------|--------|
-| [Statements](statements.md) | `CREATE`/`DROP TABLE`·`INDEX`·`VIEW`, `INSERT`/`UPDATE`/`DELETE`, `SET` |
+| [Statements](statements.md) | `CREATE`/`DROP`/`ALTER TABLE`·`INDEX`·`VIEW`, `INSERT`/`UPDATE`/`DELETE`, `SET` |
+| [Query guardrail](query-guardrail.md) | Why reads must be index-served, the bare-scan cap, and the index a rejected query asks for |
 | [Query syntax](query-syntax.md) | `SELECT`, `FROM`/joins, `WHERE`, `GROUP BY`, `ORDER BY`, set ops, CTEs, subqueries |
 | [Data types](data-types.md) | Native types and accepted aliases (`VARCHAR(n)`, `DOUBLE`, …) |
 | [Expressions](expressions.md) | Operators, comparisons & coercion, `CAST`/`TRY_CAST`, `CASE`, `IN`, `BETWEEN` |

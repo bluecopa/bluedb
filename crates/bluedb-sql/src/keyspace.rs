@@ -114,6 +114,16 @@ const TAG_INDEX: u8 = 0x03;
 /// Tag byte for per-table metadata (creation timestamp), backing `GLUE_OBJECTS`.
 /// Sorts after all data/index keys.
 const TAG_META: u8 = 0x04;
+/// Tag byte for a table's **column catalog** (field-id ↔ physical-slot mapping)
+/// enabling O(1) online ALTER. Absent for never-altered tables. Looked up by
+/// exact key per table, never prefix-scanned.
+const TAG_COLCAT: u8 = 0x05;
+/// Tag byte for the **name → table-id** mapping (`<tenant>[TAG_TABLEID]<name>` →
+/// u64-be). Data and index keys are keyed by this stable id, so RENAME TABLE only
+/// moves this one mapping (and the schema/meta/catalog singletons) — never a row.
+const TAG_TABLEID: u8 = 0x06;
+/// Tag byte for the per-tenant monotonic table-id counter (single key).
+const TAG_TABLEID_SEQ: u8 = 0x07;
 
 /// Tag floor for namespaces owned by layers *above* bluedb-sql (e.g.
 /// `bluedb-ledger`). bluedb-sql's own tags (`TAG_SCHEMA`/`TAG_DATA`/`TAG_INDEX`)
@@ -214,33 +224,53 @@ impl Keyspace {
         self.tagged(TAG_META, 0)
     }
 
-    /// The shared prefix of every row key for `table_name`:
-    /// `<tenant> [TAG_DATA] <len(table)::u32-be> <table_utf8>`.
-    pub fn data_prefix(&self, table_name: &str) -> Vec<u8> {
+    /// Encode the storage key for a table's column catalog (online-ALTER mapping).
+    pub fn colcat_key(&self, table_name: &str) -> Vec<u8> {
         let name = table_name.as_bytes();
-        let mut prefix = self.tagged(TAG_DATA, 4 + name.len());
-        Self::push_len_prefixed(&mut prefix, name);
+        let mut key = self.tagged(TAG_COLCAT, name.len());
+        key.extend_from_slice(name);
+        key
+    }
+
+    /// Encode the storage key for a table's name → stable-id mapping.
+    pub fn tableid_key(&self, table_name: &str) -> Vec<u8> {
+        let name = table_name.as_bytes();
+        let mut key = self.tagged(TAG_TABLEID, name.len());
+        key.extend_from_slice(name);
+        key
+    }
+
+    /// The single key holding the per-tenant monotonic table-id counter.
+    pub fn tableid_seq_key(&self) -> Vec<u8> {
+        self.tagged(TAG_TABLEID_SEQ, 0)
+    }
+
+    /// The shared prefix of every row key for a table:
+    /// `<tenant> [TAG_DATA] <table_id::u64-be>`. Keyed by the table's stable id
+    /// (not its name) so RENAME TABLE never re-keys a single row.
+    pub fn data_prefix(&self, table_id: u64) -> Vec<u8> {
+        let mut prefix = self.tagged(TAG_DATA, 8);
+        prefix.extend_from_slice(&table_id.to_be_bytes());
         prefix
     }
 
     /// Encode the full storage key for one row: the table prefix followed by the
     /// primary key's order-preserving big-endian bytes.
-    pub fn row_key(&self, table_name: &str, key: &Key) -> Result<Vec<u8>, SqlError> {
+    pub fn row_key(&self, table_id: u64, key: &Key) -> Result<Vec<u8>, SqlError> {
         let pk = key
             .to_cmp_be_bytes()
             .map_err(|err| SqlError::KeyEncode(err.to_string()))?;
-        let mut full = self.data_prefix(table_name);
+        let mut full = self.data_prefix(table_id);
         full.extend_from_slice(&pk);
         Ok(full)
     }
 
-    /// The shared prefix of every index *entry* for `(table, index)`:
-    /// `<tenant> [TAG_INDEX] <len(table)> <table> <len(index)> <index>`.
-    pub fn index_prefix(&self, table_name: &str, index_name: &str) -> Vec<u8> {
-        let table = table_name.as_bytes();
+    /// The shared prefix of every index *entry* for `(table_id, index)`:
+    /// `<tenant> [TAG_INDEX] <table_id::u64-be> <len(index)> <index>`.
+    pub fn index_prefix(&self, table_id: u64, index_name: &str) -> Vec<u8> {
         let index = index_name.as_bytes();
-        let mut key = self.tagged(TAG_INDEX, 8 + table.len() + index.len());
-        Self::push_len_prefixed(&mut key, table);
+        let mut key = self.tagged(TAG_INDEX, 8 + 4 + index.len());
+        key.extend_from_slice(&table_id.to_be_bytes());
         Self::push_len_prefixed(&mut key, index);
         key
     }
@@ -250,7 +280,7 @@ impl Keyspace {
     /// indexed value with several rows keeps a stable, pk-ordered sub-order).
     pub fn index_entry_key(
         &self,
-        table_name: &str,
+        table_id: u64,
         index_name: &str,
         value: &Key,
         pk: &Key,
@@ -261,7 +291,7 @@ impl Keyspace {
         let pk_bytes = pk
             .to_cmp_be_bytes()
             .map_err(|err| SqlError::KeyEncode(err.to_string()))?;
-        let mut key = self.index_prefix(table_name, index_name);
+        let mut key = self.index_prefix(table_id, index_name);
         // Order-preserving + self-terminating value segment, so the full key
         // sorts by (value, pk) AND the pk suffix is unambiguous even for
         // variable-width encoded values (e.g. strings). A length prefix would
@@ -278,14 +308,14 @@ impl Keyspace {
     /// scan via [`prefix_upper_bound`].
     pub fn index_value_prefix(
         &self,
-        table_name: &str,
+        table_id: u64,
         index_name: &str,
         value: &Key,
     ) -> Result<Vec<u8>, SqlError> {
         let value_bytes = value
             .to_cmp_be_bytes()
             .map_err(|err| SqlError::KeyEncode(err.to_string()))?;
-        let mut key = self.index_prefix(table_name, index_name);
+        let mut key = self.index_prefix(table_id, index_name);
         Self::push_order_preserving(&mut key, &value_bytes);
         Ok(key)
     }
@@ -341,8 +371,8 @@ mod tests {
         // Within a tenant, schema keys sort before all data keys, which sort
         // before index-entry keys.
         let s = ks.schema_key("t");
-        let d = ks.data_prefix("t");
-        let ient = ks.index_prefix("t", "i");
+        let d = ks.data_prefix(1);
+        let ient = ks.index_prefix(1, "i");
         assert!(s < d);
         assert!(d < ient);
     }
@@ -351,11 +381,11 @@ mod tests {
     fn length_prefix_disambiguates_sibling_tables() {
         let ks = ks();
         // Without the length prefix, "t" rows would be a prefix of "t2" rows.
-        let t = ks.data_prefix("t");
-        let t2 = ks.data_prefix("t2");
+        let t = ks.data_prefix(1);
+        let t2 = ks.data_prefix(2);
         assert!(!t2.starts_with(&t));
-        let t_row = ks.row_key("t", &Key::I64(99)).unwrap();
-        let t2_prefix = ks.data_prefix("t2");
+        let t_row = ks.row_key(1,&Key::I64(99)).unwrap();
+        let t2_prefix = ks.data_prefix(2);
         assert!(!t_row.starts_with(&t2_prefix));
     }
 
@@ -365,10 +395,10 @@ mod tests {
         // Integer keys: byte order of row keys must match numeric order,
         // including across the sign boundary.
         let mut keys: Vec<Key> = vec![Key::I64(100), Key::I64(-5), Key::I64(0), Key::I64(7)];
-        let mut encoded: Vec<Vec<u8>> = keys.iter().map(|k| ks.row_key("t", k).unwrap()).collect();
+        let mut encoded: Vec<Vec<u8>> = keys.iter().map(|k| ks.row_key(1,k).unwrap()).collect();
         encoded.sort();
         keys.sort();
-        let resorted: Vec<Vec<u8>> = keys.iter().map(|k| ks.row_key("t", k).unwrap()).collect();
+        let resorted: Vec<Vec<u8>> = keys.iter().map(|k| ks.row_key(1,k).unwrap()).collect();
         assert_eq!(encoded, resorted);
     }
 
@@ -378,13 +408,13 @@ mod tests {
         let b = Keyspace::new("bob");
         // Same table name, same pk, but the encoded keys differ and neither is
         // a prefix of the other.
-        let ka = a.row_key("t", &Key::I64(1)).unwrap();
-        let kb = b.row_key("t", &Key::I64(1)).unwrap();
+        let ka = a.row_key(1,&Key::I64(1)).unwrap();
+        let kb = b.row_key(1,&Key::I64(1)).unwrap();
         assert_ne!(ka, kb);
-        assert!(!ka.starts_with(&b.data_prefix("t")));
-        assert!(!kb.starts_with(&a.data_prefix("t")));
+        assert!(!ka.starts_with(&b.data_prefix(1)));
+        assert!(!kb.starts_with(&a.data_prefix(1)));
         // A tenant's data scan range cannot contain another tenant's keys.
-        let a_prefix = a.data_prefix("t");
+        let a_prefix = a.data_prefix(1);
         assert!(!kb.starts_with(&a_prefix));
     }
 
@@ -393,19 +423,19 @@ mod tests {
         let ks = ks();
         // Same indexed value, different pks → ordered by pk.
         let e1 = ks
-            .index_entry_key("t", "i", &Key::I64(5), &Key::I64(1))
+            .index_entry_key(1, "i",&Key::I64(5), &Key::I64(1))
             .unwrap();
         let e2 = ks
-            .index_entry_key("t", "i", &Key::I64(5), &Key::I64(2))
+            .index_entry_key(1, "i",&Key::I64(5), &Key::I64(2))
             .unwrap();
         assert!(e1 < e2);
         // Different indexed values → ordered by value first.
         let e3 = ks
-            .index_entry_key("t", "i", &Key::I64(6), &Key::I64(1))
+            .index_entry_key(1, "i",&Key::I64(6), &Key::I64(1))
             .unwrap();
         assert!(e2 < e3);
         // Every entry for value 5 falls under the value prefix.
-        let vp = ks.index_value_prefix("t", "i", &Key::I64(5)).unwrap();
+        let vp = ks.index_value_prefix(1, "i",&Key::I64(5)).unwrap();
         assert!(e1.starts_with(&vp));
         assert!(e2.starts_with(&vp));
         assert!(!e3.starts_with(&vp));
@@ -422,7 +452,7 @@ mod tests {
         let encoded: Vec<Vec<u8>> = values
             .iter()
             .map(|v| {
-                ks.index_entry_key("t", "i", &Key::Str((*v).to_owned()), &Key::I64(1))
+                ks.index_entry_key(1, "i",&Key::Str((*v).to_owned()), &Key::I64(1))
                     .unwrap()
             })
             .collect();
@@ -445,16 +475,16 @@ mod tests {
         // prevent that: an "ab" entry must NOT start with "a"'s value prefix,
         // and vice versa.
         let a_prefix = ks
-            .index_value_prefix("t", "i", &Key::Str("a".to_owned()))
+            .index_value_prefix(1, "i",&Key::Str("a".to_owned()))
             .unwrap();
         let ab_prefix = ks
-            .index_value_prefix("t", "i", &Key::Str("ab".to_owned()))
+            .index_value_prefix(1, "i",&Key::Str("ab".to_owned()))
             .unwrap();
         let ab_entry = ks
-            .index_entry_key("t", "i", &Key::Str("ab".to_owned()), &Key::I64(1))
+            .index_entry_key(1, "i",&Key::Str("ab".to_owned()), &Key::I64(1))
             .unwrap();
         let a_entry = ks
-            .index_entry_key("t", "i", &Key::Str("a".to_owned()), &Key::I64(1))
+            .index_entry_key(1, "i",&Key::Str("a".to_owned()), &Key::I64(1))
             .unwrap();
         assert!(!ab_prefix.starts_with(&a_prefix));
         assert!(!ab_entry.starts_with(&a_prefix));
@@ -471,22 +501,22 @@ mod tests {
         // Byte strings containing 0x00 must still sort correctly and stay
         // prefix-free: [0x00] vs [0x00, 0x00] vs [0x01].
         let v0 = ks
-            .index_entry_key("t", "i", &Key::Bytea(vec![0x00]), &Key::I64(1))
+            .index_entry_key(1, "i",&Key::Bytea(vec![0x00]), &Key::I64(1))
             .unwrap();
         let v00 = ks
-            .index_entry_key("t", "i", &Key::Bytea(vec![0x00, 0x00]), &Key::I64(1))
+            .index_entry_key(1, "i",&Key::Bytea(vec![0x00, 0x00]), &Key::I64(1))
             .unwrap();
         let v1 = ks
-            .index_entry_key("t", "i", &Key::Bytea(vec![0x01]), &Key::I64(1))
+            .index_entry_key(1, "i",&Key::Bytea(vec![0x01]), &Key::I64(1))
             .unwrap();
         assert!(v0 < v00);
         assert!(v00 < v1);
         // [0x00] is a byte-prefix of [0x00,0x00]; the value prefix must not be.
         let p0 = ks
-            .index_value_prefix("t", "i", &Key::Bytea(vec![0x00]))
+            .index_value_prefix(1, "i",&Key::Bytea(vec![0x00]))
             .unwrap();
         let p00 = ks
-            .index_value_prefix("t", "i", &Key::Bytea(vec![0x00, 0x00]))
+            .index_value_prefix(1, "i",&Key::Bytea(vec![0x00, 0x00]))
             .unwrap();
         assert!(!p00.starts_with(&p0));
     }
@@ -506,7 +536,7 @@ mod tests {
         // collide with each other.
         let acct = ks.external_key(TAG_EXTERNAL_BASE, &7u128.to_be_bytes());
         let xfer = ks.external_key(TAG_EXTERNAL_BASE + 1, &7u128.to_be_bytes());
-        let data = ks.data_prefix("t");
+        let data = ks.data_prefix(1);
         assert!(data < acct, "sql data namespace sorts before external tags");
         assert!(acct < xfer, "external tag 0x10 sorts before 0x11");
         // Every account key starts with the account prefix; no transfer key does.

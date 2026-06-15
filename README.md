@@ -17,10 +17,18 @@ via MkDocs Material (`mkdocs serve` after `pip install -r docs/requirements.txt`
 
 ## Why this exists
 
-The driver is enterprise **DDL-clearance pain** → wanting **one schema-flexible
-storage substrate** that is object-storage-native and tri-cloud (S3/ABS/GCS),
-instead of per-table DDL migrations on Postgres. bluedb is the first concrete
-slice of that substrate.
+bluedb is an **object-storage-native OLTP substrate**: durable state in
+S3/GCS/Azure Blob, stateless compute, single-writer safety, Jepsen-verified
+consistency, and **warehouse federation** (tables published as Iceberg so
+Snowflake / Databricks / BigQuery can join them). Tables are typed and require a
+`PRIMARY KEY`, but **schema evolution is online** — add/drop/rename a column or
+rename a table instantly, with no migration lock and no row rewrite — so you get
+the operational ease without giving up indexable, queryable structure.
+
+> Origin note: bluedb began as a "schema-flexible, no-DDL-clearance" store
+> (schemaless tables). That thesis was **dropped** (2026-06-15) in favor of
+> required schemas + online evolution + the scan/sort guardrail — see
+> `docs/superpowers/specs/2026-06-15-drop-schemaless-and-query-guardrail-design.md`.
 
 ## Architecture (target)
 
@@ -28,7 +36,7 @@ slice of that substrate.
 |-------|--------|
 | **Storage foundation** | SlateDB (LSM on object storage). Single-writer safety via SlateDB's `writer_epoch` + object-store compare-and-set fencing. |
 | **Ingest** | Stateless producers → object storage → manifest-backed queue → single consumer (WarpStream / OpenData-`buffer` style). Decouples write throughput from the single writer. |
-| **SQL** | GlueSQL over a SlateDB-backed `Store` (schemaless tables ⇒ no DDL, no migration, no clearance). Parameterized (`$N`) by construction — injection-proof. |
+| **SQL** | GlueSQL over a SlateDB-backed `Store`. Every table is **schema'd with a `PRIMARY KEY`** (no schemaless tables); schema evolution is **online** — ADD/DROP/RENAME COLUMN and RENAME TABLE are O(1) metadata ops (stable field-ids + table-ids), never a row rewrite. Reads must be index-served: a plan-time **guardrail** rejects full-table-scan / non-indexed-`ORDER BY` queries (scans and aggregation belong in the warehouse, reached via the Iceberg mirror). Parameterized (`$N`) by construction — injection-proof. |
 | **Full-text (BM25)** | tantivy + a **vendored copy of Quickwit's `quickwit-directories` read path** over object storage. Index = tantivy *splits* in object storage + our own manifest. **SQL-integrated** (Postgres `@@`/`ts_rank` rewritten to `pk IN (…)` against the index, plus trigram `LIKE`) with read-your-writes via an in-memory live segment sealed to durable splits — no separate search cluster. |
 | **Ledger** | A **TigerBeetle-style double-entry ledger** (`bluedb-ledger`): typed `Account`/`Transfer` (u128), full TB result-code parity, two-phase transfers, applied inside the serialized writer as one atomic `WriteBatch`. A crash-consistent SQL projection makes balances queryable. |
 | **HTTP surface** | A four-capability ladder (`bluedb-server`, axum, h1+h2c): data plane (`/tables`), parameterized SQL (`/sql`), structured DDL (`/schema/*`), and an off-by-default arbitrary-SQL admin escape hatch — with per-route bearer-token authz. |
@@ -43,7 +51,7 @@ slice of that substrate.
 
 - `bluedb-storage` — the object-store **seam**: a minimal read-only `BlobStore` trait (async read-byte-range) + the additive `BlobStoreMut` write seam (put/delete/ordered scan-prefix), `SlateDbBlobStore` (slatedb 0.13) with lifecycle helpers, and `ChunkedBlobStore` (large values split across ordered keys). The vendored Quickwit `Storage` adapter sits on top of `BlobStore`.
 - `bluedb-fts` — BM25 full-text search over object storage: `tantivy` + the vendored `quickwit-directories` read path, hosted on `bluedb-storage`. Indexer (docs→split), split manifest/catalog, multi-split merged search, lazy hotcache open (range-fetch, no whole-split load), the full **index lifecycle** (incremental append, generation-scoped logical deletes so a same-id update is a true in-place replace, merge/compaction that physically drops dead docs), a **GC executor** (delete superseded/orphaned splits + retention policies), a **compaction policy** (count/tombstone-ratio thresholds), **per-field analyzers** (keyword / stemming / whitespace, registered on lazily-opened splits), and **query niceties** (pagination, highlighting, FTS combined with structured filters).
-- `bluedb-sql` — SQL over the substrate: GlueSQL `Store`/`StoreMut` on SlateDB. Order-preserving key encoding (schema/data/index namespaces, `Key::to_cmp_be_bytes()` keys), schemaless tables, CREATE/INSERT/SELECT/UPDATE/DELETE/ORDER BY, **real transactions** (overlay + `DbSnapshot` + atomic `WriteBatch`, snapshot isolation, true ROLLBACK), **secondary indexes** (`CREATE/DROP INDEX`, index-backed scans), enforced **uniqueness** (PK + `UNIQUE` columns), **tenant-namespaced** keyspace, a **schema-as-data registry**, and a **`Database`** handle vending write-serialized, snapshot-isolated **concurrent connections** (a shared write lease prevents lost updates). **SQL compatibility reference: [docs/sql/](docs/sql/README.md).**
+- `bluedb-sql` — SQL over the substrate: GlueSQL `Store`/`StoreMut` on SlateDB. Order-preserving key encoding (schema/data/index namespaces, `Key::to_cmp_be_bytes()` keys, **table-id-keyed** data/index so RENAME TABLE is O(1)), **schema'd tables with a required `PRIMARY KEY`** (no schemaless), **online ALTER** (field-id column catalog → ADD/DROP/RENAME COLUMN with no row rewrite), a plan-time **scan/sort guardrail** (unfiltered SELECT capped to 100 rows in PK order; non-indexed WHERE/ORDER BY rejected with the exact `CREATE INDEX` to run), CREATE/INSERT/SELECT/UPDATE/DELETE/ORDER BY, **real transactions** (overlay + `DbSnapshot` + atomic `WriteBatch`, snapshot isolation, true ROLLBACK), **secondary indexes** (`CREATE/DROP INDEX`, index-backed scans), enforced **uniqueness** (PK + `UNIQUE` columns), **tenant-namespaced** keyspace, and a **`Database`** handle vending write-serialized, snapshot-isolated **concurrent connections** (a shared write lease prevents lost updates; user-facing connections are guarded, internal ones aren't). **SQL compatibility reference: [docs/sql/](docs/sql/README.md).**
 - `bluedb-rest` — PostgREST-style query DSL → SQL translation (filters/operators/order/limit/offset + INSERT/UPDATE/DELETE), with identifier allow-listing and literal escaping. The input-table-v2 API-parity surface; self-contained (no dependency on `bluedb-sql`).
 - `bluedb-engine` — the **facade** that composes the pillars: `rest_sql` runs a `bluedb-rest` DSL request end-to-end against `bluedb-sql` and `execute_sql` runs a parameterized single statement; `FtsIndex` is the durable full-text engine over one index (append/update/delete/search + a policy-driven compaction coordinator and background scheduler). The **SQL-integrated FTS** lives here too: `fts_sql` is the pre-parse rewrite that turns Postgres `to_tsvector(…) @@ *_tsquery(…)`/`ts_rank` (and trigram `LIKE`) into a `pk IN (…)` query gluesql can run; `LiveSegment` is the in-memory tantivy NRT tier; and `FtsEngine` maintains it from a SQL **commit tap** (read-your-writes), unions live ∪ durable splits at query time, seals live→durable in the background, and persists index definitions so they survive restart.
 - `bluedb-ledger` — a **TigerBeetle-style double-entry ledger** over the substrate: typed `Account`/`Transfer` (u128 amounts), the full TB validation order and named result-code set, two-phase transfers (pending/post/void) with timeouts, linked chains, balancing/closing, and imported events. Each batch is applied inside bluedb's serialized writer and committed as **one atomic `WriteBatch`** (reusing the lease + epoch fencing + durable-before-ack). Canonical state is native postcard records; a **crash-consistent SQL projection** (dual-written into the same `WriteBatch`) makes accounts/balances queryable as ordinary tables.
@@ -112,8 +120,12 @@ replication/orchestration) and a couple of scoped follow-ups noted below.
   (snapshot isolation, read-your-own-writes, true ROLLBACK incl. index entries).
   **Secondary indexes** (`CREATE/DROP INDEX`, order-preserving prefix-free value
   encoding so string range/ORDER-BY scans sort by content not length, maintained
-  through the txn overlay). **Tenant-namespaced** keyspace. A **schema-as-data
-  registry** with write-time validation.
+  through the txn overlay). **Tenant-namespaced** keyspace. **Schema'd tables with
+  a required `PRIMARY KEY`** (no schemaless) validated at write time; **online
+  ALTER** via stable field-ids (ADD/DROP/RENAME COLUMN with no row rewrite) and
+  table-id-keyed storage (O(1) RENAME TABLE); a non-overridable **scan/sort
+  guardrail** on user connections (unfiltered SELECT → first 100 by PK;
+  non-indexed WHERE/ORDER BY rejected with the exact `CREATE INDEX`).
 - **REST (`bluedb-rest`):** PostgREST-style DSL → SQL translation — filters/operators
   (`eq,neq,gt,gte,lt,lte,like,ilike,in,is`, `not.` negation), `select`/`order`/
   `limit`/`offset`, INSERT/UPDATE/DELETE; identifier allow-listing + literal escaping.

@@ -2,8 +2,9 @@
 
 **bluedb is an object-storage-native database.** It runs SQL, full-text search,
 and a double-entry ledger directly on object storage (S3, GCS, Azure Blob) — no
-local disks to provision, no storage cluster to operate, and no DDL/migration
-tax for schema changes.
+local disks to provision and no storage cluster to operate. Schemas are explicit
+and evolve **online**: ADD/DROP/RENAME column and RENAME TABLE are O(1) metadata
+ops, never a row rewrite.
 
 It is **CP** (consistent under partition), built on a **single serial writer
 plus asynchronous read replicas**, with automatic failover and a real
@@ -38,8 +39,9 @@ flowchart TD
 - **`bluedb-storage`** — the substrate: SlateDB on object storage, with
   tenant-namespaced, order-preserving keys.
 - **[`bluedb-sql`](sql/README.md)** — a SQL engine (GlueSQL + a compatibility
-  layer) over the substrate: typed *and* schemaless tables, transactions,
-  secondary indexes, views.
+  layer) over the substrate: schema'd tables with a `PRIMARY KEY`, online schema
+  evolution, secondary indexes, transactions, views — and a plan-time
+  [query guardrail](sql/query-guardrail.md) that keeps every read index-served.
 - **[`bluedb-fts`](sql/full-text-search.md)** — **SQL-integrated** BM25 full-text
   search (tantivy) over object storage: declare a full-text index and query it
   through SQL (Postgres `@@`/`ts_rank`), read-your-writes, no separate search
