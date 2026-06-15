@@ -5,7 +5,7 @@
 //! state across its scans; output is sorted (`reachable`) / maximin-unique
 //! (`widest_path`), so it is deterministic for a fixed graph.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 
 use bluedb_storage::Substrate;
 
@@ -115,6 +115,56 @@ pub(crate) async fn reachable(
     let mut out: Vec<String> = visited.into_iter().collect();
     out.sort();
     Ok(out)
+}
+
+/// Result of [`widest_path`]: whether `to` is reachable and, if so, the maximum
+/// bottleneck (the widest path's minimum edge weight). `from == to` → connected
+/// with `bottleneck: None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WidestPath {
+    pub connected: bool,
+    pub bottleneck: Option<i64>,
+}
+
+/// Max-bottleneck path from `from` to `to` (maximin Dijkstra with a max-heap).
+pub(crate) async fn widest_path(
+    substrate: &Substrate,
+    ks: &EvidenceKeyspace,
+    graph: &str,
+    from: &str,
+    to: &str,
+    directed: bool,
+) -> Result<WidestPath, EvidenceError> {
+    if from == to {
+        return Ok(WidestPath { connected: true, bottleneck: None });
+    }
+    // best[node] = best-known bottleneck to reach `node`. Source has +inf.
+    let mut best: HashMap<String, i64> = HashMap::new();
+    best.insert(from.to_string(), i64::MAX);
+    // Max-heap by bottleneck; ties broken by node id (deterministic).
+    let mut heap: BinaryHeap<(i64, String)> = BinaryHeap::new();
+    heap.push((i64::MAX, from.to_string()));
+
+    while let Some((bw, u)) = heap.pop() {
+        if best.get(&u).copied() != Some(bw) {
+            continue; // stale heap entry
+        }
+        if u == to {
+            return Ok(WidestPath { connected: true, bottleneck: Some(bw) });
+        }
+        let mut edges = out_neighbors(substrate, ks, graph, &u, i64::MIN).await?;
+        if !directed {
+            edges.extend(in_neighbors(substrate, ks, graph, &u, i64::MIN).await?);
+        }
+        for (v, w, _t) in edges {
+            let nb = bw.min(w);
+            if nb > best.get(&v).copied().unwrap_or(i64::MIN) {
+                best.insert(v.clone(), nb);
+                heap.push((nb, v));
+            }
+        }
+    }
+    Ok(WidestPath { connected: false, bottleneck: None })
 }
 
 #[cfg(test)]

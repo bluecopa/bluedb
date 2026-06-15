@@ -191,4 +191,17 @@ impl Graph {
     ) -> Result<Vec<String>, EvidenceError> {
         crate::traverse::reachable(&self.substrate, &self.keyspace, graph, from, floor, directed).await
     }
+
+    /// Widest (max-bottleneck) path from `from` to `to`. `connected=false` when
+    /// unreachable (not an error); `from==to` → connected, `bottleneck=None`.
+    /// `directed=false` follows in-edges too.
+    pub async fn widest_path(
+        &self,
+        graph: &str,
+        from: &str,
+        to: &str,
+        directed: bool,
+    ) -> Result<crate::traverse::WidestPath, EvidenceError> {
+        crate::traverse::widest_path(&self.substrate, &self.keyspace, graph, from, to, directed).await
+    }
 }

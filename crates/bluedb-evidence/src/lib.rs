@@ -16,3 +16,4 @@ pub use chain::{Appended, ConsistencyProof, Digest, EntryInput, Evidence, Inclus
 pub use error::EvidenceError;
 pub use graph::{EdgeRef, EdgeUpsert, Graph};
 pub use model::{ChainMeta, EdgeDelta, EdgeOp, EntryRecord, IdemRecord, Merge};
+pub use traverse::WidestPath;

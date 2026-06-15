@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use bluedb_evidence::{EdgeUpsert, Graph, Merge};
+use bluedb_evidence::{EdgeUpsert, Graph, Merge, WidestPath};
 use bluedb_sql::Database;
 use slatedb::{object_store::memory::InMemory, Db};
 
@@ -71,4 +71,51 @@ async fn reachable_unknown_seed_returns_itself() {
     let g = Graph::new(&database, "_");
     let r = g.reachable("g", &["Z".into()], i64::MIN, true).await.unwrap();
     assert_eq!(r, vec!["Z"]);
+}
+
+#[tokio::test]
+async fn widest_path_picks_max_bottleneck() {
+    let database = db().await;
+    build(&database).await;
+    let g = Graph::new(&database, "_");
+    // A->B->C->D: min(5,3,10)=3 ; A->C->D: min(1,10)=1 ; widest = 3.
+    let wp = g.widest_path("g", "A", "D", true).await.unwrap();
+    assert_eq!(wp, WidestPath { connected: true, bottleneck: Some(3) });
+}
+
+#[tokio::test]
+async fn widest_path_unreachable_directed() {
+    let database = db().await;
+    build(&database).await;
+    let g = Graph::new(&database, "_");
+    let wp = g.widest_path("g", "D", "A", true).await.unwrap();
+    assert_eq!(wp, WidestPath { connected: false, bottleneck: None });
+}
+
+#[tokio::test]
+async fn widest_path_undirected_uses_reverse_edges() {
+    let database = db().await;
+    build(&database).await;
+    let g = Graph::new(&database, "_");
+    // Undirected D..A: D-C(10)-B(3)-A(5) => 3 ; D-C(10)-A(1) => 1 ; widest = 3.
+    let wp = g.widest_path("g", "D", "A", false).await.unwrap();
+    assert_eq!(wp, WidestPath { connected: true, bottleneck: Some(3) });
+}
+
+#[tokio::test]
+async fn widest_path_from_equals_to() {
+    let database = db().await;
+    build(&database).await;
+    let g = Graph::new(&database, "_");
+    let wp = g.widest_path("g", "A", "A", true).await.unwrap();
+    assert_eq!(wp, WidestPath { connected: true, bottleneck: None });
+}
+
+#[tokio::test]
+async fn widest_path_to_unknown_node() {
+    let database = db().await;
+    build(&database).await;
+    let g = Graph::new(&database, "_");
+    let wp = g.widest_path("g", "A", "Z", true).await.unwrap();
+    assert_eq!(wp, WidestPath { connected: false, bottleneck: None });
 }
