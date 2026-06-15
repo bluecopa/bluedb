@@ -28,6 +28,18 @@ pub enum LakehouseError {
     Other(#[from] anyhow::Error),
 }
 
+impl From<iceberg::Error> for LakehouseError {
+    fn from(err: iceberg::Error) -> Self {
+        LakehouseError::Iceberg(err.to_string())
+    }
+}
+
+impl From<serde_json::Error> for LakehouseError {
+    fn from(err: serde_json::Error) -> Self {
+        LakehouseError::Iceberg(format!("metadata json: {err}"))
+    }
+}
+
 /// Convenience result type for the crate.
 pub type Result<T> = std::result::Result<T, LakehouseError>;
 
