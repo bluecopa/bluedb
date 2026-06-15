@@ -1,7 +1,7 @@
 //! Native-record key encoding for the evidence substrate, layered on
 //! bluedb-sql's tenant-namespaced [`Keyspace`] via its external-namespace tags.
 
-use bluedb_sql::{Keyspace, TAG_EXTERNAL_BASE};
+use bluedb_sql::{prefix_upper_bound, Keyspace, TAG_EXTERNAL_BASE};
 
 // Ledger uses 0x10-0x15, CDC 0x16, so evidence starts at 0x17.
 pub(crate) const TAG_EVIDENCE_ENTRY: u8 = TAG_EXTERNAL_BASE + 7; // 0x17
@@ -9,23 +9,6 @@ pub(crate) const TAG_EVIDENCE_SEQ: u8 = TAG_EXTERNAL_BASE + 8; // 0x18
 pub(crate) const TAG_EVIDENCE_IDEM: u8 = TAG_EXTERNAL_BASE + 9; // 0x19
 pub(crate) const TAG_EVIDENCE_CHAIN: u8 = TAG_EXTERNAL_BASE + 11; // 0x1B
 // 0x1A (Merkle) and 0x1C-0x1E (graph) reserved for later plans.
-
-/// Compute the exclusive upper bound for a prefix scan.
-///
-/// Copied from `bluedb_sql::keyspace` (private there). Increments the last
-/// non-`0xFF` byte, dropping trailing `0xFF`s. Returns `None` if all bytes
-/// are `0xFF` or the slice is empty.
-fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
-    let mut end = prefix.to_vec();
-    while let Some(last) = end.last_mut() {
-        if *last < 0xFF {
-            *last += 1;
-            return Some(end);
-        }
-        end.pop();
-    }
-    None
-}
 
 /// Builds storage keys for evidence records within one tenant.
 pub(crate) struct EvidenceKeyspace {

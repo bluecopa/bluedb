@@ -77,6 +77,35 @@ pub(crate) async fn get_entry(
 mod tests {
     use super::*;
     use crate::model::{ChainMeta, EntryRecord};
+    use std::sync::Arc;
+    use bluedb_sql::Database;
+    use slatedb::object_store::memory::InMemory;
+    use slatedb::Db;
+
+    async fn writer_database() -> Database {
+        let db = Db::open("evidence-test", Arc::new(InMemory::new()))
+            .await
+            .expect("open in-memory db");
+        Database::new(Arc::new(db))
+    }
+
+    #[tokio::test]
+    async fn get_seq_absent_chain_returns_zero() {
+        let database = writer_database().await;
+        let substrate = database.substrate();
+        let ks = EvidenceKeyspace::new("acme");
+        assert_eq!(get_seq(&substrate, &ks, "chain-a").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn get_seq_returns_written_value() {
+        let database = writer_database().await;
+        let substrate = database.substrate();
+        let ks = EvidenceKeyspace::new("acme");
+        let writer = substrate.require_writer().unwrap();
+        writer.put(&ks.seq_key("chain-a"), &42i64.to_be_bytes()).await.unwrap();
+        assert_eq!(get_seq(&substrate, &ks, "chain-a").await.unwrap(), 42);
+    }
 
     #[test]
     fn entry_record_encode_decode_roundtrip() {
