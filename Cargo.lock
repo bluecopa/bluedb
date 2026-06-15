@@ -616,6 +616,7 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "bluedb-sql",
+ "gluesql-core",
  "iceberg",
  "parquet",
  "tempfile",
