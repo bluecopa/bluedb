@@ -1,3 +1,5 @@
-# Docs site toolchain (MkDocs Material). Build locally with:
-#   pip install -r docs/requirements.txt && mkdocs serve
+# Docs site toolchain. Build locally with:
+#   pip install -r docs/requirements.txt && mkdocs build --strict   (or: mkdocs serve)
+# Active theme is mkdocs-shadcn; mkdocs-material is kept installed for easy switch-back.
+mkdocs-shadcn==0.10.7
 mkdocs-material==9.5.39
