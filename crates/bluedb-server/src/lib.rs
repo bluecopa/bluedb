@@ -52,6 +52,10 @@ mod evidence_api;
 mod graph_api;
 mod signer;
 
+/// ES256-DER verification helper, re-exported for Rust consumers (and the e2e
+/// test) to verify Signed Tree Heads against a published SPKI-PEM public key.
+pub use signer::verify_es256_der;
+
 use bluedb_lakehouse::{object_store_file_io, LakehouseConfig, LakehouseManager};
 use bluedb_rest::{parse_filters, DeleteRequest, InsertRequest, UpdateRequest};
 use bluedb_sql::{parse_lakehouse_pragma, CdcConfig, Database, SlateDbStorage, DEFAULT_TENANT};
@@ -295,6 +299,7 @@ impl AppState {
     ///   unset, generate an ephemeral key (dev only, logs a `WARN`).
     /// - `vault`: `VAULT_ADDR`, `VAULT_TOKEN`, `BLUEDB_EVIDENCE_VAULT_MOUNT`
     ///   (default `transit`), `BLUEDB_EVIDENCE_VAULT_KEY`.
+    ///
     /// Signing is **off by default**. Returns an error only on misconfiguration.
     pub fn with_evidence_signing(self) -> Result<Self, AppError> {
         use signer::{EvidenceSigner, LocalSigner};

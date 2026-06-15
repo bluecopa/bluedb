@@ -181,6 +181,41 @@ curl -s localhost:8081/evidence/audit-2026/digest
 `size` is the leaf count; `root_hash` is the tree root (the empty-tree root for
 `size: 0`). Plain chain → `400 E_NOT_VERIFIED`. Scope: `data:read`.
 
+### `GET /evidence/{chain}/digest/signed` — signed digest (Signed Tree Head)
+
+An ES256 (ECDSA P-256) **Signed Tree Head** over the chain's digest. Opt-in;
+returns `501 Not Implemented` unless signing is enabled (see
+[Digest signing](#digest-signing)). Scope: `data:read`.
+
+```json
+{
+  "size": 3,
+  "root_hash": "9f2c…(64 hex)",
+  "timestamp": 1718500000000,
+  "alg": "ES256",
+  "key_id": "vault:transit:evidence",
+  "signature": "MEUCIQ…(base64 ASN.1-DER)"
+}
+```
+
+The signed bytes are the canonical, domain-separated, length-delimited framing
+of `(tenant, chain, size, root_hash, timestamp_ms)` — see
+`bluedb_evidence::sth_payload`. The `signature` is a base64-encoded ASN.1-DER
+ECDSA signature. A consumer fetches the public key
+([`/evidence/signing-key`](#get-evidencesigning-key--public-key)), rebuilds the
+same payload bytes, and verifies. Because the framing binds `tenant` + `chain`,
+a signature for one chain never verifies as another's STH (no cross-chain
+replay).
+
+### `GET /evidence/signing-key` — public key
+
+The SPKI-PEM public key for verifying signed digests. `501` if signing is off.
+Scope: `data:read`.
+
+```json
+{ "key_id": "vault:transit:evidence", "alg": "ES256", "public_key": "-----BEGIN PUBLIC KEY-----\n…\n-----END PUBLIC KEY-----\n" }
+```
+
 ### `GET /evidence/{chain}/proof?seq&size` — inclusion proof
 
 Proves entry `seq` (1-based) is in the tree of size `size` (defaults to `head`):
@@ -240,15 +275,52 @@ token with no `tenant:` binding reaches only the default tenant).
 
 ## Trust model
 
-A digest fetched from the **same server** is not, by itself, proof against a
-malicious operator — the operator could in principle serve a consistent but
-forged view. Full irrepudiability requires the consumer to **externally anchor**
-digests (periodically record `{size, root_hash}` somewhere outside bluedb) and/or
-have bluedb **sign** them. v1 ships **unsigned digests + anchoring guidance**;
-digest signing (a server keypair over `{size, root_hash}`) is a documented future
-extension, not in v1. Within that model, the Merkle proofs are exactly as strong
-as Certificate Transparency's: given a trusted digest, inclusion and consistency
-are cryptographically verifiable.
+A plain (unsigned) digest fetched from the **same server** is not, by itself,
+proof against a malicious operator — the operator could in principle serve a
+consistent but forged view.
+
+bluedb can now **sign** a verified chain's digest as a **Signed Tree Head**
+(ES256, key held in a KMS — see [Digest signing](#digest-signing)). A signed
+digest gives **non-repudiation** (level 2): the operator cannot later deny, or
+retroactively rewrite, what it signed. A consumer that retains the signed
+digests it has seen and checks `consistency` between them detects any
+append-only violation against a digest the operator itself attested to. This is
+exactly as strong as Certificate Transparency's signed STH: given a trusted
+(here, signed) digest, inclusion and consistency are cryptographically
+verifiable.
+
+What signing does **not** prevent is **equivocation** (level 3): an operator
+showing *different* signed STHs to different consumers (forking the log).
+Detecting that still requires **external anchoring** — gossiping STHs between
+consumers, or periodically recording `{size, root_hash}` somewhere outside
+bluedb. Anchoring remains out of scope (a consumer-side practice).
+
+### Digest signing
+
+Signing is **opt-in, off by default**. When off, the signed-digest /
+signing-key endpoints return `501`. Configure via environment:
+
+| Env var | Meaning |
+|---|---|
+| `BLUEDB_EVIDENCE_SIGNING` | `off` (default) · `local` · `vault` |
+| `BLUEDB_EVIDENCE_SIGNING_KEY_PEM_FILE` | (`local`) PKCS#8 PEM private key; if unset, an **ephemeral** key is generated (dev only) |
+| `VAULT_ADDR`, `VAULT_TOKEN` | (`vault`) Vault address + token |
+| `BLUEDB_EVIDENCE_VAULT_MOUNT` | (`vault`) Transit mount, default `transit` |
+| `BLUEDB_EVIDENCE_VAULT_KEY` | (`vault`) Transit key name (type `ecdsa-p256`) |
+
+The `local` backend signs in-process (dev / tests / air-gapped self-host); the
+key sits in process memory, so it is **not** production trust. Production uses
+the `vault` backend: the private key lives in **HashiCorp Vault Transit** and
+never reaches the server, which holds only a token + key name. Both produce
+identical ES256 ASN.1-DER signatures that verify against the published SPKI-PEM
+public key. Example Vault setup:
+
+```bash
+vault secrets enable transit
+vault write -f transit/keys/evidence type=ecdsa-p256
+# server: BLUEDB_EVIDENCE_SIGNING=vault BLUEDB_EVIDENCE_VAULT_KEY=evidence \
+#         VAULT_ADDR=… VAULT_TOKEN=…
+```
 
 ## Limitations (v1)
 
@@ -258,8 +330,11 @@ are cryptographically verifiable.
   persisted nodes rather than scanning all leaves. The emitted proofs are
   byte-identical to the from-scratch RFC 6962 computation. Digests stay O(log N)
   via the frontier.
-- **Unsigned digests.** See [Trust model](#trust-model) — verifiability against a
-  malicious operator needs external anchoring and/or digest signing (deferred).
+- **Signing covers non-repudiation, not equivocation.** Digests can be **signed**
+  (ES256 Signed Tree Heads, key in a KMS — see [Trust model](#trust-model) /
+  [Digest signing](#digest-signing)), giving non-repudiation. Detecting an
+  operator that *forks* the log (shows different signed STHs to different
+  consumers) still needs external anchoring (level 3), which is out of scope.
 - **Redaction blanks the payload only.** `type` and `at` are retained; extending
   redaction to them is a future option (proofs are unaffected either way because
   the `leaf_hash` is kept).
