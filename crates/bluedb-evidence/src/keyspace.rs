@@ -9,7 +9,9 @@ pub(crate) const TAG_EVIDENCE_SEQ: u8 = TAG_EXTERNAL_BASE + 8; // 0x18
 pub(crate) const TAG_EVIDENCE_IDEM: u8 = TAG_EXTERNAL_BASE + 9; // 0x19
 pub(crate) const TAG_EVIDENCE_MERKLE: u8 = TAG_EXTERNAL_BASE + 10; // 0x1A
 pub(crate) const TAG_EVIDENCE_CHAIN: u8 = TAG_EXTERNAL_BASE + 11; // 0x1B
-// 0x1C-0x1E (graph) reserved for later plans.
+pub(crate) const TAG_GRAPH_EDGE: u8 = TAG_EXTERNAL_BASE + 12; // 0x1C  canonical edge
+pub(crate) const TAG_GRAPH_OUT: u8 = TAG_EXTERNAL_BASE + 13; // 0x1D  out-adjacency (by weight asc)
+pub(crate) const TAG_GRAPH_IN: u8 = TAG_EXTERNAL_BASE + 14; // 0x1E  in-adjacency (by weight asc)
 
 /// Builds storage keys for evidence records within one tenant.
 pub(crate) struct EvidenceKeyspace {
@@ -70,6 +72,57 @@ impl EvidenceKeyspace {
     pub(crate) fn merkle_key(&self, chain: &str) -> Vec<u8> {
         self.ks.external_key(TAG_EVIDENCE_MERKLE, &Self::chain_suffix(chain))
     }
+
+    /// Canonical edge key: identity `(graph, src, dst, type)`. Value = `weight_obe`.
+    pub(crate) fn graph_edge_key(&self, graph: &str, src: &str, dst: &str, etype: &str) -> Vec<u8> {
+        let mut s = Vec::new();
+        push_lp(&mut s, graph);
+        push_lp(&mut s, src);
+        push_lp(&mut s, dst);
+        push_lp(&mut s, etype);
+        self.ks.external_key(TAG_GRAPH_EDGE, &s)
+    }
+
+    /// Out-adjacency key: `graph ‖ src ‖ weight_obe ‖ dst ‖ type`. Value = `[1u8]`.
+    /// A node's out-edges sort by weight ascending under the `(graph, src)` prefix.
+    pub(crate) fn graph_out_key(&self, graph: &str, src: &str, weight: i64, dst: &str, etype: &str) -> Vec<u8> {
+        let mut s = Vec::new();
+        push_lp(&mut s, graph);
+        push_lp(&mut s, src);
+        s.extend_from_slice(&weight_obe(weight));
+        push_lp(&mut s, dst);
+        push_lp(&mut s, etype);
+        self.ks.external_key(TAG_GRAPH_OUT, &s)
+    }
+
+    /// In-adjacency key: `graph ‖ dst ‖ weight_obe ‖ src ‖ type`. Value = `[1u8]`.
+    pub(crate) fn graph_in_key(&self, graph: &str, dst: &str, weight: i64, src: &str, etype: &str) -> Vec<u8> {
+        let mut s = Vec::new();
+        push_lp(&mut s, graph);
+        push_lp(&mut s, dst);
+        s.extend_from_slice(&weight_obe(weight));
+        push_lp(&mut s, src);
+        push_lp(&mut s, etype);
+        self.ks.external_key(TAG_GRAPH_IN, &s)
+    }
+}
+
+/// Order-preserving big-endian encoding of a signed weight: flips the sign bit
+/// so two's-complement `i64`s sort numerically as unsigned bytes.
+pub(crate) fn weight_obe(w: i64) -> [u8; 8] {
+    ((w as u64) ^ (i64::MIN as u64)).to_be_bytes()
+}
+
+/// Inverse of [`weight_obe`].
+pub(crate) fn weight_from_obe(b: &[u8; 8]) -> i64 {
+    (u64::from_be_bytes(*b) ^ (i64::MIN as u64)) as i64
+}
+
+/// Append `<len::u32-be> <bytes>` to `buf` (self-delimiting component).
+fn push_lp(buf: &mut Vec<u8>, s: &str) {
+    let b = s.as_bytes();
+    buf.extend_from_slice(&(b.len() as u32).to_be_bytes());
+    buf.extend_from_slice(b);
 }
 
 #[cfg(test)]
@@ -113,6 +166,60 @@ mod tests {
         // Different chain must not fall inside this range.
         let other = ks.entry_key("chain2", 1);
         assert!(!(other >= prefix && other < end));
+    }
+
+    #[test]
+    fn weight_obe_is_order_preserving() {
+        let ws = [i64::MIN, -1000, -1, 0, 1, 1000, i64::MAX];
+        for pair in ws.windows(2) {
+            assert!(weight_obe(pair[0]) < weight_obe(pair[1]), "{} vs {}", pair[0], pair[1]);
+        }
+        for w in ws {
+            assert_eq!(weight_from_obe(&weight_obe(w)), w);
+        }
+    }
+
+    #[test]
+    fn out_index_orders_a_nodes_edges_by_weight_ascending() {
+        let ks = EvidenceKeyspace::new("acme");
+        let lo = ks.graph_out_key("g", "u", 1, "a", "");
+        let hi = ks.graph_out_key("g", "u", 100, "a", "");
+        assert!(lo < hi);
+        let neg = ks.graph_out_key("g", "u", -5, "a", "");
+        assert!(neg < lo);
+    }
+
+    #[test]
+    fn graph_tags_are_distinct_namespaces_and_ordered() {
+        let ks = EvidenceKeyspace::new("acme");
+        let edge = ks.graph_edge_key("g", "u", "v", "");
+        let out = ks.graph_out_key("g", "u", 1, "v", "");
+        let inn = ks.graph_in_key("g", "v", 1, "u", "");
+        assert_ne!(edge, out);
+        assert_ne!(edge, inn);
+        assert_ne!(out, inn);
+        // Tags sort EDGE(0x1C) < OUT(0x1D) < IN(0x1E), and all sort after CHAIN(0x1B).
+        assert!(ks.chain_meta_key("g") < edge);
+        assert!(edge < out);
+        assert!(out < inn);
+    }
+
+    #[test]
+    fn node_ids_do_not_bleed_via_length_prefix() {
+        let ks = EvidenceKeyspace::new("acme");
+        let ab = ks.graph_out_key("g", "ab", 1, "x", "");
+        let abc = ks.graph_out_key("g", "abc", 1, "x", "");
+        assert_ne!(ab, abc);
+        let g1 = ks.graph_edge_key("g1", "u", "v", "");
+        let g2 = ks.graph_edge_key("g2", "u", "v", "");
+        assert_ne!(g1, g2);
+    }
+
+    #[test]
+    fn graph_keys_are_tenant_isolated() {
+        let a = EvidenceKeyspace::new("acme").graph_edge_key("g", "u", "v", "");
+        let b = EvidenceKeyspace::new("globex").graph_edge_key("g", "u", "v", "");
+        assert_ne!(a, b);
     }
 
     #[test]
