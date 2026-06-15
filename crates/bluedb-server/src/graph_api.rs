@@ -91,6 +91,19 @@ pub async fn delete_edges(
     Ok(Json(json!({ "graph": graph, "deleted": n })))
 }
 
+/// `DELETE /graph/{graph}` — drop an entire graph (all its edges). `data:write`.
+pub async fn drop_graph(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(graph): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    state.require_active()?;
+    state.authorize(&headers, Scope::DataWrite)?;
+    let tenant = state.tenant(&headers)?;
+    let dropped = state.graph(&tenant).await?.drop_graph(&graph).await.map_err(map_evidence_err)?;
+    Ok(Json(json!({ "graph": graph, "dropped": dropped })))
+}
+
 #[derive(Deserialize)]
 pub(crate) struct ReachableBody {
     from: Vec<String>,

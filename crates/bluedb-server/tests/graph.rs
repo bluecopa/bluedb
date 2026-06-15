@@ -195,6 +195,51 @@ async fn graph_edge_auth_negatives() {
 }
 
 #[tokio::test]
+async fn http_drop_graph_clears_edges() {
+    let (_, app) = promoted(None).await;
+    let (s, _b) = call(&app, "PUT", "/graph/g/edges", Some("acme"), None, Some(json!({
+        "edges": [
+            {"src":"A","dst":"B","weight":5},
+            {"src":"B","dst":"C","weight":3}
+        ]
+    }))).await;
+    assert_eq!(s, StatusCode::OK);
+
+    let (s, body) = call(&app, "DELETE", "/graph/g", Some("acme"), None, None).await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    assert_eq!(body["dropped"], 2);
+
+    // After drop, reachable from A sees only the seed (no edges left).
+    let (s, body) = call(&app, "POST", "/graph/g/reachable", Some("acme"), None, Some(json!({ "from": ["A"] }))).await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    assert_eq!(body["nodes"], json!(["A"]));
+}
+
+/// Drop is `data:write`: a read-only token → 403; a tenant-mismatched write
+/// token → 403 (mirrors `graph_edge_auth_negatives`).
+#[tokio::test]
+async fn http_drop_graph_auth_negatives() {
+    let authz = Authz::parse_env(
+        "acmero=data:read,tenant:acme;acmerw=data:write,tenant:acme;root=superuser",
+    )
+    .unwrap();
+    let (_, app) = promoted(Some(authz)).await;
+
+    // Read-only token on the drop route → 403.
+    let (s, body) = call(&app, "DELETE", "/graph/g", Some("acme"), Some("acmero"), None).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "read-only token on drop: {s} {body}");
+
+    // Write token whose tenant scope doesn't match the header → 403.
+    let (s, body) = call(&app, "DELETE", "/graph/g", Some("globex"), Some("acmerw"), None).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "acme token on globex tenant: {s} {body}");
+
+    // Sanity: the write token works on its own tenant (empty graph → dropped:0).
+    let (s, body) = call(&app, "DELETE", "/graph/g", Some("acme"), Some("acmerw"), None).await;
+    assert_eq!(s, StatusCode::OK, "acme write token on acme tenant: {s} {body}");
+    assert_eq!(body["dropped"], 0, "dropped count: {body}");
+}
+
+#[tokio::test]
 async fn hard_delete_retract_edges_flag_over_http() {
     // Open mode; tenant header drives isolation only.
     let (_, app) = promoted(None).await;

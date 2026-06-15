@@ -122,6 +122,16 @@ impl EvidenceKeyspace {
         push_lp(&mut s, dst);
         self.ks.external_key(TAG_GRAPH_IN, &s)
     }
+
+    /// Scan prefix for ALL keys of `graph` under `tag` (one of TAG_GRAPH_EDGE/
+    /// OUT/IN). Every such key begins with `graph_lp`, so this is a clean prefix
+    /// for range-deleting an entire graph's edges. Length-prefixing means graph
+    /// "g" never matches graph "gg".
+    pub(crate) fn graph_prefix(&self, tag: u8, graph: &str) -> Vec<u8> {
+        let mut s = Vec::new();
+        push_lp(&mut s, graph);
+        self.ks.external_key(tag, &s)
+    }
 }
 
 /// Order-preserving big-endian encoding of a signed weight: flips the sign bit
@@ -259,6 +269,19 @@ mod tests {
         let k = ks.graph_in_key("g", "v", 7, "u", "");
         assert!(k.starts_with(&p));
         assert_eq!(&k[p.len()..p.len() + 8], &weight_obe(7));
+    }
+
+    #[test]
+    fn graph_prefix_covers_a_graphs_keys_and_isolates_names() {
+        let ks = EvidenceKeyspace::new("acme");
+        let pe = ks.graph_prefix(TAG_GRAPH_EDGE, "g");
+        assert!(ks.graph_edge_key("g", "a", "b", "").starts_with(&pe));
+        let po = ks.graph_prefix(TAG_GRAPH_OUT, "g");
+        assert!(ks.graph_out_key("g", "a", 1, "b", "").starts_with(&po));
+        let pi = ks.graph_prefix(TAG_GRAPH_IN, "g");
+        assert!(ks.graph_in_key("g", "b", 1, "a", "").starts_with(&pi));
+        // "g" must not be a prefix of "gg"'s keys.
+        assert!(!ks.graph_edge_key("gg", "a", "b", "").starts_with(&pe));
     }
 
     #[test]

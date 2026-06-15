@@ -127,3 +127,31 @@ async fn delete_nonexistent_is_noop() {
     g.delete("g", &[EdgeRef { src: "X".into(), dst: "Y".into(), etype: String::new() }]).await.unwrap();
     assert_eq!(count_graph_keys(&database).await, (0, 0, 0));
 }
+
+#[tokio::test]
+async fn drop_graph_removes_only_that_graph() {
+    let database = db().await;
+    let g = Graph::new(&database, "_");
+    // graph g1: two edges; graph g2: one edge.
+    g.upsert("g1", &[
+        EdgeUpsert { src: "A".into(), dst: "B".into(), weight: 5, etype: String::new() },
+        EdgeUpsert { src: "B".into(), dst: "C".into(), weight: 3, etype: String::new() },
+    ], bluedb_evidence::Merge::Set).await.unwrap();
+    g.upsert("g2", &[
+        EdgeUpsert { src: "X".into(), dst: "Y".into(), weight: 1, etype: String::new() },
+    ], bluedb_evidence::Merge::Set).await.unwrap();
+    assert_eq!(count_graph_keys(&database).await, (3, 3, 3)); // 2 + 1 edges
+
+    let dropped = g.drop_graph("g1").await.unwrap();
+    assert_eq!(dropped, 2);
+    // Only g2's single edge remains.
+    assert_eq!(count_graph_keys(&database).await, (1, 1, 1));
+}
+
+#[tokio::test]
+async fn drop_empty_graph_is_noop() {
+    let database = db().await;
+    let g = Graph::new(&database, "_");
+    assert_eq!(g.drop_graph("nope").await.unwrap(), 0);
+    assert_eq!(count_graph_keys(&database).await, (0, 0, 0));
+}

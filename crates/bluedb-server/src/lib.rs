@@ -652,6 +652,7 @@ pub fn build_app(state: AppState) -> Router {
             "/graph/{graph}/edges",
             put(graph_api::upsert_edges).delete(graph_api::delete_edges),
         )
+        .route("/graph/{graph}", delete(graph_api::drop_graph))
         .route("/graph/{graph}/reachable", post(graph_api::reachable))
         .route("/graph/{graph}/widest-path", post(graph_api::widest_path))
         // Read-only Iceberg REST Catalog for warehouse discovery (Phase 5).

@@ -15,7 +15,7 @@ use slatedb::config::WriteOptions;
 use slatedb::WriteBatch;
 
 use crate::error::EvidenceError;
-use crate::keyspace::{weight_obe, EvidenceKeyspace};
+use crate::keyspace::{weight_obe, EvidenceKeyspace, TAG_GRAPH_EDGE, TAG_GRAPH_IN, TAG_GRAPH_OUT};
 use crate::model::{EdgeDelta, EdgeOp, Merge};
 use crate::store;
 
@@ -178,6 +178,39 @@ impl Graph {
         drop(_lease);
         writer.flush().await.map_err(Self::storage_err)?;
         Ok(())
+    }
+
+    /// Drop an ENTIRE graph: range-delete all canonical/out/in keys for `graph`
+    /// in one atomic batch. Returns the number of edges (canonical keys) removed.
+    /// The graph is a rebuildable projection of the chain, so this is ordinary
+    /// maintenance (`data:write`), not log erasure. v1: O(keys) — scans the
+    /// graph's three tag ranges and deletes each key in a single WriteBatch.
+    pub async fn drop_graph(&self, graph: &str) -> Result<usize, EvidenceError> {
+        let _lease = self.write_lease.lock().await;
+        let writer = self.substrate.require_writer().map_err(|_| EvidenceError::NotWriter)?;
+        let mut batch = WriteBatch::new();
+        let mut edges = 0usize;
+        for tag in [TAG_GRAPH_EDGE, TAG_GRAPH_OUT, TAG_GRAPH_IN] {
+            let prefix = self.keyspace.graph_prefix(tag, graph);
+            let end = bluedb_sql::prefix_upper_bound(&prefix);
+            let mut iter = self.substrate.scan_range(&prefix, end.as_deref()).await?;
+            while let Some(kv) = iter.next().await.map_err(Self::storage_err)? {
+                if tag == TAG_GRAPH_EDGE {
+                    edges += 1;
+                }
+                batch.delete(kv.key.as_ref());
+            }
+        }
+        if batch.is_empty() {
+            return Ok(0); // nothing to drop — SlateDB rejects an empty batch
+        }
+        writer
+            .write_with_options(batch, &WriteOptions { await_durable: false, ..Default::default() })
+            .await
+            .map_err(Self::storage_err)?;
+        drop(_lease);
+        writer.flush().await.map_err(Self::storage_err)?;
+        Ok(edges)
     }
 
     /// Nodes reachable from `from` over edges with weight ≥ `floor`. Seeds are
