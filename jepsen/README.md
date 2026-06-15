@@ -37,6 +37,22 @@ any read below the count of acknowledged increments is a lost update.
 fresh primary key; the checker flags any id acknowledged (HTTP 200) more than
 once. Uses a tiny id space + no stagger to maximize the narrow insert TOCTOU.
 
+**`evidence` — append durability + dense seq.** Append-heavy load on one fresh
+verified evidence chain. The checker proves every acknowledged append survives,
+nothing is fabricated, and the final chain's server-assigned seqs are exactly
+`1..N` (dense, gap-free, unique) across failover. Best for the evidence chain's
+durability-before-ack + dense-sequencing guarantee.
+
+**`graph` — graph-traversal snapshot isolation.** The writer atomically swaps a
+tiny diamond between config A (`R→A→Z`) and config B (`R→B→Z`) via the atomic
+rewire `POST /graph/{g}/mutate`; clients run `reachable(R)` concurrently. The
+checker enforces that every acknowledged result is one *whole* config — `{R,A,Z}`
+or `{R,B,Z}`, sink `Z` always present. A traversal pins one snapshot (Phase 2),
+so its multiple scans see a single cut; a non-snapshot read that scanned `R`
+before a swap and the bridge after would drop `Z` (`:sink-dropped`) and fail.
+The `pause` nemesis — freezing a traversal between scans, across a swap — is the
+sharpest stressor.
+
 In the set/list-append/counter cases the cluster is driven as a single logical writer whose identity
 moves on failover (bluedb's guarantee: one serial writer + async read replicas).
 The client discovers the active writer via `/admin/status` and re-discovers on a
@@ -143,6 +159,12 @@ NODES="--node node1 --node node2 --node node3"
 ./bin/lein run test --workload evidence --nemesis kill      --time-limit 120 --concurrency 10 $NODES
 ./bin/lein run test --workload evidence --nemesis partition --time-limit 120 --concurrency 10 $NODES
 ./bin/lein run test --workload evidence --nemesis mix       --time-limit 180 --concurrency 10 $NODES
+
+# graph (traversal snapshot isolation — atomic diamond swap vs concurrent reachable)
+./bin/lein run test --workload graph --nemesis pause     --time-limit 120 --concurrency 10 $NODES
+./bin/lein run test --workload graph --nemesis kill      --time-limit 120 --concurrency 10 $NODES
+./bin/lein run test --workload graph --nemesis partition --time-limit 120 --concurrency 10 $NODES
+./bin/lein run test --workload graph --nemesis mix       --time-limit 180 --concurrency 10 $NODES
 ```
 
 Results land in `store/`; `store/latest/results.edn` holds the verdict and
@@ -156,5 +178,7 @@ checker found no anomalies.
 - `src/bluedb/jepsen/list_append.clj` — Elle list-append client (txn → `/sql`)
 - `src/bluedb/jepsen/counter.clj` — counter client (autocommit RMW increments)
 - `src/bluedb/jepsen/unique.clj` — same-PK insert client + soundness checker
+- `src/bluedb/jepsen/evidence.clj` — evidence-chain append client + dense-seq checker
+- `src/bluedb/jepsen/graph.clj` — graph-swap client + snapshot-isolation checker
 - `src/bluedb/jepsen/nemesis.clj` — docker-driven kill / partition / pause / skew
 - `src/bluedb/jepsen/core.clj` — workloads, generator, checker, CLI

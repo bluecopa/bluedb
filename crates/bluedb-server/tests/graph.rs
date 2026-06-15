@@ -556,3 +556,75 @@ async fn http_traversal_requires_read_scope() {
     // No edges upserted in authz mode → seed only.
     assert_eq!(body["nodes"], json!(["A"]), "seed-only reachable: {body}");
 }
+
+/// `POST /graph/{graph}/mutate` atomically rewires the diamond from config A
+/// (R→A→Z) to config B (R→B→Z): the install/delete sets commit in one batch, so
+/// a traversal sees one whole config and the sink Z is always reachable — the
+/// Jepsen graph-swap invariant, over HTTP. Also checks the unknown-merge 400.
+#[tokio::test]
+async fn http_atomic_mutate_swaps_config() {
+    let (_, app) = promoted(None).await;
+
+    // Seed config A.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/graph/g/mutate",
+        Some("acme"),
+        None,
+        Some(json!({ "upserts": [
+            {"src":"R","dst":"A","weight":1},
+            {"src":"A","dst":"Z","weight":1}
+        ] })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "seed mutate: {s} {body}");
+    assert_eq!(body["upserted"], 2, "{body}");
+    assert_eq!(body["deleted"], 0, "{body}");
+
+    let reach = |app: &Router| {
+        let app = app.clone();
+        async move {
+            call(&app, "POST", "/graph/g/reachable", Some("acme"), None,
+                 Some(json!({ "from": ["R"], "directed": true }))).await
+        }
+    };
+
+    let (s, body) = reach(&app).await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    assert_eq!(body["nodes"], json!(["A", "R", "Z"]), "config A: {body}");
+
+    // Atomic swap A → B: add the B pair, delete the A pair, in one batch.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/graph/g/mutate",
+        Some("acme"),
+        None,
+        Some(json!({
+            "upserts": [{"src":"R","dst":"B","weight":1}, {"src":"B","dst":"Z","weight":1}],
+            "deletes": [{"src":"R","dst":"A"}, {"src":"A","dst":"Z"}]
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "swap mutate: {s} {body}");
+    assert_eq!(body["upserted"], 2, "{body}");
+    assert_eq!(body["deleted"], 2, "{body}");
+
+    // Now exactly config B — Z still reachable, A gone. Never a torn {R} / {R,A}.
+    let (s, body) = reach(&app).await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    assert_eq!(body["nodes"], json!(["B", "R", "Z"]), "config B after swap: {body}");
+
+    // Unknown merge mode → 400.
+    let (s, _body) = call(
+        &app,
+        "POST",
+        "/graph/g/mutate",
+        Some("acme"),
+        None,
+        Some(json!({ "upserts": [{"src":"R","dst":"A","weight":1}], "merge": "nonsense" })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "unknown merge → 400");
+}

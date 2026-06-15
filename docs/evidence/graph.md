@@ -88,6 +88,29 @@ Body `{"edges": [{src, dst, type?}]}`. Deleting a non-existent edge is a no-op.
 Because the graph is a rebuildable projection, this is ordinary maintenance —
 scope `data:write`, not `schema:admin`. Scope: `data:write`.
 
+### `POST /graph/{graph}/mutate` — atomic edge rewire
+
+```bash
+curl -s -X POST localhost:8081/graph/lineage/mutate \
+  -H 'content-type: application/json' \
+  -d '{ "upserts": [{"src":"R","dst":"B","weight":1},{"src":"B","dst":"Z","weight":1}],
+        "deletes": [{"src":"R","dst":"A"},{"src":"A","dst":"Z"}] }'
+```
+
+```json
+{ "graph": "lineage", "upserted": 2, "deleted": 2 }
+```
+
+Applies `upserts` **and** `deletes` in **one** `WriteBatch` — an atomic rewire.
+Every reader observes all the changes at one sequence or none of them, so a path
+can be swapped (delete the old edges, add the new ones) without ever exposing a
+torn graph where a node is transiently unreachable. Body `{"upserts"?:
+[{src,dst,weight,type?}], "deletes"?: [{src,dst,type?}], "merge"?:
+"set"|"max"}`; `merge` applies to the upserts. Upserts are applied before
+deletes, so if the same edge identity appears in both, the delete wins. Scope:
+`data:write`. (This is the primitive the Jepsen graph-swap snapshot-isolation
+workload uses.)
+
 ### `DELETE /graph/{graph}` — drop an entire graph
 
 ```bash
