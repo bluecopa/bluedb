@@ -95,6 +95,7 @@ pub async fn append(
         let payload = B64
             .decode(payload_b64)
             .map_err(|e| AppError::bad_request(format!("events[{i}]: invalid base64: {e}")))?;
+        // "" = no wall-clock time supplied by the caller; stored verbatim
         let at = ev
             .get("at")
             .and_then(|v| v.as_str())
@@ -148,11 +149,11 @@ pub async fn head(
 // --- GET /evidence/{chain}/entries ------------------------------------------
 
 #[derive(Deserialize)]
-pub struct EntriesQuery {
-    pub from: Option<i64>,
-    pub to: Option<i64>,
-    pub after: Option<i64>,
-    pub limit: Option<usize>,
+pub(crate) struct EntriesQuery {
+    from: Option<i64>,
+    to: Option<i64>,
+    after: Option<i64>,
+    limit: Option<usize>,
 }
 
 /// `GET /evidence/{chain}/entries` — read entries.
@@ -170,7 +171,7 @@ pub async fn read_entries(
     let ev = state.evidence(&tenant).await?;
 
     let entries: Vec<(i64, bluedb_evidence::EntryRecord)> =
-        if q.after.is_some() || (q.from.is_none() && q.to.is_none() && q.after.is_some()) {
+        if q.after.is_some() {
             // read_from path
             let after = q.after.unwrap_or(0);
             ev.read_from(&chain, after, q.limit)
