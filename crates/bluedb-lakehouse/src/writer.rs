@@ -22,7 +22,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow_array::{
     ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array,
-    RecordBatch, StringArray,
+    LargeBinaryArray, RecordBatch, StringArray,
 };
 use arrow_schema::DataType as ArrowDataType;
 use bytes::Bytes;
@@ -324,11 +324,18 @@ impl LakehouseWriter {
 
     /// Build a full-table-schema RecordBatch carrying the primary keys (other
     /// columns null). The equality-delete writer projects it down to the PK.
+    ///
+    /// Non-PK fields are forced **nullable** in this batch's Arrow schema: they
+    /// are filled with NULL placeholders (the writer projects them away), so a
+    /// `NOT NULL` non-PK column — e.g. a composite-key component — would
+    /// otherwise fail `RecordBatch` validation even though those values are
+    /// discarded.
     fn keys_to_delete_batch(&self, keys: &[&Key]) -> Result<RecordBatch> {
-        let arrow_schema = Arc::new(schema_to_arrow_schema(&self.schema)?);
+        let full = schema_to_arrow_schema(&self.schema)?;
         let pk_values: Vec<Value> = keys.iter().map(|k| key_to_value(k)).collect();
-        let mut columns: Vec<ArrayRef> = Vec::with_capacity(arrow_schema.fields().len());
-        for field in arrow_schema.fields() {
+        let mut fields = Vec::with_capacity(full.fields().len());
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(full.fields().len());
+        for field in full.fields() {
             let is_pk = field
                 .metadata()
                 .get(parquet::arrow::PARQUET_FIELD_ID_META_KEY)
@@ -339,9 +346,19 @@ impl LakehouseWriter {
             } else {
                 vec![&Value::Null; keys.len()]
             };
+            // Keep the PK field as-is; relax every other field to nullable.
+            fields.push(if is_pk {
+                field.clone()
+            } else {
+                Arc::new(field.as_ref().clone().with_nullable(true))
+            });
             columns.push(build_arrow_column(field.data_type(), &cells)?);
         }
-        RecordBatch::try_new(arrow_schema, columns)
+        let schema = Arc::new(arrow_schema::Schema::new_with_metadata(
+            fields,
+            full.metadata().clone(),
+        ));
+        RecordBatch::try_new(schema, columns)
             .map_err(|e| LakehouseError::Iceberg(format!("delete batch: {e}")))
     }
 
@@ -645,6 +662,17 @@ fn build_arrow_column(arrow_dt: &ArrowDataType, cells: &[&Value]) -> Result<Arra
                     _ => None,
                 })
                 .collect::<BinaryArray>(),
+        ),
+        // iceberg-rust maps Iceberg `binary` to Arrow `LargeBinary` — used by the
+        // composite-PK surrogate column (`__bluedb_pk BYTEA`) and any BYTEA column.
+        ArrowDataType::LargeBinary => Arc::new(
+            cells
+                .iter()
+                .map(|v| match v {
+                    Value::Bytea(b) => Some(b.clone()),
+                    _ => None,
+                })
+                .collect::<LargeBinaryArray>(),
         ),
         other => {
             return Err(LakehouseError::Schema(format!(
