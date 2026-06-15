@@ -144,3 +144,76 @@ async fn pragma_off_means_no_mirror() {
         "no table should be mirrored when off: {tables}"
     );
 }
+
+#[tokio::test]
+async fn altered_column_visible_through_rest_catalog() {
+    let state = make_state().await;
+    let app = build_app(state.clone());
+
+    let (s, _) = call(&app, "POST", "/sql", Some(json!({"sql": "PRAGMA lakehouse_mirror = on"}))).await;
+    assert!(s.is_success());
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/schema/tables",
+        Some(json!({
+            "name": "docs",
+            "columns": [
+                {"name": "id", "type": "INTEGER", "primary_key": true},
+                {"name": "body", "type": "TEXT"}
+            ]
+        })),
+    )
+    .await;
+    assert!(s.is_success(), "create table: {s}");
+
+    let (s, _) = call(&app, "POST", "/sql", Some(json!({"sql": "INSERT INTO docs VALUES (1, 'a')"}))).await;
+    assert!(s.is_success());
+    state.seal_now().await.expect("seal");
+
+    // ALTER ADD COLUMN over /admin/sql (DDL surface), write a row, seal again.
+    let (s, body) = call(&app, "POST", "/admin/sql", Some(json!({"sql": "ALTER TABLE docs ADD COLUMN c INTEGER"}))).await;
+    assert!(s.is_success(), "alter add: {s} {body}");
+    let (s, _) = call(&app, "POST", "/sql", Some(json!({"sql": "INSERT INTO docs VALUES (2, 'b', 7)"}))).await;
+    assert!(s.is_success());
+    state.seal_now().await.expect("seal");
+
+    // The REST catalog's loadTable schema now carries the new column.
+    let (s, load) = call(&app, "GET", "/catalog/v1/namespaces/default/tables/docs", None).await;
+    assert!(s.is_success(), "load table: {s} {load}");
+    let metadata = load["metadata"].to_string();
+    assert!(metadata.contains("\"c\""), "evolved schema should expose c: {metadata}");
+    assert!(metadata.contains("\"body\""), "schema still has body: {metadata}");
+}
+
+#[tokio::test]
+async fn drop_key_column_rejected_over_http() {
+    let state = make_state().await;
+    let app = build_app(state.clone());
+
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/schema/tables",
+        Some(json!({
+            "name": "docs",
+            "columns": [
+                {"name": "id", "type": "INTEGER", "primary_key": true},
+                {"name": "body", "type": "TEXT"}
+            ]
+        })),
+    )
+    .await;
+    assert!(s.is_success(), "create table: {s}");
+
+    // Dropping the primary-key column is rejected (it is the merge-on-read identity).
+    let (s, body) = call(&app, "POST", "/admin/sql", Some(json!({"sql": "ALTER TABLE docs DROP COLUMN id"}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "drop key should be rejected: {body}");
+    assert!(
+        body.to_string().to_lowercase().contains("primary key"),
+        "error should mention the primary key: {body}"
+    );
+    // A non-key column still drops.
+    let (s, body) = call(&app, "POST", "/admin/sql", Some(json!({"sql": "ALTER TABLE docs DROP COLUMN body"}))).await;
+    assert!(s.is_success(), "drop non-key column: {s} {body}");
+}
