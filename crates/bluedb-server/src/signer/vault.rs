@@ -29,7 +29,7 @@ impl VaultTransitSigner {
         format!("vault:{}:{}", self.mount, self.key)
     }
 
-    pub(crate) async fn sign(&self, payload: &[u8]) -> Result<Vec<u8>, AppError> {
+    pub(crate) async fn sign(&self, payload: &[u8]) -> Result<(u64, Vec<u8>), AppError> {
         let url = format!("{}/v1/{}/sign/{}", self.addr, self.mount, self.key);
         // ecdsa-p256 transit key: Vault hashes sha2-256 unless `prehashed`.
         // `marshaling_algorithm: asn1` makes the signature ASN.1 DER (what the
@@ -52,7 +52,7 @@ impl VaultTransitSigner {
         parse_signature(&v)
     }
 
-    pub(crate) async fn public_key_pem(&self) -> Result<String, AppError> {
+    pub(crate) async fn public_key(&self) -> Result<(u64, String), AppError> {
         let url = format!("{}/v1/{}/keys/{}", self.addr, self.mount, self.key);
         let resp = self
             .client
@@ -66,21 +66,32 @@ impl VaultTransitSigner {
     }
 }
 
-/// Decode a Transit `sign` response into ASN.1-DER signature bytes.
-/// Response: `{"data":{"signature":"vault:v<N>:<base64(DER)>"}}`.
-fn parse_signature(v: &Value) -> Result<Vec<u8>, AppError> {
+/// Decode a Transit `sign` response into `(key_version, ASN.1-DER signature)`.
+/// Response: `{"data":{"signature":"vault:v<N>:<base64(DER)>"}}` — the `v<N>`
+/// segment is the key version that produced the signature.
+fn parse_signature(v: &Value) -> Result<(u64, Vec<u8>), AppError> {
     let sig = v
         .pointer("/data/signature")
         .and_then(|s| s.as_str())
         .ok_or_else(|| AppError::internal("vault sign: missing data.signature"))?;
-    // Strip the "vault:v<N>:" prefix; the trailing field is base64(DER).
-    let b64 = sig.rsplit(':').next().unwrap_or_default();
-    B64.decode(b64).map_err(|e| AppError::internal(format!("vault sig decode: {e}")))
+    // `vault:v<N>:<b64-DER>` — split into the three fixed fields.
+    let parts: Vec<&str> = sig.splitn(3, ':').collect();
+    if parts.len() != 3 || parts[0] != "vault" {
+        return Err(AppError::internal(format!("vault sign: unexpected signature format '{sig}'")));
+    }
+    let version: u64 = parts[1]
+        .strip_prefix('v')
+        .and_then(|n| n.parse().ok())
+        .ok_or_else(|| AppError::internal(format!("vault sign: bad key version in '{sig}'")))?;
+    let der = B64
+        .decode(parts[2])
+        .map_err(|e| AppError::internal(format!("vault sig decode: {e}")))?;
+    Ok((version, der))
 }
 
-/// Extract the latest version's SPKI-PEM public key from a Transit `keys` response.
+/// Extract `(latest_version, SPKI-PEM public key)` from a Transit `keys` response.
 /// Response: `{"data":{"latest_version":N,"keys":{"N":{"public_key":"...PEM..."}}}}`.
-fn parse_public_key(v: &Value) -> Result<String, AppError> {
+fn parse_public_key(v: &Value) -> Result<(u64, String), AppError> {
     let latest = v
         .pointer("/data/latest_version")
         .and_then(|x| x.as_i64())
@@ -89,7 +100,7 @@ fn parse_public_key(v: &Value) -> Result<String, AppError> {
         .pointer(&format!("/data/keys/{latest}/public_key"))
         .and_then(|s| s.as_str())
         .ok_or_else(|| AppError::internal("vault keys: missing public_key"))?;
-    Ok(pem.to_string())
+    Ok((latest as u64, pem.to_string()))
 }
 
 async fn parse_ok(resp: reqwest::Response) -> Result<Value, AppError> {
@@ -110,7 +121,12 @@ mod tests {
     fn parses_transit_sign_and_keys_responses() {
         let sign: Value =
             serde_json::from_str(r#"{"data":{"signature":"vault:v1:MEUCIQ=="}}"#).unwrap();
-        assert_eq!(parse_signature(&sign).unwrap(), B64.decode("MEUCIQ==").unwrap());
+        assert_eq!(parse_signature(&sign).unwrap(), (1, B64.decode("MEUCIQ==").unwrap()));
+
+        // A non-1 version is parsed from the `v<N>` segment.
+        let signed_v7: Value =
+            serde_json::from_str(r#"{"data":{"signature":"vault:v7:MEUCIQ=="}}"#).unwrap();
+        assert_eq!(parse_signature(&signed_v7).unwrap(), (7, B64.decode("MEUCIQ==").unwrap()));
 
         let keys: Value = serde_json::from_str(
             r#"{"data":{"latest_version":2,"keys":{"2":{"public_key":"-----BEGIN PUBLIC KEY-----\nABC\n-----END PUBLIC KEY-----"}}}}"#,
@@ -118,7 +134,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             parse_public_key(&keys).unwrap(),
-            "-----BEGIN PUBLIC KEY-----\nABC\n-----END PUBLIC KEY-----"
+            (2, "-----BEGIN PUBLIC KEY-----\nABC\n-----END PUBLIC KEY-----".to_string())
         );
     }
 

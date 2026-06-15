@@ -14,8 +14,10 @@ pub(crate) enum EvidenceSigner {
 }
 
 impl EvidenceSigner {
-    /// Sign `payload` → ASN.1-DER ES256 signature bytes.
-    pub(crate) async fn sign(&self, payload: &[u8]) -> Result<Vec<u8>, AppError> {
+    /// Sign `payload` → `(key_version, ASN.1-DER ES256 signature bytes)`. The
+    /// version identifies which key generation produced the signature, so it
+    /// stays attributable across KMS rotations.
+    pub(crate) async fn sign(&self, payload: &[u8]) -> Result<(u64, Vec<u8>), AppError> {
         match self {
             EvidenceSigner::Local(s) => s.sign(payload),
             EvidenceSigner::Vault(s) => s.sign(payload).await,
@@ -28,11 +30,11 @@ impl EvidenceSigner {
             EvidenceSigner::Vault(s) => s.key_id(),
         }
     }
-    /// SPKI public key, PEM-encoded, for consumer verification.
-    pub(crate) async fn public_key_pem(&self) -> Result<String, AppError> {
+    /// `(latest_key_version, SPKI public key PEM)` for consumer verification.
+    pub(crate) async fn public_key(&self) -> Result<(u64, String), AppError> {
         match self {
-            EvidenceSigner::Local(s) => Ok(s.public_key_pem()),
-            EvidenceSigner::Vault(s) => s.public_key_pem().await,
+            EvidenceSigner::Local(s) => Ok(s.public_key()),
+            EvidenceSigner::Vault(s) => s.public_key().await,
         }
     }
     pub(crate) fn alg(&self) -> &'static str {
@@ -54,13 +56,14 @@ impl LocalSigner {
         let key = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
         Self { key, key_id: "local-ephemeral".to_string() }
     }
-    fn sign(&self, payload: &[u8]) -> Result<Vec<u8>, AppError> {
+    /// The local fixture has no real versioning — it always reports version `1`.
+    fn sign(&self, payload: &[u8]) -> Result<(u64, Vec<u8>), AppError> {
         let sig: Signature = self.key.sign(payload); // RFC 6979 deterministic; SHA-256
-        Ok(sig.to_der().as_bytes().to_vec())
+        Ok((1, sig.to_der().as_bytes().to_vec()))
     }
-    fn public_key_pem(&self) -> String {
+    fn public_key(&self) -> (u64, String) {
         let vk: VerifyingKey = *self.key.verifying_key();
-        vk.to_public_key_pem(Default::default()).expect("spki pem")
+        (1, vk.to_public_key_pem(Default::default()).expect("spki pem"))
     }
 }
 
@@ -87,15 +90,17 @@ mod tests {
     #[test]
     fn local_signer_sign_then_verify_roundtrips() {
         let s = LocalSigner::ephemeral();
-        let pem = s.public_key_pem();
+        let (pv, pem) = s.public_key();
+        assert_eq!(pv, 1, "local fixture reports version 1");
         let payload = sth_payload("acme", "c", 5, &[7u8; 32], 1_700_000_000_000);
-        let sig = s.sign(&payload).unwrap();
+        let (sv, sig) = s.sign(&payload).unwrap();
+        assert_eq!(sv, 1, "local fixture signs as version 1");
         assert!(verify_es256_der(&pem, &payload, &sig));
         // Tamper: a different payload must NOT verify against the same sig.
         let other = sth_payload("acme", "c", 6, &[7u8; 32], 1_700_000_000_000);
         assert!(!verify_es256_der(&pem, &other, &sig));
         // A different key's pub must NOT verify.
-        let pem2 = LocalSigner::ephemeral().public_key_pem();
+        let (_v2, pem2) = LocalSigner::ephemeral().public_key();
         assert!(!verify_es256_der(&pem2, &payload, &sig));
     }
 }
