@@ -105,13 +105,21 @@ known. Add a desired-schema computation and a schema-update emission:
   genuinely new column id. Dropped columns simply do not appear in the desired
   schema. This makes the result an *evolution* of the persisted schema, not a
   recomputation — so unchanged columns (including their nested ids) are stable.
-- **Emit the schema update** in `commit_internal`: if the desired schema differs
-  from `metadata.current_schema()`, apply it through the metadata builder before
-  adding the snapshot:
+- **Emit the schema update** as its own metadata version in `open`, *before* any
+  data is staged: if the evolved schema differs from `metadata.current_schema()`,
+  apply it through the metadata builder and publish the next `metadata.json`, so
+  the subsequent snapshot is authored against the already-current evolved schema
+  (its `schema_id`). A schema-only commit (no snapshot) keeps the snapshot-id /
+  schema-id ordering simple and is standard Iceberg.
 
   ```rust
-  builder = builder.add_current_schema(desired_schema)?;
-  // ...then add the snapshot, stamped with the new current schema-id.
+  let result = self.metadata.clone()
+      .into_builder(Some(current_md_loc))
+      .add_current_schema(evolved)?
+      .build()?;
+  self.metadata = result.metadata;
+  self.version += 1;
+  self.write_metadata(self.version).await?;
   ```
 
 **De-risked.** iceberg-rust 0.9.1's
@@ -128,20 +136,23 @@ The writer must re-derive its in-memory `self.schema` (and the Arrow schema used
 for the next data file) from the evolved schema, so the data written in the same
 snapshot matches.
 
-### 3. Build the record batch by field-id, not position
+### 3. Reconcile keeps the in-memory schema in logical column order
 
-`rows_to_record_batch` currently maps Arrow field index → `row.get(col_idx)`.
-That breaks after a mid-table DROP. Change it to map **each Iceberg/Arrow field
-to the logical column that currently carries its field-id**:
+The seal hands the writer rows in **current logical order** (storage's
+`collect_rows` applies `catalog.to_logical`), and `rows_to_record_batch` zips
+each Arrow field to `row.get(col_idx)`. Today that breaks after a mid-table DROP
+only because the writer keeps the **frozen** old schema (old order, with the
+dropped column still present) instead of the current one.
 
-- The seal already hands the writer rows in **current logical order** (storage's
-  `collect_rows` applies `catalog.to_logical`), and the logical column at
-  position `i` has field-id `slots[i] + 1`.
-- Build a `field_id → logical_position` lookup once per seal; for each Arrow
-  field, read its `PARQUET:field_id` metadata and pull `row[lookup[field_id]]`.
-- This keys the row→column placement on the same stable id as the schema, so any
-  allowed `ALTER` stays aligned. The equality-delete batch (`keys_to_delete_batch`)
-  already keys off `pk_field_id` and is unaffected.
+The reconcile in §2 builds the desired/evolved schema by iterating the current
+logical columns **in order** (reusing persisted fields by id), so the evolved
+`Schema`'s field order *is* the current logical order. Once the writer adopts the
+evolved schema as `self.schema`, the existing positional zip is correct again —
+Arrow field `i` ↔ logical column `i` ↔ `row[i]`. **No field-id-indexed remap is
+needed**, and the writer reconciles purely from the persisted and desired
+`Schema` objects (it never needs the slot vector itself; the engine bakes the
+slot-based field-ids into the desired schema via `table_to_iceberg`). The
+equality-delete batch keys off the stable `pk_field_id` and is unaffected.
 
 ### 4. Guardrails
 
@@ -173,11 +184,15 @@ reconciled into Iceberg with stable field-ids; RENAME TABLE already works
 - `crates/bluedb-lakehouse/src/schema.rs` — `table_to_iceberg` takes
   `slots: Option<&[u32]>`; slot-based top-level/PK field-ids; nested ids above
   `width`.
-- `crates/bluedb-lakehouse/src/writer.rs` — desired-schema reconcile + reuse-by-id
-  helper; `add_current_schema` emission in `commit_internal`; re-derive
-  `self.schema`; `rows_to_record_batch` by field-id.
+- `crates/bluedb-lakehouse/src/writer.rs` — pure `reconcile_schema(current,
+  desired)` (reuse-by-id, rename, add, drop); in `open`, when the desired schema
+  differs from the persisted current schema, emit a schema-only metadata commit
+  via `add_current_schema` and adopt the evolved schema as `self.schema`.
+  `rows_to_record_batch` is unchanged (positional, now correct because
+  `self.schema` is in logical order).
 - `crates/bluedb-lakehouse/src/engine.rs` — fetch `column_slots` in `writer_for`
-  and thread to `table_to_iceberg`; pass the slots so the writer can reconcile.
+  and thread to `table_to_iceberg`; make `sort_field_ids` slot-based (component
+  field-id = `slot + 1`) so the sort order stays stable across `ALTER`.
 - Tests: a new `crates/bluedb-lakehouse/tests/schema_evolution.rs` (ADD/DROP/
   RENAME round-trips read back through the iceberg reader), schema.rs unit tests
   for slot-based ids, and an engine/HTTP e2e proving `ALTER` then a query in the
