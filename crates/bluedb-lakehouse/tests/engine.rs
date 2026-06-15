@@ -381,3 +381,23 @@ async fn failover_resumes_mirror_exactly_once() {
     assert_eq!(rows.get(&2).map(String::as_str), Some("b"));
     assert_eq!(rows.get(&3).map(String::as_str), Some("c"));
 }
+
+#[tokio::test]
+async fn target_file_bytes_pragma_is_durable() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    let db = make_db("target-persist").await;
+    let cdc = CdcConfig::default();
+
+    {
+        let eng = engine(root, db.clone(), cdc.clone()).await;
+        // Unset → engine default (128 MiB, no env override in tests).
+        assert_eq!(eng.target_file_bytes(), 128 * 1024 * 1024);
+        eng.apply_pragma(LhPragma::TargetFileBytes(1_048_576)).await.unwrap();
+        assert_eq!(eng.target_file_bytes(), 1_048_576);
+    }
+
+    // Reopen over the same root: the durable registry restores the target.
+    let eng2 = engine(root, db.clone(), cdc.clone()).await;
+    assert_eq!(eng2.target_file_bytes(), 1_048_576);
+}
