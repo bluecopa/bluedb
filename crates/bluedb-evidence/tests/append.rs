@@ -1,4 +1,4 @@
-use bluedb_evidence::{EntryInput, Evidence};
+use bluedb_evidence::{EntryInput, Evidence, EdgeDelta, EdgeOp, Merge};
 mod harness;
 
 fn ev_entry(t: &str) -> EntryInput {
@@ -37,4 +37,55 @@ async fn idempotent_retry_returns_same_seqs_and_conflicts_on_change() {
     assert_eq!(ev.head("c").await.unwrap(), 1);
     let err = ev.append("c", vec![ev_entry("y")], Some("k1")).await.unwrap_err();
     assert!(matches!(err, bluedb_evidence::EvidenceError::IdemConflict));
+}
+
+// Fix 1: same etype/payload/at but different edges → IdemConflict.
+#[tokio::test]
+async fn idem_conflict_on_edge_change() {
+    let db = harness::memory_db().await;
+    let ev = Evidence::new(&db, "_");
+    let edge_a = EdgeDelta {
+        graph: "g".into(),
+        src: "A".into(),
+        dst: "B".into(),
+        weight: 1,
+        etype: String::new(),
+        op: EdgeOp::Upsert { merge: Merge::Set },
+    };
+    let edge_b = EdgeDelta {
+        graph: "g".into(),
+        src: "A".into(),
+        dst: "C".into(), // different dst
+        weight: 1,
+        etype: String::new(),
+        op: EdgeOp::Upsert { merge: Merge::Set },
+    };
+    let entry_with_edge_a = EntryInput {
+        etype: "ev".into(),
+        payload: b"data".to_vec(),
+        at: "2026-01-01".into(),
+        edges: vec![edge_a],
+    };
+    let entry_with_edge_b = EntryInput {
+        etype: "ev".into(),
+        payload: b"data".to_vec(),
+        at: "2026-01-01".into(),
+        edges: vec![edge_b],
+    };
+    ev.append("c", vec![entry_with_edge_a], Some("k-edges")).await.unwrap();
+    let err = ev.append("c", vec![entry_with_edge_b], Some("k-edges")).await.unwrap_err();
+    assert!(matches!(err, bluedb_evidence::EvidenceError::IdemConflict));
+}
+
+// Fix 4: empty append leaves head unchanged and returns empty seqs.
+#[tokio::test]
+async fn empty_append_is_noop() {
+    let db = harness::memory_db().await;
+    let ev = Evidence::new(&db, "_");
+    ev.append("c", vec![ev_entry("x")], None).await.unwrap();
+    let head_before = ev.head("c").await.unwrap();
+    let r = ev.append("c", vec![], None).await.unwrap();
+    assert_eq!(r.seqs, Vec::<i64>::new());
+    assert_eq!(r.base_seq, head_before);
+    assert_eq!(ev.head("c").await.unwrap(), head_before);
 }

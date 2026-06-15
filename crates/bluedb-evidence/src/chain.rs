@@ -81,15 +81,22 @@ impl Evidence {
         writer
             .write_with_options(batch, &WriteOptions { await_durable: false, ..Default::default() })
             .await
-            .map_err(|e| EvidenceError::Storage(anyhow::anyhow!("{e}")))?;
+            .map_err(Self::storage_err)?;
         drop(_lease);
-        writer.flush().await.map_err(|e| EvidenceError::Storage(anyhow::anyhow!("{e}")))?;
+        writer.flush().await.map_err(Self::storage_err)?;
         Ok(())
     }
 
     // ---- Append ----
 
+    /// Map any `Display`-able error into [`EvidenceError::Storage`].
+    fn storage_err(e: impl std::fmt::Display) -> EvidenceError {
+        EvidenceError::Storage(anyhow::anyhow!("{e}"))
+    }
+
     /// Compute a fingerprint of `entries` for idempotency comparison.
+    /// Covers etype, payload, at, AND edges so that same-key replays with
+    /// different edges are correctly detected as IdemConflict.
     fn fingerprint(entries: &[EntryInput]) -> [u8; 32] {
         let mut h = Sha256::new();
         h.update((entries.len() as u64).to_be_bytes());
@@ -97,6 +104,21 @@ impl Evidence {
             for field in [e.etype.as_bytes(), &e.payload, e.at.as_bytes()] {
                 h.update((field.len() as u64).to_be_bytes());
                 h.update(field);
+            }
+            // Fix 1: fold edges into the fingerprint.
+            h.update((e.edges.len() as u64).to_be_bytes());
+            for ed in &e.edges {
+                for field in [ed.graph.as_bytes(), ed.src.as_bytes(), ed.dst.as_bytes(), ed.etype.as_bytes()] {
+                    h.update((field.len() as u64).to_be_bytes());
+                    h.update(field);
+                }
+                h.update(ed.weight.to_be_bytes());
+                let discriminant: u8 = match &ed.op {
+                    crate::model::EdgeOp::Upsert { merge: crate::model::Merge::Set } => 0,
+                    crate::model::EdgeOp::Upsert { merge: crate::model::Merge::Max } => 1,
+                    crate::model::EdgeOp::Delete => 2,
+                };
+                h.update([discriminant]);
             }
         }
         h.finalize().into()
@@ -122,6 +144,11 @@ impl Evidence {
         entries: Vec<EntryInput>,
         idem_key: Option<&str>,
     ) -> Result<Appended, EvidenceError> {
+        // Fix 4: short-circuit an empty append — no lease, no write, no flush.
+        if entries.is_empty() {
+            return Ok(Appended { base_seq: self.head(chain).await?, seqs: Vec::new() });
+        }
+
         let _lease = self.write_lease.lock().await;
         let writer = self.substrate.require_writer().map_err(|_| EvidenceError::NotWriter)?;
 
@@ -156,13 +183,13 @@ impl Evidence {
             );
         }
 
-        // Write each entry record.
-        for (entry, &seq) in entries.iter().zip(&seqs) {
+        // Write each entry record — consume entries to avoid cloning.
+        for (entry, &seq) in entries.into_iter().zip(&seqs) {
             let rec = EntryRecord {
-                etype: entry.etype.clone(),
-                payload: entry.payload.clone(),
-                at: entry.at.clone(),
-                edges: entry.edges.clone(),
+                etype: entry.etype,
+                payload: entry.payload,
+                at: entry.at,
+                edges: entry.edges,
                 leaf_hash: None,
                 redacted: false,
             };
@@ -181,9 +208,9 @@ impl Evidence {
         writer
             .write_with_options(batch, &WriteOptions { await_durable: false, ..Default::default() })
             .await
-            .map_err(|e| EvidenceError::Storage(anyhow::anyhow!("{e}")))?;
+            .map_err(Self::storage_err)?;
         drop(_lease);
-        writer.flush().await.map_err(|e| EvidenceError::Storage(anyhow::anyhow!("{e}")))?;
+        writer.flush().await.map_err(Self::storage_err)?;
 
         Ok(Appended { base_seq: base, seqs })
     }
@@ -233,10 +260,10 @@ impl Evidence {
     ) -> Result<Vec<(i64, EntryRecord)>, EvidenceError> {
         let mut out = Vec::new();
         let mut iter = self.substrate.scan_range(start, Some(end)).await?;
-        while let Some(kv) = iter.next().await.map_err(|e| EvidenceError::Storage(anyhow::anyhow!("{e}")))? {
-            if out.len() >= cap {
-                break;
-            }
+        // Fix 5: check cap BEFORE fetching the next kv so we never pull an
+        // extra SlateDB read once the cap is reached.
+        while out.len() < cap {
+            let Some(kv) = iter.next().await.map_err(Self::storage_err)? else { break };
             let key = kv.key.as_ref();
             // The seq is the last 8 bytes of the key.
             let tail: [u8; 8] = key[key.len() - 8..].try_into().unwrap();

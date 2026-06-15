@@ -54,3 +54,15 @@ async fn read_from_paging_reproduces_full_range() {
     );
     assert_eq!(paged.len(), 250);
 }
+
+// Fix 6: read_range with hi = i64::MAX exercises the checked_add(1) → entry_prefix_end branch.
+#[tokio::test]
+async fn read_range_i64_max_hi_returns_all() {
+    let db = harness::memory_db().await;
+    let ev = Evidence::new(&db, "_");
+    ev.append("c", vec![e("first"), e("second")], None).await.unwrap();
+    let all = ev.read_range("c", 1, i64::MAX).await.unwrap();
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].0, 1);
+    assert_eq!(all[1].0, 2);
+}
