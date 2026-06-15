@@ -29,6 +29,7 @@ use crate::{LakehouseError, Result};
 pub fn table_to_iceberg(
     schema: &GlueSchema,
     sample_rows: &[&[Value]],
+    slots: Option<&[u32]>,
 ) -> Result<(IcebergSchema, i32)> {
     let columns = schema.column_defs.as_ref().ok_or_else(|| {
         LakehouseError::Schema(format!(
@@ -36,6 +37,17 @@ pub fn table_to_iceberg(
             schema.table_name
         ))
     })?;
+
+    if let Some(s) = slots {
+        if s.len() != columns.len() {
+            return Err(LakehouseError::Schema(format!(
+                "table '{}': slot vector len {} != column count {}",
+                schema.table_name,
+                s.len(),
+                columns.len()
+            )));
+        }
+    }
 
     let pk_positions: Vec<usize> = columns
         .iter()
@@ -60,10 +72,22 @@ pub fn table_to_iceberg(
     };
 
     let n = columns.len();
-    let mut next_nested_id = n as i32 + 1;
+    // field_id(column i) = slot(i) + 1. Absent catalog ⇒ identity (slot == i),
+    // which reproduces the historical positional ids 1..N exactly, so an
+    // already-mirrored table keeps the same field-ids (no rewrite).
+    let field_id_of = |i: usize| -> i32 {
+        match slots {
+            Some(s) => s[i] as i32 + 1,
+            None => i as i32 + 1,
+        }
+    };
+    // Nested (list/map) ids start above the max top-level id so a slot-based id
+    // can never collide with a nested id (identity case: N + 1, as before).
+    let max_top = (0..n).map(field_id_of).max().unwrap_or(0);
+    let mut next_nested_id = max_top + 1;
     let mut fields = Vec::with_capacity(n);
     for (col_idx, col) in columns.iter().enumerate() {
-        let field_id = col_idx as i32 + 1;
+        let field_id = field_id_of(col_idx);
         let cells: Vec<&Value> = sample_rows
             .iter()
             .filter_map(|r| r.get(col_idx))
@@ -78,7 +102,7 @@ pub fn table_to_iceberg(
         fields.push(field.into());
     }
 
-    let pk_field_id = pk_idx as i32 + 1;
+    let pk_field_id = field_id_of(pk_idx);
     let iceberg_schema = IcebergSchema::builder()
         .with_schema_id(0)
         .with_identifier_field_ids(vec![pk_field_id])
@@ -282,6 +306,8 @@ fn take_id(c: &mut i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gluesql_core::ast::{ColumnDef, ColumnUniqueOption};
+    use gluesql_core::data::Schema as GlueSchema;
     use std::collections::BTreeMap;
 
     fn prim(t: &Type) -> &PrimitiveType {
@@ -289,6 +315,69 @@ mod tests {
             Type::Primitive(p) => p,
             other => panic!("expected primitive, got {other:?}"),
         }
+    }
+
+    /// A minimal gluesql schema with a single-column PK on column 0.
+    fn schema_with(cols: &[(&str, DataType)]) -> GlueSchema {
+        let column_defs = cols
+            .iter()
+            .enumerate()
+            .map(|(i, (name, dt))| ColumnDef {
+                name: name.to_string(),
+                data_type: dt.clone(),
+                nullable: i != 0,
+                default: None,
+                unique: (i == 0).then_some(ColumnUniqueOption { is_primary: true }),
+                comment: None,
+            })
+            .collect();
+        GlueSchema {
+            table_name: "t".into(),
+            column_defs: Some(column_defs),
+            indexes: vec![],
+            engine: None,
+            foreign_keys: vec![],
+            comment: None,
+        }
+    }
+
+    fn field_ids(s: &IcebergSchema) -> Vec<i32> {
+        s.as_struct().fields().iter().map(|f| f.id).collect()
+    }
+
+    #[test]
+    fn identity_slots_give_positional_field_ids() {
+        let s = schema_with(&[("id", DataType::Int), ("a", DataType::Text)]);
+        let (ice, pk) = table_to_iceberg(&s, &[], None).unwrap();
+        assert_eq!(field_ids(&ice), vec![1, 2]); // back-compat with today
+        assert_eq!(pk, 1);
+    }
+
+    #[test]
+    fn slots_drive_field_ids_after_drop() {
+        // logical [id, b] after dropping middle `a`; slots [0, 2].
+        let s = schema_with(&[("id", DataType::Int), ("b", DataType::Text)]);
+        let (ice, pk) = table_to_iceberg(&s, &[], Some(&[0, 2])).unwrap();
+        assert_eq!(field_ids(&ice), vec![1, 3]);
+        assert_eq!(pk, 1);
+    }
+
+    #[test]
+    fn added_slot_gets_its_own_field_id() {
+        // logical [id, a, c]; `c` appended at slot 2 ⇒ ids [1,2,3].
+        let s = schema_with(&[
+            ("id", DataType::Int),
+            ("a", DataType::Text),
+            ("c", DataType::Text),
+        ]);
+        let (ice, _) = table_to_iceberg(&s, &[], Some(&[0, 1, 2])).unwrap();
+        assert_eq!(field_ids(&ice), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn slot_len_mismatch_errors() {
+        let s = schema_with(&[("id", DataType::Int), ("a", DataType::Text)]);
+        assert!(table_to_iceberg(&s, &[], Some(&[0])).is_err());
     }
 
     #[test]
