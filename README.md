@@ -29,9 +29,11 @@ Start with the [Quickstart](docs/quickstart.md) and the
 | **Full-text search** — SQL-integrated BM25 (Postgres `@@`/`ts_rank`), read-your-writes, no separate search cluster | [Full-text search](docs/sql/full-text-search.md) |
 | **Ledger** — TigerBeetle-style double-entry (typed accounts/transfers, two-phase, balances queryable over SQL) | [Ledger](docs/api/ledger.md) |
 | **Lakehouse mirror** — continuous **Apache Iceberg** mirror in the same bucket (full CRUD, seconds-fresh, exactly-once) + a read-only Iceberg REST catalog, so BigQuery/Databricks/Snowflake/DuckDB join bluedb data with no ETL | [Iceberg mirror](docs/lakehouse/iceberg-mirror.md) |
+| **Evidence chains** — append-only, **verifiable** log: server-assigned dense sequencing, RFC 6962 Merkle inclusion/consistency proofs, GDPR-grade redaction | [Evidence chains](docs/evidence/chains.md) |
+| **Graph store** — native weighted-edge adjacency with traversal (`reachable`, `widest_path`); edges can be appended atomically with evidence events | [Graph store](docs/evidence/graph.md) |
 | **High availability** — single-writer lease election + SlateDB epoch fencing, automatic failover (RPO 0 intra-region) | [Active-passive HA](docs/ha/active-passive.md) |
 | **Guarantees** — snapshot-isolated transactions, Jepsen-verified consistency | [Consistency](docs/guarantees/consistency.md) · [Jepsen](docs/guarantees/jepsen.md) |
-| **HTTP API** — `/tables` CRUD, `/sql`, `/schema/*` DDL, `/ledger/*`, `/catalog/v1/*` | [REST API](docs/api/rest.md) · [Configuration](docs/deployment/configuration.md) |
+| **HTTP API** — `/tables` CRUD, `/sql`, `/schema/*` DDL, `/ledger/*`, `/evidence/*`, `/graph/*`, `/catalog/v1/*` | [REST API](docs/api/rest.md) · [Configuration](docs/deployment/configuration.md) |
 
 ## Repository layout
 
@@ -42,6 +44,7 @@ Start with the [Quickstart](docs/quickstart.md) and the
 | `bluedb-fts` | BM25 full-text search (vendored Quickwit read path over object storage) |
 | `bluedb-ledger` | TigerBeetle-style double-entry ledger |
 | `bluedb-lakehouse` | Apache Iceberg CDC mirror + Iceberg REST catalog |
+| `bluedb-evidence` | verifiable evidence chains (RFC 6962 Merkle) + native graph store |
 | `bluedb-engine` | facade composing the pillars (incl. SQL-integrated FTS) |
 | `bluedb-rest` | PostgREST-style query DSL → SQL |
 | `bluedb-server` | the HTTP/REST service (axum) — the integration surface |

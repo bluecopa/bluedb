@@ -30,9 +30,11 @@ flowchart TD
     ENG --> FTS["Full-text search<br/>(bluedb-fts)"]
     ENG --> LED["Ledger<br/>(bluedb-ledger)"]
     ENG --> LAKE["Lakehouse mirror<br/>(bluedb-lakehouse)"]
+    ENG --> EVI["Evidence + graph<br/>(bluedb-evidence)"]
     SQL --> STO["bluedb-storage<br/>(SlateDB substrate)"]
     FTS --> STO
     LED --> STO
+    EVI --> STO
     LAKE --> OS
     STO --> OS["Object storage<br/>S3 · GCS · Azure"]
     HA["bluedb-ha<br/>lease election + fencing"] -.governs writer.-> SRV
@@ -54,6 +56,11 @@ flowchart TD
   tables to **Apache Iceberg** in the same bucket (full CRUD, seconds-fresh,
   exactly-once) so warehouses (BigQuery/Databricks/Snowflake) join bluedb data
   with **no ETL**; served through a read-only Iceberg REST catalog.
+- **[`bluedb-evidence`](evidence/chains.md)** — append-only, **verifiable
+  evidence chains** (server-assigned dense sequencing, RFC 6962 Merkle
+  inclusion/consistency proofs, GDPR-grade redaction) plus a **native graph
+  store** with weighted-edge adjacency and traversal (`reachable`,
+  `widest_path`).
 - **`bluedb-engine`** — composes the pillars behind one facade.
 - **`bluedb-server`** — the HTTP/REST service (axum): CRUD, `/sql`, admin.
 - **[`bluedb-ha`](ha/active-passive.md)** — single-writer high availability:
