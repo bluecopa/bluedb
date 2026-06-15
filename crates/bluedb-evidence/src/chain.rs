@@ -197,7 +197,7 @@ impl Evidence {
         }
 
         // Advance the sequence counter.
-        batch.put(self.keyspace.seq_key(chain), &(base + k).to_be_bytes());
+        batch.put(self.keyspace.seq_key(chain), (base + k).to_be_bytes());
 
         // Persist the idempotency record if requested.
         if let Some(key) = idem_key {
