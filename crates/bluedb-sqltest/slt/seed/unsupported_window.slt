@@ -1,0 +1,15 @@
+# Window functions (SQL:2003). GlueSQL rejects WINDOW at translation time, so
+# this file MUST land in the UNSUPPORTED bucket.
+
+statement ok
+CREATE TABLE s (id INTEGER PRIMARY KEY, v INTEGER)
+
+statement ok
+INSERT INTO s VALUES (1, 10), (2, 20), (3, 30)
+
+query I
+SELECT SUM(v) OVER (ORDER BY id) FROM s
+----
+10
+30
+60

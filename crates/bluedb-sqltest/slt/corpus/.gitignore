@@ -1,0 +1,4 @@
+# Third-party (public-domain) SQLite sqllogictest data — fetched, not vendored.
+# Populate with ../../fetch_corpus.sh. Ignore the data; keep this file.
+*
+!.gitignore

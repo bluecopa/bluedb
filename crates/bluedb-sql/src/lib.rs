@@ -61,16 +61,28 @@
 //! [`bluedb-storage`]: https://docs.rs/bluedb-storage
 //! [`bluedb-fts`]: https://docs.rs/bluedb-fts
 
+mod coerce;
 mod connection;
+mod cte;
 mod error;
 mod keyspace;
+mod nullorder;
+mod precheck;
 mod projection;
+mod pushdown;
 mod registry;
+mod rewrite;
+mod setops;
 mod storage;
 
 pub use connection::Database;
+pub use cte::{inline_ctes, inline_views, parse_create_view, parse_drop_view};
 pub use error::SqlError;
 pub use keyspace::{Keyspace, DEFAULT_TENANT, TAG_EXTERNAL_BASE};
+pub use nullorder::{parse_default_null_order, rewrite_null_order};
+pub use precheck::unsupported_reason;
 pub use projection::{ProjColumn, ProjValue, ProjectedTable};
 pub use registry::SchemaRegistry;
+pub use rewrite::rewrite_multitable;
+pub use setops::rewrite_set_ops;
 pub use storage::{CommitObserver, RowChange, SlateDbStorage, WriteLease};

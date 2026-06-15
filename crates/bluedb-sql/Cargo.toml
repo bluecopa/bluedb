@@ -25,6 +25,12 @@ futures      = "0.3"
 # `SchemaIndex::created` is a `chrono::NaiveDateTime`; we stamp new indexes with
 # `Utc::now()`. Same 0.4 line gluesql-core resolves.
 chrono       = "0.4"
+# SQL rewrite shim (comma-join -> INNER JOIN ON TRUE). Pinned to the exact
+# version gluesql-core 0.19 uses so the AST and re-serialized SQL round-trip.
+sqlparser    = "=0.52.0"
 
 [dev-dependencies]
 tokio = { workspace = true }
+# GlueSQL's official custom-storage conformance battery (Store/StoreMut/Index/
+# Transaction/AlterTable/Metadata). Pinned to the same core version.
+gluesql-test-suite = "=0.19.0"
