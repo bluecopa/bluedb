@@ -328,22 +328,347 @@ fn to_hex(bytes: &[u8]) -> String {
     out
 }
 
-/// SELECT/UPDATE/DELETE rewrites against a composite-PK table (Phase 3).
+/// SELECT/UPDATE/DELETE rewrites against a composite-PK table.
+///
+/// Component predicates that form a **leading prefix** of the key (equalities on
+/// `a`, `a,b`, … plus an optional trailing range on the next component) are
+/// rewritten to `__bluedb_pk` bounds — the same set of shapes Postgres's
+/// multicolumn B-tree serves. The bounds ride the clustered-PK pseudo-index
+/// (`storage::scan_pk_range`), so on a guarded connection a composite-key lookup
+/// is an allowed point/range scan rather than a rejected non-indexed filter.
+/// `SELECT *` is expanded to the user columns so `__bluedb_pk` never surfaces.
 pub(crate) mod dml {
-    use super::*;
+    use std::collections::HashMap;
 
-    /// The table a single-table DML statement targets, if it is a shape we
-    /// rewrite (a single `FROM`/`UPDATE`/`DELETE` table).
-    pub(crate) fn target_table(_stmt: &Statement) -> Option<String> {
-        None // implemented in Phase 3
+    use sqlparser::ast::{
+        AssignmentTarget, BinaryOperator, FromTable, OrderByExpr, Query, SelectItem, SetExpr,
+        TableFactor, TableWithJoins,
+    };
+
+    use super::*;
+    use crate::keyspace::prefix_upper_bound;
+
+    /// The single table a DML statement targets (composite rewrites apply only to
+    /// single-table SELECT/UPDATE/DELETE; joins/subqueries are left alone).
+    pub(crate) fn target_table(stmt: &Statement) -> Option<String> {
+        match stmt {
+            Statement::Query(query) => match query.body.as_ref() {
+                SetExpr::Select(select) => single_table(&select.from),
+                _ => None,
+            },
+            Statement::Update { table, .. } => factor_table(&table.relation),
+            Statement::Delete(delete) => match &delete.from {
+                FromTable::WithFromKeyword(t) | FromTable::WithoutKeyword(t) => single_table(t),
+            },
+            _ => None,
+        }
+    }
+
+    fn single_table(from: &[TableWithJoins]) -> Option<String> {
+        match from {
+            [only] if only.joins.is_empty() => factor_table(&only.relation),
+            _ => None,
+        }
+    }
+
+    fn factor_table(factor: &TableFactor) -> Option<String> {
+        match factor {
+            TableFactor::Table { name, .. } => Some(object_table_name(name)),
+            _ => None,
+        }
     }
 
     pub(crate) fn rewrite(
-        _stmt: &mut Statement,
-        _catalog: &PkCatalog,
-        _user_cols: &[String],
+        stmt: &mut Statement,
+        catalog: &PkCatalog,
+        user_cols: &[String],
     ) -> Result<(), SqlError> {
-        Ok(()) // implemented in Phase 3
+        match stmt {
+            Statement::Query(query) => rewrite_query(query, catalog, user_cols)?,
+            Statement::Update {
+                assignments,
+                selection,
+                ..
+            } => {
+                reject_pk_assignment(assignments, catalog)?;
+                rewrite_selection(selection, catalog)?;
+            }
+            Statement::Delete(delete) => rewrite_selection(&mut delete.selection, catalog)?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn rewrite_query(
+        query: &mut Query,
+        catalog: &PkCatalog,
+        user_cols: &[String],
+    ) -> Result<(), SqlError> {
+        if let SetExpr::Select(select) = query.body.as_mut() {
+            hide_surrogate(&mut select.projection, user_cols);
+            rewrite_selection(&mut select.selection, catalog)?;
+        }
+        if let Some(order) = query.order_by.as_mut() {
+            rewrite_order_by(&mut order.exprs, catalog);
+        }
+        Ok(())
+    }
+
+    /// Expand `*`/`t.*` to the explicit user columns so `__bluedb_pk` is hidden.
+    fn hide_surrogate(projection: &mut Vec<SelectItem>, user_cols: &[String]) {
+        let has_wildcard = projection.iter().any(|item| {
+            matches!(
+                item,
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)
+            )
+        });
+        if !has_wildcard {
+            return;
+        }
+        let mut expanded = Vec::new();
+        for item in std::mem::take(projection) {
+            match item {
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => {
+                    for col in user_cols {
+                        expanded.push(SelectItem::UnnamedExpr(Expr::Identifier(Ident::new(col))));
+                    }
+                }
+                other => expanded.push(other),
+            }
+        }
+        *projection = expanded;
+    }
+
+    fn rewrite_selection(
+        selection: &mut Option<Expr>,
+        catalog: &PkCatalog,
+    ) -> Result<(), SqlError> {
+        if let Some(expr) = selection.take() {
+            selection.replace(rewrite_predicate(expr, catalog)?);
+        }
+        Ok(())
+    }
+
+    /// Reject an UPDATE that assigns a primary-key component (the row's identity,
+    /// hence `__bluedb_pk`, would change — delete+reinsert; not supported in v1).
+    fn reject_pk_assignment(
+        assignments: &[sqlparser::ast::Assignment],
+        catalog: &PkCatalog,
+    ) -> Result<(), SqlError> {
+        for assignment in assignments {
+            let targets = match &assignment.target {
+                AssignmentTarget::ColumnName(name) => vec![object_table_name(name)],
+                AssignmentTarget::Tuple(names) => names.iter().map(object_table_name).collect(),
+            };
+            for target in targets {
+                if target == PK_COL || catalog.columns.contains(&target) {
+                    return Err(SqlError::CompositePk(format!(
+                        "UPDATE of primary-key column '{target}' is not supported"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Rewrite a leading-prefix of component predicates into `__bluedb_pk` bounds.
+    fn rewrite_predicate(selection: Expr, catalog: &PkCatalog) -> Result<Expr, SqlError> {
+        let pk_index: HashMap<&str, usize> = catalog
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.as_str(), i))
+            .collect();
+
+        // Split the top-level AND chain; classify each conjunct as a usable
+        // component comparison (keeping the original expr to restore if unused).
+        let mut eqs: HashMap<usize, (Key, Expr)> = HashMap::new();
+        let mut ranges: Vec<(usize, BinaryOperator, Key, Expr)> = Vec::new();
+        let mut residual: Vec<Expr> = Vec::new();
+        for conjunct in split_and(selection) {
+            match component_compare(&conjunct, &pk_index) {
+                Some((idx, BinaryOperator::Eq, key)) if !eqs.contains_key(&idx) => {
+                    eqs.insert(idx, (key, conjunct));
+                }
+                Some((idx, op, key)) if is_range(&op) => {
+                    ranges.push((idx, op, key, conjunct));
+                }
+                _ => residual.push(conjunct),
+            }
+        }
+
+        // The usable equality prefix: contiguous from column 0.
+        let mut prefix_keys = Vec::new();
+        let mut k = 0;
+        while let Some((key, _)) = eqs.remove(&k) {
+            prefix_keys.push(key);
+            k += 1;
+        }
+        // Equalities past the contiguous prefix (or with a gap) stay as filters.
+        for (_, (_, expr)) in eqs {
+            residual.push(expr);
+        }
+        // At most one range, and only on the column right after the prefix.
+        let mut chosen_range = None;
+        let n = catalog.columns.len();
+        for (idx, op, key, expr) in ranges {
+            if chosen_range.is_none() && idx == k && k < n {
+                chosen_range = Some((op, key));
+            } else {
+                residual.push(expr);
+            }
+        }
+
+        if prefix_keys.is_empty() && chosen_range.is_none() {
+            return Ok(rebuild_and(residual)); // nothing rewritten
+        }
+
+        let pk_predicate = build_pk_predicate(&prefix_keys, chosen_range, n)?;
+        let mut all = Vec::with_capacity(residual.len() + 1);
+        all.push(pk_predicate);
+        all.extend(residual);
+        Ok(rebuild_and(all))
+    }
+
+    /// Construct the `__bluedb_pk` predicate for an equality prefix + optional
+    /// trailing range, using the order-preserving encoding's prefix bounds.
+    fn build_pk_predicate(
+        prefix_keys: &[Key],
+        range: Option<(BinaryOperator, Key)>,
+        n: usize,
+    ) -> Result<Expr, SqlError> {
+        let base = encode_composite_key(prefix_keys)?;
+        match range {
+            None if prefix_keys.len() == n => Ok(pk_cmp(BinaryOperator::Eq, &base)),
+            None => Ok(range_pred(base.clone(), prefix_upper_bound(&base))),
+            Some((op, value)) => {
+                let mut with_range = prefix_keys.to_vec();
+                with_range.push(value);
+                let point = encode_composite_key(&with_range)?;
+                let base_upper = prefix_upper_bound(&base);
+                let (low, high) = match op {
+                    BinaryOperator::Gt => (
+                        prefix_upper_bound(&point).unwrap_or_else(|| point.clone()),
+                        base_upper,
+                    ),
+                    BinaryOperator::GtEq => (point, base_upper),
+                    BinaryOperator::Lt => (base, Some(point)),
+                    BinaryOperator::LtEq => (base, prefix_upper_bound(&point)),
+                    _ => unreachable!("is_range gated the operator"),
+                };
+                Ok(range_pred(low, high))
+            }
+        }
+    }
+
+    /// `__bluedb_pk >= X'low' [AND __bluedb_pk < X'high']`.
+    fn range_pred(low: Vec<u8>, high: Option<Vec<u8>>) -> Expr {
+        let lower = pk_cmp(BinaryOperator::GtEq, &low);
+        match high {
+            Some(high) => and(lower, pk_cmp(BinaryOperator::Lt, &high)),
+            None => lower,
+        }
+    }
+
+    /// `__bluedb_pk <op> X'bytes'`.
+    fn pk_cmp(op: BinaryOperator, bytes: &[u8]) -> Expr {
+        Expr::BinaryOp {
+            left: Box::new(Expr::Identifier(Ident::new(PK_COL))),
+            op,
+            right: Box::new(Expr::Value(SqlValue::HexStringLiteral(to_hex(bytes)))),
+        }
+    }
+
+    fn and(left: Expr, right: Expr) -> Expr {
+        Expr::BinaryOp {
+            left: Box::new(left),
+            op: BinaryOperator::And,
+            right: Box::new(right),
+        }
+    }
+
+    fn rebuild_and(mut conjuncts: Vec<Expr>) -> Expr {
+        if conjuncts.is_empty() {
+            return Expr::Value(SqlValue::Boolean(true));
+        }
+        let mut acc = conjuncts.remove(0);
+        for next in conjuncts {
+            acc = and(acc, next);
+        }
+        acc
+    }
+
+    /// If `expr` is `<pk-component> <cmp> <literal>`, return `(index, op, key)`.
+    fn component_compare(
+        expr: &Expr,
+        pk_index: &HashMap<&str, usize>,
+    ) -> Option<(usize, BinaryOperator, Key)> {
+        match expr {
+            Expr::Nested(inner) => component_compare(inner, pk_index),
+            Expr::BinaryOp { left, op, right } if is_cmp(op) => {
+                let col = ident_name(left)?;
+                let idx = *pk_index.get(col.as_str())?;
+                let key = literal_to_key(right).ok()?;
+                Some((idx, op.clone(), key))
+            }
+            _ => None,
+        }
+    }
+
+    fn ident_name(expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Identifier(ident) => Some(ident.value.clone()),
+            Expr::CompoundIdentifier(parts) => parts.last().map(|i| i.value.clone()),
+            Expr::Nested(inner) => ident_name(inner),
+            _ => None,
+        }
+    }
+
+    fn split_and(expr: Expr) -> Vec<Expr> {
+        match expr {
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::And,
+                right,
+            } => {
+                let mut out = split_and(*left);
+                out.extend(split_and(*right));
+                out
+            }
+            Expr::Nested(inner) => split_and(*inner),
+            other => vec![other],
+        }
+    }
+
+    fn is_cmp(op: &BinaryOperator) -> bool {
+        matches!(op, BinaryOperator::Eq) || is_range(op)
+    }
+
+    fn is_range(op: &BinaryOperator) -> bool {
+        matches!(
+            op,
+            BinaryOperator::Gt | BinaryOperator::Lt | BinaryOperator::GtEq | BinaryOperator::LtEq
+        )
+    }
+
+    /// Rewrite `ORDER BY a[, b, …]` (a leading PK prefix, uniform direction) to
+    /// `ORDER BY __bluedb_pk` so the ordered scan is index-served (the pk order
+    /// equals the tuple order).
+    fn rewrite_order_by(exprs: &mut Vec<OrderByExpr>, catalog: &PkCatalog) {
+        if exprs.is_empty() || exprs.len() > catalog.columns.len() {
+            return;
+        }
+        let is_leading_prefix = exprs
+            .iter()
+            .enumerate()
+            .all(|(i, e)| ident_name(&e.expr).as_deref() == Some(catalog.columns[i].as_str()));
+        let uniform_direction = exprs.iter().all(|e| e.asc == exprs[0].asc);
+        if !is_leading_prefix || !uniform_direction {
+            return;
+        }
+        let mut collapsed = exprs[0].clone();
+        collapsed.expr = Expr::Identifier(Ident::new(PK_COL));
+        *exprs = vec![collapsed];
     }
 }
 
@@ -452,6 +777,44 @@ mod tests {
         assert_eq!(literal_to_key(&lit("'x'")).unwrap(), Key::Str("x".into()));
         assert_eq!(literal_to_key(&lit("true")).unwrap(), Key::Bool(true));
         assert!(literal_to_key(&lit("NULL")).is_err());
+    }
+
+    fn rewrite_query_sql(sql: &str) -> String {
+        let catalog = PkCatalog {
+            columns: vec!["a".into(), "b".into()],
+        };
+        let user_cols = vec!["a".to_string(), "b".to_string(), "payload".to_string()];
+        let mut stmt = parse_one(sql);
+        dml::rewrite(&mut stmt, &catalog, &user_cols).unwrap();
+        stmt.to_string()
+    }
+
+    #[test]
+    fn full_key_equality_becomes_a_point_predicate() {
+        let sql = rewrite_query_sql("SELECT payload FROM t WHERE a = 1 AND b = 'x'");
+        assert!(sql.contains("__bluedb_pk = X'"), "not a point lookup: {sql}");
+        assert!(!sql.contains("a = 1"), "component predicate not consumed: {sql}");
+    }
+
+    #[test]
+    fn leading_prefix_becomes_a_range() {
+        let sql = rewrite_query_sql("SELECT payload FROM t WHERE a = 1");
+        assert!(sql.contains("__bluedb_pk >= X'"), "no lower bound: {sql}");
+        assert!(sql.contains("__bluedb_pk < X'"), "no upper bound: {sql}");
+    }
+
+    #[test]
+    fn non_pk_predicate_is_left_untouched() {
+        let sql = rewrite_query_sql("SELECT a FROM t WHERE payload = 'p'");
+        assert!(sql.contains("payload = 'p'"), "residual predicate lost: {sql}");
+        assert!(!sql.contains("__bluedb_pk"), "spurious rewrite: {sql}");
+    }
+
+    #[test]
+    fn select_star_expands_to_user_columns() {
+        let sql = rewrite_query_sql("SELECT * FROM t WHERE a = 1 AND b = 'x'");
+        assert!(sql.contains("SELECT a, b, payload"), "wildcard not expanded: {sql}");
+        assert!(!sql.contains('*'), "wildcard remains: {sql}");
     }
 
     #[test]
