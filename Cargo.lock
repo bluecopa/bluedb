@@ -682,6 +682,7 @@ dependencies = [
  "futures",
  "gluesql-core",
  "gluesql-test-suite",
+ "postcard",
  "serde",
  "serde_json",
  "slatedb",

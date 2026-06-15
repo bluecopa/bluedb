@@ -32,6 +32,10 @@ sqlparser    = "=0.52.0"
 # unfiltered SELECT. Pinned to the exact line gluesql-core 0.19 uses for
 # `ast::Literal::Number(BigDecimal)`, so the AST type matches.
 bigdecimal   = "=0.4.10"
+# Compact binary encoding for CDC-log entries (the lakehouse mirror). Smaller and
+# faster than JSON for the high-volume change log; data rows themselves still use
+# serde_json (see `storage::encode`).
+postcard     = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

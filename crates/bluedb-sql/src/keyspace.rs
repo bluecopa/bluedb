@@ -131,6 +131,14 @@ const TAG_TABLEID_SEQ: u8 = 0x07;
 /// inside a shared tenant keyspace.
 pub const TAG_EXTERNAL_BASE: u8 = 0x10;
 
+/// CDC log for the lakehouse mirror: `external_key(TAG_CDC, seq.to_be_bytes())`
+/// → `postcard(CdcEntry)`. One entry per committed row change on a
+/// mirror-enabled table, written into the same `WriteBatch` as the data so an
+/// entry exists iff the data committed (see [`crate::cdc`], `storage::commit`).
+/// `bluedb-ledger` owns `TAG_EXTERNAL_BASE`..=`TAG_EXTERNAL_BASE+5` (0x10–0x15);
+/// CDC takes the next free tag.
+pub const TAG_CDC: u8 = TAG_EXTERNAL_BASE + 6; // 0x16
+
 /// The default tenant used by [`SlateDbStorage::new`](crate::SlateDbStorage::new).
 ///
 /// A single underscore keeps the encoded prefix tiny while still being a valid,
