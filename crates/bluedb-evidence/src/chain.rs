@@ -247,12 +247,16 @@ impl Evidence {
         batch.put(self.keyspace.seq_key(chain), (base + k).to_be_bytes());
 
         // Advance the Merkle frontier on verified chains (same batch — crash-consistent).
+        // Each push's carry-merge emits complete-subtree parents; persist them in the
+        // same batch so O(log N) proofs can read them instead of all leaves.
         if verified {
             let mut frontier = store::get_frontier(&self.substrate, &self.keyspace, chain)
                 .await?
                 .unwrap_or_default();
             for lh in leaves {
-                frontier.push(lh);
+                for (level, index, hash) in frontier.push_emit(lh) {
+                    batch.put(self.keyspace.merkle_node_key(chain, level, index), &hash);
+                }
             }
             batch.put(self.keyspace.merkle_key(chain), &store::encode(&frontier)?);
         }
@@ -505,5 +509,61 @@ impl Evidence {
         drop(_lease);
         writer.flush().await.map_err(Self::storage_err)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use bluedb_sql::Database;
+    use slatedb::{object_store::memory::InMemory, Db};
+
+    async fn db() -> Database {
+        let d = Db::open("chain-test", Arc::new(InMemory::new())).await.unwrap();
+        Database::new(Arc::new(d))
+    }
+
+    /// Value-correctness for the persisted nodes: every persisted `(level, index)`
+    /// node equals `merkle_root` of its leaf range over the actual stored leaves.
+    /// In-crate test so it can reach `crate::merkle::{leaf_hash, merkle_root}` and
+    /// `store::get_merkle_node` (all `pub(crate)`).
+    #[tokio::test]
+    async fn persisted_nodes_equal_merkle_root_of_their_leaf_range() {
+        let database = db().await;
+        let ev = Evidence::new(&database, "_");
+        let substrate = database.substrate();
+        let ks = EvidenceKeyspace::new("_");
+        let mut leaves: Vec<[u8; 32]> = Vec::new();
+        for i in 0..16u8 {
+            let payload = vec![i];
+            ev.append("c", vec![EntryInput { etype: "t".into(), payload: payload.clone(), at: String::new(), edges: vec![] }], None)
+                .await
+                .unwrap();
+            leaves.push(crate::merkle::leaf_hash("t", &payload, "", &[]));
+            let size = leaves.len() as u64;
+            // Check every complete subtree fully inside [0, size).
+            for level in 1u8..64 {
+                let span = 1u64 << level;
+                if span > size {
+                    break;
+                }
+                let mut index = 0u64;
+                while (index + 1) * span <= size {
+                    let lo = (index * span) as usize;
+                    let hi = lo + span as usize;
+                    let got = store::get_merkle_node(&substrate, &ks, "c", level, index)
+                        .await
+                        .unwrap()
+                        .unwrap_or_else(|| panic!("node (L{level},{index}) missing at size {size}"));
+                    assert_eq!(
+                        got,
+                        crate::merkle::merkle_root(&leaves[lo..hi]),
+                        "node (L{level},{index}) wrong at size {size}"
+                    );
+                    index += 1;
+                }
+            }
+        }
     }
 }

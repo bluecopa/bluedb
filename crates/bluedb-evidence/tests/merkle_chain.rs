@@ -1,4 +1,5 @@
 use bluedb_evidence::{EntryInput, Evidence};
+use bluedb_sql::{prefix_upper_bound, Keyspace};
 use sha2::{Digest as Sha2Digest, Sha256};
 
 mod harness;
@@ -145,4 +146,49 @@ async fn digest_matches_recompute_and_proofs_are_well_formed() {
         Some(d.root),
         "inclusion proof for seq 4 must reconstruct the digest root"
     );
+}
+
+/// Count persisted complete-subtree nodes (tag 0x1F) for chain `chain`, tenant `_`,
+/// via the public `bluedb_sql::Keyspace` (an independent verifier of what append
+/// wrote). The node key is `external_key(0x1F, <len(chain)::u32-be ‖ chain>)`.
+async fn count_merkle_nodes(db: &bluedb_sql::Database, chain: &str) -> usize {
+    let ks = Keyspace::new("_");
+    let mut suffix = (chain.len() as u32).to_be_bytes().to_vec();
+    suffix.extend_from_slice(chain.as_bytes());
+    let prefix = ks.external_key(0x1F, &suffix);
+    let end = prefix_upper_bound(&prefix);
+    let mut it = db.substrate().scan_range(&prefix, end.as_deref()).await.unwrap();
+    let mut n = 0;
+    while it.next().await.unwrap().is_some() {
+        n += 1;
+    }
+    n
+}
+
+#[tokio::test]
+async fn append_persists_complete_subtree_nodes() {
+    let db = harness::memory_db().await;
+    let ev = Evidence::new(&db, "_");
+    // Append 7 single-entry leaves on a verified (default) chain.
+    for i in 0..7u8 {
+        ev.append("c", vec![EntryInput { etype: "t".into(), payload: vec![i], at: String::new(), edges: vec![] }], None)
+            .await
+            .unwrap();
+    }
+    // Node (level 2, index 0) must be present and 32 bytes — the root over leaves
+    // [0,4). Re-derive its key independently via the public Keyspace API.
+    let ks = Keyspace::new("_");
+    let mut suffix = (1u32).to_be_bytes().to_vec(); // len("c") == 1
+    suffix.extend_from_slice(b"c");
+    suffix.push(2u8); // level 2
+    suffix.extend_from_slice(&0u64.to_be_bytes()); // index 0
+    let key = ks.external_key(0x1F, &suffix);
+    let node = db.substrate().get(&key).await.unwrap().expect("node (2,0) present");
+    assert_eq!(node.len(), 32);
+
+    // Total persisted internal nodes after N appends == N − popcount(N): the count
+    // of carry-merges across the incremental pushes. For N=7: 7 − 3 = 4.
+    let n = 7usize;
+    let expected = n - (n as u64).count_ones() as usize;
+    assert_eq!(count_merkle_nodes(&db, "c").await, expected, "node count must equal N - popcount(N)");
 }
