@@ -48,6 +48,14 @@ manage and pay for.
   (manifests → manifest list → snapshot → `metadata.json`) itself and publishes
   it through its own catalog pointer. It runs on the published `apache/iceberg-rust`
   with no fork, no patch, and no `unsafe`.
+- **Sorted for free — one clustering, two engines.** bluedb tables are
+  [index-organized](../concepts/architecture.md#storage-model-index-organized-tables):
+  rows are stored clustered by the primary key. The seal collapses changes into
+  that same key order, so each Parquet data file (and its row groups) comes out
+  **sorted by the key with no re-sort step** — yielding tight per-column min/max
+  statistics and strong file/row-group **pruning** in the warehouse. The
+  operational and analytical clusterings are the same ordering. The mirror also
+  declares a matching Iceberg **sort order** (on the key columns) so engines know.
 - **Compaction is memory-bounded.** A background worker rewrites a table's
   small files into larger ones with deletes applied, streaming so peak memory is
   ≈ one output file regardless of table size.
