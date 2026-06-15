@@ -2,7 +2,7 @@
   "Jepsen test entry point for bluedb.
 
   Workloads (pick with --workload): set (default) | list-append | counter |
-  unique | ledger. Highlights:
+  unique | ledger | evidence. Highlights:
 
   * `set` (default) — a grow-only set. Clients append unique ints through the
     active writer; a final read reads the whole set back. `set-full` proves every
@@ -30,6 +30,7 @@
       --concurrency 10 --node node1 --node node2 --node node3"
   (:require [bluedb.jepsen.client :as bc]
             [bluedb.jepsen.counter :as bcnt]
+            [bluedb.jepsen.evidence :as ev]
             [bluedb.jepsen.http :as h]
             [bluedb.jepsen.ledger :as bl]
             [bluedb.jepsen.list-append :as la]
@@ -174,6 +175,20 @@
      :final-generator (gen/once {:type :invoke :f :read})
      :checker         (bl/checker)}))
 
+(defn- evidence-workload
+  "Append-heavy load on one fresh evidence chain, plus occasional reads. Checks
+  that every acknowledged append survives, nothing is fabricated, and the final
+  chain's server-assigned seqs are exactly 1..N (dense, gap-free, unique) across
+  faults. No schema reset needed — the chain name is namespaced per run."
+  [_opts]
+  (let [append (fn [] {:type :invoke :f :append})
+        read   (fn [] {:type :invoke :f :read})]
+    {:client          (ev/client)
+     :generator       (gen/mix [(repeatedly append) (repeatedly append)
+                                (repeatedly append) (repeatedly read)])
+     :final-generator (gen/once {:type :invoke :f :read})
+     :checker         (ev/checker)}))
+
 (defn bluedb-test
   [opts]
   (let [kind      (:nemesis opts "mix")
@@ -184,6 +199,7 @@
                      "counter"     counter-workload
                      "unique"      unique-workload
                      "ledger"      ledger-workload
+                     "evidence"    evidence-workload
                      set-workload)
                    opts)]
     (merge tests/noop-test
@@ -227,10 +243,10 @@
     :validate [#{"kill" "partition" "partition-half" "skew" "pause"
                  "arbiter" "arbiter-hard" "storage" "disk-full" "mix" "chaos" "none"}
                "unknown nemesis"]]
-   [nil "--workload NAME" "Workload: set | list-append | counter | unique | ledger"
+   [nil "--workload NAME" "Workload: set | list-append | counter | unique | ledger | evidence"
     :default "set"
-    :validate [#{"set" "list-append" "counter" "unique" "ledger"}
-               "must be set, list-append, counter, unique, or ledger"]]
+    :validate [#{"set" "list-append" "counter" "unique" "ledger" "evidence"}
+               "must be set, list-append, counter, unique, ledger, or evidence"]]
    [nil "--consistency MODEL" "list-append model: serializable | strict-serializable"
     :default "serializable"
     :validate [#{"serializable" "strict-serializable"}
