@@ -52,6 +52,7 @@ use bluedb_storage::Substrate;
 use slatedb::{Db, DbReader};
 use tokio::sync::Mutex;
 
+use crate::cdc::{next_cdc_seq, CdcSeq};
 use crate::error::SqlError;
 use crate::keyspace::DEFAULT_TENANT;
 use crate::storage::{SeqAllocator, SlateDbStorage, WriteLease};
@@ -66,6 +67,10 @@ pub struct Database {
     write_lease: WriteLease,
     insert_lock: WriteLease,
     seq: SeqAllocator,
+    /// Global, lazily-seeded CDC sequence counter, shared by every connection
+    /// vended from this handle so the lakehouse CDC log stays totally ordered
+    /// across them (see [`crate::cdc`]).
+    cdc_seq: CdcSeq,
 }
 
 impl Database {
@@ -89,7 +94,15 @@ impl Database {
             write_lease: Arc::new(Mutex::new(())),
             insert_lock: Arc::new(Mutex::new(())),
             seq: Arc::new(Mutex::new(HashMap::new())),
+            cdc_seq: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Allocate the next global CDC sequence (1-based, monotonic). Seeds lazily
+    /// from the persisted max on first use, so a freshly promoted writer
+    /// re-derives the counter from object storage after a failover.
+    pub async fn next_cdc_seq(&self) -> Result<i64, SqlError> {
+        next_cdc_seq(&self.cdc_seq, &self.substrate).await
     }
 
     /// Is this a writer handle (vs. a read replica)?
