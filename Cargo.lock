@@ -663,6 +663,7 @@ dependencies = [
  "axum",
  "bluedb-engine",
  "bluedb-ha",
+ "bluedb-lakehouse",
  "bluedb-ledger",
  "bluedb-rest",
  "bluedb-sql",

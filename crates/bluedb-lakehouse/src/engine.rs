@@ -31,6 +31,11 @@ struct Registry {
     default_on: bool,
     /// Explicit per-table enable flags, overriding `default_on`.
     tables: HashMap<String, bool>,
+    /// Tables that have actually been materialized to Iceberg (sealed at least
+    /// once). The authoritative list for the REST catalog — independent of
+    /// whether a table is enabled explicitly or by the opt-out default.
+    #[serde(default)]
+    materialized: std::collections::BTreeSet<String>,
 }
 
 /// The lakehouse mirror engine.
@@ -145,6 +150,7 @@ impl LakehouseEngine {
         let mut writer = self.writer_for(table, &schema, &sample_rows).await?;
         writer.upsert(&rows).await?;
         writer.commit_snapshot(watermark).await?;
+        self.mark_materialized(table).await?;
         Ok(())
     }
 
@@ -289,6 +295,7 @@ impl LakehouseEngine {
         writer.upsert(&upserts).await?;
         writer.delete(&deletes).await?;
         writer.commit_snapshot(watermark).await?;
+        self.mark_materialized(table).await?;
         Ok(())
     }
 
@@ -356,6 +363,71 @@ impl LakehouseEngine {
                 }
             }
         })
+    }
+
+    /// The Iceberg namespace this engine publishes under (for the REST catalog).
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    /// The current `metadata.json` location for a sealed table, or `None` if the
+    /// table has no Iceberg table yet. Read-only — creates nothing.
+    pub async fn table_metadata_location(&self, table: &str) -> Result<Option<String>> {
+        let dir = format!("{}/{}/{}/metadata", self.root, self.namespace, table);
+        let hint = format!("{dir}/version-hint.text");
+        if !self.file_io.exists(&hint).await? {
+            return Ok(None);
+        }
+        let raw = self.file_io.new_input(&hint)?.read().await?;
+        let version: u64 = String::from_utf8_lossy(&raw)
+            .trim()
+            .parse()
+            .map_err(|e| LakehouseError::Iceberg(format!("bad version-hint: {e}")))?;
+        Ok(Some(format!("{dir}/v{version}.metadata.json")))
+    }
+
+    /// Load a table's current `(metadata_location, metadata_json)` for an Iceberg
+    /// REST-catalog `loadTable`, or `None` if it isn't mirrored yet.
+    pub async fn table_metadata_json(
+        &self,
+        table: &str,
+    ) -> Result<Option<(String, serde_json::Value)>> {
+        let Some(loc) = self.table_metadata_location(table).await? else {
+            return Ok(None);
+        };
+        let bytes = self.file_io.new_input(&loc)?.read().await?;
+        let json: serde_json::Value = serde_json::from_slice(&bytes)?;
+        Ok(Some((loc, json)))
+    }
+
+    /// Tables that have actually been materialized to Iceberg (sealed at least
+    /// once) and still have metadata on disk — what the REST catalog lists.
+    pub async fn list_iceberg_tables(&self) -> Result<Vec<String>> {
+        let candidates: Vec<String> = {
+            self.state.read().unwrap().materialized.iter().cloned().collect()
+        };
+        let mut out = Vec::new();
+        for table in candidates {
+            if self.table_metadata_location(&table).await?.is_some() {
+                out.push(table);
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// Record that `table` now has an Iceberg table (persists on first sight).
+    async fn mark_materialized(&self, table: &str) -> Result<()> {
+        let newly = self
+            .state
+            .write()
+            .unwrap()
+            .materialized
+            .insert(table.to_string());
+        if newly {
+            self.persist_registry().await?;
+        }
+        Ok(())
     }
 
     /// Fetch a table's gluesql schema through a read connection.
