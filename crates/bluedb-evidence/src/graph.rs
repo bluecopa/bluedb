@@ -180,6 +180,61 @@ impl Graph {
         Ok(())
     }
 
+    /// Atomically apply `upserts` **and** `deletes` to `graph` in **one**
+    /// `WriteBatch` — an atomic edge rewire. Every reader observes the whole set
+    /// of changes at one sequence, or none of them; there is no committed state
+    /// in between. This is what lets a caller swap a path (e.g. delete `R→A`,
+    /// `A→Z` and add `R→B`, `B→Z`) without ever exposing a torn graph where the
+    /// sink is unreachable. Upserts are applied before deletes, so if the same
+    /// edge identity appears in both the delete wins (last-write-wins per key).
+    pub async fn mutate(
+        &self,
+        graph: &str,
+        upserts: &[EdgeUpsert],
+        deletes: &[EdgeRef],
+        merge: Merge,
+    ) -> Result<(), EvidenceError> {
+        if upserts.is_empty() && deletes.is_empty() {
+            return Ok(());
+        }
+        let _lease = self.write_lease.lock().await;
+        let writer = self.substrate.require_writer().map_err(|_| EvidenceError::NotWriter)?;
+        let mut batch = WriteBatch::new();
+        let mut overlay = HashMap::new();
+        for e in upserts {
+            let d = EdgeDelta {
+                graph: graph.to_string(),
+                src: e.src.clone(),
+                dst: e.dst.clone(),
+                weight: e.weight,
+                etype: e.etype.clone(),
+                op: EdgeOp::Upsert { merge },
+            };
+            apply_edge_delta(&self.substrate, &self.keyspace, &mut batch, &mut overlay, &d).await?;
+        }
+        for e in deletes {
+            let d = EdgeDelta {
+                graph: graph.to_string(),
+                src: e.src.clone(),
+                dst: e.dst.clone(),
+                weight: 0,
+                etype: e.etype.clone(),
+                op: EdgeOp::Delete,
+            };
+            apply_edge_delta(&self.substrate, &self.keyspace, &mut batch, &mut overlay, &d).await?;
+        }
+        if batch.is_empty() {
+            return Ok(());
+        }
+        writer
+            .write_with_options(batch, &WriteOptions { await_durable: false, ..Default::default() })
+            .await
+            .map_err(Self::storage_err)?;
+        drop(_lease);
+        writer.flush().await.map_err(Self::storage_err)?;
+        Ok(())
+    }
+
     /// Drop an ENTIRE graph: range-delete all canonical/out/in keys for `graph`
     /// in one atomic batch. Returns the number of edges (canonical keys) removed.
     /// The graph is a rebuildable projection of the chain, so this is ordinary

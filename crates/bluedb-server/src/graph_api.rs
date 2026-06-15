@@ -105,6 +105,57 @@ pub async fn drop_graph(
 }
 
 #[derive(Deserialize)]
+pub(crate) struct MutateBody {
+    #[serde(default)]
+    upserts: Vec<UpsertEdge>,
+    #[serde(default)]
+    deletes: Vec<DeleteEdge>,
+    #[serde(default)]
+    merge: Option<String>,
+}
+
+/// `POST /graph/{graph}/mutate` — apply `upserts` **and** `deletes` in one
+/// atomic batch (an atomic edge rewire). `merge` in {"set","max"} (default set)
+/// applies to the upserts. `data:write`.
+pub async fn mutate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(graph): Path<String>,
+    Json(body): Json<MutateBody>,
+) -> Result<Json<Value>, AppError> {
+    state.require_active()?;
+    state.authorize(&headers, Scope::DataWrite)?;
+    let tenant = state.tenant(&headers)?;
+    let merge = match body.merge.as_deref() {
+        None | Some("set") => Merge::Set,
+        Some("max") => Merge::Max,
+        Some(other) => {
+            return Err(AppError::bad_request(format!(
+                "unknown merge mode '{other}' (want 'set' or 'max')"
+            )))
+        }
+    };
+    let upserts: Vec<EdgeUpsert> = body
+        .upserts
+        .into_iter()
+        .map(|e| EdgeUpsert { src: e.src, dst: e.dst, weight: e.weight, etype: e.etype })
+        .collect();
+    let deletes: Vec<EdgeRef> = body
+        .deletes
+        .into_iter()
+        .map(|e| EdgeRef { src: e.src, dst: e.dst, etype: e.etype })
+        .collect();
+    let (nu, nd) = (upserts.len(), deletes.len());
+    state
+        .graph(&tenant)
+        .await?
+        .mutate(&graph, &upserts, &deletes, merge)
+        .await
+        .map_err(map_evidence_err)?;
+    Ok(Json(json!({ "graph": graph, "upserted": nu, "deleted": nd })))
+}
+
+#[derive(Deserialize)]
 pub(crate) struct ReachableBody {
     from: Vec<String>,
     #[serde(default)]

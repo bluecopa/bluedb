@@ -235,7 +235,7 @@ mod tests {
     use std::sync::Arc;
     use bluedb_sql::Database;
     use slatedb::{object_store::memory::InMemory, Db};
-    use crate::graph::{Graph, EdgeUpsert};
+    use crate::graph::{Graph, EdgeRef, EdgeUpsert};
     use crate::model::Merge;
 
     async fn db() -> Database {
@@ -304,5 +304,40 @@ mod tests {
         let fresh = database.substrate().read_view().await.unwrap();
         let seen_now = reachable(&fresh, &ks, "g", &["A".to_string()], i64::MIN, true).await.unwrap();
         assert_eq!(seen_now, vec!["A".to_string(), "B".to_string(), "C".to_string()]);
+    }
+
+    /// The Jepsen graph-swap invariant, in miniature. Config A = {R→A, A→Z};
+    /// the writer atomically rewires to config B = {R→B, B→Z} (delete the A
+    /// pair + add the B pair in one batch). Under a pinned snapshot every
+    /// traversal sees exactly one config — the sink Z is *always* reachable and
+    /// the result is always size 3 — never the torn `{R,A}` (Z dropped) a
+    /// non-snapshot read could produce when the swap lands between its scan of
+    /// R and its scan of the bridge.
+    #[tokio::test]
+    async fn atomic_swap_never_drops_the_sink() {
+        let database = db().await;
+        let g = Graph::new(&database, "_");
+        let ks = EvidenceKeyspace::new("_");
+        let e = |s: &str, d: &str| EdgeUpsert { src: s.into(), dst: d.into(), weight: 1, etype: String::new() };
+        let r = |s: &str, d: &str| EdgeRef { src: s.into(), dst: d.into(), etype: String::new() };
+
+        // Seed config A.
+        g.mutate("g", &[e("R", "A"), e("A", "Z")], &[], Merge::Set).await.unwrap();
+
+        // Pin a view on config A, then atomically swap A → B.
+        let pinned = database.substrate().read_view().await.unwrap();
+        g.mutate("g", &[e("R", "B"), e("B", "Z")], &[r("R", "A"), r("A", "Z")], Merge::Set).await.unwrap();
+
+        // The pinned snapshot still sees config A in full — Z reachable.
+        let from_r = vec!["R".to_string()];
+        let pre = reachable(&pinned, &ks, "g", &from_r, i64::MIN, true).await.unwrap();
+        assert_eq!(pre, vec!["A".to_string(), "R".to_string(), "Z".to_string()]);
+        assert!(pre.contains(&"Z".to_string()), "sink must stay reachable on the pinned cut");
+
+        // A fresh view sees config B in full (the swap was all-or-nothing) — Z
+        // still reachable, never the torn {R, A}.
+        let fresh = database.substrate().read_view().await.unwrap();
+        let post = reachable(&fresh, &ks, "g", &from_r, i64::MIN, true).await.unwrap();
+        assert_eq!(post, vec!["B".to_string(), "R".to_string(), "Z".to_string()]);
     }
 }
