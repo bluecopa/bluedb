@@ -242,6 +242,165 @@ pub(crate) fn extract_fts_predicate(sql: &str) -> Result<Option<FtsPredicate>> {
 }
 
 // ---------------------------------------------------------------------------
+// B3: trigram-accelerated LIKE '%lit%'
+// ---------------------------------------------------------------------------
+
+/// A `col LIKE '%lit%'` predicate whose literal is a **clean infix** safe to
+/// accelerate with a trigram prefilter: `column` is a bare identifier, `literal`
+/// is the infix core with its (one optional) leading/trailing `%` stripped and
+/// contains no remaining `LIKE` wildcards (`%`/`_`) and is ≥ 3 chars.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LikePredicate {
+    pub table: String,
+    pub column: String,
+    /// The clean infix literal (no surrounding `%`, no internal wildcards, len ≥ 3).
+    pub literal: String,
+}
+
+/// Recursively search an `Expr` tree for the first non-negated `Expr::Like` whose
+/// `expr` is a bare column and `pattern` is a string literal. Returns the
+/// `(column, raw_pattern)`. Recurses through AND/OR/Nested like [`find_at_at`],
+/// but never into a negated LIKE (a trigram prefilter on a negation would be a
+/// false-negative trap) and never into sub-selects.
+fn find_like(expr: &Expr) -> Option<(&str, &str)> {
+    match expr {
+        Expr::Like {
+            negated: false,
+            any: false,
+            expr: col,
+            pattern,
+            ..
+        } => {
+            let column = as_identifier(col)?;
+            let pat = as_string_literal(pattern)?;
+            Some((column, pat))
+        }
+        Expr::BinaryOp { left, right, .. } => find_like(left).or_else(|| find_like(right)),
+        Expr::Nested(inner) => find_like(inner),
+        _ => None,
+    }
+}
+
+/// Strip one optional leading and one optional trailing `%` from `pattern`,
+/// returning the infix core — but only if the core is a CLEAN literal: ≥ 3 chars
+/// and containing no remaining `%` or `_` (a `LIKE` wildcard inside the core makes
+/// the literal's trigrams an unsound prefilter). Returns `None` otherwise (so the
+/// caller passes the SQL through to gluesql's exact scan).
+fn clean_infix_core(pattern: &str) -> Option<String> {
+    // Strip ONE optional leading `%`, then ONE optional trailing `%`.
+    let after_prefix = pattern.strip_prefix('%').unwrap_or(pattern);
+    let core = after_prefix.strip_suffix('%').unwrap_or(after_prefix);
+    if core.chars().count() < 3 {
+        return None;
+    }
+    // Any remaining wildcard inside the core makes the literal's trigrams an
+    // unsound prefilter (a `_`/`%` would match rows the trigrams don't cover).
+    if core.contains('%') || core.contains('_') {
+        return None;
+    }
+    Some(core.to_string())
+}
+
+/// Parse `sql` and extract a trigram-accelerable `col LIKE '%lit%'` predicate from
+/// the WHERE clause (single table, no joins — mirrors [`extract_fts_predicate`]).
+///
+/// Returns `Ok(Some(..))` only for a clean ≥3-char infix LIKE; any other shape
+/// (no LIKE, negated, internal wildcard, <3-char core, prefix-only `foo%` whose
+/// core fails the clean test, multi-table) → `Ok(None)` — a non-prunable LIKE is
+/// valid SQL gluesql runs, NOT an error. (An unparseable SQL is still an `Err`.)
+pub(crate) fn extract_like_predicate(sql: &str) -> Result<Option<LikePredicate>> {
+    let mut stmts = parse(sql).map_err(|e| EngineError::Rejected(format!("parse error: {e}")))?;
+    if stmts.len() != 1 {
+        return Ok(None);
+    }
+    let stmt = stmts.remove(0);
+    let query = match stmt {
+        Statement::Query(q) => q,
+        _ => return Ok(None),
+    };
+    let select = match *query.body {
+        SetExpr::Select(s) => s,
+        _ => return Ok(None),
+    };
+    let Some(selection) = select.selection.as_ref() else {
+        return Ok(None);
+    };
+    // Single table, no joins (multi-table → unsupported shape → pass-through).
+    if select.from.len() != 1 || !select.from[0].joins.is_empty() {
+        return Ok(None);
+    }
+    let table = match &select.from[0].relation {
+        TableFactor::Table { name, .. } => {
+            name.0.last().map(|i| i.value.clone()).unwrap_or_default()
+        }
+        _ => return Ok(None),
+    };
+
+    let Some((column, pattern)) = find_like(selection) else {
+        return Ok(None);
+    };
+    let Some(literal) = clean_infix_core(pattern) else {
+        return Ok(None);
+    };
+    Ok(Some(LikePredicate {
+        table,
+        column: column.to_string(),
+        literal,
+    }))
+}
+
+/// Add a `pk IN (candidates)` conjunct to `sql`'s WHERE clause, keeping the
+/// original `Expr::Like` intact (gluesql's authoritative exact verify). Empty
+/// candidates → a `1 = 0` never-match conjunct (reusing the `@@` empty-hit
+/// approach). Re-emits via Display.
+///
+/// The caller guarantees `sql` matched [`extract_like_predicate`], so the WHERE
+/// clause is present; if the shape changed unexpectedly, returns `Ok(None)`.
+pub(crate) fn rewrite_like_query(
+    sql: &str,
+    pk_column: &str,
+    candidates: &[i64],
+) -> Result<Option<String>> {
+    let mut stmts = parse(sql).map_err(|e| EngineError::Rejected(format!("parse error: {e}")))?;
+    let stmt = stmts.remove(0);
+    let mut query = match stmt {
+        Statement::Query(q) => q,
+        _ => return Ok(None),
+    };
+    let select = match query.body.as_mut() {
+        SetExpr::Select(s) => s,
+        _ => return Ok(None),
+    };
+    let Some(selection) = select.selection.take() else {
+        return Ok(None);
+    };
+
+    let pk_ident = Expr::Identifier(Ident::new(pk_column));
+    let prefilter: Expr = if candidates.is_empty() {
+        Expr::BinaryOp {
+            left: Box::new(int_literal(1)),
+            op: BinaryOperator::Eq,
+            right: Box::new(int_literal(0)),
+        }
+    } else {
+        Expr::InList {
+            expr: Box::new(pk_ident),
+            list: candidates.iter().map(|pk| int_literal(*pk)).collect(),
+            negated: false,
+        }
+    };
+
+    // `prefilter AND (original WHERE)` — the original LIKE stays as gluesql's verify.
+    select.selection = Some(Expr::BinaryOp {
+        left: Box::new(prefilter),
+        op: BinaryOperator::And,
+        right: Box::new(Expr::Nested(Box::new(selection))),
+    });
+
+    Ok(Some(Statement::Query(query).to_string()))
+}
+
+// ---------------------------------------------------------------------------
 // Task 3: rewrite_fts_query
 // ---------------------------------------------------------------------------
 
@@ -367,6 +526,97 @@ pub async fn rewrite_fts_query(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- B3: extract_like_predicate (gating) ---
+
+    #[test]
+    fn extract_like_clean_infix() {
+        let p = extract_like_predicate("SELECT id FROM docs WHERE body LIKE '%overdue%'")
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.table, "docs");
+        assert_eq!(p.column, "body");
+        assert_eq!(p.literal, "overdue", "one leading + one trailing % stripped");
+    }
+
+    #[test]
+    fn extract_like_prefix_and_suffix_cores() {
+        // Suffix anchor `%lit`: strip leading %, no trailing % → core 'overdue'.
+        let p = extract_like_predicate("SELECT id FROM docs WHERE body LIKE '%overdue'")
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.literal, "overdue");
+        // Prefix anchor `lit%`: no leading %, strip trailing % → core 'overdue'.
+        let p = extract_like_predicate("SELECT id FROM docs WHERE body LIKE 'overdue%'")
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.literal, "overdue");
+        // Bare literal (no % at all) ≥ 3 chars is also a clean infix core.
+        let p = extract_like_predicate("SELECT id FROM docs WHERE body LIKE 'overdue'")
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.literal, "overdue");
+    }
+
+    #[test]
+    fn extract_like_gated_cases_pass_through() {
+        // < 3-char core → None.
+        assert!(extract_like_predicate("SELECT id FROM docs WHERE body LIKE '%ab%'")
+            .unwrap()
+            .is_none());
+        // Internal wildcard in the core → None.
+        assert!(extract_like_predicate("SELECT id FROM docs WHERE body LIKE '%ov_rdue%'")
+            .unwrap()
+            .is_none());
+        assert!(extract_like_predicate("SELECT id FROM docs WHERE body LIKE '%over%due%'")
+            .unwrap()
+            .is_none());
+        // Negated LIKE → None.
+        assert!(extract_like_predicate("SELECT id FROM docs WHERE body NOT LIKE '%overdue%'")
+            .unwrap()
+            .is_none());
+        // No LIKE at all → None.
+        assert!(extract_like_predicate("SELECT id FROM docs WHERE status = 'open'")
+            .unwrap()
+            .is_none());
+        // Multi-table → None (pass-through, not error).
+        assert!(extract_like_predicate("SELECT id FROM a, b WHERE x LIKE '%overdue%'")
+            .unwrap()
+            .is_none());
+    }
+
+    // --- B3: rewrite_like_query ---
+
+    #[test]
+    fn rewrite_like_adds_pk_in_prefilter_keeping_like() {
+        let sql = "SELECT id FROM docs WHERE body LIKE '%overdue%'";
+        let out = rewrite_like_query(sql, "id", &[1, 3]).unwrap().unwrap();
+        assert_eq!(
+            out,
+            "SELECT id FROM docs WHERE id IN (1, 3) AND (body LIKE '%overdue%')"
+        );
+    }
+
+    #[test]
+    fn rewrite_like_empty_candidates_never_match() {
+        let sql = "SELECT id FROM docs WHERE body LIKE '%overdue%'";
+        let out = rewrite_like_query(sql, "id", &[]).unwrap().unwrap();
+        assert_eq!(
+            out,
+            "SELECT id FROM docs WHERE 1 = 0 AND (body LIKE '%overdue%')"
+        );
+    }
+
+    #[test]
+    fn rewrite_like_preserves_extra_conditions() {
+        let sql = "SELECT id FROM docs WHERE body LIKE '%overdue%' AND status = 'open'";
+        let out = rewrite_like_query(sql, "id", &[7]).unwrap().unwrap();
+        // The original WHERE (LIKE AND status) is nested under the prefilter,
+        // both the LIKE and the status condition preserved for gluesql.
+        assert!(out.contains("id IN (7)"), "prefilter present: {out}");
+        assert!(out.contains("body LIKE '%overdue%'"), "LIKE kept: {out}");
+        assert!(out.contains("status = 'open'"), "extra condition kept: {out}");
+    }
 
     // --- Task 2: extract_fts_predicate ---
 

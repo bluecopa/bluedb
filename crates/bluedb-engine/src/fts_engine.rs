@@ -49,7 +49,10 @@ use tokio::task::JoinHandle;
 
 use crate::error::{EngineError, Result};
 use crate::fts::FtsIndex;
-use crate::fts_sql::{extract_fts_predicate, rewrite_fts_query, FtsHit, FtsPredicate, FtsSearcher};
+use crate::fts_sql::{
+    extract_fts_predicate, extract_like_predicate, rewrite_fts_query, rewrite_like_query, FtsHit,
+    FtsPredicate, FtsSearcher, TsQueryKind,
+};
 use crate::live_segment::{analyzer_for_config, translate_query, LiveSegment};
 use crate::rest_sql;
 
@@ -488,10 +491,21 @@ impl FtsEngine {
             .await
     }
 
-    /// Rewrite a `@@` query against the matching index — the **union** of its
-    /// live segment and (if durable) its durable splits, with the live tier
-    /// authoritative for any pk it covers. `Ok(None)` when the SQL has no `@@`.
+    /// Rewrite `sql` against the matching index. Tries the `@@`/`ts_rank` path
+    /// first (BM25 fulltext); if the SQL has no `@@`, tries the trigram-accelerated
+    /// `LIKE '%lit%'` path. `Ok(None)` when neither applies (the SQL runs unchanged
+    /// on gluesql's exact scan).
     pub async fn rewrite_for(&self, sql: &str) -> Result<Option<String>> {
+        if let Some(rewritten) = self.rewrite_at_at(sql).await? {
+            return Ok(Some(rewritten));
+        }
+        self.rewrite_like(sql).await
+    }
+
+    /// The `@@`/`ts_rank` rewrite (Spec B §4.2/§4.3): union the matching FULLTEXT
+    /// index's live segment and (if durable) its durable splits, live authoritative
+    /// for any pk it covers. `Ok(None)` when the SQL has no `@@`.
+    async fn rewrite_at_at(&self, sql: &str) -> Result<Option<String>> {
         let Some(pred) = extract_fts_predicate(sql)? else {
             return Ok(None);
         };
@@ -523,6 +537,49 @@ impl FtsEngine {
 
         let merged = union_hits(&segment, durable.as_deref(), durable_body_field, &pred).await?;
         rewrite_fts_query(sql, &pk_column, &PrecomputedSearcher { hits: merged }).await
+    }
+
+    /// The trigram-accelerated `LIKE '%lit%'` rewrite (Spec B §4.6). When `sql` is
+    /// a clean ≥3-char infix LIKE AND a `Trigram`-kind def exists for the column,
+    /// trigram-search the literal and add a `pk IN (candidates)` prefilter while
+    /// keeping the original `LIKE` as gluesql's authoritative verify (so a
+    /// candidate-set bug can only over-include, never drop a real match). `Ok(None)`
+    /// (pass-through) for any other LIKE shape or when no trigram index is declared.
+    async fn rewrite_like(&self, sql: &str) -> Result<Option<String>> {
+        let Some(pred) = extract_like_predicate(sql)? else {
+            return Ok(None);
+        };
+        // Resolve the TRIGRAM def for (table, column). No trigram def → pass-through.
+        let (segment, durable, durable_body_field, pk_column) = {
+            let idx = self.indexes.read().unwrap();
+            match idx
+                .get(&pred.table)
+                .and_then(|v| v.iter().find(|d| d.column == pred.column && d.kind == IndexKind::Trigram))
+            {
+                Some(def) => (
+                    def.segment.clone(),
+                    def.durable.clone(),
+                    def.durable_body_field,
+                    def.pk_column.clone(),
+                ),
+                None => return Ok(None),
+            }
+        };
+
+        // The candidate search: trigramize the literal into a Plain (AND-of-terms)
+        // predicate so EVERY trigram must match — a correct superset of the rows
+        // that contain the literal. `union_hits` masks stale durable hits via the
+        // live `covered()` set, so candidates stay a superset across seals.
+        let tpred = FtsPredicate {
+            table: pred.table.clone(),
+            column: pred.column.clone(),
+            config: "whitespace".into(),
+            query: trigramize(&pred.literal),
+            kind: TsQueryKind::Plain,
+        };
+        let merged = union_hits(&segment, durable.as_deref(), durable_body_field, &tpred).await?;
+        let candidates: Vec<i64> = merged.iter().map(|h| h.pk).collect();
+        rewrite_like_query(sql, &pk_column, &candidates)
     }
 
     /// Execute `sql`: rewrite `@@`/`ts_rank` against the live segment if present,
@@ -720,7 +777,6 @@ impl FtsSearcher for PrecomputedSearcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fts_sql::TsQueryKind;
     use bluedb_sql::Database;
     use slatedb::object_store::memory::InMemory;
     use slatedb::Db;
