@@ -102,8 +102,9 @@ impl LakehouseEngine {
         Ok(())
     }
 
-    /// Enable mirroring for `table` (persisted). Backfill of pre-existing rows
-    /// lands in a later task; this records intent and updates the CDC control.
+    /// Enable mirroring for `table` (persisted), then **backfill** any rows that
+    /// already exist (committed before CDC was on) into Iceberg as one snapshot,
+    /// so the mirror starts complete and subsequent CDC layers on top.
     pub async fn enable_table(&self, table: &str) -> Result<()> {
         self.cdc.set_table(table, true);
         self.state
@@ -111,7 +112,40 @@ impl LakehouseEngine {
             .unwrap()
             .tables
             .insert(table.to_string(), true);
-        self.persist_registry().await
+        self.persist_registry().await?;
+        self.backfill(table).await
+    }
+
+    /// Publish a table's current rows as one Iceberg snapshot. A no-op if the
+    /// table doesn't exist or is empty. Used by [`Self::enable_table`].
+    async fn backfill(&self, table: &str) -> Result<()> {
+        let Some(schema) = self.try_fetch_schema(table).await? else {
+            return Ok(()); // table not created yet — nothing to backfill
+        };
+        let rows = self.scan_all_rows(table).await?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let sample_rows: Vec<&[gluesql_core::data::Value]> = rows
+            .iter()
+            .filter_map(|(_, row)| match row {
+                DataRow::Vec(vals) => Some(vals.as_slice()),
+                DataRow::Map(_) => None,
+            })
+            .collect();
+        // Watermark = current max CDC sequence, so the snapshot reflects state up
+        // to now and later seals (higher sequences) layer on cleanly.
+        let watermark = self
+            .db
+            .scan_cdc(0)
+            .await?
+            .last()
+            .map(|(seq, _)| *seq)
+            .unwrap_or(0);
+        let mut writer = self.writer_for(table, &schema, &sample_rows).await?;
+        writer.upsert(&rows).await?;
+        writer.commit_snapshot(watermark).await?;
+        Ok(())
     }
 
     /// Disable mirroring for `table` (persisted).
@@ -258,10 +292,34 @@ impl LakehouseEngine {
 
     /// Fetch a table's gluesql schema through a read connection.
     pub async fn fetch_schema(&self, table: &str) -> Result<gluesql_core::data::Schema> {
-        let conn = self.db.connection();
-        conn.fetch_schema(table)
-            .await
-            .map_err(|e| LakehouseError::Sql(bluedb_sql::SqlError::Serde(e.to_string())))?
+        self.try_fetch_schema(table)
+            .await?
             .ok_or_else(|| LakehouseError::Schema(format!("table '{table}' not found")))
     }
+
+    /// Fetch a table's schema, or `None` if it doesn't exist.
+    async fn try_fetch_schema(&self, table: &str) -> Result<Option<gluesql_core::data::Schema>> {
+        self.db
+            .connection()
+            .fetch_schema(table)
+            .await
+            .map_err(glue_err)
+    }
+
+    /// Read every current row of `table` (engine-internal scan — guardrail-exempt,
+    /// since the seal path must read full tables for backfill/compaction).
+    async fn scan_all_rows(
+        &self,
+        table: &str,
+    ) -> Result<Vec<(gluesql_core::data::Key, DataRow)>> {
+        use futures::TryStreamExt;
+        let conn = self.db.connection();
+        let iter = conn.scan_data(table).await.map_err(glue_err)?;
+        iter.try_collect::<Vec<_>>().await.map_err(glue_err)
+    }
+}
+
+/// Map a gluesql execution error into a [`LakehouseError`].
+fn glue_err(e: gluesql_core::error::Error) -> LakehouseError {
+    LakehouseError::Sql(bluedb_sql::SqlError::Serde(e.to_string()))
 }

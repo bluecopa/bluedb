@@ -26,10 +26,10 @@ async fn engine(root: &str, db: Database, cdc: CdcConfig) -> LakehouseEngine {
         .unwrap()
 }
 
-/// Read the `docs` mirror back as id -> body (columns by index: 0=id, 1=body).
-async fn read_docs(engine: &LakehouseEngine) -> BTreeMap<i64, String> {
-    let schema = engine.fetch_schema("docs").await.unwrap();
-    let writer = engine.writer_for("docs", &schema, &[]).await.unwrap();
+/// Read a `(id BIGINT, body TEXT)` mirror back as id -> body (columns by index).
+async fn read_table(engine: &LakehouseEngine, table: &str) -> BTreeMap<i64, String> {
+    let schema = engine.fetch_schema(table).await.unwrap();
+    let writer = engine.writer_for(table, &schema, &[]).await.unwrap();
     let table = writer.to_table().unwrap();
     let batches: Vec<RecordBatch> = table
         .scan()
@@ -107,14 +107,14 @@ async fn seal_publishes_final_state_then_gcs() {
 
     eng.seal().await.unwrap();
 
-    let rows = read_docs(&eng).await;
+    let rows = read_table(&eng, "docs").await;
     assert_eq!(rows.len(), 1, "id=2 deleted");
     assert_eq!(rows.get(&1).map(String::as_str), Some("c"), "id=1 updated");
 
     // The log is GC'd through the sealed watermark; sealing again is a no-op.
     assert!(db.scan_cdc(0).await.unwrap().is_empty());
     eng.seal().await.unwrap();
-    assert_eq!(read_docs(&eng).await.len(), 1, "no-op seal changes nothing");
+    assert_eq!(read_table(&eng, "docs").await.len(), 1, "no-op seal changes nothing");
 }
 
 /// Does the Iceberg table exist yet (version-hint present)?
@@ -153,7 +153,7 @@ async fn seal_loop_fires_on_commit_and_skips_idle() {
     }
     let mut sealed = false;
     for _ in 0..60 {
-        if table_exists(&root).await && read_docs(&eng).await.get(&1).map(String::as_str) == Some("a")
+        if table_exists(&root).await && read_table(&eng, "docs").await.get(&1).map(String::as_str) == Some("a")
         {
             sealed = true;
             break;
@@ -162,4 +162,31 @@ async fn seal_loop_fires_on_commit_and_skips_idle() {
     }
     handle.abort();
     assert!(sealed, "seal loop should publish the row shortly after commit");
+}
+
+#[tokio::test]
+async fn enable_backfills_preexisting_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    let db = make_db("backfill").await;
+    let cdc = CdcConfig::default();
+    let eng = engine(root, db.clone(), cdc.clone()).await;
+
+    // Rows written with CDC OFF (plain connection): no CDC entries recorded.
+    {
+        let mut g = Glue::new(db.connection_serialized());
+        g.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT);")
+            .await
+            .unwrap();
+        g.execute("INSERT INTO docs VALUES (1,'a'),(2,'b'),(3,'c');")
+            .await
+            .unwrap();
+    }
+    assert!(db.scan_cdc(0).await.unwrap().is_empty(), "no CDC yet");
+
+    // Enabling mirrors the existing rows via a backfill scan (not CDC).
+    eng.enable_table("docs").await.unwrap();
+    let rows = read_table(&eng, "docs").await;
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows.get(&2).map(String::as_str), Some("b"));
 }
