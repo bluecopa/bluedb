@@ -1,6 +1,6 @@
 # bluedb — Production Readiness Roadmap
 
-Current state: **M1 (FTS) and M2 (SQL pillar) are both feature-complete** (`cargo test --workspace` 140 tests; `cargo clippy --workspace --all-targets` clean). The only remaining items are M1 ops-side niceties already covered by libraries (auto-compaction scheduling) and one M2 wiring follow-up (`bluedb-rest`→`bluedb-sql`). Working today:
+Current state: **M1 (FTS), M2 (SQL), M3 (engine + HTTP service), and the M4 single-writer core are complete**, and three follow-on tracks have merged to `dev`: **HTTP surface & write-path hardening (Spec A)**, **SQL-integrated full-text search (Spec B)**, and the **double-entry ledger** (`bluedb-ledger`) — see the dedicated sections below. `cargo test --workspace` is green (380 tests); `cargo clippy --workspace --all-targets` clean. Remaining is the **M4 deployment layer** (concrete lease store + cross-region replication/orchestration) plus the scoped follow-ups flagged per section (FTS regex `~`, ledger cluster-Jepsen, the docs-site build). Foundations working today:
 - ✅ `BlobStore` seam + `SlateDbBlobStore` (slatedb 0.13); durability proven across `Db` reopen; `BlobStoreMut` write seam; `ChunkedBlobStore` large-value layer.
 - ✅ Vendored Quickwit read path (Bundle/Storage/Hot/Caching directories) on the tantivy fork, bridged to `BlobStore`.
 - ✅ FTS: real indexer, lazy hotcache open, split manifest, multi-split BM25 search; **logical deletes (generation-scoped tombstones), incremental append, same-id update, and merge/compaction** (re-index live docs, physically drop the dead).
@@ -44,7 +44,7 @@ Items below marked ✅ are done; unchecked items remain. Ordered by build-order 
 - [x] **`bluedb-engine`** crate — unifies the pillars behind one facade the service wraps:
   - REST→SQL execution (`rest_sql`): a `bluedb-rest` DSL request → SQL → `bluedb-sql` `Glue::execute` → rows; `RestError` vs SQL error kept distinct in `EngineError`. *(carried from M2 follow-ups — done.)*
   - `FtsIndex` facade — ingest (`append`), in-place `update`, generation-scoped `delete`, `search`, and a policy-driven `maybe_compact` (load manifest+tombstones → `CompactionPolicy` → `Compactor` → persist → `gc_keys`) + `spawn_compaction_scheduler` background loop. Manifest read-modify-write serialized by an in-process write lock. *(carried from M1 follow-ups — done.)*
-- [x] The Rust service binary (`bluedb-server`): an **HTTP/REST API** over `bluedb-engine` (axum) — PostgREST-style CRUD (`GET`/`POST`/`PATCH`/`DELETE` over `/tables/{table}`, filters/order/limit in the query string, JSON bodies), a raw `/sql` admin endpoint (DDL + arbitrary queries), and `/health`. Each request draws a fresh isolated connection from a shared `Database`; `EngineError` maps to HTTP status (REST/SQL → 400, infra → 500). `build_app(state) -> Router` is testable via `oneshot` (no socket); `main` opens the `Db` (local FS or in-memory via env) and serves.
+- [x] The Rust service binary (`bluedb-server`): an **HTTP/REST API** over `bluedb-engine` (axum) — PostgREST-style CRUD (`GET`/`POST`/`PATCH`/`DELETE` over `/tables/{table}`, filters/order/limit in the query string, JSON bodies), a `/sql` endpoint (later split by Spec A into a parameterized `/sql` + an off-by-default `/admin/sql` — see the Spec A section), and `/health`. Each request draws a fresh isolated connection from a shared `Database`; `EngineError` maps to HTTP status (REST/SQL → 400, infra → 500). `build_app(state) -> Router` is testable via `oneshot` (no socket); `main` opens the `Db` (local FS or in-memory via env) and serves.
 - ~~PyO3 bindings / `fx_api` embedding / maturin~~ — **dropped** (2026-06-14): no Python embedding; the HTTP service is the integration surface.
 
 ## M4 — High availability
@@ -62,6 +62,33 @@ deployment layer behind the `LeaseProvider` seam.
 - [ ] **Active-passive multi-region** (RPO > 0): object-store cross-region replication (bucket config), gated promotion after "waiting out" the old lease to avoid cross-bucket split-brain, and consistency-aware recovery via SlateDB checkpoints on promotion. Orchestrated by an external operator/controller driving `/admin/promote`+`/admin/demote` (no Python/Temporal-in-fx_worker — that path was dropped). *(deployment layer + a checkpoint-recovery hook to add.)*
 - [ ] **Failback** — reverse replication + re-promote, via the same `/admin` control surface. *(runbook/ops.)*
 
+## HTTP surface & write-path hardening (Spec A) — **complete**
+
+- [x] **A1** — param-only data plane: `bluedb-rest` emits `$N` placeholders + a typed `Param` vec, the engine binds via `execute_with_params` — **injection-proof by construction**; array INSERT → server-wrapped `BEGIN..COMMIT` batch.
+- [x] **A2** — `flush_interval` knob (`BLUEDB_FLUSH_INTERVAL_MS`, default 25 ms; an open-time SlateDB `Settings` field, strong durability always — relaxed durability rejected).
+- [x] **A3a** — `/sql` = one **parameterized** non-DDL statement; `/admin/sql` = arbitrary SQL (off by default, audited). Closes the old unauthenticated arbitrary-`/sql` exposure.
+- [x] **A3b** — `/schema/*` structured JSON → validated DDL (identifier + type-keyword allow-lists; the client authors no SQL → injection-proof).
+- [x] **A3c** — per-route **bearer-token authz** scopes (`data:read`/`data:write`/`data:query`/`schema:admin`/`superuser`); enforced when `BLUEDB_AUTHZ_TOKENS` is set, open otherwise.
+- [x] **A4** — HTTP/2 (h2c) so one connection multiplexes many concurrent in-flight writes.
+
+## SQL-integrated full-text search (Spec B) — **built** (`feat/http-surface-and-fts`)
+
+- [x] **B1** — pre-parse rewrite of the Postgres FTS surface (`to_tsvector(…) @@ *_tsquery(…)`, `ts_rank`) → `pk IN (…)` + a rank-preserving `CASE` ordering (gluesql `translate` rejects `@@`, so the rewrite runs before it) + the `FtsSearcher` seam.
+- [x] **B2a** — in-memory tantivy `LiveSegment`: real BM25, NRT read-your-writes, update (delete-term-then-add) + tombstones, tsquery-kind → tantivy-query translation.
+- [x] **B2c** — SQL **commit tap** (`CommitObserver`/`RowChange` in `bluedb-sql`, fires after the durable write) → `FtsEngine` maintains the live index → **read-your-writes through SQL**.
+- [x] **B2b** — `CREATE FULLTEXT INDEX` via `POST /schema/.../fulltext-indexes` + `@@`/`ts_rank` over `/sql` (RYW over HTTP).
+- [x] **B4** — durable tier: union searcher (live ∪ durable splits, live's covered-set masks stale hits) + background **seal** (live→split) + persisted index-definition **registry** + **reopen** on restart + seal scheduler + server lifecycle wiring (`BLUEDB_FTS_SEAL_INTERVAL_MS`, bound on promote).
+- [x] **B3 (part 1)** — trigram index (pre-trigramized via the built-in whitespace analyzer; reuses the FTS machinery) + correctness-gated `col LIKE '%lit%'` acceleration (`pk IN` prefilter + gluesql's `LIKE` as the exact verify).
+- [ ] **B3 (part 2)** — regex `~`/`~*`/`!~` (designed; gluesql has no regex engine, so it needs an in-rewrite candidate-value fetch + Rust `regex` verify).
+- [ ] Cross-node FTS **failover replay** of the un-sealed live tail from the SQL watermark *(HA-M4 — one process owns the index today)*.
+- [ ] REST `?col=fts.<query>` DSL operator on `/tables` *(deferred)*.
+
+## Double-entry ledger (`bluedb-ledger`) — phases A–H **complete**
+
+- [x] **A–G** — TigerBeetle data-plane parity: typed `Account`/`Transfer` (u128), all flags, the full named result-code set in TB's exact validation order, two-phase transfers (pending/post/void) + apply-time timeout expiry, linked chains, balancing, closing, imported events, `id_already_failed` semantics. 107 engine tests.
+- [x] **H** — atomic **SQL projection** (rows dual-written into the SAME `WriteBatch` as the canonical postcard records, via `bluedb_sql::ProjectedTable`) + `/ledger/{accounts,transfers}` batched create (per-item result codes, u128 as JSON strings) + lookups + a Jepsen `ledger` workload (conservation Σdebits=Σcredits + accounting bounds).
+- [ ] Run the Jepsen `ledger` workload on a **live 3-node cluster** against the current group-commit write path *(today: in-process tests + `lein check` only; needs a `docker compose up -d --build` rebuild)*.
+
 ---
 
 ## Cross-cutting (advance alongside every milestone)
@@ -69,13 +96,13 @@ deployment layer behind the `LeaseProvider` seam.
 ### Storage / SlateDB
 - [x] Durability round-trip proven: reopen the `Db` and read after restart (`durability_survives_reopen` over `LocalFileSystem`). Note: WAL is on by default (no `wal_disable` feature); a bare put-then-drop is **not** guaranteed durable — an explicit `flush()`/`close()` is required for determinism.
 - [x] `Db` lifecycle management (`SlateDbBlobStore::open`/`open_local`/`open_in_memory`/`flush`/`shutdown`).
-- [ ] SlateDB settings tuned per workload (block cache / Foyer, flush interval, L0 SST size).
+- [ ] SlateDB settings tuned per workload — **`flush_interval` done** (Spec A2: `BLUEDB_FLUSH_INTERVAL_MS`, default 25 ms); block cache / Foyer + L0 SST size remain.
 - [x] Fix the `get_range` KV caveat — `ChunkedBlobStore` splits large values across ordered keys + manifest; range reads fetch only overlapping chunks. *(opt-in layer; not yet wired under the FTS/SQL read paths.)*
 
 ### Robustness
 - [ ] Typed error taxonomy at lib boundaries (replace stringly `anyhow`/`unwrap`/`expect`).
 - [ ] Handle corrupt/partial splits, missing keys, version/format mismatches.
-- [ ] Input validation; query timeouts; memory/result-size caps; backpressure.
+- [ ] Input validation — **identifier/type allow-listing + param-only (injection-proof) done** (Spec A1/A3); query timeouts, memory/result-size caps, backpressure remain.
 
 ### Observability
 - [ ] Tracing via OpenTelemetry (align with fx-runtime `core.observalibity`).
@@ -93,13 +120,13 @@ deployment layer behind the `LeaseProvider` seam.
 ### Security & multi-tenancy
 - [ ] Tenant isolation (keyspace boundaries; no cross-tenant reads).
 - [ ] Encryption at rest (object-store SSE) + in transit.
-- [ ] AuthZ integration with fx-runtime auth; audit logging.
+- [ ] AuthZ — **per-route bearer-token scopes + `/admin/sql` audit done** (Spec A3c); real-IdP integration with fx-runtime auth + structured audit log remain.
 - [ ] Data retention / deletion (compliance), tied to the hot-window strategy.
 
 ### Maintenance / supply chain
 - [ ] Vendored-fork update process: document the tantivy fork-rev pin + Quickwit vendor snapshot; procedure to bump and forward-port the 7 directory files.
 - [ ] `cargo deny`/`audit` for vulns + license compliance; lockfile discipline.
-- [ ] rustdoc API docs, usage examples, architecture docs.
+- [ ] Docs — README/ROADMAP cover all tracks; an **MkDocs Material site exists** (`docs.yml` + content on `sql-conformance-harness`) but the build workflow + `docs/` tree must land on `dev` for `bluecopa.github.io/bluedb` to publish (Pages source is `dev:/`, never built). rustdoc API docs + usage examples remain.
 
 ### Ops / deployment
 - [ ] Dockerfile; K8s manifests (Deployment, topology-spread, Lease RBAC).

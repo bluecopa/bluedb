@@ -6,17 +6,22 @@
 //! - [`bluedb_fts`] — BM25 full-text search + the index lifecycle pieces;
 //! - [`bluedb_storage`] — the SlateDB blob seam.
 //!
-//! `bluedb-engine` is the one crate that *composes* them, so the upcoming
-//! service binary and PyO3 bindings (M3) wrap a single surface instead of
-//! re-implementing the glue:
+//! `bluedb-engine` is the one crate that *composes* them, so the `bluedb-server`
+//! HTTP service wraps a single surface instead of re-implementing the glue:
 //!
 //! - [`rest_sql`] — run a REST DSL request end-to-end against a SQL connection
-//!   (translate → `Glue::execute` → rows). Closes the loop `bluedb-rest` leaves
-//!   open by design.
-//! - [`FtsIndex`] — a full-text engine facade over one logical index: ingest,
+//!   (translate → `Glue::execute` → rows), plus `execute_sql` for one
+//!   parameterized (`$N`) non-DDL statement.
+//! - [`FtsIndex`] — the durable full-text engine over one logical index: ingest,
 //!   delete/update, search, and a policy-driven compaction coordinator +
 //!   background scheduler (load manifest/tombstones → `CompactionPolicy` →
 //!   `Compactor` → persist → GC).
+//! - **SQL-integrated FTS** — [`fts_sql`] is the pre-parse rewrite that turns the
+//!   Postgres surface (`to_tsvector(…) @@ *_tsquery(…)`/`ts_rank`, and trigram
+//!   `LIKE`) into a `pk IN (…)` query gluesql can run; [`LiveSegment`] is the
+//!   in-memory tantivy NRT tier; and [`FtsEngine`] maintains it from a SQL commit
+//!   tap (read-your-writes), unions live ∪ durable splits, seals live→durable in
+//!   the background, and persists index definitions so they survive restart.
 //!
 //! Errors from any pillar fold into [`EngineError`].
 
