@@ -56,9 +56,12 @@ manage and pay for.
   statistics and strong file/row-group **pruning** in the warehouse. The
   operational and analytical clusterings are the same ordering. The mirror also
   declares a matching Iceberg **sort order** (on the key columns) so engines know.
-- **Compaction is memory-bounded.** A background worker rewrites a table's
-  small files into larger ones with deletes applied, streaming so peak memory is
-  ≈ one output file regardless of table size.
+- **Compaction is memory-bounded, and incremental.** A background worker keeps
+  the file count in check with two passes (see [Compaction](#compaction)): a
+  cheap **minor** pass that bin-packs only the small data files, and a periodic
+  **major** pass that rewrites the whole table to reclaim accumulated
+  equality-delete files. Both stream, so peak memory is ≈ one output file
+  regardless of table size.
 
 A **primary key is required** on every mirrored table (it keys the merge-on-read
 deletes) — which bluedb's [schema regime](../sql/query-guardrail.md) already
@@ -190,6 +193,33 @@ column to an already-materialized table. Dropping a primary-key (or composite-ke
 component) column is **rejected** — it is the merge-on-read identity and the
 clustering key.
 
+## Compaction
+
+Streaming the CDC log into snapshots produces many small files over time. A
+background worker keeps them in check with two complementary passes:
+
+- **Minor (incremental bin-pack)** — the frequent, cheap pass. It rewrites only
+  the **small** data files (those below the target size) into fewer larger ones,
+  leaving already-large files untouched, so its cost is proportional to the small
+  files, not the whole table. Merge-on-read is preserved: the equality deletes
+  that apply to the rewritten files are materialized into the output. Runs once a
+  table exceeds `BLUEDB_LAKEHOUSE_MAX_DATA_FILES` data files.
+- **Major (whole-table rewrite)** — the periodic pass that also **reclaims
+  equality-delete files**: it re-materializes the entire table into fresh data
+  files with all deletes applied, leaving zero delete files. Runs once a table
+  exceeds `BLUEDB_LAKEHOUSE_MAX_DELETE_FILES` delete files (the minor pass keeps
+  delete files around, since a delete may still target a surviving file).
+
+Both passes stream, so peak memory is ≈ one output file regardless of table size.
+
+Set the bin-pack **target file size** with a PRAGMA (durable per tenant, like the
+mirror flags); unset, it falls back to `BLUEDB_LAKEHOUSE_TARGET_FILE_BYTES` or a
+128 MiB default:
+
+```sql
+PRAGMA lakehouse_target_file_bytes = 134217728;   -- 128 MiB
+```
+
 ## Type mapping
 
 gluesql column types map to Iceberg types (see the
@@ -221,12 +251,16 @@ All optional; sensible defaults shown.
 | `BLUEDB_LAKEHOUSE_SEAL_DEBOUNCE_MS` | `2000` | coalesce a burst of commits this long before sealing |
 | `BLUEDB_LAKEHOUSE_SEAL_MAX_INTERVAL_MS` | `10000` | cap on how long a steady write stream delays a seal |
 | `BLUEDB_LAKEHOUSE_COMPACTION_INTERVAL_MS` | `60000` | how often the compaction worker runs |
-| `BLUEDB_LAKEHOUSE_MAX_DATA_FILES` | `8` | compact a table once it exceeds this many data files |
+| `BLUEDB_LAKEHOUSE_MAX_DATA_FILES` | `8` | minor-compact (bin-pack) a table once it exceeds this many data files |
+| `BLUEDB_LAKEHOUSE_MAX_DELETE_FILES` | `16` | major-compact (reclaim deletes) a table once it exceeds this many delete files |
+| `BLUEDB_LAKEHOUSE_TARGET_FILE_BYTES` | `134217728` | bin-pack target file size (default when no `PRAGMA lakehouse_target_file_bytes` is set) |
 
 ## Limitations (v1)
 
 - **Schema evolution** reconciles ADD/DROP/RENAME column (see
   [Schema evolution](#schema-evolution)); changing a column's *type* and adding a
   `LIST`/`MAP` column to an already-materialized table are not yet reconciled.
-- **Compaction rewrites the whole table** per run (correct and memory-bounded);
-  incremental bin-packed compaction is a planned optimization.
+- **Compaction** is incremental (minor bin-pack) plus a periodic major rewrite
+  (see [Compaction](#compaction)); delete-file reclamation happens only on the
+  major pass. Partition-aware bin-packing is out of scope (the mirror is
+  unpartitioned).

@@ -51,7 +51,9 @@ off until enabled with `PRAGMA lakehouse_mirror`.
 | `BLUEDB_LAKEHOUSE_SEAL_DEBOUNCE_MS` | `2000` | Coalesce a burst of commits this long before sealing |
 | `BLUEDB_LAKEHOUSE_SEAL_MAX_INTERVAL_MS` | `10000` | Cap on how long a steady write stream delays a seal |
 | `BLUEDB_LAKEHOUSE_COMPACTION_INTERVAL_MS` | `60000` | How often the compaction worker runs |
-| `BLUEDB_LAKEHOUSE_MAX_DATA_FILES` | `8` | Compact a table once it exceeds this many data files |
+| `BLUEDB_LAKEHOUSE_MAX_DATA_FILES` | `8` | Minor-compact (bin-pack small files) a table once it exceeds this many data files |
+| `BLUEDB_LAKEHOUSE_MAX_DELETE_FILES` | `16` | Major-compact (whole-table rewrite, reclaims delete files) once it exceeds this many delete files |
+| `BLUEDB_LAKEHOUSE_TARGET_FILE_BYTES` | `134217728` | Bin-pack target file size; default when no `PRAGMA lakehouse_target_file_bytes` is set |
 
 ## API surface & authorization
 

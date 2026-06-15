@@ -217,3 +217,45 @@ async fn drop_key_column_rejected_over_http() {
     let (s, body) = call(&app, "POST", "/admin/sql", Some(json!({"sql": "ALTER TABLE docs DROP COLUMN body"}))).await;
     assert!(s.is_success(), "drop non-key column: {s} {body}");
 }
+
+#[tokio::test]
+async fn target_file_bytes_pragma_accepted_over_http() {
+    let state = make_state().await;
+    let app = build_app(state.clone());
+
+    // The compaction target-size PRAGMA is accepted over /sql (intercepted before
+    // gluesql, like the mirror PRAGMA) and does not disturb mirroring.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "PRAGMA lakehouse_target_file_bytes = 1048576"})),
+    )
+    .await;
+    assert!(s.is_success(), "target pragma: {s} {body}");
+
+    let (s, _) = call(&app, "POST", "/sql", Some(json!({"sql": "PRAGMA lakehouse_mirror = on"}))).await;
+    assert!(s.is_success());
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/schema/tables",
+        Some(json!({
+            "name": "docs",
+            "columns": [
+                {"name": "id", "type": "INTEGER", "primary_key": true},
+                {"name": "body", "type": "TEXT"}
+            ]
+        })),
+    )
+    .await;
+    assert!(s.is_success(), "create table: {s}");
+    let (s, _) = call(&app, "POST", "/sql", Some(json!({"sql": "INSERT INTO docs VALUES (1, 'a')"}))).await;
+    assert!(s.is_success());
+    state.seal_now().await.expect("seal");
+
+    // Mirror still materializes through the REST catalog after setting the target.
+    let (s, load) = call(&app, "GET", "/catalog/v1/namespaces/default/tables/docs", None).await;
+    assert!(s.is_success(), "load table: {s} {load}");
+    assert!(load["metadata"].to_string().contains("\"id\""));
+}

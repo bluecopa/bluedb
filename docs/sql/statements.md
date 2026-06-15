@@ -193,6 +193,10 @@ See [Transactions](transactions.md) for isolation and concurrency details.
 
 - `SET default_null_order = 'nulls_first' | 'nulls_last'` — controls where
   `NULL`s sort in `ORDER BY` (see [Query syntax](query-syntax.md#order-by)).
+- `PRAGMA lakehouse_mirror[...]` and `PRAGMA lakehouse_target_file_bytes = <n>`
+  control the [Iceberg mirror](../lakehouse/iceberg-mirror.md) (mirroring on/off
+  per table or globally, and the compaction bin-pack target size). These are
+  **applied**, not no-ops.
 - Other engine-config `SET` / `PRAGMA` knobs are accepted as **no-ops** rather
   than rejected, so scripts written for other engines run unchanged.
 

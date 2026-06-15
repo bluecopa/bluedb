@@ -23,6 +23,7 @@ fn cfg() -> LakehouseConfig {
         seal_max_interval: Duration::from_secs(30),
         compaction_interval: Duration::from_secs(30),
         max_data_files: 1024,
+        max_delete_files: 1024,
     }
 }
 
