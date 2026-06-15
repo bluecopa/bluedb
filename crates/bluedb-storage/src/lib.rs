@@ -53,7 +53,7 @@ pub trait BlobStoreMut: BlobStore {
 }
 
 mod substrate;
-pub use substrate::Substrate;
+pub use substrate::{ReadView, Substrate};
 
 mod slatedb_backend;
 pub use slatedb_backend::SlateDbBlobStore;

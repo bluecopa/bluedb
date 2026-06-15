@@ -30,9 +30,9 @@ Start with the [Quickstart](docs/quickstart.md) and the
 | **Ledger** — TigerBeetle-style double-entry (typed accounts/transfers, two-phase, balances queryable over SQL) | [Ledger](docs/api/ledger.md) |
 | **Lakehouse mirror** — continuous **Apache Iceberg** mirror in the same bucket (full CRUD, seconds-fresh, exactly-once) + a read-only Iceberg REST catalog, so BigQuery/Databricks/Snowflake/DuckDB join bluedb data with no ETL | [Iceberg mirror](docs/lakehouse/iceberg-mirror.md) |
 | **Evidence chains** — append-only, **verifiable** log: server-assigned dense sequencing, RFC 6962 Merkle inclusion/consistency proofs (O(log N)), optional KMS-signed digests (ES256), GDPR-grade redaction | [Evidence chains](docs/evidence/chains.md) |
-| **Graph store** — native weighted-edge adjacency with traversal (`reachable`, `widest_path`); edges can be appended atomically with evidence events | [Graph store](docs/evidence/graph.md) |
+| **Graph store** — native weighted-edge adjacency with **snapshot-isolated** traversal (`reachable`, `widest_path`); edges append atomically with evidence events or rewire atomically via `mutate` | [Graph store](docs/evidence/graph.md) |
 | **High availability** — single-writer lease election + SlateDB epoch fencing, automatic failover (RPO 0 intra-region) | [Active-passive HA](docs/ha/active-passive.md) |
-| **Guarantees** — snapshot-isolated transactions, Jepsen-verified consistency | [Consistency](docs/guarantees/consistency.md) · [Jepsen](docs/guarantees/jepsen.md) |
+| **Guarantees** — snapshot-isolated transactions + graph traversal, Jepsen-verified consistency (set, evidence-chain, graph-swap workloads) | [Consistency](docs/guarantees/consistency.md) · [Jepsen](docs/guarantees/jepsen.md) |
 | **HTTP API** — `/tables` CRUD, `/sql`, `/schema/*` DDL, `/ledger/*`, `/evidence/*`, `/graph/*`, `/catalog/v1/*` | [REST API](docs/api/rest.md) · [Configuration](docs/deployment/configuration.md) |
 
 ## Repository layout
@@ -54,13 +54,17 @@ Start with the [Quickstart](docs/quickstart.md) and the
 
 M1–M4 core complete (FTS, SQL, engine + HTTP service, single-writer HA), plus the
 HTTP/write-path hardening, SQL-integrated FTS, the double-entry ledger, the
-schema regime (required PK + online ALTER + scan guardrail), and the Iceberg
+schema regime (required PK + online ALTER + scan guardrail), the Iceberg
 lakehouse mirror (all four v1 spike items shipped: multi-tenancy, composite PKs,
-schema-evolution reconciliation, incremental compaction). Consistency is
-Jepsen-verified on the live cluster against the post-group-commit write path, and
-the tri-cloud object store is exercised end-to-end (S3/Azure via emulators, GCS
-against real GCS). See [ROADMAP.md](ROADMAP.md). Remaining is the deployment layer
-(concrete shared lease store + cross-region orchestration).
+schema-evolution reconciliation, incremental compaction), and the evidence
+substrate (verifiable Merkle chains + native graph store with snapshot-isolated
+traversal). Consistency is Jepsen-verified on the live cluster against the
+post-group-commit write path — the `set` (durability), `evidence` (chain
+durability + dense gap-free seq), and `graph` (graph-traversal snapshot
+isolation) workloads are all `:valid? true` across crash / partition / pause +
+failover — and the tri-cloud object store is exercised end-to-end (S3/Azure via
+emulators, GCS against real GCS). See [ROADMAP.md](ROADMAP.md). Remaining is the
+deployment layer (concrete shared lease store + cross-region orchestration).
 
 ## Licensing
 

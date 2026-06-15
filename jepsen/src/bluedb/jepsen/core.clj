@@ -2,7 +2,7 @@
   "Jepsen test entry point for bluedb.
 
   Workloads (pick with --workload): set (default) | list-append | counter |
-  unique | ledger | evidence. Highlights:
+  unique | ledger | evidence | graph. Highlights:
 
   * `set` (default) — a grow-only set. Clients append unique ints through the
     active writer; a final read reads the whole set back. `set-full` proves every
@@ -31,6 +31,7 @@
   (:require [bluedb.jepsen.client :as bc]
             [bluedb.jepsen.counter :as bcnt]
             [bluedb.jepsen.evidence :as ev]
+            [bluedb.jepsen.graph :as gr]
             [bluedb.jepsen.http :as h]
             [bluedb.jepsen.ledger :as bl]
             [bluedb.jepsen.list-append :as la]
@@ -189,6 +190,24 @@
      :final-generator (gen/once {:type :invoke :f :read})
      :checker         (ev/checker)}))
 
+(defn- graph-workload
+  "Graph-traversal snapshot-isolation probe. The writer atomically swaps a tiny
+  diamond between config A (R→A→Z) and config B (R→B→Z); clients run
+  reachable(R) concurrently. Every acknowledged result must be one whole config
+  ({R,A,Z} or {R,B,Z}) — a torn (non-snapshot) traversal that scans R then the
+  bridge across a swap would drop the sink Z and be caught. No schema reset —
+  the graph name is namespaced per run; the client seeds config A in setup!."
+  [_opts]
+  (let [swap  (fn [] {:type :invoke :f :swap})
+        reach (fn [] {:type :invoke :f :reach})]
+    {:client          (gr/client)
+     ;; Bias toward reads but keep swaps frequent, so traversals constantly race
+     ;; an atomic rewire (the pause nemesis freezes a read across one).
+     :generator       (gen/mix [(repeatedly reach) (repeatedly reach)
+                                (repeatedly swap)])
+     :final-generator (gen/once {:type :invoke :f :reach})
+     :checker         (gr/checker)}))
+
 (defn bluedb-test
   [opts]
   (let [kind      (:nemesis opts "mix")
@@ -200,6 +219,7 @@
                      "unique"      unique-workload
                      "ledger"      ledger-workload
                      "evidence"    evidence-workload
+                     "graph"       graph-workload
                      set-workload)
                    opts)]
     (merge tests/noop-test
@@ -243,10 +263,10 @@
     :validate [#{"kill" "partition" "partition-half" "skew" "pause"
                  "arbiter" "arbiter-hard" "storage" "disk-full" "mix" "chaos" "none"}
                "unknown nemesis"]]
-   [nil "--workload NAME" "Workload: set | list-append | counter | unique | ledger | evidence"
+   [nil "--workload NAME" "Workload: set | list-append | counter | unique | ledger | evidence | graph"
     :default "set"
-    :validate [#{"set" "list-append" "counter" "unique" "ledger" "evidence"}
-               "must be set, list-append, counter, unique, ledger, or evidence"]]
+    :validate [#{"set" "list-append" "counter" "unique" "ledger" "evidence" "graph"}
+               "must be set, list-append, counter, unique, ledger, evidence, or graph"]]
    [nil "--consistency MODEL" "list-append model: serializable | strict-serializable"
     :default "serializable"
     :validate [#{"serializable" "strict-serializable"}
