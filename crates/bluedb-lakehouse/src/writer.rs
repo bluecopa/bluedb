@@ -31,10 +31,10 @@ use gluesql_core::store::DataRow;
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::io::FileIO;
 use iceberg::spec::{
-    DataContentType, DataFile, DataFileFormat, ManifestFile, ManifestListWriter,
-    ManifestWriterBuilder, NullOrder, Operation, Schema as IcebergSchema, SchemaRef, Snapshot,
-    SnapshotReference, SnapshotRetention, SortDirection, SortField, SortOrder, Summary,
-    TableMetadata, Transform, MAIN_BRANCH,
+    DataContentType, DataFile, DataFileFormat, ManifestContentType, ManifestFile,
+    ManifestListWriter, ManifestWriterBuilder, NullOrder, Operation, Schema as IcebergSchema,
+    SchemaRef, Snapshot, SnapshotReference, SnapshotRetention, SortDirection, SortField, SortOrder,
+    Summary, TableMetadata, Transform, MAIN_BRANCH,
 };
 use iceberg::table::Table;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
@@ -431,6 +431,95 @@ impl LakehouseWriter {
             }
         }
         Ok(count)
+    }
+
+    /// Scan a transient snapshot that references only `manifests` — a hand-picked
+    /// subset of the table's live manifest files (e.g. a compaction cohort's data
+    /// manifests plus the delete manifests) — returning the merged-on-read rows.
+    ///
+    /// This reuses iceberg-rust's own reader, so equality deletes are applied
+    /// (sequence-aware, from the carried-forward manifest entries) to just the
+    /// referenced data files. The only durable side effect is a throwaway
+    /// manifest-list `.avro`; the real table metadata is untouched. It is the
+    /// building block for incremental compaction: rewrite a cohort's *current*
+    /// rows without scanning (or disturbing) the rest of the table.
+    async fn scan_manifest_subset(
+        &self,
+        manifests: Vec<ManifestFile>,
+    ) -> Result<Vec<RecordBatch>> {
+        use futures::TryStreamExt;
+
+        let snapshot_id = fresh_snapshot_id(&self.metadata);
+        let next_seq = self.metadata.next_sequence_number();
+        let parent_id = self.metadata.current_snapshot_id();
+
+        let manifest_list_path = format!("{}/scoped-{snapshot_id}.avro", self.metadata_dir());
+        let mut mlw = ManifestListWriter::v2(
+            self.file_io.new_output(&manifest_list_path)?,
+            snapshot_id,
+            parent_id,
+            next_seq,
+        );
+        mlw.add_manifests(manifests.into_iter())?;
+        mlw.close().await?;
+
+        let summary = Summary {
+            operation: Operation::Replace,
+            additional_properties: std::collections::HashMap::new(),
+        };
+        let snapshot = Snapshot::builder()
+            .with_manifest_list(manifest_list_path)
+            .with_snapshot_id(snapshot_id)
+            .with_parent_snapshot_id(parent_id)
+            .with_sequence_number(next_seq)
+            .with_summary(summary)
+            .with_schema_id(self.metadata.current_schema_id())
+            .with_timestamp_ms(now_ms())
+            .build();
+
+        let current_md_loc = format!("{}/v{}.metadata.json", self.metadata_dir(), self.version);
+        let result = self
+            .metadata
+            .clone()
+            .into_builder(Some(current_md_loc))
+            .add_snapshot(snapshot)?
+            .set_ref(
+                MAIN_BRANCH,
+                SnapshotReference::new(snapshot_id, SnapshotRetention::branch(None, None, None)),
+            )?
+            .build()?;
+        let table = Table::builder()
+            .identifier(self.table_ident.clone())
+            .file_io(self.file_io.clone())
+            .metadata(result.metadata)
+            .build()?;
+        let batches = table
+            .scan()
+            .build()?
+            .to_arrow()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(batches)
+    }
+
+    /// The current snapshot's live manifest files, split into (data, delete) by
+    /// [`ManifestContentType`]. Empty when the table has no snapshot yet.
+    async fn live_manifest_files(&self) -> Result<(Vec<ManifestFile>, Vec<ManifestFile>)> {
+        let Some(snapshot) = self.metadata.current_snapshot() else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+        let metadata_ref = Arc::new(self.metadata.clone());
+        let list = snapshot.load_manifest_list(&self.file_io, &metadata_ref).await?;
+        let mut data = Vec::new();
+        let mut deletes = Vec::new();
+        for mf in list.entries() {
+            match mf.content {
+                ManifestContentType::Data => data.push(mf.clone()),
+                ManifestContentType::Deletes => deletes.push(mf.clone()),
+            }
+        }
+        Ok((data, deletes))
     }
 
     /// **Compaction** (spec §5.1): re-materialize the table's merged-on-read
@@ -837,6 +926,92 @@ fn to_i64(v: &Value) -> Option<i64> {
         Value::U16(n) => Some(*n as i64),
         Value::U32(n) => Some(*n as i64),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod scoped_scan_spike {
+    //! De-risk spike for incremental compaction: prove we can scan a transient
+    //! snapshot that references a hand-picked subset of manifest files, with the
+    //! reader applying equality deletes (sequence-aware) to just that subset.
+    use super::*;
+    use gluesql_core::data::Key;
+    use gluesql_core::store::DataRow;
+    use iceberg::spec::{NestedField, PrimitiveType, Schema as IcebergSchema, Type};
+
+    fn docs_schema() -> IcebergSchema {
+        IcebergSchema::builder()
+            .with_schema_id(0)
+            .with_identifier_field_ids(vec![1])
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::optional(2, "body", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .unwrap()
+    }
+
+    fn row(id: i64, body: &str) -> (Key, DataRow) {
+        (
+            Key::I64(id),
+            DataRow::Vec(vec![Value::I64(id), Value::Str(body.to_string())]),
+        )
+    }
+
+    async fn rows_of(batches: &[RecordBatch]) -> std::collections::BTreeMap<i64, String> {
+        use arrow_array::{Int64Array, StringArray};
+        let mut out = std::collections::BTreeMap::new();
+        for b in batches {
+            let ids = b.column_by_name("id").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
+            let bodies = b.column_by_name("body").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+            for i in 0..b.num_rows() {
+                out.insert(ids.value(i), bodies.value(i).to_string());
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn scoped_scan_applies_deletes_to_a_manifest_subset() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let mut w = LakehouseWriter::open_local(root, "main", "docs", docs_schema(), 1)
+            .await
+            .unwrap();
+
+        // Three commits → three data manifests + three delete manifests (each
+        // upsert stages an equality delete on its key).
+        w.upsert(&[row(1, "a")]).await.unwrap(); // seq 1
+        w.commit_snapshot(1).await.unwrap();
+        w.upsert(&[row(2, "b")]).await.unwrap(); // seq 2
+        w.commit_snapshot(2).await.unwrap();
+        w.upsert(&[row(1, "A")]).await.unwrap(); // seq 3 — updates key 1
+        w.commit_snapshot(3).await.unwrap();
+
+        // Full merged state is {1:"A", 2:"b"}.
+        let full = rows_of(&w.scan_manifest_subset({
+            let (mut d, mut del) = w.live_manifest_files().await.unwrap();
+            d.append(&mut del);
+            d
+        }).await.unwrap()).await;
+        assert_eq!(full.get(&1).map(String::as_str), Some("A"));
+        assert_eq!(full.get(&2).map(String::as_str), Some("b"));
+
+        // Cohort = every data manifest EXCEPT the newest (which holds (1,"A")),
+        // plus ALL delete manifests. The seq-3 delete on key 1 must still retire
+        // the old (1,"a") in the lower-seq data file we keep.
+        let (mut data, deletes) = w.live_manifest_files().await.unwrap();
+        let newest = data.iter().map(|m| m.sequence_number).max().unwrap();
+        data.retain(|m| m.sequence_number != newest); // drop the (1,"A") manifest
+        let mut cohort = data;
+        cohort.extend(deletes);
+
+        let scoped = rows_of(&w.scan_manifest_subset(cohort).await.unwrap()).await;
+        // (1,"A") absent (its manifest omitted); (1,"a") absent (seq-3 delete
+        // applied); (2,"b") present. Proves subset scoping AND delete application.
+        assert_eq!(scoped.len(), 1, "scoped = {scoped:?}");
+        assert_eq!(scoped.get(&2).map(String::as_str), Some("b"));
+        assert_eq!(scoped.get(&1), None);
     }
 }
 
