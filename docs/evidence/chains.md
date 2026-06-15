@@ -194,9 +194,14 @@ returns `501 Not Implemented` unless signing is enabled (see
   "timestamp": 1718500000000,
   "alg": "ES256",
   "key_id": "vault:transit:evidence",
+  "key_version": 1,
   "signature": "MEUCIQ…(base64 ASN.1-DER)"
 }
 ```
+
+`key_version` is the Vault key version that produced the signature, so each STH
+stays attributable across key rotations (a rotated key signs new STHs under a
+higher version; older signatures still verify against their version's key).
 
 The signed bytes are the canonical, domain-separated, length-delimited framing
 of `(tenant, chain, size, root_hash, timestamp_ms)` — see
@@ -213,8 +218,10 @@ The SPKI-PEM public key for verifying signed digests. `501` if signing is off.
 Scope: `data:read`.
 
 ```json
-{ "key_id": "vault:transit:evidence", "alg": "ES256", "public_key": "-----BEGIN PUBLIC KEY-----\n…\n-----END PUBLIC KEY-----\n" }
+{ "key_id": "vault:transit:evidence", "alg": "ES256", "key_version": 1, "public_key": "-----BEGIN PUBLIC KEY-----\n…\n-----END PUBLIC KEY-----\n" }
 ```
+
+`key_version` is the current (latest) Vault key version backing this public key.
 
 ### `GET /evidence/{chain}/proof?seq&size` — inclusion proof
 
@@ -280,7 +287,10 @@ proof against a malicious operator — the operator could in principle serve a
 consistent but forged view.
 
 bluedb can now **sign** a verified chain's digest as a **Signed Tree Head**
-(ES256, key held in a KMS — see [Digest signing](#digest-signing)). A signed
+(ES256, key held in a KMS — see [Digest signing](#digest-signing)). bluedb
+itself never holds the private key; signing is delegated to the KMS, which also
+owns key rotation (the signed responses carry a `key_version` so signatures stay
+attributable across rotations). A signed
 digest gives **non-repudiation** (level 2): the operator cannot later deny, or
 retroactively rewrite, what it signed. A consumer that retains the signed
 digests it has seen and checks `consistency` between them detects any
@@ -298,22 +308,27 @@ bluedb. Anchoring remains out of scope (a consumer-side practice).
 ### Digest signing
 
 Signing is **opt-in, off by default**. When off, the signed-digest /
-signing-key endpoints return `501`. Configure via environment:
+signing-key endpoints return `501`. Signing is **KMS-only**: production never
+holds private key material — the only key-bearing mode is `vault`. Configure via
+environment:
 
 | Env var | Meaning |
 |---|---|
-| `BLUEDB_EVIDENCE_SIGNING` | `off` (default) · `local` · `vault` |
-| `BLUEDB_EVIDENCE_SIGNING_KEY_PEM_FILE` | (`local`) PKCS#8 PEM private key; if unset, an **ephemeral** key is generated (dev only) |
+| `BLUEDB_EVIDENCE_SIGNING` | `off` (default) · `vault` |
 | `VAULT_ADDR`, `VAULT_TOKEN` | (`vault`) Vault address + token |
 | `BLUEDB_EVIDENCE_VAULT_MOUNT` | (`vault`) Transit mount, default `transit` |
 | `BLUEDB_EVIDENCE_VAULT_KEY` | (`vault`) Transit key name (type `ecdsa-p256`) |
 
-The `local` backend signs in-process (dev / tests / air-gapped self-host); the
-key sits in process memory, so it is **not** production trust. Production uses
-the `vault` backend: the private key lives in **HashiCorp Vault Transit** and
-never reaches the server, which holds only a token + key name. Both produce
-identical ES256 ASN.1-DER signatures that verify against the published SPKI-PEM
-public key. Example Vault setup:
+The `vault` backend keeps the private key in **HashiCorp Vault Transit**: it
+never reaches the server, which holds only a Vault token + key name. bluedb thus
+holds **no private key material** of its own — key custody and rotation are the
+KMS's responsibility (the surfaced `key_version` makes each signature
+attributable across rotations). It produces ES256 ASN.1-DER signatures that
+verify against the published SPKI-PEM public key. An in-process signer exists
+**solely as a test fixture** (an ephemeral key injected by integration tests);
+it is **not** a configuration option and cannot be selected from any env var, so
+there is no config path by which bluedb generates or loads an in-process key.
+Example Vault setup:
 
 ```bash
 vault secrets enable transit
