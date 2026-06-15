@@ -240,6 +240,160 @@ async fn evidence_idempotency() {
 }
 
 #[tokio::test]
+async fn evidence_merkle_and_erasure_e2e() {
+    let (_, app) = promoted().await;
+
+    // --- Verified chain "v": append 5 events ---
+    for i in 0..5u32 {
+        let (s, body) = call(
+            &app,
+            "POST",
+            "/evidence/v/entries",
+            Some("tenant1"),
+            Some(json!({
+                "events": [{ "type": "ev", "payload_b64": B64.encode(format!("p{i}").as_bytes()) }]
+            })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "append v[{i}]: {s} {body}");
+    }
+
+    // GET /evidence/v/digest → size==5, root_hash is 64 lowercase hex chars.
+    let (s, body) = call(&app, "GET", "/evidence/v/digest", Some("tenant1"), None).await;
+    assert_eq!(s, StatusCode::OK, "digest: {s} {body}");
+    assert_eq!(body["size"], 5, "digest size: {body}");
+    let root_hash = body["root_hash"].as_str().expect("root_hash is string").to_string();
+    assert_eq!(root_hash.len(), 64, "root_hash must be 64 hex chars: {root_hash}");
+    assert!(root_hash.chars().all(|c| c.is_ascii_hexdigit()), "root_hash lowercase hex: {root_hash}");
+    let digest_before = root_hash;
+
+    // GET /evidence/v/proof?seq=3 → audit_path non-empty.
+    let (s, body) = call(&app, "GET", "/evidence/v/proof?seq=3", Some("tenant1"), None).await;
+    assert_eq!(s, StatusCode::OK, "proof: {s} {body}");
+    let audit_path = body["audit_path"].as_array().expect("audit_path is array");
+    assert!(!audit_path.is_empty(), "audit_path should be non-empty for size=5: {body}");
+
+    // GET /evidence/v/consistency?from=2 → proof present.
+    let (s, body) = call(&app, "GET", "/evidence/v/consistency?from=2", Some("tenant1"), None).await;
+    assert_eq!(s, StatusCode::OK, "consistency: {s} {body}");
+    assert!(body["proof"].as_array().is_some(), "consistency proof field: {body}");
+
+    // POST /evidence/v/entries/3/redact → 200.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/evidence/v/entries/3/redact",
+        Some("tenant1"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "redact: {s} {body}");
+    assert_eq!(body["redacted"], true, "redact response: {body}");
+
+    // GET /evidence/v/entries?from=1&to=5 → 5 rows; seq=3 has redacted:true and no payload_b64.
+    let (s, body) = call(
+        &app,
+        "GET",
+        "/evidence/v/entries?from=1&to=5",
+        Some("tenant1"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "entries after redact: {s} {body}");
+    let rows = body.as_array().expect("entries array");
+    assert_eq!(rows.len(), 5, "5 rows: {body}");
+    let row3 = rows.iter().find(|r| r["seq"] == 3).expect("row seq=3");
+    assert_eq!(row3["redacted"], true, "seq=3 redacted: {row3}");
+    assert!(row3.get("payload_b64").is_none() || row3["payload_b64"].is_null(), "seq=3 no payload_b64: {row3}");
+
+    // GET /evidence/v/head → 5.
+    let (s, body) = call(&app, "GET", "/evidence/v/head", Some("tenant1"), None).await;
+    assert_eq!(s, StatusCode::OK, "head: {s} {body}");
+    assert_eq!(body["seq"], 5, "head still 5: {body}");
+
+    // GET /evidence/v/digest → root_hash unchanged (redaction keeps the digest).
+    let (s, body) = call(&app, "GET", "/evidence/v/digest", Some("tenant1"), None).await;
+    assert_eq!(s, StatusCode::OK, "digest after redact: {s} {body}");
+    assert_eq!(
+        body["root_hash"].as_str().unwrap(),
+        digest_before,
+        "digest must not change after redaction: {body}"
+    );
+
+    // --- Plain chain "p": PUT {verified:false}; digest → 400 E_NOT_VERIFIED ---
+    let (s, body) = call(
+        &app,
+        "PUT",
+        "/evidence/p",
+        Some("tenant1"),
+        Some(json!({ "verified": false })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "create plain chain: {s} {body}");
+
+    let (s, body) = call(&app, "GET", "/evidence/p/digest", Some("tenant1"), None).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "digest on plain chain: {s} {body}");
+    assert!(
+        body["error"].as_str().unwrap_or("").contains("E_NOT_VERIFIED"),
+        "E_NOT_VERIFIED message: {body}"
+    );
+
+    // --- DELETE /evidence/v/entries/1 (verified chain) → 409 E_VERIFIED_NO_DELETE ---
+    let (s, body) = call(
+        &app,
+        "DELETE",
+        "/evidence/v/entries/1",
+        Some("tenant1"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "hard-delete on verified: {s} {body}");
+    assert!(
+        body["error"].as_str().unwrap_or("").contains("E_VERIFIED_NO_DELETE"),
+        "E_VERIFIED_NO_DELETE message: {body}"
+    );
+
+    // --- Plain chain: append 2 events, then hard-delete seq 1 ---
+    for i in 0..2u32 {
+        let (s, body) = call(
+            &app,
+            "POST",
+            "/evidence/p/entries",
+            Some("tenant1"),
+            Some(json!({
+                "events": [{ "type": "plain", "payload_b64": B64.encode(format!("q{i}").as_bytes()) }]
+            })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "append p[{i}]: {s} {body}");
+    }
+
+    let (s, body) = call(
+        &app,
+        "DELETE",
+        "/evidence/p/entries/1",
+        Some("tenant1"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "hard-delete plain: {s} {body}");
+    assert_eq!(body["deleted"], true, "deleted response: {body}");
+
+    // GET /evidence/p/entries → seq 1 absent (gap); seq 2 present.
+    let (s, body) = call(&app, "GET", "/evidence/p/entries", Some("tenant1"), None).await;
+    assert_eq!(s, StatusCode::OK, "entries after delete: {s} {body}");
+    let rows = body.as_array().expect("entries array");
+    let seqs: Vec<i64> = rows.iter().map(|r| r["seq"].as_i64().unwrap()).collect();
+    assert!(!seqs.contains(&1), "seq 1 must be absent (gap): {seqs:?}");
+    assert!(seqs.contains(&2), "seq 2 must remain: {seqs:?}");
+
+    // GET /evidence/p/head → 2 (head unchanged by hard-delete).
+    let (s, body) = call(&app, "GET", "/evidence/p/head", Some("tenant1"), None).await;
+    assert_eq!(s, StatusCode::OK, "head plain: {s} {body}");
+    assert_eq!(body["seq"], 2, "plain head unchanged: {body}");
+}
+
+#[tokio::test]
 async fn evidence_negative_seq_params_rejected() {
     let (_, app) = promoted().await;
 

@@ -32,7 +32,23 @@ fn map_evidence_err(e: EvidenceError) -> AppError {
             AppError::service_unavailable("node is a read-only replica (not the active writer)")
         }
         EvidenceError::Storage(e) => AppError::internal(format!("evidence storage: {e}")),
+        EvidenceError::NotVerified(c) => {
+            AppError::bad_request(format!("E_NOT_VERIFIED: chain '{c}' is not a verified chain"))
+        }
+        EvidenceError::VerifiedNoDelete(c) => {
+            AppError::conflict(format!("E_VERIFIED_NO_DELETE: chain '{c}' is verified; cannot hard-delete"))
+        }
+        EvidenceError::InvalidArgument(m) => AppError::bad_request(m),
     }
+}
+
+fn hex32(b: &[u8; 32]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(64);
+    for x in b {
+        let _ = write!(s, "{x:02x}");
+    }
+    s
 }
 
 // --- PUT /evidence/{chain} --------------------------------------------------
@@ -216,4 +232,102 @@ pub async fn read_entries(
         .collect();
 
     Ok(Json(Value::Array(out)))
+}
+
+// --- POST /evidence/{chain}/entries/{seq}/redact ----------------------------
+
+/// Redact (blank the payload of) one entry. Requires `schema:admin`.
+pub async fn redact(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((chain, seq)): Path<(String, i64)>,
+) -> Result<Json<Value>, AppError> {
+    state.require_active()?;
+    state.authorize(&headers, Scope::SchemaAdmin)?;
+    let tenant = state.tenant(&headers)?;
+    state.evidence(&tenant).await?.redact(&chain, seq).await.map_err(map_evidence_err)?;
+    Ok(Json(json!({ "chain": chain, "seq": seq, "redacted": true })))
+}
+
+// --- DELETE /evidence/{chain}/entries/{seq} ---------------------------------
+
+/// Hard-delete one entry (plain chains only). Requires `schema:admin`.
+pub async fn hard_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((chain, seq)): Path<(String, i64)>,
+) -> Result<Json<Value>, AppError> {
+    state.require_active()?;
+    state.authorize(&headers, Scope::SchemaAdmin)?;
+    let tenant = state.tenant(&headers)?;
+    state.evidence(&tenant).await?.hard_delete(&chain, seq).await.map_err(map_evidence_err)?;
+    Ok(Json(json!({ "chain": chain, "seq": seq, "deleted": true })))
+}
+
+// --- GET /evidence/{chain}/digest -------------------------------------------
+
+/// Merkle digest `{ size, root_hash }` for a verified chain.
+pub async fn digest(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(chain): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    state.authorize(&headers, Scope::DataRead)?;
+    let tenant = state.tenant(&headers)?;
+    let d = state.evidence(&tenant).await?.digest(&chain).await.map_err(map_evidence_err)?;
+    Ok(Json(json!({ "size": d.size, "root_hash": hex32(&d.root) })))
+}
+
+// --- GET /evidence/{chain}/proof?seq&size -----------------------------------
+
+#[derive(Deserialize)]
+pub(crate) struct ProofQuery {
+    seq: i64,
+    size: Option<i64>,
+}
+
+/// Inclusion proof for `seq` against tree `size` (defaults to head).
+pub async fn inclusion(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(chain): Path<String>,
+    Query(q): Query<ProofQuery>,
+) -> Result<Json<Value>, AppError> {
+    state.authorize(&headers, Scope::DataRead)?;
+    let tenant = state.tenant(&headers)?;
+    let p = state
+        .evidence(&tenant)
+        .await?
+        .inclusion(&chain, q.seq, q.size)
+        .await
+        .map_err(map_evidence_err)?;
+    let path: Vec<String> = p.audit_path.iter().map(hex32).collect();
+    Ok(Json(json!({ "seq": p.seq, "size": p.size, "audit_path": path })))
+}
+
+// --- GET /evidence/{chain}/consistency?from&to ------------------------------
+
+#[derive(Deserialize)]
+pub(crate) struct ConsistencyQuery {
+    from: i64,
+    to: Option<i64>,
+}
+
+/// Consistency proof between sizes `from` and `to` (defaults to head).
+pub async fn consistency(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(chain): Path<String>,
+    Query(q): Query<ConsistencyQuery>,
+) -> Result<Json<Value>, AppError> {
+    state.authorize(&headers, Scope::DataRead)?;
+    let tenant = state.tenant(&headers)?;
+    let c = state
+        .evidence(&tenant)
+        .await?
+        .consistency(&chain, q.from, q.to)
+        .await
+        .map_err(map_evidence_err)?;
+    let proof: Vec<String> = c.proof.iter().map(hex32).collect();
+    Ok(Json(json!({ "first": c.first, "second": c.second, "proof": proof })))
 }

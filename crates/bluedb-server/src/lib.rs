@@ -631,6 +631,11 @@ pub fn build_app(state: AppState) -> Router {
             post(evidence_api::append).get(evidence_api::read_entries),
         )
         .route("/evidence/{chain}/head", get(evidence_api::head))
+        .route("/evidence/{chain}/entries/{seq}/redact", post(evidence_api::redact))
+        .route("/evidence/{chain}/entries/{seq}", delete(evidence_api::hard_delete))
+        .route("/evidence/{chain}/digest", get(evidence_api::digest))
+        .route("/evidence/{chain}/proof", get(evidence_api::inclusion))
+        .route("/evidence/{chain}/consistency", get(evidence_api::consistency))
         // Read-only Iceberg REST Catalog for warehouse discovery (Phase 5).
         .route("/catalog/v1/config", get(catalog::config))
         .route("/catalog/v1/namespaces", get(catalog::list_namespaces))
