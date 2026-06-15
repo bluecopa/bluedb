@@ -84,6 +84,25 @@ pub(crate) async fn get_entry(
     }
 }
 
+/// Point read of the canonical edge weight for `(graph, src, dst, etype)`,
+/// or `None` if the edge does not exist. The canonical value is `weight_obe`.
+pub(crate) async fn get_edge_weight(
+    substrate: &Substrate,
+    ks: &EvidenceKeyspace,
+    graph: &str,
+    src: &str,
+    dst: &str,
+    etype: &str,
+) -> Result<Option<i64>> {
+    match substrate.get(&ks.graph_edge_key(graph, src, dst, etype)).await? {
+        Some(b) => {
+            let arr: [u8; 8] = b.as_ref().try_into().context("edge weight must be 8 bytes")?;
+            Ok(Some(crate::keyspace::weight_from_obe(&arr)))
+        }
+        None => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,5 +158,16 @@ mod tests {
         let bytes = encode(&meta).unwrap();
         let back: ChainMeta = decode(&bytes).unwrap();
         assert_eq!(meta, back);
+    }
+
+    #[tokio::test]
+    async fn get_edge_weight_absent_then_present() {
+        let database = writer_database().await;
+        let substrate = database.substrate();
+        let ks = EvidenceKeyspace::new("acme");
+        assert_eq!(get_edge_weight(&substrate, &ks, "g", "u", "v", "").await.unwrap(), None);
+        let writer = substrate.require_writer().unwrap();
+        writer.put(&ks.graph_edge_key("g", "u", "v", ""), &crate::keyspace::weight_obe(-7)).await.unwrap();
+        assert_eq!(get_edge_weight(&substrate, &ks, "g", "u", "v", "").await.unwrap(), Some(-7));
     }
 }
