@@ -102,12 +102,13 @@ Continuously mirrors bluedb tables into Apache **Iceberg** in the same bucket so
 
 ---
 
-## Evidence substrate (`bluedb-evidence`) — **complete** (merged, PR #8); hardening pending PR
+## Evidence substrate (`bluedb-evidence`) — **complete** (merged: core PR #8, hardening PR #9, KMS-only PR #12, Jepsen PR #13)
 
-- [x] Append-only **verifiable evidence chains**: server-assigned dense gap-free `seq`, idempotency, durability-before-ack, per-chain verified/plain mode; **RFC 6962 Merkle** (digest + inclusion + consistency proofs, client-side verification); **erasure** (redaction crypto-shred keeping `leaf_hash` + plain-chain hard-delete); HTTP `/evidence/*`; multi-tenant.
-- [x] Native **graph store**: directed weighted typed edges with out/in adjacency, **append-with-edges** (graph = reproducible projection of the chain), edges API, **traversal** (`reachable`, `widest_path`), drop-graph; HTTP `/graph/*`.
-- [x] **Hardening (v1.1 — `feat/evidence-hardening`, reviewed-clean, pending PR):** **O(log N)** inclusion/consistency proofs (persisted complete-subtree node store); **parallel** BFS frontier expansion in `reachable`; **KMS-only digest signing** (ES256 Signed Tree Heads — HashiCorp Vault Transit; **no in-process keys** — bluedb holds only a Vault token + key name, the in-process signer is a test fixture only) for **non-repudiation**, with key rotation delegated to the KMS (the signing key version, `key_version`, is surfaced on signed responses).
-- [ ] **External anchoring / witnessing** — level-3 equivocation defense (gossip STHs between consumers, or anchor `{size, root_hash}` outside bluedb); snapshot-consistent traversal; redaction of `type`/`at`.
+- [x] Append-only **verifiable evidence chains**: server-assigned dense gap-free `seq`, idempotency, durability-before-ack, per-chain verified/plain mode; **RFC 6962 Merkle** (digest + inclusion + consistency proofs, client-side verification); **erasure** (redaction crypto-shred keeping `leaf_hash` + plain-chain hard-delete); HTTP `/evidence/*`; multi-tenant. **Jepsen-validated** (`evidence` workload — no acked loss + dense gap-free `1..N` seq across kill/partition/mix).
+- [x] Native **graph store**: directed weighted typed edges with out/in adjacency, **append-with-edges** (graph = reproducible projection of the chain), edges API, **traversal** (`reachable`, `widest_path`), **atomic edge rewire** (`Graph::mutate` + `POST /graph/{graph}/mutate` — upserts + deletes in one batch), drop-graph; HTTP `/graph/*`.
+- [x] **Hardening (v1.1 — merged PR #9 / KMS-only PR #12):** **O(log N)** inclusion/consistency proofs (persisted complete-subtree node store); **parallel** BFS frontier expansion in `reachable`; **KMS-only digest signing** (ES256 Signed Tree Heads — HashiCorp Vault Transit; **no in-process keys** — bluedb holds only a Vault token + key name, the in-process signer is a test fixture only) for **non-repudiation**, with key rotation delegated to the KMS (the signing key version, `key_version`, is surfaced on signed responses).
+- [x] **Snapshot-consistent traversal (`feat/evidence-snapshot-traversal`, pending PR):** every traversal pins one `ReadView` — a true MVCC snapshot on the active writer (`Db::snapshot`), the live reader on a replica — so its many scans observe a single consistent cut. **Jepsen-validated** (`graph` workload — atomic diamond swap vs concurrent `reachable`; 0 violations / 0 sink-drops over ~7,000 traversals racing ~2,700 swaps across pause/kill/partition/mix).
+- [ ] **External anchoring / witnessing** — level-3 equivocation defense (gossip STHs between consumers, or anchor `{size, root_hash}` outside bluedb); redaction of `type`/`at`.
 
 ---
 
@@ -134,7 +135,7 @@ Continuously mirrors bluedb tables into Apache **Iceberg** in the same bucket so
 - [x] Integration tests against real S3/GCS/Azure (not just `InMemory`) — `objstore_emulators.rs`: a real SlateDB round-trip (write → close → reopen → read, incl. conditional-put) per backend. **S3** (MinIO) + **Azure** (Azurite) via the emulator stack; **GCS** against **real GCS** (`gcs_real_round_trip`, env-gated — object_store's GCS XML API isn't fully served by local emulators).
 - [ ] Benchmarks: index throughput, query latency, rebuild time, memory — validate the ~100M-rows/year + rebuild-budget assumptions.
 - [ ] Fuzz the split parser.
-- [x] HA chaos/failover tests — real Jepsen suite (`jepsen/`): leader-aware client + docker-CLI nemesis; `set` workload × {none, kill, partition, mix, skew} all `:valid? true` / lost-count 0 on the live 3-node cluster, **re-verified on the post-group-commit write path** (2026-06-16). *(Remaining: port `list-append`/`counter`/`unique`/`ledger` to the schema regime; load/soak tests.)*
+- [x] HA chaos/failover tests — real Jepsen suite (`jepsen/`): leader-aware client + docker-CLI nemesis; `set` workload × {none, kill, partition, mix, skew} all `:valid? true` / lost-count 0 on the live 3-node cluster, **re-verified on the post-group-commit write path** (2026-06-16). Plus two evidence workloads live-validated (2026-06-16): **`evidence`** (chain durability + dense gap-free seq) and **`graph`** (graph-traversal **snapshot isolation** — atomic diamond swap vs concurrent `reachable`, 0 violations / 0 sink-drops across pause/kill/partition/mix). *(Remaining: port `list-append`/`counter`/`unique`/`ledger` to the schema regime; load/soak tests.)*
 - [ ] CI: build + test + `clippy -D warnings` + `fmt --check` + `cargo deny`.
 
 ### Security & multi-tenancy

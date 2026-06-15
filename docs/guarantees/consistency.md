@@ -19,7 +19,10 @@ acknowledged write.
   a racing `INSERT` of the same primary key succeeds at most once.
 - **Snapshot isolation** for transactional reads; explicit transactions are
   checked up to **strict-serializable** (see [Transactions &
-  isolation](transactions.md)).
+  isolation](transactions.md)). [Evidence graph traversals](../evidence/graph.md#consistency)
+  on the active writer are snapshot-isolated too — each pins one snapshot, so a
+  traversal sees a single consistent cut of the graph even under concurrent
+  edge rewrites.
 - **No split-brain.** If the lease arbiter or object store is unreachable, the
   writer self-fences and standbys decline to promote — the cluster goes
   *writer-less* (rejects writes) rather than admit two writers.

@@ -6,7 +6,7 @@ recorded history.
 
 ## What it checks
 
-Four workloads, pick with `--workload`:
+Six workloads, pick with `--workload`:
 
 **`set` (default) — grow-only set.** Clients append unique integers through the
 active writer; a final-read phase reads the whole set back. The `set-full`

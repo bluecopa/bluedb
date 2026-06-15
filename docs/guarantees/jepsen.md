@@ -15,6 +15,8 @@ and drives the [Docker Compose cluster](../deployment/local.md).
 | **`list-append`** | Each transaction is a `BEGIN; …; COMMIT;` of appends + reads, run as one explicit transaction | **Serializability** via Elle — flags G0/G1/G2, write skew, lost update; checked `serializable` or `strict-serializable` |
 | **`counter`** | Concurrent autocommit `UPDATE c SET n = n + 1` | **No lost updates** (no read below the count of acked increments) |
 | **`unique`** | Many clients race to `INSERT` the same fresh primary key | **No double-apply** (an id is acked at most once) |
+| **`evidence`** | Append-heavy load on one fresh [evidence chain](../evidence/chains.md); a final read reads the whole chain back | **No acked loss** + the server-assigned `seq` is **dense, gap-free, unique `1..N`** — durability-before-ack and the [R1 dense-sequence](../evidence/chains.md) invariant hold across failover |
+| **`graph`** | The writer atomically swaps a diamond between `R→A→Z` and `R→B→Z` via [`POST /graph/{g}/mutate`](../evidence/graph.md#post-graphgraphmutate-atomic-edge-rewire); clients run `reachable(R)` concurrently | **Snapshot isolation** for [graph traversal](../evidence/graph.md#consistency) — every traversal observes one *whole* config (`{R,A,Z}` or `{R,B,Z}`), the sink `Z` is never dropped; a non-snapshot read would tear mid-swap |
 
 In the set/list-append/counter workloads the cluster is driven as one logical
 writer whose identity moves on failover; the client discovers the active writer
@@ -78,11 +80,23 @@ Injected against the Compose stack via the `docker` CLI:
   failover, and **`strict-serializable`** under `kill` (adds real-time order,
   through crashes). Elle finds no G0/G1/G2, lost update, write skew, or
   incompatible-order anomaly on the explicit-transaction (`/admin/sql`) path.
+- **Evidence chain (2026-06-16):** the **`evidence`** workload is **`:valid?
+  true`** across `none` / `kill` / `partition` / `mix` on the live 3-node
+  cluster — **zero acked appends lost** and the server-assigned `seq` stayed
+  **dense, gap-free `1..N`** through ~22 leadership epochs. Durability-before-ack
+  and dense sequencing survive crash / partition / pause + failover.
+- **Graph-traversal snapshot isolation (2026-06-16):** the **`graph`** workload
+  is **`:valid? true`** across `pause` / `kill` / `partition` / `mix` — **0
+  violations, 0 sink-drops** over ~7,000 traversals racing ~2,700 atomic swaps,
+  leadership moving across ~29 epochs. Every traversal pinned one snapshot and
+  observed a single consistent cut; the sink was never dropped, even under
+  `pause` (which freezes a traversal between scans, straddling a swap). This
+  demonstrates [snapshot-consistent traversal](../evidence/graph.md#consistency).
 
 The dependency-fault results (`arbiter` / `storage` / `disk-full`) above were
 established before the schema regime landed; they are being re-run as the
-remaining workloads are ported (see the warning above). The `set` and
-`list-append` re-verifications are current.
+remaining workloads are ported (see the warning above). The `set`,
+`list-append`, `evidence`, and `graph` re-verifications are current.
 
 !!! note "Methodology"
     Fault windows straddle the lease TTL so failover completes inside each
@@ -99,8 +113,10 @@ Prerequisites: the cluster up (`docker compose up -d` from the repo root) and
 cd jepsen
 export LEIN_HOME="$PWD/.lein"
 NODES="--node node1 --node node2 --node node3"
-bin/lein run test --workload set --nemesis kill      --time-limit 120 $NODES
-bin/lein run test --workload set --nemesis partition --time-limit 120 $NODES
+bin/lein run test --workload set      --nemesis kill      --time-limit 120 $NODES
+bin/lein run test --workload set      --nemesis partition --time-limit 120 $NODES
+bin/lein run test --workload evidence --nemesis mix       --time-limit 180 $NODES
+bin/lein run test --workload graph    --nemesis pause     --time-limit 120 $NODES
 ```
 
 (Pass the `--node` flags explicitly — a shell that doesn't word-split an
