@@ -6,7 +6,7 @@ use bluedb_storage::Substrate;
 use serde::{de::DeserializeOwned, Serialize};
 
 use crate::keyspace::EvidenceKeyspace;
-use crate::model::{ChainMeta, EntryRecord, IdemRecord};
+use crate::model::{ChainMeta, EntryRecord, Frontier, IdemRecord};
 
 /// Encode a native record with `postcard`.
 pub(crate) fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
@@ -53,6 +53,19 @@ pub(crate) async fn get_idem(
     idem: &str,
 ) -> Result<Option<IdemRecord>> {
     match substrate.get(&ks.idem_key(chain, idem)).await? {
+        Some(b) => Ok(Some(decode(&b)?)),
+        None => Ok(None),
+    }
+}
+
+/// Point read of the Merkle frontier for `chain`, or `None` if the chain has no
+/// frontier yet (never appended-to as a verified chain).
+pub(crate) async fn get_frontier(
+    substrate: &Substrate,
+    ks: &EvidenceKeyspace,
+    chain: &str,
+) -> Result<Option<Frontier>> {
+    match substrate.get(&ks.merkle_key(chain)).await? {
         Some(b) => Ok(Some(decode(&b)?)),
         None => Ok(None),
     }

@@ -7,8 +7,9 @@ use bluedb_sql::{prefix_upper_bound, Keyspace, TAG_EXTERNAL_BASE};
 pub(crate) const TAG_EVIDENCE_ENTRY: u8 = TAG_EXTERNAL_BASE + 7; // 0x17
 pub(crate) const TAG_EVIDENCE_SEQ: u8 = TAG_EXTERNAL_BASE + 8; // 0x18
 pub(crate) const TAG_EVIDENCE_IDEM: u8 = TAG_EXTERNAL_BASE + 9; // 0x19
+pub(crate) const TAG_EVIDENCE_MERKLE: u8 = TAG_EXTERNAL_BASE + 10; // 0x1A
 pub(crate) const TAG_EVIDENCE_CHAIN: u8 = TAG_EXTERNAL_BASE + 11; // 0x1B
-// 0x1A (Merkle) and 0x1C-0x1E (graph) reserved for later plans.
+// 0x1C-0x1E (graph) reserved for later plans.
 
 /// Builds storage keys for evidence records within one tenant.
 pub(crate) struct EvidenceKeyspace {
@@ -63,6 +64,11 @@ impl EvidenceKeyspace {
     /// Key for the chain-level metadata record.
     pub(crate) fn chain_meta_key(&self, chain: &str) -> Vec<u8> {
         self.ks.external_key(TAG_EVIDENCE_CHAIN, &Self::chain_suffix(chain))
+    }
+
+    /// Key for the per-chain Merkle frontier (verified chains only).
+    pub(crate) fn merkle_key(&self, chain: &str) -> Vec<u8> {
+        self.ks.external_key(TAG_EVIDENCE_MERKLE, &Self::chain_suffix(chain))
     }
 }
 
@@ -123,9 +129,15 @@ mod tests {
         assert_ne!(seq, idem);
         assert_ne!(seq, meta);
         assert_ne!(idem, meta);
-        // Tags sort in order: ENTRY(0x17) < SEQ(0x18) < IDEM(0x19) < CHAIN(0x1B).
+        let merkle = ks.merkle_key("c");
+        assert_ne!(merkle, entry);
+        assert_ne!(merkle, seq);
+        assert_ne!(merkle, idem);
+        assert_ne!(merkle, meta);
+        // Tags sort in order: ENTRY(0x17) < SEQ(0x18) < IDEM(0x19) < MERKLE(0x1A) < CHAIN(0x1B).
         assert!(entry < seq);
         assert!(seq < idem);
-        assert!(idem < meta);
+        assert!(idem < merkle);
+        assert!(merkle < meta);
     }
 }

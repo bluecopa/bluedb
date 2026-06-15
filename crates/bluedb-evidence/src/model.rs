@@ -45,9 +45,26 @@ pub struct ChainMeta {
     pub verified: bool,
 }
 
+/// RFC 6962 incremental Merkle frontier: the ≤ log N perfect-subtree roots
+/// ("peaks") covering `size` leaves, ordered left→right (largest subtree first).
+/// Persisted per verified chain and advanced in the same WriteBatch as entries.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Frontier {
+    pub size: i64,
+    pub peaks: Vec<[u8; 32]>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frontier_roundtrips_through_postcard() {
+        let f = Frontier { size: 3, peaks: vec![[1u8; 32], [2u8; 32]] };
+        let bytes = postcard::to_allocvec(&f).unwrap();
+        let back: Frontier = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(f, back);
+    }
 
     #[test]
     fn entry_record_roundtrips_through_postcard() {
