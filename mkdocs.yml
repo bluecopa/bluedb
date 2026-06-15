@@ -64,6 +64,8 @@ nav:
       - Transactions: sql/transactions.md
       - Metadata: sql/metadata.md
       - Limitations & differences: sql/limitations.md
+  - Ledger:
+      - Overview: api/ledger.md
   - Guarantees:
       - Consistency model: guarantees/consistency.md
       - Transactions & isolation: guarantees/transactions.md
@@ -78,6 +80,6 @@ nav:
       - Configuration: deployment/configuration.md
   - Operations:
       - Administration: operations/admin.md
+      - Sizing & capacity: operations/sizing.md
   - API:
       - REST: api/rest.md
-      - Ledger: api/ledger.md

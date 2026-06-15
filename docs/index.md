@@ -51,6 +51,37 @@ flowchart TD
 - **[`bluedb-ha`](ha/active-passive.md)** — single-writer high availability:
   lease election, self-fencing, automatic failover.
 
+## Performance
+
+bluedb acks a write only once it's **durable** (`await_durable`), so write latency
+tracks the WAL flush interval (`BLUEDB_FLUSH_INTERVAL_MS`, default 25 ms) — and
+throughput **scales with the number of in-flight write clients**, because the lone
+writer's WAL group-commits every concurrent insert into a single flush. bluedb
+stays **single-writer**: the rows below are *N concurrent client connections*, each
+issuing back-to-back single-row autocommit `INSERT`s against the one writer node —
+not N writers. Measured on one node:
+
+| Concurrent clients | Inserts/sec | p50 | p99 |
+|--:|--:|--:|--:|
+| 1 | 37 | 27 ms | 29 ms |
+| 8 | 300 | 27 ms | 28 ms |
+| 32 | 1,200 | 27 ms | 29 ms |
+| 128 | 4,800 | 27 ms | 30 ms |
+| 256 | 9,600 | 27 ms | 31 ms |
+
+Latency stays flat at ≈ the flush interval regardless of load; throughput rises
+~linearly with concurrency. A bulk load wrapped in one `BEGIN…COMMIT` commits as a
+single `WriteBatch` — thousands of rows in one durable write. Writes survive
+kill/partition with **zero acked-write loss** ([Jepsen](guarantees/jepsen.md)). See
+**[Sizing & capacity](operations/sizing.md)** to turn this into a node count — how
+many concurrent clients a node sustains, and the writes/sec that implies.
+
+*Method & caveat:* single node, local-disk (SSD) backend, `flush_interval=25 ms`,
+strong durability. Networked object storage (S3/GCS/Azure) adds its PUT latency on
+top of each flush, so read these as a local upper bound — a full object-store +
+multi-node characterization is in progress. Reproduce with
+`cargo test --release -p bluedb-sql --test throughput_bench -- --ignored`.
+
 ## Start here
 
 - **[Quickstart](quickstart.md)** — run a local cluster and your first query.
