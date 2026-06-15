@@ -105,6 +105,23 @@ impl EvidenceKeyspace {
         push_lp(&mut s, etype);
         self.ks.external_key(TAG_GRAPH_IN, &s)
     }
+
+    /// Scan prefix for all out-edges of `(graph, src)`: every `graph_out_key`
+    /// for this node begins with this, then `weight_obe ‖ dst ‖ type`.
+    pub(crate) fn graph_out_prefix(&self, graph: &str, src: &str) -> Vec<u8> {
+        let mut s = Vec::new();
+        push_lp(&mut s, graph);
+        push_lp(&mut s, src);
+        self.ks.external_key(TAG_GRAPH_OUT, &s)
+    }
+
+    /// Scan prefix for all in-edges of `(graph, dst)`.
+    pub(crate) fn graph_in_prefix(&self, graph: &str, dst: &str) -> Vec<u8> {
+        let mut s = Vec::new();
+        push_lp(&mut s, graph);
+        push_lp(&mut s, dst);
+        self.ks.external_key(TAG_GRAPH_IN, &s)
+    }
 }
 
 /// Order-preserving big-endian encoding of a signed weight: flips the sign bit
@@ -220,6 +237,28 @@ mod tests {
         let a = EvidenceKeyspace::new("acme").graph_edge_key("g", "u", "v", "");
         let b = EvidenceKeyspace::new("globex").graph_edge_key("g", "u", "v", "");
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn out_prefix_is_exact_prefix_of_out_keys() {
+        let ks = EvidenceKeyspace::new("acme");
+        let p = ks.graph_out_prefix("g", "u");
+        let k1 = ks.graph_out_key("g", "u", 1, "v", "");
+        let k2 = ks.graph_out_key("g", "u", i64::MAX, "z", "t");
+        assert!(k1.starts_with(&p));
+        assert!(k2.starts_with(&p));
+        let other = ks.graph_out_key("g", "uu", 1, "v", "");
+        assert!(!other.starts_with(&p));
+        assert_eq!(&k1[p.len()..p.len() + 8], &weight_obe(1));
+    }
+
+    #[test]
+    fn in_prefix_is_exact_prefix_of_in_keys() {
+        let ks = EvidenceKeyspace::new("acme");
+        let p = ks.graph_in_prefix("g", "v");
+        let k = ks.graph_in_key("g", "v", 7, "u", "");
+        assert!(k.starts_with(&p));
+        assert_eq!(&k[p.len()..p.len() + 8], &weight_obe(7));
     }
 
     #[test]
