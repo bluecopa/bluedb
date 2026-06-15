@@ -39,6 +39,7 @@ use serde_json::{json, Map, Value};
 use tokio::sync::RwLock;
 
 pub mod authz;
+mod catalog;
 pub mod objstore;
 mod schema;
 
@@ -47,8 +48,9 @@ use bluedb_ha::{HaError, Status, WriterController};
 use bluedb_ledger::Ledger;
 
 mod ledger_api;
+use bluedb_lakehouse::{object_store_file_io, LakehouseEngine};
 use bluedb_rest::{parse_filters, DeleteRequest, InsertRequest, UpdateRequest};
-use bluedb_sql::{Database, SlateDbStorage};
+use bluedb_sql::{parse_lakehouse_pragma, CdcConfig, Database, SlateDbStorage};
 use gluesql_core::prelude::{Glue, Payload, Value as SqlValue};
 use slatedb::object_store::ObjectStore;
 use slatedb::{Db, DbReader, Settings};
@@ -87,6 +89,63 @@ fn parse_fts_seal_interval_ms(raw: Option<&str>) -> Duration {
 /// (default 30 s).
 fn fts_seal_interval() -> Duration {
     parse_fts_seal_interval_ms(std::env::var("BLUEDB_FTS_SEAL_INTERVAL_MS").ok().as_deref())
+}
+
+/// The Iceberg namespace the mirror publishes under (what the warehouse sees in
+/// the REST catalog). Single-tenant v1.
+const LAKEHOUSE_NAMESPACE: &str = "default";
+
+/// Object-storage key prefix under which the Iceberg mirror lives (alongside the
+/// SlateDB data in the same bucket). `BLUEDB_LAKEHOUSE_ROOT`, default `lakehouse`.
+fn lakehouse_root() -> String {
+    std::env::var("BLUEDB_LAKEHOUSE_ROOT")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "lakehouse".to_string())
+}
+
+/// Parse a millisecond env value into a `Duration`, falling back to `default_ms`.
+fn parse_ms(raw: Option<&str>, default_ms: u64) -> Duration {
+    Duration::from_millis(
+        raw.and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(default_ms),
+    )
+}
+
+/// Lakehouse seal debounce: coalesce a burst of commits this long before sealing.
+/// `BLUEDB_LAKEHOUSE_SEAL_DEBOUNCE_MS`, default 2 s (seconds-fresh mirror).
+fn lakehouse_seal_debounce() -> Duration {
+    parse_ms(
+        std::env::var("BLUEDB_LAKEHOUSE_SEAL_DEBOUNCE_MS").ok().as_deref(),
+        2_000,
+    )
+}
+
+/// Cap on how long a steady write stream delays a seal.
+/// `BLUEDB_LAKEHOUSE_SEAL_MAX_INTERVAL_MS`, default 10 s.
+fn lakehouse_seal_max_interval() -> Duration {
+    parse_ms(
+        std::env::var("BLUEDB_LAKEHOUSE_SEAL_MAX_INTERVAL_MS").ok().as_deref(),
+        10_000,
+    )
+}
+
+/// How often the compaction worker runs.
+/// `BLUEDB_LAKEHOUSE_COMPACTION_INTERVAL_MS`, default 60 s.
+fn lakehouse_compaction_interval() -> Duration {
+    parse_ms(
+        std::env::var("BLUEDB_LAKEHOUSE_COMPACTION_INTERVAL_MS").ok().as_deref(),
+        60_000,
+    )
+}
+
+/// Compact a table once its live data-file count exceeds this.
+/// `BLUEDB_LAKEHOUSE_MAX_DATA_FILES`, default 8.
+fn lakehouse_max_data_files() -> usize {
+    std::env::var("BLUEDB_LAKEHOUSE_MAX_DATA_FILES")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(8)
 }
 
 /// SlateDB `Settings` for the writer `Db`: bluedb's `flush_interval` default,
@@ -132,6 +191,24 @@ struct Inner {
     /// The background seal/compaction scheduler for the durable FTS engine, spawned
     /// on promote and aborted on demote / re-promote. `None` until the first promote.
     seal_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Shared CDC control for the lakehouse mirror — installed on every write
+    /// connection so mutations on mirror-enabled tables land in the CDC log, and
+    /// mutated by `PRAGMA lakehouse_mirror`. Lives for the node's lifetime so the
+    /// opt-out state is stable across role flips (the registry is the source of
+    /// truth, re-applied on each promote).
+    cdc: CdcConfig,
+    /// Fully-qualified storage base URI for the lakehouse (e.g. `s3://bucket`,
+    /// `file:///abs`). Empty = bare keys (in-memory). Makes the Iceberg
+    /// `metadata.json` a warehouse loads contain resolvable locations. Set at
+    /// startup via [`AppState::with_lakehouse_base`].
+    lakehouse_base: String,
+    /// The active lakehouse mirror engine: `Some` only while this node is the
+    /// active writer (reopened on promote over the writer's `Database` + the
+    /// object store, dropped on demote). A passive node mirrors nothing.
+    lakehouse: RwLock<Option<Arc<LakehouseEngine>>>,
+    /// The lakehouse seal loop + compaction worker handles, spawned on promote and
+    /// aborted on demote / re-promote.
+    lakehouse_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl AppState {
@@ -154,8 +231,24 @@ impl AppState {
                 authz: OnceLock::new(),
                 fts: RwLock::new(FtsEngine::new()),
                 seal_handle: Mutex::new(None),
+                cdc: CdcConfig::default(),
+                lakehouse_base: String::new(),
+                lakehouse: RwLock::new(None),
+                lakehouse_handles: Mutex::new(Vec::new()),
             }),
         }
+    }
+
+    /// Set the fully-qualified storage base URI the lakehouse mirror publishes
+    /// under (e.g. `s3://bucket`, `file:///abs/dir`), so the Iceberg metadata a
+    /// warehouse loads has resolvable locations. Must be called at startup,
+    /// before the `Arc<Inner>` is shared; `main` derives it from the object-store
+    /// config. No-op once the state is shared.
+    pub fn with_lakehouse_base(mut self, base: impl Into<String>) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.lakehouse_base = base.into();
+        }
+        self
     }
 
     /// Enable (or disable) `POST /admin/sql` (arbitrary SQL, audited). Returns
@@ -236,6 +329,43 @@ impl AppState {
         let handle = fts.clone().spawn_seal_scheduler(fts_seal_interval());
         *self.inner.seal_handle.lock().unwrap() = Some(handle);
         *self.inner.fts.write().await = fts;
+
+        // Reopen the lakehouse mirror over the SAME object store + writer database
+        // (the Iceberg tables live alongside the SQL data, in the same bucket the
+        // warehouse reads). Restores the durable opt-out registry, then spawns the
+        // event-driven seal loop + compaction worker.
+        // Publish under a fully-qualified base URI so the Iceberg metadata a
+        // warehouse loads has resolvable locations; the FileIO strips the base to
+        // recover object-store keys. Empty base (in-memory) → bare-key root.
+        let base = self.inner.lakehouse_base.clone();
+        let root = if base.is_empty() {
+            lakehouse_root()
+        } else {
+            format!("{base}/{}", lakehouse_root())
+        };
+        let file_io = object_store_file_io(self.inner.object_store.clone(), base);
+        let lakehouse = LakehouseEngine::reopen(
+            file_io,
+            root,
+            LAKEHOUSE_NAMESPACE,
+            database.clone(),
+            self.inner.cdc.clone(),
+        )
+        .await
+        .map_err(|e| AppError::internal(format!("reopen lakehouse: {e}")))?;
+        let lakehouse = Arc::new(lakehouse);
+        // Stop prior lakehouse handles (re-promote) before spawning fresh ones.
+        for h in self.inner.lakehouse_handles.lock().unwrap().drain(..) {
+            h.abort();
+        }
+        let seal = lakehouse
+            .clone()
+            .spawn_seal_loop(lakehouse_seal_debounce(), lakehouse_seal_max_interval());
+        let compact = lakehouse
+            .clone()
+            .spawn_compaction_worker(lakehouse_compaction_interval(), lakehouse_max_data_files());
+        *self.inner.lakehouse_handles.lock().unwrap() = vec![seal, compact];
+        *self.inner.lakehouse.write().await = Some(lakehouse);
         Ok(())
     }
 
@@ -259,6 +389,13 @@ impl AppState {
             h.abort();
         }
         *self.inner.fts.write().await = FtsEngine::new();
+        // Stop the lakehouse seal loop + compaction worker and drop the engine —
+        // a passive node mirrors nothing (the next promote reopens from the
+        // registry).
+        for h in self.inner.lakehouse_handles.lock().unwrap().drain(..) {
+            h.abort();
+        }
+        *self.inner.lakehouse.write().await = None;
         self.attach_reader().await;
         Ok(())
     }
@@ -320,12 +457,33 @@ impl AppState {
     async fn connection(&self) -> Result<SlateDbStorage, AppError> {
         let fts = self.inner.fts.read().await.clone();
         match self.inner.db.read().await.as_ref() {
-            Some(db) => Ok(db.connection_guarded().with_commit_observer(fts)),
+            Some(db) => Ok(db
+                .connection_guarded()
+                .with_cdc(self.inner.cdc.clone())
+                .with_commit_observer(fts)),
             None => Err(AppError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 message: "node has no database yet (no writer has been promoted)".to_string(),
             }),
         }
+    }
+
+    /// The active lakehouse engine, or `None` if this node isn't the writer.
+    pub(crate) async fn lakehouse(&self) -> Option<Arc<LakehouseEngine>> {
+        self.inner.lakehouse.read().await.clone()
+    }
+
+    /// Force the lakehouse mirror to seal pending changes into Iceberg now (a
+    /// no-op on a passive node). Useful before a graceful step-down and for
+    /// deterministic tests; the background loop seals on its own otherwise.
+    pub async fn seal_now(&self) -> Result<(), AppError> {
+        if let Some(engine) = self.inner.lakehouse.read().await.clone() {
+            engine
+                .seal()
+                .await
+                .map_err(|e| AppError::internal(format!("seal: {e}")))?;
+        }
+        Ok(())
     }
 
     /// Like [`Self::connection`] but the connection also serializes autocommit
@@ -338,6 +496,7 @@ impl AppState {
         match self.inner.db.read().await.as_ref() {
             Some(db) => Ok(db
                 .connection_serialized_guarded()
+                .with_cdc(self.inner.cdc.clone())
                 .with_commit_observer(fts)),
             None => Err(AppError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
@@ -405,6 +564,15 @@ pub fn build_app(state: AppState) -> Router {
         .route("/ledger/transfers", post(ledger_api::create_transfers))
         .route("/ledger/accounts/{id}", get(ledger_api::get_account))
         .route("/ledger/transfers/{id}", get(ledger_api::get_transfer))
+        // Read-only Iceberg REST Catalog for warehouse discovery (Phase 5).
+        .route("/catalog/v1/config", get(catalog::config))
+        .route("/catalog/v1/namespaces", get(catalog::list_namespaces))
+        .route("/catalog/v1/namespaces/{ns}", get(catalog::get_namespace))
+        .route("/catalog/v1/namespaces/{ns}/tables", get(catalog::list_tables))
+        .route(
+            "/catalog/v1/namespaces/{ns}/tables/{table}",
+            get(catalog::load_table),
+        )
         .with_state(state)
 }
 
@@ -452,6 +620,20 @@ async fn exec_sql(
 ) -> Result<Json<Value>, AppError> {
     state.authorize(&headers, authz::Scope::DataQuery)?;
     state.require_active()?;
+    // Intercept `PRAGMA lakehouse_mirror[...]` before gluesql (which would reject
+    // it): apply the opt-out/opt-in to the live engine and ack.
+    if let Some(pragma) = parse_lakehouse_pragma(&req.sql) {
+        match state.lakehouse().await {
+            Some(engine) => {
+                engine
+                    .apply_pragma(pragma)
+                    .await
+                    .map_err(|e| AppError::internal(format!("lakehouse pragma: {e}")))?;
+                return Ok(Json(json!({ "ok": true, "pragma": "lakehouse_mirror" })));
+            }
+            None => return Err(AppError::internal("lakehouse engine not bound")),
+        }
+    }
     let params = req.params.iter().map(json_to_param).collect::<Result<Vec<_>, _>>()?;
     let mut glue = Glue::new(state.connection_serialized().await?);
     // Route through the FTS engine: it rewrites `@@`/`ts_rank` against the live

@@ -108,9 +108,10 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use bluedb_storage::Substrate;
 
+use crate::cdc::{next_cdc_seq, CdcConfig, CdcEntry, CdcSeq};
 use crate::colcat::ColumnCatalog;
 use crate::error::SqlError;
-use crate::keyspace::{prefix_upper_bound, Keyspace, DEFAULT_TENANT};
+use crate::keyspace::{prefix_upper_bound, Keyspace, DEFAULT_TENANT, TAG_CDC};
 
 /// A shared **write lease** — the async mutex that serializes *explicit* write
 /// transactions across connections to one [`Db`]. Connections created from the
@@ -230,6 +231,13 @@ pub struct SlateDbStorage {
     /// [`CommitObserver::on_commit`] after the durable commit write. `None` by
     /// default → zero behavior change and no per-row clone cost.
     commit_observer: Option<Arc<dyn CommitObserver>>,
+    /// Optional lakehouse CDC control. When set, committed changes on
+    /// mirror-enabled tables are also written as [`CdcEntry`]s into the same
+    /// `WriteBatch` as the data (see `commit`). `None` → no CDC overhead.
+    cdc: Option<CdcConfig>,
+    /// Shared global CDC sequence counter (the one held by [`crate::Database`]),
+    /// used to stamp CDC entries at commit. Unused when `cdc` is `None`.
+    cdc_seq: CdcSeq,
     /// `Some` while a `BEGIN ... COMMIT/ROLLBACK` block is open.
     txn: Option<TxnState>,
 }
@@ -255,19 +263,21 @@ impl SlateDbStorage {
             Arc::new(Mutex::new(())),
             Arc::new(Mutex::new(())),
             Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(None)),
         )
     }
 
     /// Construct over any [`Substrate`] (writer or read replica), sharing the
-    /// `write_lease`, `insert_lock` and `seq` allocator. A reader substrate
-    /// yields a **read-only** connection: reads work, but writes and `BEGIN`
-    /// error (`require_writer`).
+    /// `write_lease`, `insert_lock`, `seq` allocator and `cdc_seq` counter. A
+    /// reader substrate yields a **read-only** connection: reads work, but writes
+    /// and `BEGIN` error (`require_writer`).
     pub(crate) fn with_substrate(
         substrate: Substrate,
         tenant: &str,
         write_lease: WriteLease,
         insert_lock: WriteLease,
         seq: SeqAllocator,
+        cdc_seq: CdcSeq,
     ) -> Self {
         Self {
             substrate,
@@ -278,8 +288,20 @@ impl SlateDbStorage {
             serialize_writes: false,
             strict: false,
             commit_observer: None,
+            cdc: None,
+            cdc_seq,
             txn: None,
         }
+    }
+
+    /// Enable the lakehouse CDC mirror on this connection: committed changes on
+    /// tables that `cdc` marks enabled are written as [`CdcEntry`]s into the same
+    /// atomic `WriteBatch` as the data (see `commit`). Pairs with
+    /// [`crate::Database::connection_with_cdc`], which also serializes writes so
+    /// read-modify-write updates are captured in full.
+    pub fn with_cdc(mut self, cdc: CdcConfig) -> Self {
+        self.cdc = Some(cdc);
+        self
     }
 
     /// Make autocommit statements on this connection serialize on the write lease
@@ -309,12 +331,21 @@ impl SlateDbStorage {
         self
     }
 
-    /// Buffer a row change for the commit observer, but only when one is
-    /// installed and a txn is active (gluesql always runs statements inside a
-    /// txn). The caller guards the (potentially cloning) call site on
-    /// `commit_observer.is_some()` so a non-observed commit pays nothing.
+    /// Does this connection need committed changes buffered for `table` — either
+    /// a [`CommitObserver`] is installed, or the CDC mirror is enabled for it?
+    /// Call sites guard the (cloning) `record_change` call on this so an
+    /// unobserved, non-mirrored commit pays nothing.
+    fn wants_changes(&self, table: &str) -> bool {
+        self.commit_observer.is_some()
+            || self.cdc.as_ref().is_some_and(|c| c.is_enabled(table))
+    }
+
+    /// Buffer a row change for the commit observer and/or the CDC log, when one
+    /// is wanted for `table` and a txn is active (gluesql always runs statements
+    /// inside a txn). The buffered changes are drained at `commit`: written into
+    /// the CDC namespace of the batch and/or handed to the observer.
     fn record_change(&mut self, table: &str, key: Key, row: Option<DataRow>) {
-        if self.commit_observer.is_none() {
+        if !self.wants_changes(table) {
             return;
         }
         if let Some(txn) = self.txn.as_mut() {
@@ -816,7 +847,9 @@ impl StoreMut for SlateDbStorage {
             // Index entries + the commit tap see the *logical* row (schema order).
             self.apply_index_entries(table_name, &key, &row, true)
                 .await?;
-            if self.commit_observer.is_some() {
+            // Commit tap: buffer the committed insert for the observer/CDC log
+            // (guarded so the clone only happens when a consumer wants it).
+            if self.wants_changes(table_name) {
                 self.record_change(table_name, key.clone(), Some(row.clone()));
             }
             // Persist the *physical* row (online-ALTER slot order) when a catalog
@@ -859,7 +892,7 @@ impl StoreMut for SlateDbStorage {
                 .await?;
             // Commit tap: buffer the committed insert/update (UPDATE re-inserts
             // the same key with the new row → the engine's `index()` supersedes).
-            if self.commit_observer.is_some() {
+            if self.wants_changes(table_name) {
                 self.record_change(table_name, key.clone(), Some(row.clone()));
             }
             // Persist the *physical* row (online-ALTER slot order) when a catalog
@@ -892,7 +925,7 @@ impl StoreMut for SlateDbStorage {
                     .await?;
             }
             // Commit tap: buffer the committed delete (row None).
-            if self.commit_observer.is_some() {
+            if self.wants_changes(table_name) {
                 self.record_change(table_name, key.clone(), None);
             }
             self.delete_key(storage_key).await?;
@@ -1000,7 +1033,38 @@ impl Transaction for SlateDbStorage {
                         None => batch.delete(key),
                     }
                 }
+                // Lakehouse CDC: append one entry per mirror-enabled change into
+                // the SAME batch as the data, stamped with a global monotonic
+                // sequence. Because it rides the one atomic `WriteBatch`, a CDC
+                // entry is durable iff its data row is — exactly-once capture for
+                // the seal loop. Default-tenant only for v1 (see `crate::cdc`).
+                let mut cdc_to_signal = None;
+                if let Some(cdc) = self.cdc.clone() {
+                    let mut wrote_cdc = false;
+                    for ch in &txn.changes {
+                        if !cdc.is_enabled(&ch.table) {
+                            continue;
+                        }
+                        let seq = next_cdc_seq(&self.cdc_seq, &self.substrate).await?;
+                        let entry = CdcEntry {
+                            table: ch.table.clone(),
+                            key: ch.key.clone(),
+                            row: ch.row.clone(),
+                        };
+                        let cdc_key = self.keyspace.external_key(TAG_CDC, &seq.to_be_bytes());
+                        batch.put(&cdc_key, &entry.encode()?);
+                        wrote_cdc = true;
+                    }
+                    if wrote_cdc {
+                        cdc_to_signal = Some(cdc);
+                    }
+                }
                 self.writer()?.write(batch).await.map_err(SqlError::from)?;
+                // Wake the lakehouse seal loop now that mirror-enabled changes are
+                // durable (event-driven freshness).
+                if let Some(cdc) = cdc_to_signal {
+                    cdc.signal_seal();
+                }
                 // Commit tap: the durable write succeeded → report the buffered
                 // changes. An observer thus never sees a change that didn't commit.
                 if let Some(obs) = self.commit_observer.as_ref() {

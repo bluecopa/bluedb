@@ -16,6 +16,7 @@ bluedb-ledger  = { path = "crates/bluedb-ledger" }
 bluedb-rest    = { path = "crates/bluedb-rest" }
 bluedb-engine  = { path = "crates/bluedb-engine" }
 bluedb-ha      = { path = "crates/bluedb-ha" }
+bluedb-lakehouse = { path = "crates/bluedb-lakehouse" }
 
 # --- external ---
 # tantivy MUST match the exact rev quickwit-oss/quickwit@main pins — the

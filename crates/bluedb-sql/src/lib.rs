@@ -61,6 +61,7 @@
 //! [`bluedb-storage`]: https://docs.rs/bluedb-storage
 //! [`bluedb-fts`]: https://docs.rs/bluedb-fts
 
+mod cdc;
 mod coerce;
 mod colcat;
 mod connection;
@@ -68,6 +69,7 @@ mod cte;
 mod error;
 mod guardrail;
 mod keyspace;
+mod lakehouse;
 mod nullorder;
 mod precheck;
 mod projection;
@@ -78,10 +80,12 @@ mod schema_rules;
 mod setops;
 mod storage;
 
+pub use cdc::{collapse_lww, CdcConfig, CdcEntry, CollapsedChanges};
 pub use connection::Database;
 pub use cte::{inline_ctes, inline_views, parse_create_view, parse_drop_view};
 pub use error::SqlError;
-pub use keyspace::{Keyspace, DEFAULT_TENANT, TAG_EXTERNAL_BASE};
+pub use keyspace::{Keyspace, DEFAULT_TENANT, TAG_CDC, TAG_EXTERNAL_BASE};
+pub use lakehouse::{parse_lakehouse_pragma, LhPragma};
 pub use nullorder::{parse_default_null_order, rewrite_null_order};
 pub use precheck::unsupported_reason;
 pub use projection::{ProjColumn, ProjValue, ProjectedTable};

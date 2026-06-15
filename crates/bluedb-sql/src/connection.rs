@@ -52,8 +52,9 @@ use bluedb_storage::Substrate;
 use slatedb::{Db, DbReader};
 use tokio::sync::Mutex;
 
+use crate::cdc::{cdc_seq_from_key, next_cdc_seq, CdcConfig, CdcEntry, CdcSeq};
 use crate::error::SqlError;
-use crate::keyspace::DEFAULT_TENANT;
+use crate::keyspace::{prefix_upper_bound, Keyspace, DEFAULT_TENANT, TAG_CDC};
 use crate::storage::{SeqAllocator, SlateDbStorage, WriteLease};
 
 /// A handle to one SlateDB database that vends isolated [`SlateDbStorage`]
@@ -66,6 +67,10 @@ pub struct Database {
     write_lease: WriteLease,
     insert_lock: WriteLease,
     seq: SeqAllocator,
+    /// Global, lazily-seeded CDC sequence counter, shared by every connection
+    /// vended from this handle so the lakehouse CDC log stays totally ordered
+    /// across them (see [`crate::cdc`]).
+    cdc_seq: CdcSeq,
 }
 
 impl Database {
@@ -89,7 +94,15 @@ impl Database {
             write_lease: Arc::new(Mutex::new(())),
             insert_lock: Arc::new(Mutex::new(())),
             seq: Arc::new(Mutex::new(HashMap::new())),
+            cdc_seq: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Allocate the next global CDC sequence (1-based, monotonic). Seeds lazily
+    /// from the persisted max on first use, so a freshly promoted writer
+    /// re-derives the counter from object storage after a failover.
+    pub async fn next_cdc_seq(&self) -> Result<i64, SqlError> {
+        next_cdc_seq(&self.cdc_seq, &self.substrate).await
     }
 
     /// Is this a writer handle (vs. a read replica)?
@@ -179,7 +192,52 @@ impl Database {
             self.write_lease.clone(),
             self.insert_lock.clone(),
             self.seq.clone(),
+            self.cdc_seq.clone(),
         )
+    }
+
+    /// A new connection that mirrors committed changes to the lakehouse CDC log
+    /// (see [`crate::cdc`]). Writes are serialized (like [`Self::connection_serialized`])
+    /// so a single-statement read-modify-write is captured in full rather than
+    /// losing the pre-image of a concurrent update. `cdc` is shared, so a PRAGMA
+    /// toggle is seen across connections.
+    pub fn connection_with_cdc(&self, cdc: CdcConfig) -> SlateDbStorage {
+        self.connection_serialized().with_cdc(cdc)
+    }
+
+    /// Read CDC log entries with sequence `> after`, in sequence (commit) order,
+    /// each paired with its sequence. Default tenant only (v1).
+    pub async fn scan_cdc(&self, after: i64) -> Result<Vec<(i64, CdcEntry)>, SqlError> {
+        let ks = Keyspace::new(DEFAULT_TENANT);
+        let start = ks.external_key(TAG_CDC, &after.saturating_add(1).to_be_bytes());
+        let end = prefix_upper_bound(&ks.external_prefix(TAG_CDC));
+        let mut out = Vec::new();
+        let mut it = self.substrate.scan_range(&start, end.as_deref()).await?;
+        while let Some(kv) = it.next().await? {
+            let Some(seq) = cdc_seq_from_key(kv.key.as_ref()) else {
+                continue;
+            };
+            out.push((seq, CdcEntry::decode(kv.value.as_ref())?));
+        }
+        Ok(out)
+    }
+
+    /// Delete CDC log entries with sequence `<= through`, after the seal loop has
+    /// durably published them to Iceberg. Default tenant only (v1).
+    pub async fn gc_cdc(&self, through: i64) -> Result<(), SqlError> {
+        let ks = Keyspace::new(DEFAULT_TENANT);
+        let mut batch = slatedb::WriteBatch::new();
+        for (seq, _) in self.scan_cdc(0).await? {
+            if seq <= through {
+                batch.delete(&ks.external_key(TAG_CDC, &seq.to_be_bytes()));
+            }
+        }
+        self.substrate
+            .require_writer()?
+            .write(batch)
+            .await
+            .map_err(SqlError::from)?;
+        Ok(())
     }
 }
 

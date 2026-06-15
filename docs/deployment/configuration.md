@@ -40,6 +40,19 @@ single node only).
 See [Active-passive HA](../ha/active-passive.md) for how TTL and margin govern
 failover timing and safety.
 
+## Lakehouse mirror
+
+See [Iceberg mirror](../lakehouse/iceberg-mirror.md). All optional. The mirror is
+off until enabled with `PRAGMA lakehouse_mirror`.
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `BLUEDB_LAKEHOUSE_ROOT` | `lakehouse` | Object-store key prefix for the Iceberg tables (same bucket as the data) |
+| `BLUEDB_LAKEHOUSE_SEAL_DEBOUNCE_MS` | `2000` | Coalesce a burst of commits this long before sealing |
+| `BLUEDB_LAKEHOUSE_SEAL_MAX_INTERVAL_MS` | `10000` | Cap on how long a steady write stream delays a seal |
+| `BLUEDB_LAKEHOUSE_COMPACTION_INTERVAL_MS` | `60000` | How often the compaction worker runs |
+| `BLUEDB_LAKEHOUSE_MAX_DATA_FILES` | `8` | Compact a table once it exceeds this many data files |
+
 ## API surface & authorization
 
 | Variable | Default | Meaning |

@@ -206,6 +206,19 @@ Once declared, query both through [`/sql`](../sql/full-text-search.md).
 `/ledger/accounts` and `/ledger/transfers` (batched create + lookup) expose the
 [double-entry ledger](ledger.md).
 
+## Iceberg REST catalog
+
+`GET /catalog/v1/*` is a read-only [Iceberg REST Catalog](../lakehouse/iceberg-mirror.md)
+warehouses use to discover and load the mirrored tables:
+
+- `GET /catalog/v1/config`
+- `GET /catalog/v1/namespaces` · `GET /catalog/v1/namespaces/{ns}`
+- `GET /catalog/v1/namespaces/{ns}/tables` — list mirrored tables
+- `GET /catalog/v1/namespaces/{ns}/tables/{table}` — `loadTable` (metadata location + schema)
+
+Requires `data:read` when authorization is enabled. Control which tables are
+mirrored with `PRAGMA lakehouse_mirror` over [`POST /sql`](#post-sql-run-one-parameterized-statement).
+
 ## Health & admin
 
 `GET /health`, `GET /admin/status`, `POST /admin/promote`, `POST /admin/demote` —
