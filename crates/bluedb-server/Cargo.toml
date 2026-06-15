@@ -31,6 +31,9 @@ serde         = { workspace = true }
 serde_json    = { workspace = true }
 anyhow        = { workspace = true }
 base64        = { workspace = true }
+# Evidence digest signing (ES256 / ECDSA P-256). The `pem`/`pkcs8` feature set
+# exposes SPKI PEM encode/decode for the local signer + the e2e verify helper.
+p256          = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
 
 [dev-dependencies]
 tower          = { version = "0.5", features = ["util"] }

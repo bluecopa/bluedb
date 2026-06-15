@@ -50,6 +50,7 @@ use bluedb_ledger::Ledger;
 mod ledger_api;
 mod evidence_api;
 mod graph_api;
+mod signer;
 
 use bluedb_lakehouse::{object_store_file_io, LakehouseConfig, LakehouseManager};
 use bluedb_rest::{parse_filters, DeleteRequest, InsertRequest, UpdateRequest};
