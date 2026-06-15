@@ -535,8 +535,11 @@ impl LakehouseWriter {
     pub async fn compact(&mut self, watermark: i64) -> Result<()> {
         use futures::TryStreamExt;
 
-        if self.data_file_count().await? <= 1 {
-            return Ok(()); // nothing to gain
+        // Nothing to gain only when there is at most one data file AND no delete
+        // files: a lone data file with delete files still needs a rewrite to
+        // apply (and reclaim) those deletes.
+        if self.data_file_count().await? <= 1 && self.delete_file_count().await? == 0 {
+            return Ok(());
         }
 
         // Stream the current merged state and re-write it through one rolling
@@ -562,6 +565,118 @@ impl LakehouseWriter {
         self.commit_internal(watermark, true).await
     }
 
+    /// Number of live equality-delete files in the current table state. Drives
+    /// the worker's choice of major (reclaim deletes) vs minor compaction.
+    pub async fn delete_file_count(&self) -> Result<usize> {
+        let Some(snapshot) = self.metadata.current_snapshot() else {
+            return Ok(0);
+        };
+        let metadata_ref = Arc::new(self.metadata.clone());
+        let list = snapshot.load_manifest_list(&self.file_io, &metadata_ref).await?;
+        let mut count = 0;
+        for mf in list.entries() {
+            let manifest = mf.load_manifest(&self.file_io).await?;
+            for entry in manifest.entries() {
+                if entry.is_alive() && entry.content_type() == DataContentType::EqualityDeletes {
+                    count += 1;
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    /// **Incremental (minor) compaction**: bin-pack the table's small data files
+    /// into fewer, larger files without rewriting the whole table.
+    ///
+    /// Selects the per-seal data manifests whose live data bytes are below
+    /// `target_bytes` (the bin-pack candidates; already-large files are left
+    /// alone), scans just those — with all delete files applied, via
+    /// [`Self::scan_manifest_subset`] — and commits an `Overwrite` that carries
+    /// the survivor data manifests and **all** delete manifests forward intact
+    /// (preserving their sequence numbers) while dropping the compacted cohort.
+    /// The rewritten rows take the new (highest) sequence with deletes already
+    /// materialized, so merge-on-read is preserved. No-op for <2 candidates.
+    ///
+    /// Delete files are *kept* (a delete may still target a survivor); the
+    /// whole-table [`Self::compact`] reclaims them.
+    pub async fn compact_incremental(&mut self, target_bytes: u64, watermark: i64) -> Result<()> {
+        let (data_manifests, delete_manifests) = self.live_manifest_files().await?;
+
+        // Partition data manifests into the small-file cohort and the survivors.
+        let mut cohort = Vec::new();
+        let mut survivors = Vec::new();
+        for mf in data_manifests {
+            if self.manifest_data_bytes(&mf).await? < target_bytes {
+                cohort.push(mf);
+            } else {
+                survivors.push(mf);
+            }
+        }
+        if cohort.len() < 2 {
+            return Ok(()); // nothing worth merging
+        }
+
+        // Read the cohort's current rows (deletes applied) and re-write them.
+        let mut scoped = cohort.clone();
+        scoped.extend(delete_manifests.iter().cloned());
+        let batches = self.scan_manifest_subset(scoped).await?;
+        let mut rolling = self.new_data_file_writer().await?;
+        let mut wrote_any = false;
+        for batch in batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            rolling.write(batch).await?;
+            wrote_any = true;
+        }
+        let new_files = rolling.close().await?;
+
+        // Keep survivors + all delete manifests; drop the cohort data manifests.
+        let mut keep = survivors;
+        keep.extend(delete_manifests);
+        let snapshot_id = fresh_snapshot_id(&self.metadata);
+
+        if !wrote_any {
+            // The cohort merged to nothing (every row deleted): just drop it.
+            return self
+                .publish_snapshot(snapshot_id, keep, Operation::Replace, watermark)
+                .await;
+        }
+
+        // Write a new data manifest for the compacted files, then publish.
+        let schema = self.metadata.current_schema().clone();
+        let partition_spec = self.metadata.default_partition_spec().as_ref().clone();
+        let path = format!("{}/{snapshot_id}-data.avro", self.metadata_dir());
+        let mut mw = ManifestWriterBuilder::new(
+            self.file_io.new_output(&path)?,
+            Some(snapshot_id),
+            None,
+            schema,
+            partition_spec,
+        )
+        .build_v2_data();
+        for df in new_files {
+            mw.add_file(df, -1)?;
+        }
+        let mut manifests = keep;
+        manifests.push(mw.write_manifest_file().await?);
+        self.publish_snapshot(snapshot_id, manifests, Operation::Replace, watermark)
+            .await
+    }
+
+    /// Total live data bytes referenced by one data manifest (sum of its alive
+    /// data files' sizes) — the bin-pack candidacy measure.
+    async fn manifest_data_bytes(&self, mf: &ManifestFile) -> Result<u64> {
+        let manifest = mf.load_manifest(&self.file_io).await?;
+        let mut bytes = 0;
+        for entry in manifest.entries() {
+            if entry.is_alive() && entry.content_type() == DataContentType::Data {
+                bytes += entry.data_file().file_size_in_bytes();
+            }
+        }
+        Ok(bytes)
+    }
+
     /// Author one snapshot from the pending data/delete files. When `replace`,
     /// the manifest list contains ONLY the new files (a compaction `Replace`);
     /// otherwise it carries the parent's manifests forward (incremental
@@ -569,8 +684,6 @@ impl LakehouseWriter {
     /// publishes the next `metadata.json`.
     async fn commit_internal(&mut self, watermark: i64, replace: bool) -> Result<()> {
         let snapshot_id = fresh_snapshot_id(&self.metadata);
-        let next_seq = self.metadata.next_sequence_number();
-        let parent_id = self.metadata.current_snapshot_id();
         let schema = self.metadata.current_schema().clone();
         let partition_spec = self.metadata.default_partition_spec().as_ref().clone();
 
@@ -627,6 +740,32 @@ impl LakehouseWriter {
             manifests.push(mw.write_manifest_file().await?);
         }
 
+        let operation = if replace {
+            Operation::Replace
+        } else if self.metadata.current_snapshot().is_none() {
+            Operation::Append
+        } else {
+            Operation::Overwrite
+        };
+        self.publish_snapshot(snapshot_id, manifests, operation, watermark)
+            .await
+    }
+
+    /// Author one snapshot from an explicit, already-built set of `manifests`
+    /// (carried-forward + freshly-written manifest files), tag it `operation` +
+    /// `watermark`, apply the table updates to our hosted metadata, and publish
+    /// the next `metadata.json`. Shared by [`Self::commit_internal`] and the
+    /// incremental-compaction commit so both author snapshots identically.
+    async fn publish_snapshot(
+        &mut self,
+        snapshot_id: i64,
+        manifests: Vec<ManifestFile>,
+        operation: Operation,
+        watermark: i64,
+    ) -> Result<()> {
+        let next_seq = self.metadata.next_sequence_number();
+        let parent_id = self.metadata.current_snapshot_id();
+
         let manifest_list_path = format!("{}/snap-{snapshot_id}.avro", self.metadata_dir());
         let mut mlw = ManifestListWriter::v2(
             self.file_io.new_output(&manifest_list_path)?,
@@ -637,13 +776,6 @@ impl LakehouseWriter {
         mlw.add_manifests(manifests.into_iter())?;
         mlw.close().await?;
 
-        let operation = if replace {
-            Operation::Replace
-        } else if self.metadata.current_snapshot().is_none() {
-            Operation::Append
-        } else {
-            Operation::Overwrite
-        };
         let summary = Summary {
             operation,
             additional_properties: std::collections::HashMap::from([(

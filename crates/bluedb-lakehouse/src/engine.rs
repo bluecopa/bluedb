@@ -57,6 +57,20 @@ struct Registry {
     /// whether a table is enabled explicitly or by the opt-out default.
     #[serde(default)]
     materialized: std::collections::BTreeSet<String>,
+    /// Bin-pack target file size for incremental compaction (set via
+    /// `PRAGMA lakehouse_target_file_bytes`). `None` ⇒ use the engine default.
+    #[serde(default)]
+    target_file_bytes: Option<u64>,
+}
+
+/// Default incremental-compaction bin-pack target when no PRAGMA is set:
+/// `BLUEDB_LAKEHOUSE_TARGET_FILE_BYTES` if valid, else 128 MiB.
+fn default_target_bytes() -> u64 {
+    std::env::var("BLUEDB_LAKEHOUSE_TARGET_FILE_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(128 * 1024 * 1024)
 }
 
 /// The lakehouse mirror engine — **one per tenant**. Its `tenant` scopes which
@@ -211,7 +225,25 @@ impl LakehouseEngine {
             }
             LhPragma::Table(table, true) => self.enable_table(&table).await,
             LhPragma::Table(table, false) => self.disable_table(&table).await,
+            LhPragma::TargetFileBytes(bytes) => self.set_target_file_bytes(bytes).await,
         }
+    }
+
+    /// Set the incremental-compaction bin-pack target file size (persisted to the
+    /// registry, restored on promote/failover). `0` clears it (revert to default).
+    pub async fn set_target_file_bytes(&self, bytes: u64) -> Result<()> {
+        self.state.write().unwrap().target_file_bytes = (bytes > 0).then_some(bytes);
+        self.persist_registry().await
+    }
+
+    /// The configured bin-pack target file size, or the engine default when
+    /// unset (see [`default_target_bytes`]).
+    pub fn target_file_bytes(&self) -> u64 {
+        self.state
+            .read()
+            .unwrap()
+            .target_file_bytes
+            .unwrap_or_else(default_target_bytes)
     }
 
     /// Is `table` currently mirrored (effective `default_on XOR override`)?
@@ -397,8 +429,9 @@ impl LakehouseEngine {
             .collect())
     }
 
-    /// Compact a mirrored table's Iceberg files (memory-bounded streaming
-    /// rewrite; see [`LakehouseWriter::compact`]). No-op for ≤1 data file.
+    /// **Major** compaction: whole-table memory-bounded rewrite that also
+    /// reclaims equality-delete files (see [`LakehouseWriter::compact`]). No-op
+    /// for ≤1 data file.
     pub async fn compact(&self, table: &str) -> Result<()> {
         let schema = self.fetch_schema(table).await?;
         let mut writer = self.writer_for(table, &schema, &[]).await?;
@@ -406,10 +439,29 @@ impl LakehouseEngine {
         writer.compact(watermark).await
     }
 
+    /// **Minor** compaction: incremental bin-pack of the table's small data files
+    /// (see [`LakehouseWriter::compact_incremental`]), using the configured
+    /// [`Self::target_file_bytes`]. Leaves large files and all delete files alone.
+    pub async fn compact_incremental(&self, table: &str) -> Result<()> {
+        let schema = self.fetch_schema(table).await?;
+        let mut writer = self.writer_for(table, &schema, &[]).await?;
+        let watermark = writer.current_watermark().unwrap_or(0);
+        writer
+            .compact_incremental(self.target_file_bytes(), watermark)
+            .await
+    }
+
     /// Number of live data files in a table's current Iceberg state.
     pub async fn data_file_count(&self, table: &str) -> Result<usize> {
         let schema = self.fetch_schema(table).await?;
         self.writer_for(table, &schema, &[]).await?.data_file_count().await
+    }
+
+    /// Number of live equality-delete files in a table's current Iceberg state
+    /// (drives the worker's choice of major vs minor compaction).
+    pub async fn delete_file_count(&self, table: &str) -> Result<usize> {
+        let schema = self.fetch_schema(table).await?;
+        self.writer_for(table, &schema, &[]).await?.delete_file_count().await
     }
 
     /// Spawn a throttled background worker that compacts mirrored tables whose
