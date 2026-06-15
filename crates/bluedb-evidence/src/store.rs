@@ -46,7 +46,6 @@ pub(crate) async fn get_seq(
 }
 
 /// Point read of an idempotency record, or `None` if the token is unseen.
-#[allow(dead_code)]
 pub(crate) async fn get_idem(
     substrate: &Substrate,
     ks: &EvidenceKeyspace,

@@ -266,7 +266,9 @@ impl Evidence {
             let Some(kv) = iter.next().await.map_err(Self::storage_err)? else { break };
             let key = kv.key.as_ref();
             // The seq is the last 8 bytes of the key.
-            let tail: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
+            let tail: [u8; 8] = key[key.len() - 8..]
+                .try_into()
+                .map_err(|_| Self::storage_err("entry key too short: expected trailing 8-byte seq"))?;
             let seq = i64::from_be_bytes(tail);
             let rec: EntryRecord = store::decode(&kv.value)?;
             out.push((seq, rec));

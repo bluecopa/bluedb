@@ -167,6 +167,16 @@ pub async fn read_entries(
     Query(q): Query<EntriesQuery>,
 ) -> Result<Json<Value>, AppError> {
     state.authorize(&headers, Scope::DataRead)?;
+
+    // Server-assigned seqs are always >= 1; negative values encode to large
+    // unsigned keys and silently return empty, so reject them early.
+    if q.from.is_some_and(|v| v < 0)
+        || q.to.is_some_and(|v| v < 0)
+        || q.after.is_some_and(|v| v < 0)
+    {
+        return Err(AppError::bad_request("seq query params must be >= 0"));
+    }
+
     let tenant = state.tenant(&headers)?;
     let ev = state.evidence(&tenant).await?;
 

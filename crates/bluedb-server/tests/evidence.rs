@@ -238,3 +238,41 @@ async fn evidence_idempotency() {
         "idem conflict message: {body}"
     );
 }
+
+#[tokio::test]
+async fn evidence_negative_seq_params_rejected() {
+    let (_, app) = promoted().await;
+
+    // ?from=-1 should be rejected with 400.
+    let (s, body) = call(
+        &app,
+        "GET",
+        "/evidence/audit/entries?from=-1&to=2",
+        Some("acme"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "negative from: {s} {body}");
+
+    // ?to=-1 should also be rejected.
+    let (s, body) = call(
+        &app,
+        "GET",
+        "/evidence/audit/entries?from=1&to=-1",
+        Some("acme"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "negative to: {s} {body}");
+
+    // ?after=-1 should also be rejected.
+    let (s, body) = call(
+        &app,
+        "GET",
+        "/evidence/audit/entries?after=-1",
+        Some("acme"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "negative after: {s} {body}");
+}
