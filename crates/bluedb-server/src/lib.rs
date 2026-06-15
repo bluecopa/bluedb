@@ -364,6 +364,10 @@ pub fn build_app(state: AppState) -> Router {
             "/schema/tables/{table}/fulltext-indexes",
             post(schema::create_fulltext_index),
         )
+        .route(
+            "/schema/tables/{table}/trigram-indexes",
+            post(schema::create_trigram_index),
+        )
         .with_state(state)
 }
 

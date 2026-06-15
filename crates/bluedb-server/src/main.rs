@@ -51,6 +51,8 @@
 //! - `DELETE /schema/tables/{table}/indexes/{name}`   — drop index.
 //! - `POST   /schema/tables/{table}/fulltext-indexes` — declare a full-text index
 //!   on a text column (the table's integer primary key is auto-resolved).
+//! - `POST   /schema/tables/{table}/trigram-indexes`  — declare a trigram index on
+//!   a text column (accelerates `col LIKE '%lit%'`; primary key auto-resolved).
 //!
 //! All `/schema/*` endpoints validate every identifier (allow-list `^[A-Za-z_][A-Za-z0-9_]*$`)
 //! and every type keyword against an explicit allow-list before building DDL; no

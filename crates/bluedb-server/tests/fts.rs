@@ -229,6 +229,107 @@ async fn durable_engine_serves_a_second_fulltext_index() {
 }
 
 #[tokio::test]
+async fn trigram_like_over_http_read_your_writes() {
+    let app = make_app(true).await;
+
+    // 1. create the table.
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/schema/tables",
+        Some(json!({
+            "name": "docs",
+            "columns": [
+                {"name": "id", "type": "INTEGER", "primary_key": true},
+                {"name": "body", "type": "TEXT"}
+            ]
+        })),
+    )
+    .await;
+    assert!(s.is_success(), "create table: {s}");
+
+    // 2. declare a TRIGRAM index (this increment's new endpoint).
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/schema/tables/docs/trigram-indexes",
+        Some(json!({"column": "body"})),
+    )
+    .await;
+    assert!(s.is_success(), "create trigram index: {s} {body}");
+
+    // 3. insert via /sql — the observed connection maintains the live trigram index.
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({
+            "sql": "INSERT INTO docs (id, body) VALUES (1, 'quarterly invoice overdue'), (2, 'weather sunny'), (3, 'overdue notice')"
+        })),
+    )
+    .await;
+    assert!(s.is_success(), "insert: {s}");
+
+    // 4. LIKE '%overdue%' over /sql is trigram-accelerated AND correct (RYW over HTTP).
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "SELECT id FROM docs WHERE body LIKE '%overdue%'"})),
+    )
+    .await;
+    assert!(s.is_success(), "LIKE select: {s} {body}");
+    assert_eq!(body, json!([{ "id": 1 }, { "id": 3 }]), "matching rows 1 and 3");
+
+    // 5. a column with NO trigram index still works (pass-through to the exact scan).
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/schema/tables",
+        Some(json!({
+            "name": "notes",
+            "columns": [
+                {"name": "id", "type": "INTEGER", "primary_key": true},
+                {"name": "memo", "type": "TEXT"}
+            ]
+        })),
+    )
+    .await;
+    assert!(s.is_success(), "create notes: {s}");
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "INSERT INTO notes (id, memo) VALUES (1, 'overdue payment'), (2, 'paid')"})),
+    )
+    .await;
+    assert!(s.is_success(), "insert notes: {s}");
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "SELECT id FROM notes WHERE memo LIKE '%overdue%'"})),
+    )
+    .await;
+    assert!(s.is_success(), "LIKE on un-indexed column: {s} {body}");
+    assert_eq!(body, json!([{ "id": 1 }]), "pass-through scan still correct");
+}
+
+#[tokio::test]
+async fn trigram_index_on_missing_table_is_400() {
+    let app = make_app(true).await;
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/schema/tables/ghost/trigram-indexes",
+        Some(json!({"column": "body"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "missing table → 400");
+    assert!(body.get("error").is_some(), "error body: {body}");
+}
+
+#[tokio::test]
 async fn fulltext_index_on_missing_table_is_400() {
     let app = make_app(true).await;
     let (s, body) = call(

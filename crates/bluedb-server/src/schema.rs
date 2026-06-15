@@ -6,10 +6,12 @@
 //! true`. No raw SQL is ever accepted from the client.
 //!
 //! ## Endpoints
-//! - `POST   /schema/tables`                        — create table
-//! - `DELETE /schema/tables/{table}`                — drop table
-//! - `POST   /schema/tables/{table}/indexes`        — create index
-//! - `DELETE /schema/tables/{table}/indexes/{name}` — drop index
+//! - `POST   /schema/tables`                          — create table
+//! - `DELETE /schema/tables/{table}`                  — drop table
+//! - `POST   /schema/tables/{table}/indexes`          — create index
+//! - `DELETE /schema/tables/{table}/indexes/{name}`   — drop index
+//! - `POST   /schema/tables/{table}/fulltext-indexes` — declare a full-text index
+//! - `POST   /schema/tables/{table}/trigram-indexes`  — declare a trigram index
 //!
 //! All endpoints require the node to be the active writer (503 otherwise).
 
@@ -77,6 +79,15 @@ pub(crate) struct CreateFulltextIndexRequest {
 
 fn default_analyzer() -> String {
     "english".into()
+}
+
+/// Body for `POST /schema/tables/{table}/trigram-indexes`. Like the fulltext
+/// variant, the table's primary key is auto-resolved; the caller names only the
+/// text column. A trigram index always tokenizes through the `whitespace`
+/// analyzer (it stores pre-trigramized text), so there is no analyzer field.
+#[derive(Deserialize)]
+pub(crate) struct CreateTrigramIndexRequest {
+    pub column: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -218,6 +229,32 @@ pub(crate) async fn create_fulltext_index(
         "created_fulltext_index": column,
         "on": table,
         "analyzer": req.analyzer,
+    })))
+}
+
+/// `POST /schema/tables/{table}/trigram-indexes` — declare a trigram index on a
+/// text column (Spec B §4.6). The table's integer primary key is resolved from
+/// its schema; once declared, `/sql` accelerates `col LIKE '%lit%'` over it (a
+/// `pk IN (...)` prefilter with gluesql's `LIKE` kept as the exact verify).
+pub(crate) async fn create_trigram_index(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(table): Path<String>,
+    Json(req): Json<CreateTrigramIndexRequest>,
+) -> Result<Json<Value>, AppError> {
+    state.authorize(&headers, Scope::SchemaAdmin)?;
+    state.require_active()?;
+    let table = ident(&table)?.to_string();
+    let column = ident(&req.column)?.to_string();
+    let conn = state.connection().await?;
+    state
+        .fts()
+        .await
+        .create_trigram_index_auto(&conn, &table, &column)
+        .await?;
+    Ok(Json(json!({
+        "created_trigram_index": column,
+        "on": table,
     })))
 }
 
