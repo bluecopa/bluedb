@@ -112,6 +112,11 @@ NODES="--node node1 --node node2 --node node3"
 # counter (lost-update) and unique (same-PK) — use high concurrency
 ./bin/lein run test --workload counter --nemesis kill --time-limit 90 --concurrency 10 $NODES
 ./bin/lein run test --workload unique  --nemesis none --time-limit 15 --concurrency 40 $NODES
+
+# evidence (append durability + dense/gap-free seq on a verified evidence chain)
+./bin/lein run test --workload evidence --nemesis kill      --time-limit 120 --concurrency 10 $NODES
+./bin/lein run test --workload evidence --nemesis partition --time-limit 120 --concurrency 10 $NODES
+./bin/lein run test --workload evidence --nemesis mix       --time-limit 180 --concurrency 10 $NODES
 ```
 
 Results land in `store/`; `store/latest/results.edn` holds the verdict and
