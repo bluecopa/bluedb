@@ -172,13 +172,27 @@ tenant `_`); the same graph name under two tenants is fully isolated. With
 [authorization](../operations/admin.md) on, routes require the noted scope plus a
 matching `tenant:<name>` binding (a `superuser` token reaches any).
 
+## Consistency
+
+A traversal (`reachable` / `widest_path`) pins **one read view for its whole
+run** before its first scan and reads every adjacency scan — across every BFS
+level, including the concurrently-expanded ones — through it.
+
+- **On the active writer** the view is a true MVCC snapshot (SlateDB
+  `Db::snapshot`): every read is served at one sequence number, so an edge
+  written after the traversal starts is invisible, and because each edge is
+  written as one atomic batch (canonical + out + in keys) the traversal never
+  sees a torn edge. A traversal therefore reflects a single consistent cut of
+  the graph — **snapshot isolation**. This is Jepsen-checked under faults (see
+  the graph-traversal workload).
+- **On a read replica** SlateDB exposes no point-in-time snapshot, so the view
+  is the live reader: consistent within a single scan but free to advance to a
+  newer checkpoint between scans. Replica traversals are best-effort
+  checkpoint-consistent, not strictly point-in-time. Drive snapshot-isolated
+  traversals against the writer.
+
 ## Limitations (v1)
 
-- **No cross-scan snapshot.** A traversal issues many scans and there is no
-  single snapshot across them, so it sees read-committed state — a write
-  concurrent with a long traversal may be partially visible. For a graph that
-  isn't changing under the traversal the result is deterministic (`reachable`
-  sorts; `widest_path`'s maximin is unique).
 - **`widest_path` frontier is sequential.** `reachable` now expands each BFS
   level concurrently (bounded fan-out, default 16), so its latency tracks graph
   *diameter* rather than node count. `widest_path` keeps its sequential
