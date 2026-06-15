@@ -39,6 +39,7 @@ use serde_json::{json, Map, Value};
 use tokio::sync::RwLock;
 
 pub mod authz;
+pub mod objstore;
 mod schema;
 
 use bluedb_engine::{rest_sql, EngineError, FtsEngine};

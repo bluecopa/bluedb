@@ -9,10 +9,12 @@
 //! - `BLUEDB_ADDR`     — listen address (default `0.0.0.0:8080`).
 //! - `BLUEDB_DB_PATH`  — SlateDB path/prefix inside the object store (default `bluedb`).
 //!   Also used as the lease `resource` key.
-//! - Object store (first match wins):
-//!   - `BLUEDB_S3_BUCKET` (+ `BLUEDB_S3_ENDPOINT` for MinIO, `BLUEDB_S3_REGION`,
-//!     `BLUEDB_S3_ACCESS_KEY_ID`, `BLUEDB_S3_SECRET_ACCESS_KEY`) — S3/MinIO. The
-//!     shared store for a real multi-node cluster.
+//! - Object store (first match wins) — the same image runs on any cloud; only
+//!   these env vars differ (see [`bluedb_server::objstore`]):
+//!   - `BLUEDB_S3_BUCKET` (+ `BLUEDB_S3_ENDPOINT` for MinIO/R2, `BLUEDB_S3_REGION`,
+//!     `BLUEDB_S3_ACCESS_KEY_ID`, `BLUEDB_S3_SECRET_ACCESS_KEY`) — S3/MinIO.
+//!   - `BLUEDB_AZURE_CONTAINER` (+ `BLUEDB_AZURE_ACCOUNT`, `BLUEDB_AZURE_ACCESS_KEY`) — Azure Blob.
+//!   - `BLUEDB_GCS_BUCKET` (+ `BLUEDB_GCS_SERVICE_ACCOUNT` path) — Google Cloud Storage.
 //!   - `BLUEDB_DATA_DIR` — local filesystem (single-node persistence).
 //!   - else — in-memory (ephemeral; single node only).
 //! - `BLUEDB_LEASE_PG_URL` — Postgres lease arbiter for multi-node election; if
@@ -78,48 +80,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bluedb_ha::{LeaseProvider, LocalLeaseProvider, PostgresLeaseProvider, SystemClock, WriterController};
-use bluedb_server::{authz::Authz, build_app, AppState};
-use slatedb::object_store::aws::AmazonS3Builder;
-use slatedb::object_store::local::LocalFileSystem;
-use slatedb::object_store::memory::InMemory;
-use slatedb::object_store::ObjectStore;
+use bluedb_server::{authz::Authz, build_app, objstore, AppState};
 
 fn env_secs(key: &str, default: u64) -> Duration {
     Duration::from_secs(std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default))
 }
 
-/// Build the object store from env (S3/MinIO, local FS, or in-memory).
-fn build_object_store() -> anyhow::Result<Arc<dyn ObjectStore>> {
-    if let Ok(bucket) = std::env::var("BLUEDB_S3_BUCKET") {
-        let mut builder = AmazonS3Builder::new()
-            .with_bucket_name(bucket)
-            .with_region(std::env::var("BLUEDB_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string()));
-        if let Ok(endpoint) = std::env::var("BLUEDB_S3_ENDPOINT") {
-            // MinIO / non-AWS: custom endpoint, allow plain HTTP.
-            builder = builder.with_endpoint(endpoint).with_allow_http(true);
-        }
-        if let Ok(key) = std::env::var("BLUEDB_S3_ACCESS_KEY_ID") {
-            builder = builder.with_access_key_id(key);
-        }
-        if let Ok(secret) = std::env::var("BLUEDB_S3_SECRET_ACCESS_KEY") {
-            builder = builder.with_secret_access_key(secret);
-        }
-        eprintln!("bluedb-server: object store = S3/MinIO");
-        Ok(Arc::new(builder.build()?))
-    } else if let Ok(dir) = std::env::var("BLUEDB_DATA_DIR") {
-        std::fs::create_dir_all(&dir)?;
-        eprintln!("bluedb-server: object store = local fs at {dir}");
-        Ok(Arc::new(LocalFileSystem::new_with_prefix(&dir)?))
-    } else {
-        eprintln!("bluedb-server: object store = in-memory (ephemeral, single-node)");
-        Ok(Arc::new(InMemory::new()))
-    }
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let db_path = std::env::var("BLUEDB_DB_PATH").unwrap_or_else(|_| "bluedb".to_string());
-    let object_store = build_object_store()?;
+    let object_store =
+        objstore::build_object_store(&objstore::parse_object_store_config(|k| std::env::var(k).ok()))?;
 
     // Lease arbiter: shared Postgres for real multi-node HA, else in-process.
     let lease: Arc<dyn LeaseProvider> = match std::env::var("BLUEDB_LEASE_PG_URL") {
