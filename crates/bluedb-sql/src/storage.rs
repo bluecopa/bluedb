@@ -646,6 +646,14 @@ impl SlateDbStorage {
         Ok(self.read_pk_catalog(table_name).await?.map(|c| c.columns))
     }
 
+    /// The stable physical slot of each current logical column (in schema
+    /// order), or `None` for a never-altered table (identity: slot == position).
+    /// The lakehouse mirror derives Iceberg field-ids as `slot + 1`, so a column
+    /// keeps its field-id across ADD/DROP/RENAME. Mirrors [`Self::pk_columns`].
+    pub async fn column_slots(&self, table_name: &str) -> Result<Option<Vec<u32>>, SqlError> {
+        Ok(self.read_catalog(table_name).await?.map(|c| c.slots))
+    }
+
     /// Persist a table's composite-primary-key catalog (written at CREATE TABLE,
     /// before the rewritten DDL runs). A durable, immediate write (no open txn).
     pub(crate) async fn write_pk_catalog(
