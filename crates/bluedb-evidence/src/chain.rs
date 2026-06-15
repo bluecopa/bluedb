@@ -407,4 +407,61 @@ impl Evidence {
         let proof = crate::merkle::consistency_proof(&leaves, first as usize);
         Ok(ConsistencyProof { first, second, proof })
     }
+
+    // ---- Erasure ----
+
+    /// Redact the payload of entry `seq` on `chain` (any mode). Blanks the
+    /// payload and sets `redacted = true`, **keeping** seq/type/at/edges and
+    /// (on verified chains) `leaf_hash` — so digest and proofs still verify.
+    /// Idempotent. 404 if the entry is absent. Caller must hold `schema:admin`.
+    pub async fn redact(&self, chain: &str, seq: i64) -> Result<(), EvidenceError> {
+        let _lease = self.write_lease.lock().await;
+        let writer = self.substrate.require_writer().map_err(|_| EvidenceError::NotWriter)?;
+        let mut rec = store::get_entry(&self.substrate, &self.keyspace, chain, seq)
+            .await?
+            .ok_or(EvidenceError::EntryNotFound { chain: chain.to_string(), seq })?;
+        rec.payload = Vec::new();
+        rec.redacted = true;
+        let mut batch = WriteBatch::new();
+        batch.put(self.keyspace.entry_key(chain, seq), &store::encode(&rec)?);
+        writer
+            .write_with_options(batch, &WriteOptions { await_durable: false, ..Default::default() })
+            .await
+            .map_err(Self::storage_err)?;
+        drop(_lease);
+        writer.flush().await.map_err(Self::storage_err)?;
+        Ok(())
+    }
+
+    /// Hard-delete entry `seq` on a **plain** chain: removes the slot (leaving a
+    /// gap); the counter does not decrement so `head` is unchanged. Verified
+    /// chains return [`EvidenceError::VerifiedNoDelete`] (dropping a slot would
+    /// break the consistency proof). 404 if the entry is absent. Caller must
+    /// hold `schema:admin`.
+    ///
+    /// Note: retracting the entry's `edges[]` from the graph store is deferred
+    /// to Plan 3 (the graph store does not exist yet).
+    pub async fn hard_delete(&self, chain: &str, seq: i64) -> Result<(), EvidenceError> {
+        let _lease = self.write_lease.lock().await;
+        let writer = self.substrate.require_writer().map_err(|_| EvidenceError::NotWriter)?;
+        let verified = store::get_chain_meta(&self.substrate, &self.keyspace, chain)
+            .await?
+            .map(|m| m.verified)
+            .unwrap_or(true);
+        if verified {
+            return Err(EvidenceError::VerifiedNoDelete(chain.to_string()));
+        }
+        if store::get_entry(&self.substrate, &self.keyspace, chain, seq).await?.is_none() {
+            return Err(EvidenceError::EntryNotFound { chain: chain.to_string(), seq });
+        }
+        let mut batch = WriteBatch::new();
+        batch.delete(self.keyspace.entry_key(chain, seq));
+        writer
+            .write_with_options(batch, &WriteOptions { await_durable: false, ..Default::default() })
+            .await
+            .map_err(Self::storage_err)?;
+        drop(_lease);
+        writer.flush().await.map_err(Self::storage_err)?;
+        Ok(())
+    }
 }

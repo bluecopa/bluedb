@@ -14,6 +14,8 @@ pub enum EvidenceError {
     NotVerified(String),
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+    #[error("cannot hard-delete from a verified chain '{0}'")]
+    VerifiedNoDelete(String),
     #[error(transparent)]
     Storage(#[from] anyhow::Error),
 }

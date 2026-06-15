@@ -72,7 +72,6 @@ pub(crate) async fn get_frontier(
 }
 
 /// Point read of one entry by seq, or `None` if absent.
-#[allow(dead_code)]
 pub(crate) async fn get_entry(
     substrate: &Substrate,
     ks: &EvidenceKeyspace,
