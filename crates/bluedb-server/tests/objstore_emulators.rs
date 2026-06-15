@@ -1,6 +1,13 @@
-//! Live round-trip tests against the three object-store emulators.
+//! Live round-trip tests for the object-store backends.
 //!
-//! Ignored by default — they need the emulator stack running:
+//! Each test proves bluedb's actual substrate — a SlateDB `Db` — can open on the
+//! backend, write durably, reopen, and read the value back. That exercises the
+//! real read/write/list/conditional-put paths (the conditional put is what backs
+//! single-writer safety), not just client construction, so a pass means the
+//! cloud genuinely works end-to-end through
+//! [`bluedb_server::objstore::build_object_store`].
+//!
+//! **S3 (MinIO) + Azure (Azurite)** run against the local emulator stack:
 //!
 //! ```text
 //! docker compose -f crates/bluedb-server/tests/emulators/docker-compose.yml up -d
@@ -8,11 +15,13 @@
 //! docker compose -f crates/bluedb-server/tests/emulators/docker-compose.yml down -v
 //! ```
 //!
-//! Each test proves bluedb's actual substrate — a SlateDB `Db` — can open on the
-//! backend, write durably, reopen, and read the value back. That exercises the
-//! real read/write/list/conditional-put paths, not just client construction, so
-//! a pass means the cloud genuinely works end-to-end through
-//! [`bluedb_server::objstore::build_object_store`].
+//! **GCS is verified against real GCS, not an emulator.** object_store's GCS
+//! client speaks the GCS *XML* API, which the common local emulators do not
+//! fully serve — `fake-gcs-server` is JSON-only (400 on the XML PUT), and
+//! Google's `storage-testbench` does XML PUT/GET + conditional-put CAS but not
+//! XML list/delete. So `gcs_fake_round_trip` is left `#[ignore]` (it hangs on
+//! fake-gcs), and `gcs_real_round_trip` is the real verification — env-gated, no
+//! creds committed (see that test's docs).
 
 use std::sync::Arc;
 
