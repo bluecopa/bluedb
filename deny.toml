@@ -1,0 +1,56 @@
+# cargo-deny configuration — the machine gate that keeps bluedb cleanly
+# Apache-2.0. Run locally with `cargo deny check`; enforced on every PR by
+# .github/workflows/deny.yml.
+#
+# Two layers guard the same footgun (see README "Licensing" + crates/bluedb-fts/
+# vendor/NOTICE): bluedb vendors a minimal copy of Quickwit's `quickwit-directories`
+# read path from quickwit-oss/quickwit@main (Apache-2.0) rather than depending on
+# the crates.io `quickwit-*` packages, which are stale and AGPL-3.0. AGPL is a
+# network-copyleft incompatible with shipping bluedb as Apache-2.0.
+
+[graph]
+all-features = true
+
+[licenses]
+# Allowlist (stronger than a denylist): the build fails on ANY license not
+# listed here — so a *new* AGPL (or other copyleft) dependency from any source
+# is caught automatically, not just the ones we thought to ban. These are the
+# permissive licenses actually present in the resolved graph today.
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "0BSD",
+    "ISC",
+    "BSL-1.0",
+    "Zlib",
+    "zlib-acknowledgement",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "MPL-2.0", # file-level copyleft only (does not infect bluedb's own code)
+]
+confidence-threshold = 0.9
+
+[bans]
+# Belt-and-suspenders: ban the crates.io `quickwit-*` packages by name, so
+# `cargo add quickwit-directories` (or any sibling) fails immediately with a
+# clear message — even if its license metadata were mislabeled. The Apache-2.0
+# read path is vendored under crates/bluedb-fts/vendor/ instead.
+deny = [
+    { name = "quickwit-directories" },
+    { name = "quickwit-common" },
+    { name = "quickwit-storage" },
+    { name = "quickwit-proto" },
+    { name = "quickwit-config" },
+    { name = "quickwit-doc-mapper" },
+    { name = "quickwit-query" },
+]
+
+[advisories]
+# RustSec advisory checks are handled separately (they need a fresh DB and can
+# change without a code change); keep this file focused on the license/ban gate.
+version = 2
+ignore = []
