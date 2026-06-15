@@ -70,8 +70,21 @@ async fn azure_azurite_round_trip() {
     slatedb_round_trip(store, "emul-roundtrip-azure").await;
 }
 
+/// GCS round-trip against `fake-gcs-server`.
+///
+/// NOTE: `fake-gcs-server` does not faithfully implement the operations SlateDB
+/// performs (notably the conditional/manifest writes), so this round-trip
+/// **hangs** against it — object_store retries the unsupported response with
+/// backoff. This is an emulator-fidelity limitation, not a bluedb bug: the GCS
+/// bridge ([`build_object_store`]) uses the same `object_store` GCS client that
+/// real GCS serves, and the S3 (MinIO) and Azure (Azurite) round-trips above
+/// exercise the identical bridge end-to-end. The emulator endpoint is supplied
+/// via the service-account JSON's `gcs_base_url` + `disable_oauth`
+/// (`tests/emulators/gcs-fake-sa.json`) — object_store's idiomatic GCS-emulator
+/// hook — and the `bluedb` bucket is created by the compose `fake-gcs-init`.
+/// Re-enable once a higher-fidelity GCS emulator (or real GCS) is wired up.
 #[tokio::test]
-#[ignore = "needs the emulator stack (see module docs)"]
+#[ignore = "fake-gcs-server can't service SlateDB's round-trip (hangs); see fn docs"]
 async fn gcs_fake_round_trip() {
     let sa = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/emulators/gcs-fake-sa.json");
     let cfg = ObjectStoreConfig::Gcs { bucket: "bluedb".into(), service_account: Some(sa.into()) };

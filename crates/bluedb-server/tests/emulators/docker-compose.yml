@@ -70,8 +70,7 @@ services:
       - /bin/sh
       - -c
       - >
-        until curl -sf -X POST 'http://fake-gcs:4443/storage/v1/b?project=test'
-          -H 'Content-Type: application/json' -d '{"name":"bluedb"}'; do
+        until curl -sf -X POST 'http://fake-gcs:4443/storage/v1/b?project=test' -H 'Content-Type: application/json' -d '{"name":"bluedb"}'; do
           echo 'waiting for fake-gcs...'; sleep 2;
         done;
         echo 'fake-gcs bucket ready';
