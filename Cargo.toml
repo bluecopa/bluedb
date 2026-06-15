@@ -39,3 +39,4 @@ time         = { version = "0.3", features = ["std", "formatting", "macros"] }
 tracing      = "0.1"
 tempfile     = "3"
 sha2         = "0.10"
+base64       = "0.22"

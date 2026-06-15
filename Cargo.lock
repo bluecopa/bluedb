@@ -676,7 +676,9 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
  "bluedb-engine",
+ "bluedb-evidence",
  "bluedb-ha",
  "bluedb-lakehouse",
  "bluedb-ledger",

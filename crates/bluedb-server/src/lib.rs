@@ -33,7 +33,7 @@ use std::time::Duration;
 use axum::extract::{Path, RawQuery, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde_json::{json, Map, Value};
 use tokio::sync::RwLock;
@@ -48,6 +48,7 @@ use bluedb_ha::{HaError, Status, WriterController};
 use bluedb_ledger::Ledger;
 
 mod ledger_api;
+mod evidence_api;
 use bluedb_lakehouse::{object_store_file_io, LakehouseConfig, LakehouseManager};
 use bluedb_rest::{parse_filters, DeleteRequest, InsertRequest, UpdateRequest};
 use bluedb_sql::{parse_lakehouse_pragma, CdcConfig, Database, SlateDbStorage, DEFAULT_TENANT};
@@ -566,6 +567,17 @@ impl AppState {
         }
     }
 
+    /// Build an [`Evidence`] handle over the currently-bound database for `tenant`,
+    /// or `503` if the node has no database yet. Mirrors [`Self::ledger`].
+    pub(crate) async fn evidence(&self, tenant: &str) -> Result<bluedb_evidence::Evidence, AppError> {
+        match self.inner.db.read().await.as_ref() {
+            Some(db) => Ok(bluedb_evidence::Evidence::new(db, tenant)),
+            None => Err(AppError::service_unavailable(
+                "node has no database yet (no writer has been promoted)",
+            )),
+        }
+    }
+
     /// Reject a mutating request unless this node is the active writer.
     pub(crate) fn require_active(&self) -> Result<(), AppError> {
         if self.inner.writer.is_active() {
@@ -611,6 +623,13 @@ pub fn build_app(state: AppState) -> Router {
         .route("/ledger/transfers", post(ledger_api::create_transfers))
         .route("/ledger/accounts/{id}", get(ledger_api::get_account))
         .route("/ledger/transfers/{id}", get(ledger_api::get_transfer))
+        // Evidence substrate.
+        .route("/evidence/{chain}", put(evidence_api::create_chain))
+        .route(
+            "/evidence/{chain}/entries",
+            post(evidence_api::append).get(evidence_api::read_entries),
+        )
+        .route("/evidence/{chain}/head", get(evidence_api::head))
         // Read-only Iceberg REST Catalog for warehouse discovery (Phase 5).
         .route("/catalog/v1/config", get(catalog::config))
         .route("/catalog/v1/namespaces", get(catalog::list_namespaces))
@@ -1067,6 +1086,20 @@ impl AppError {
     pub(crate) fn not_found(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn service_unavailable(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
             message: message.into(),
         }
     }
