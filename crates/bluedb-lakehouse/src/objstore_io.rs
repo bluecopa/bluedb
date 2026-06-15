@@ -29,23 +29,36 @@ use object_store::path::Path as OsPath;
 use object_store::ObjectStore;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-/// A [`FileIO`] that reads/writes through `store` (shares the bucket with
-/// SlateDB). Use a bare key prefix as the lakehouse root.
-pub fn object_store_file_io(store: Arc<dyn ObjectStore>) -> FileIO {
-    FileIOBuilder::new(Arc::new(ObjStoreFactory { store })).build()
+/// A [`FileIO`] that reads/writes through `store`, sharing the bucket with
+/// SlateDB.
+///
+/// `strip_base` is the fully-qualified location prefix the tables are published
+/// under (e.g. `s3://bucket` or `file:///abs/root`); it is stripped from every
+/// Iceberg path to recover the object-store key. Pass `""` to treat paths as
+/// bare keys (e.g. an in-memory store with a bare-prefix root). A fully-qualified
+/// base means the `metadata.json` a warehouse loads contains resolvable URIs.
+pub fn object_store_file_io(store: Arc<dyn ObjectStore>, strip_base: impl Into<String>) -> FileIO {
+    FileIOBuilder::new(Arc::new(ObjStoreFactory {
+        store,
+        strip_base: strip_base.into(),
+    }))
+    .build()
 }
 
 fn os_err(e: impl std::fmt::Display) -> Error {
     Error::new(ErrorKind::Unexpected, format!("object_store: {e}"))
 }
 
-/// Treat an iceberg path string as an object-store key.
-fn key(path: &str) -> OsPath {
-    OsPath::from(path)
+/// Recover the object-store key from an iceberg path: drop the `strip_base`
+/// prefix (if present) and any leading separators.
+fn key(path: &str, strip_base: &str) -> OsPath {
+    let rest = path.strip_prefix(strip_base).unwrap_or(path);
+    OsPath::from(rest.trim_start_matches('/'))
 }
 
 struct ObjStoreFactory {
     store: Arc<dyn ObjectStore>,
+    strip_base: String,
 }
 
 impl Debug for ObjStoreFactory {
@@ -72,12 +85,20 @@ impl StorageFactory for ObjStoreFactory {
     fn build(&self, _config: &StorageConfig) -> IceResult<Arc<dyn Storage>> {
         Ok(Arc::new(ObjStoreStorage {
             store: self.store.clone(),
+            strip_base: self.strip_base.clone(),
         }))
     }
 }
 
 struct ObjStoreStorage {
     store: Arc<dyn ObjectStore>,
+    strip_base: String,
+}
+
+impl ObjStoreStorage {
+    fn key(&self, path: &str) -> OsPath {
+        key(path, &self.strip_base)
+    }
 }
 
 impl Debug for ObjStoreStorage {
@@ -100,7 +121,7 @@ impl<'de> Deserialize<'de> for ObjStoreStorage {
 #[typetag::serde]
 impl Storage for ObjStoreStorage {
     async fn exists(&self, path: &str) -> IceResult<bool> {
-        match self.store.head(&key(path)).await {
+        match self.store.head(&self.key(path)).await {
             Ok(_) => Ok(true),
             Err(object_store::Error::NotFound { .. }) => Ok(false),
             Err(e) => Err(os_err(e)),
@@ -108,41 +129,41 @@ impl Storage for ObjStoreStorage {
     }
 
     async fn metadata(&self, path: &str) -> IceResult<FileMetadata> {
-        let meta = self.store.head(&key(path)).await.map_err(os_err)?;
+        let meta = self.store.head(&self.key(path)).await.map_err(os_err)?;
         Ok(FileMetadata { size: meta.size })
     }
 
     async fn read(&self, path: &str) -> IceResult<Bytes> {
-        let res = self.store.get(&key(path)).await.map_err(os_err)?;
+        let res = self.store.get(&self.key(path)).await.map_err(os_err)?;
         res.bytes().await.map_err(os_err)
     }
 
     async fn reader(&self, path: &str) -> IceResult<Box<dyn FileRead>> {
         Ok(Box::new(ObjRead {
             store: self.store.clone(),
-            path: key(path),
+            path: self.key(path),
         }))
     }
 
     async fn write(&self, path: &str, bs: Bytes) -> IceResult<()> {
-        self.store.put(&key(path), bs.into()).await.map_err(os_err)?;
+        self.store.put(&self.key(path), bs.into()).await.map_err(os_err)?;
         Ok(())
     }
 
     async fn writer(&self, path: &str) -> IceResult<Box<dyn FileWrite>> {
         Ok(Box::new(ObjWrite {
             store: self.store.clone(),
-            path: key(path),
+            path: self.key(path),
             buf: Vec::new(),
         }))
     }
 
     async fn delete(&self, path: &str) -> IceResult<()> {
-        self.store.delete(&key(path)).await.map_err(os_err)
+        self.store.delete(&self.key(path)).await.map_err(os_err)
     }
 
     async fn delete_prefix(&self, path: &str) -> IceResult<()> {
-        let prefix = key(path);
+        let prefix = self.key(path);
         let mut stream = self.store.list(Some(&prefix));
         while let Some(meta) = stream.next().await {
             let meta = meta.map_err(os_err)?;
@@ -155,6 +176,7 @@ impl Storage for ObjStoreStorage {
         Ok(InputFile::new(
             Arc::new(ObjStoreStorage {
                 store: self.store.clone(),
+                strip_base: self.strip_base.clone(),
             }),
             path.to_string(),
         ))
@@ -164,6 +186,7 @@ impl Storage for ObjStoreStorage {
         Ok(OutputFile::new(
             Arc::new(ObjStoreStorage {
                 store: self.store.clone(),
+                strip_base: self.strip_base.clone(),
             }),
             path.to_string(),
         ))

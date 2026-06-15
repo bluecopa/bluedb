@@ -197,6 +197,11 @@ struct Inner {
     /// opt-out state is stable across role flips (the registry is the source of
     /// truth, re-applied on each promote).
     cdc: CdcConfig,
+    /// Fully-qualified storage base URI for the lakehouse (e.g. `s3://bucket`,
+    /// `file:///abs`). Empty = bare keys (in-memory). Makes the Iceberg
+    /// `metadata.json` a warehouse loads contain resolvable locations. Set at
+    /// startup via [`AppState::with_lakehouse_base`].
+    lakehouse_base: String,
     /// The active lakehouse mirror engine: `Some` only while this node is the
     /// active writer (reopened on promote over the writer's `Database` + the
     /// object store, dropped on demote). A passive node mirrors nothing.
@@ -227,10 +232,23 @@ impl AppState {
                 fts: RwLock::new(FtsEngine::new()),
                 seal_handle: Mutex::new(None),
                 cdc: CdcConfig::default(),
+                lakehouse_base: String::new(),
                 lakehouse: RwLock::new(None),
                 lakehouse_handles: Mutex::new(Vec::new()),
             }),
         }
+    }
+
+    /// Set the fully-qualified storage base URI the lakehouse mirror publishes
+    /// under (e.g. `s3://bucket`, `file:///abs/dir`), so the Iceberg metadata a
+    /// warehouse loads has resolvable locations. Must be called at startup,
+    /// before the `Arc<Inner>` is shared; `main` derives it from the object-store
+    /// config. No-op once the state is shared.
+    pub fn with_lakehouse_base(mut self, base: impl Into<String>) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.lakehouse_base = base.into();
+        }
+        self
     }
 
     /// Enable (or disable) `POST /admin/sql` (arbitrary SQL, audited). Returns
@@ -316,10 +334,19 @@ impl AppState {
         // (the Iceberg tables live alongside the SQL data, in the same bucket the
         // warehouse reads). Restores the durable opt-out registry, then spawns the
         // event-driven seal loop + compaction worker.
-        let file_io = object_store_file_io(self.inner.object_store.clone());
+        // Publish under a fully-qualified base URI so the Iceberg metadata a
+        // warehouse loads has resolvable locations; the FileIO strips the base to
+        // recover object-store keys. Empty base (in-memory) → bare-key root.
+        let base = self.inner.lakehouse_base.clone();
+        let root = if base.is_empty() {
+            lakehouse_root()
+        } else {
+            format!("{base}/{}", lakehouse_root())
+        };
+        let file_io = object_store_file_io(self.inner.object_store.clone(), base);
         let lakehouse = LakehouseEngine::reopen(
             file_io,
-            lakehouse_root(),
+            root,
             LAKEHOUSE_NAMESPACE,
             database.clone(),
             self.inner.cdc.clone(),

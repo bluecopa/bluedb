@@ -281,7 +281,7 @@ async fn seals_into_the_same_object_store_as_slatedb() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let db = Database::new(Arc::new(Db::open("bluedb", store.clone()).await.unwrap()));
     let cdc = CdcConfig::default();
-    let file_io = object_store_file_io(store.clone());
+    let file_io = object_store_file_io(store.clone(), "");
     let eng = LakehouseEngine::reopen(file_io, "lakehouse", "main", db.clone(), cdc.clone())
         .await
         .unwrap();
@@ -326,7 +326,7 @@ async fn failover_resumes_mirror_exactly_once() {
     let db_a = Database::new(Arc::new(Db::open("bluedb", store.clone()).await.unwrap()));
     let cdc_a = CdcConfig::default();
     let eng_a = LakehouseEngine::reopen(
-        object_store_file_io(store.clone()),
+        object_store_file_io(store.clone(), ""),
         "lakehouse",
         "default",
         db_a.clone(),
@@ -352,7 +352,7 @@ async fn failover_resumes_mirror_exactly_once() {
     let db_b = Database::new(Arc::new(Db::open("bluedb", store.clone()).await.unwrap()));
     let cdc_b = CdcConfig::default();
     let eng_b = LakehouseEngine::reopen(
-        object_store_file_io(store.clone()),
+        object_store_file_io(store.clone(), ""),
         "lakehouse",
         "default",
         db_b.clone(),

@@ -89,8 +89,11 @@ fn env_secs(key: &str, default: u64) -> Duration {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let db_path = std::env::var("BLUEDB_DB_PATH").unwrap_or_else(|_| "bluedb".to_string());
-    let object_store =
-        objstore::build_object_store(&objstore::parse_object_store_config(|k| std::env::var(k).ok()))?;
+    let objstore_cfg = objstore::parse_object_store_config(|k| std::env::var(k).ok());
+    // Fully-qualified base for the lakehouse mirror's Iceberg locations (so a
+    // warehouse can resolve them); the FileIO strips it back to object-store keys.
+    let lakehouse_base = objstore_cfg.base_uri();
+    let object_store = objstore::build_object_store(&objstore_cfg)?;
 
     // Lease arbiter: shared Postgres for real multi-node HA, else in-process.
     let lease: Arc<dyn LeaseProvider> = match std::env::var("BLUEDB_LEASE_PG_URL") {
@@ -117,7 +120,8 @@ async fn main() -> anyhow::Result<()> {
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     let mut state = AppState::new(object_store, db_path, writer)
-        .with_admin_sql_enabled(admin_sql_enabled);
+        .with_admin_sql_enabled(admin_sql_enabled)
+        .with_lakehouse_base(lakehouse_base);
     if let Ok(raw) = std::env::var("BLUEDB_AUTHZ_TOKENS") {
         let authz = Authz::parse_env(&raw).expect("invalid BLUEDB_AUTHZ_TOKENS");
         state = state.with_authz(authz);

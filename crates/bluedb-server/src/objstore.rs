@@ -72,6 +72,27 @@ pub fn parse_object_store_config(get: impl Fn(&str) -> Option<String>) -> Object
     }
 }
 
+impl ObjectStoreConfig {
+    /// The fully-qualified storage base URI the lakehouse publishes Iceberg
+    /// tables under, so the `metadata.json` a warehouse loads contains resolvable
+    /// locations (e.g. `s3://bucket`, `file:///abs/dir`). Empty for the in-memory
+    /// store (no external reader). The lakehouse FileIO strips this prefix to
+    /// recover object-store keys.
+    pub fn base_uri(&self) -> String {
+        match self {
+            ObjectStoreConfig::S3 { bucket, .. } => format!("s3://{bucket}"),
+            ObjectStoreConfig::Gcs { bucket, .. } => format!("gs://{bucket}"),
+            ObjectStoreConfig::Azure { container, .. } => format!("abfss://{container}"),
+            ObjectStoreConfig::Local { dir } => {
+                let abs = std::fs::canonicalize(dir)
+                    .unwrap_or_else(|_| std::path::PathBuf::from(dir));
+                format!("file://{}", abs.display())
+            }
+            ObjectStoreConfig::Memory => String::new(),
+        }
+    }
+}
+
 /// Build the configured object store. S3/Azure/GCS construct their client
 /// without a network round-trip — credentials resolve lazily on first request;
 /// local creates the directory; memory is ephemeral.
