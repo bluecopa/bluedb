@@ -13,7 +13,9 @@ parquet = "57"
 tokio = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
-# metadata.json (TableMetadata) (de)serialization for our self-hosted catalog.
+# metadata.json (TableMetadata) (de)serialization for our self-hosted catalog,
+# and the durable mirror registry.
+serde = { workspace = true }
 serde_json = { workspace = true }
 # Collecting the Iceberg reader's Arrow record-batch stream in tests + the seal path.
 futures = "0.3"
@@ -22,3 +24,5 @@ bytes = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Engine tests drive a real Database over an in-memory SlateDB.
+slatedb = { workspace = true }

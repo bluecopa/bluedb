@@ -7,10 +7,86 @@
 //! heterogeneous → `string` (the value is JSON-encoded at write).
 
 use gluesql_core::ast::DataType;
-use gluesql_core::data::Value;
-use iceberg::spec::{ListType, MapType, NestedField, PrimitiveType, Type};
+use gluesql_core::data::{Schema as GlueSchema, Value};
+use iceberg::spec::{
+    ListType, MapType, NestedField, PrimitiveType, Schema as IcebergSchema, Type,
+};
 
 use crate::{LakehouseError, Result};
+
+/// Map a gluesql table [`GlueSchema`] to an Iceberg [`IcebergSchema`] plus the
+/// primary-key field-id (used as the equality-delete identifier).
+///
+/// Field-ids are positional and 1-based in column order (nested fields draw
+/// from a counter starting after the top-level columns), and the single
+/// `PRIMARY KEY` column becomes the Iceberg identifier field. `sample_rows`
+/// supplies cell values for inferring the element/value types of `List`/`Map`
+/// columns (see [`iceberg_type`]).
+///
+/// Errors if the table is schemaless (no `column_defs`) or does not have exactly
+/// one primary-key column — the mirror keys merge-on-read deletes on the PK
+/// (spec §2; the schema-direction baseline requires a PK on every table).
+pub fn table_to_iceberg(
+    schema: &GlueSchema,
+    sample_rows: &[&[Value]],
+) -> Result<(IcebergSchema, i32)> {
+    let columns = schema.column_defs.as_ref().ok_or_else(|| {
+        LakehouseError::Schema(format!(
+            "table '{}' is schemaless; the lakehouse mirror requires a schema with a primary key",
+            schema.table_name
+        ))
+    })?;
+
+    let pk_positions: Vec<usize> = columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.unique.as_ref().is_some_and(|u| u.is_primary))
+        .map(|(i, _)| i)
+        .collect();
+    let pk_idx = match pk_positions.as_slice() {
+        [only] => *only,
+        [] => {
+            return Err(LakehouseError::Schema(format!(
+                "table '{}' has no primary key; the lakehouse mirror requires one",
+                schema.table_name
+            )))
+        }
+        _ => {
+            return Err(LakehouseError::Schema(format!(
+                "table '{}' has a composite primary key; the v1 mirror supports single-column keys only",
+                schema.table_name
+            )))
+        }
+    };
+
+    let n = columns.len();
+    let mut next_nested_id = n as i32 + 1;
+    let mut fields = Vec::with_capacity(n);
+    for (col_idx, col) in columns.iter().enumerate() {
+        let field_id = col_idx as i32 + 1;
+        let cells: Vec<&Value> = sample_rows
+            .iter()
+            .filter_map(|r| r.get(col_idx))
+            .collect();
+        let ty = iceberg_type(&col.data_type, &cells, &mut next_nested_id)?;
+        // The PK column is always required; otherwise honor the column's nullability.
+        let field = if col_idx == pk_idx || !col.nullable {
+            NestedField::required(field_id, &col.name, ty)
+        } else {
+            NestedField::optional(field_id, &col.name, ty)
+        };
+        fields.push(field.into());
+    }
+
+    let pk_field_id = pk_idx as i32 + 1;
+    let iceberg_schema = IcebergSchema::builder()
+        .with_schema_id(0)
+        .with_identifier_field_ids(vec![pk_field_id])
+        .with_fields(fields)
+        .build()
+        .map_err(|e| LakehouseError::Schema(format!("building iceberg schema: {e}")))?;
+    Ok((iceberg_schema, pk_field_id))
+}
 
 /// Map a gluesql scalar [`DataType`] to an Iceberg [`PrimitiveType`] (spec §7.1).
 ///

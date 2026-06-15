@@ -1,0 +1,117 @@
+//! Engine tests: the durable mirror registry survives reopen, and `seal()`
+//! drains the CDC log into Iceberg (final state, then GC).
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use arrow_array::{Int64Array, RecordBatch, StringArray};
+use bluedb_lakehouse::LakehouseEngine;
+use bluedb_sql::{CdcConfig, Database};
+use futures::TryStreamExt;
+use gluesql_core::prelude::Glue;
+use iceberg::io::FileIO;
+use slatedb::object_store::memory::InMemory;
+use slatedb::Db;
+
+async fn make_db(name: &str) -> Database {
+    Database::new(Arc::new(
+        Db::open(name, Arc::new(InMemory::new())).await.unwrap(),
+    ))
+}
+
+async fn engine(root: &str, db: Database, cdc: CdcConfig) -> LakehouseEngine {
+    LakehouseEngine::reopen(FileIO::new_with_fs(), root, "main", db, cdc)
+        .await
+        .unwrap()
+}
+
+/// Read the `docs` mirror back as id -> body (columns by index: 0=id, 1=body).
+async fn read_docs(engine: &LakehouseEngine) -> BTreeMap<i64, String> {
+    let schema = engine.fetch_schema("docs").await.unwrap();
+    let writer = engine.writer_for("docs", &schema, &[]).await.unwrap();
+    let table = writer.to_table().unwrap();
+    let batches: Vec<RecordBatch> = table
+        .scan()
+        .build()
+        .unwrap()
+        .to_arrow()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+
+    let mut out = BTreeMap::new();
+    for batch in batches {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let bodies = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            out.insert(ids.value(i), bodies.value(i).to_string());
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn registry_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    let db = make_db("reg").await;
+
+    let cdc = CdcConfig::default();
+    let eng = engine(root, db.clone(), cdc.clone()).await;
+    eng.enable_table("docs").await.unwrap();
+    assert!(eng.is_mirrored("docs"));
+
+    // A fresh engine + fresh CDC control over the same root re-derives the set.
+    let cdc2 = CdcConfig::default();
+    let eng2 = engine(root, db.clone(), cdc2.clone()).await;
+    assert_eq!(eng2.mirrored_tables(), vec!["docs".to_string()]);
+    assert!(cdc2.is_enabled("docs"), "registry applied to the fresh CDC control");
+}
+
+#[tokio::test]
+async fn seal_publishes_final_state_then_gcs() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    let db = make_db("seal").await;
+    let cdc = CdcConfig::default();
+    let eng = engine(root, db.clone(), cdc.clone()).await;
+    eng.enable_table("docs").await.unwrap();
+
+    {
+        let mut g = Glue::new(db.connection_serialized());
+        g.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT);")
+            .await
+            .unwrap();
+    }
+    {
+        let mut g = Glue::new(db.connection_with_cdc(cdc.clone()));
+        g.execute("INSERT INTO docs VALUES (1,'a'),(2,'b');")
+            .await
+            .unwrap();
+        g.execute("UPDATE docs SET body='c' WHERE id=1;")
+            .await
+            .unwrap();
+        g.execute("DELETE FROM docs WHERE id=2;").await.unwrap();
+    }
+
+    eng.seal().await.unwrap();
+
+    let rows = read_docs(&eng).await;
+    assert_eq!(rows.len(), 1, "id=2 deleted");
+    assert_eq!(rows.get(&1).map(String::as_str), Some("c"), "id=1 updated");
+
+    // The log is GC'd through the sealed watermark; sealing again is a no-op.
+    assert!(db.scan_cdc(0).await.unwrap().is_empty());
+    eng.seal().await.unwrap();
+    assert_eq!(read_docs(&eng).await.len(), 1, "no-op seal changes nothing");
+}

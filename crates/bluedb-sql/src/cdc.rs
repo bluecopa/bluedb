@@ -10,7 +10,7 @@
 //! Multi-tenant CDC is out of scope for v1: the log lives under the default
 //! tenant only (see [`crate::keyspace::DEFAULT_TENANT`]).
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -133,6 +133,25 @@ pub(crate) async fn max_persisted_cdc_seq(substrate: &Substrate) -> Result<i64, 
     Ok(max)
 }
 
+/// The final state per table after collapsing a CDC scan: `Some(row)` is the
+/// last insert/update for that primary key, `None` a final delete.
+pub type CollapsedChanges = HashMap<String, BTreeMap<Key, Option<DataRow>>>;
+
+/// Collapse CDC entries (already in ascending sequence order) to their final
+/// per-`(table, primary key)` state — last-writer-wins. An insert then update
+/// then delete on one key collapses to a single `None`; insert then update to a
+/// single `Some(latest row)`. The seal loop turns `Some` into an upsert and
+/// `None` into an equality-delete.
+pub fn collapse_lww(entries: Vec<(i64, CdcEntry)>) -> CollapsedChanges {
+    let mut out: CollapsedChanges = HashMap::new();
+    for (_seq, entry) in entries {
+        out.entry(entry.table)
+            .or_default()
+            .insert(entry.key, entry.row);
+    }
+    out
+}
+
 /// Recover the sequence from a CDC storage key (its trailing 8 big-endian bytes).
 pub(crate) fn cdc_seq_from_key(key: &[u8]) -> Option<i64> {
     let n = key.len();
@@ -173,6 +192,34 @@ mod tests {
         cfg.set_table("docs", false);
         assert!(!cfg.is_enabled("docs")); // explicitly excluded
         assert!(cfg.is_enabled("other"));
+    }
+
+    #[test]
+    fn collapse_is_last_writer_wins_per_key() {
+        use gluesql_core::store::DataRow;
+        let e = |seq: i64, key: i64, row: Option<Vec<i64>>| {
+            (
+                seq,
+                CdcEntry {
+                    table: "t".into(),
+                    key: Key::I64(key),
+                    row: row.map(|vs| {
+                        DataRow::Vec(vs.into_iter().map(gluesql_core::data::Value::I64).collect())
+                    }),
+                },
+            )
+        };
+        // key 1: insert -> update -> survives as latest; key 2: insert -> delete.
+        let collapsed = collapse_lww(vec![
+            e(1, 1, Some(vec![1])),
+            e(2, 2, Some(vec![2])),
+            e(3, 1, Some(vec![99])),
+            e(4, 2, None),
+        ]);
+        let t = &collapsed["t"];
+        assert_eq!(t.len(), 2);
+        assert!(matches!(&t[&Key::I64(1)], Some(DataRow::Vec(v)) if v == &[gluesql_core::data::Value::I64(99)]));
+        assert_eq!(t[&Key::I64(2)], None);
     }
 
     #[test]
