@@ -4,6 +4,7 @@
 //! inside the serialized writer).
 
 mod error;
+mod graph;
 mod keyspace;
 mod merkle;
 mod model;
@@ -12,4 +13,5 @@ pub mod chain;
 
 pub use chain::{Appended, ConsistencyProof, Digest, EntryInput, Evidence, InclusionProof};
 pub use error::EvidenceError;
+pub use graph::{EdgeRef, EdgeUpsert, Graph};
 pub use model::{ChainMeta, EdgeDelta, EdgeOp, EntryRecord, IdemRecord, Merge};
