@@ -8,8 +8,11 @@ pub mod catalog;
 pub mod cdc;
 pub mod compaction;
 pub mod engine;
+pub mod objstore_io;
 pub mod schema;
 pub mod writer;
+
+pub use objstore_io::object_store_file_io;
 
 /// Errors raised by the lakehouse mirror.
 #[derive(Debug, thiserror::Error)]

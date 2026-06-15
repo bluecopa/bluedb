@@ -615,11 +615,13 @@ dependencies = [
  "anyhow",
  "arrow-array",
  "arrow-schema",
+ "async-trait",
  "bluedb-sql",
  "bytes",
  "futures",
  "gluesql-core",
  "iceberg",
+ "object_store",
  "parquet",
  "serde",
  "serde_json",
@@ -627,6 +629,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "typetag",
 ]
 
 [[package]]

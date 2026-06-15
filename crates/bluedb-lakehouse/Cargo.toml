@@ -21,6 +21,12 @@ serde_json = { workspace = true }
 futures = "0.3"
 # OutputFile::write takes bytes::Bytes (metadata.json + version-hint writes).
 bytes = { workspace = true }
+# Bridge iceberg's pluggable Storage onto the same object store as SlateDB, so
+# the mirror writes Iceberg into the same bucket the warehouse reads from.
+object_store = "0.12"
+async-trait = { workspace = true }
+# iceberg's Storage/StorageFactory traits require typetag::serde.
+typetag = "0.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }

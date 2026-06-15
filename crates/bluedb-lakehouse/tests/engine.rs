@@ -6,12 +6,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow_array::{Int64Array, RecordBatch, StringArray};
-use bluedb_lakehouse::LakehouseEngine;
+use bluedb_lakehouse::{object_store_file_io, LakehouseEngine};
 use bluedb_sql::{CdcConfig, Database, LhPragma};
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use gluesql_core::prelude::Glue;
 use iceberg::io::FileIO;
 use slatedb::object_store::memory::InMemory;
+use slatedb::object_store::{path::Path as OsPath, ObjectStore};
 use slatedb::Db;
 
 async fn make_db(name: &str) -> Database {
@@ -271,4 +272,48 @@ async fn pragma_controls_default_and_per_table_and_persists() {
     let eng2 = engine(root, db.clone(), cdc2.clone()).await;
     assert!(eng2.is_mirrored("anything_else"));
     assert!(!eng2.is_mirrored("secret"));
+}
+
+#[tokio::test]
+async fn seals_into_the_same_object_store_as_slatedb() {
+    // One object store backs BOTH SlateDB (the data) and the Iceberg mirror —
+    // exactly the production layout a warehouse reads from.
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Database::new(Arc::new(Db::open("bluedb", store.clone()).await.unwrap()));
+    let cdc = CdcConfig::default();
+    let file_io = object_store_file_io(store.clone());
+    let eng = LakehouseEngine::reopen(file_io, "lakehouse", "main", db.clone(), cdc.clone())
+        .await
+        .unwrap();
+    eng.enable_table("docs").await.unwrap();
+
+    {
+        let mut g = Glue::new(db.connection_serialized());
+        g.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT);")
+            .await
+            .unwrap();
+    }
+    {
+        let mut g = Glue::new(db.connection_with_cdc(cdc.clone()));
+        g.execute("INSERT INTO docs VALUES (1,'a'),(2,'b');")
+            .await
+            .unwrap();
+        g.execute("DELETE FROM docs WHERE id=1;").await.unwrap();
+    }
+    eng.seal().await.unwrap();
+
+    // Read the mirror back (through the same object-store FileIO).
+    let rows = read_table(&eng, "docs").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows.get(&2).map(String::as_str), Some("b"));
+
+    // The Iceberg files physically live under the `lakehouse/` prefix in the
+    // shared store (metadata.json, manifests, parquet) — what the warehouse reads.
+    let keys: Vec<String> = store
+        .list(Some(&OsPath::from("lakehouse")))
+        .map(|m| m.unwrap().location.to_string())
+        .collect()
+        .await;
+    assert!(keys.iter().any(|k| k.ends_with(".metadata.json")), "metadata present: {keys:?}");
+    assert!(keys.iter().any(|k| k.contains("/data/") && k.ends_with(".parquet")), "data present");
 }
