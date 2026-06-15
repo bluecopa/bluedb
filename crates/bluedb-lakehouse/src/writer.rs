@@ -123,18 +123,22 @@ impl LakehouseWriter {
             let md_path = format!("{table_root}/metadata/v{version}.metadata.json");
             let bytes = file_io.new_input(&md_path)?.read().await?;
             let metadata: TableMetadata = serde_json::from_slice(&bytes)?;
-            let schema = metadata.current_schema().clone();
-            Ok(Self {
+            let mut writer = Self {
                 file_io,
                 table_root,
                 table_ident,
-                schema,
+                schema: metadata.current_schema().clone(),
                 pk_field_id,
                 metadata,
                 version,
                 pending_data: Vec::new(),
                 pending_deletes: Vec::new(),
-            })
+            };
+            // Reconcile any ALTER since the last seal into the Iceberg schema,
+            // self-authoring a schema-only metadata commit. No-op when unchanged
+            // (the common path), so an untouched table pays only a comparison.
+            writer.evolve_schema_to(&schema).await?;
+            Ok(writer)
         } else {
             let creation = TableCreation::builder()
                 .name(table.to_string())
@@ -160,6 +164,32 @@ impl LakehouseWriter {
             writer.write_metadata(0).await?;
             Ok(writer)
         }
+    }
+
+    /// If `desired` differs from the current Iceberg schema, evolve to it by
+    /// self-authoring a schema-only metadata version (`add_current_schema`) and
+    /// adopt the evolved schema for subsequent writes. No-op when equal — the
+    /// common (never-altered) path, so an unchanged table pays only a comparison.
+    ///
+    /// The evolved schema's field order is the current logical column order, so
+    /// the positional record-batch construction in [`Self::rows_to_record_batch`]
+    /// stays correct after the ALTER.
+    async fn evolve_schema_to(&mut self, desired: &IcebergSchema) -> Result<()> {
+        let Some(evolved) = reconcile_schema(self.metadata.current_schema(), desired)? else {
+            return Ok(());
+        };
+        let current_md_loc = format!("{}/v{}.metadata.json", self.metadata_dir(), self.version);
+        let result = self
+            .metadata
+            .clone()
+            .into_builder(Some(current_md_loc))
+            .add_current_schema(evolved)?
+            .build()?;
+        self.metadata = result.metadata;
+        self.version += 1;
+        self.schema = self.metadata.current_schema().clone();
+        self.write_metadata(self.version).await?;
+        Ok(())
     }
 
     /// Stage an upsert of `rows` (insert or new version of an existing key).
