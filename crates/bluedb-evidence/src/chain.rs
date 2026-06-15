@@ -4,7 +4,7 @@
 
 use bluedb_sql::{Database, WriteLease};
 use bluedb_storage::Substrate;
-use sha2::{Digest, Sha256};
+use sha2::{Digest as Sha2Digest, Sha256};
 use slatedb::config::WriteOptions;
 use slatedb::WriteBatch;
 
@@ -40,6 +40,29 @@ pub struct Appended {
     pub base_seq: i64,
     /// The server-assigned seqs for each entry in input order.
     pub seqs: Vec<i64>,
+}
+
+/// `{ size, root }` — the Merkle digest of a verified chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Digest {
+    pub size: i64,
+    pub root: [u8; 32],
+}
+
+/// An RFC 6962 inclusion proof for `seq` (1-based) against tree size `size`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InclusionProof {
+    pub seq: i64,
+    pub size: i64,
+    pub audit_path: Vec<[u8; 32]>,
+}
+
+/// An RFC 6962 consistency proof between sizes `first` and `second`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsistencyProof {
+    pub first: i64,
+    pub second: i64,
+    pub proof: Vec<[u8; 32]>,
 }
 
 const MAX_PAGE: usize = 1000;
@@ -173,6 +196,8 @@ impl Evidence {
         let k = entries.len() as i64;
         let seqs: Vec<i64> = (base + 1..=base + k).collect();
 
+        let verified = existing_meta.map(|m| m.verified).unwrap_or(true);
+
         let mut batch = WriteBatch::new();
 
         // Auto-create the chain meta if it has never been explicitly created.
@@ -183,9 +208,10 @@ impl Evidence {
             );
         }
 
-        // Write each entry record — consume entries to avoid cloning.
+        // Write each entry record — compute leaf_hash on verified chains.
+        let mut leaves: Vec<[u8; 32]> = Vec::new();
         for (entry, &seq) in entries.into_iter().zip(&seqs) {
-            let rec = EntryRecord {
+            let mut rec = EntryRecord {
                 etype: entry.etype,
                 payload: entry.payload,
                 at: entry.at,
@@ -193,11 +219,27 @@ impl Evidence {
                 leaf_hash: None,
                 redacted: false,
             };
+            if verified {
+                let lh = crate::merkle::leaf_hash(&rec.etype, &rec.payload, &rec.at, &rec.edges);
+                rec.leaf_hash = Some(lh);
+                leaves.push(lh);
+            }
             batch.put(self.keyspace.entry_key(chain, seq), &store::encode(&rec)?);
         }
 
         // Advance the sequence counter.
         batch.put(self.keyspace.seq_key(chain), (base + k).to_be_bytes());
+
+        // Advance the Merkle frontier on verified chains (same batch — crash-consistent).
+        if verified {
+            let mut frontier = store::get_frontier(&self.substrate, &self.keyspace, chain)
+                .await?
+                .unwrap_or_default();
+            for lh in leaves {
+                frontier.push(lh);
+            }
+            batch.put(self.keyspace.merkle_key(chain), &store::encode(&frontier)?);
+        }
 
         // Persist the idempotency record if requested.
         if let Some(key) = idem_key {
@@ -274,5 +316,95 @@ impl Evidence {
             out.push((seq, rec));
         }
         Ok(out)
+    }
+
+    // ---- Merkle reads ----
+
+    /// Require that `chain` is a verified chain (auto-created chains are
+    /// verified). Returns `NotVerified` on an explicitly-plain chain.
+    async fn require_verified(&self, chain: &str) -> Result<(), EvidenceError> {
+        match store::get_chain_meta(&self.substrate, &self.keyspace, chain).await? {
+            Some(m) if !m.verified => Err(EvidenceError::NotVerified(chain.to_string())),
+            _ => Ok(()),
+        }
+    }
+
+    /// Read the dense leaf hashes for seqs `1..=upto` on a verified chain.
+    /// Errors if a slot is missing or lacks a `leaf_hash` (would indicate a
+    /// non-verified or corrupted chain).
+    async fn leaf_hashes(&self, chain: &str, upto: i64) -> Result<Vec<[u8; 32]>, EvidenceError> {
+        let rows = self.read_range(chain, 1, upto).await?;
+        if rows.len() as i64 != upto {
+            return Err(Self::storage_err(format!(
+                "expected {upto} dense entries for proof, found {}",
+                rows.len()
+            )));
+        }
+        let mut out = Vec::with_capacity(rows.len());
+        for (seq, rec) in rows {
+            let lh = rec
+                .leaf_hash
+                .ok_or_else(|| Self::storage_err(format!("entry {seq} has no leaf_hash")))?;
+            out.push(lh);
+        }
+        Ok(out)
+    }
+
+    /// Merkle digest `{ size, root }` for a verified chain. O(log N) — folds the
+    /// persisted frontier. Empty/never-appended verified chain → size 0,
+    /// `empty_root`.
+    pub async fn digest(&self, chain: &str) -> Result<Digest, EvidenceError> {
+        self.require_verified(chain).await?;
+        match store::get_frontier(&self.substrate, &self.keyspace, chain).await? {
+            Some(f) => Ok(Digest { size: f.size, root: f.root() }),
+            None => Ok(Digest { size: 0, root: crate::merkle::empty_root() }),
+        }
+    }
+
+    /// Inclusion proof for `seq` (1-based) against tree size `size` (defaults to
+    /// `head`). O(N) — reads leaf hashes for `1..=size`.
+    pub async fn inclusion(
+        &self,
+        chain: &str,
+        seq: i64,
+        size: Option<i64>,
+    ) -> Result<InclusionProof, EvidenceError> {
+        self.require_verified(chain).await?;
+        let head = self.head(chain).await?;
+        let size = size.unwrap_or(head);
+        if size < 1 || size > head {
+            return Err(EvidenceError::InvalidArgument(format!(
+                "size {size} out of range (head={head})"
+            )));
+        }
+        if seq < 1 || seq > size {
+            return Err(EvidenceError::InvalidArgument(format!(
+                "seq {seq} out of range (size={size})"
+            )));
+        }
+        let leaves = self.leaf_hashes(chain, size).await?;
+        let audit_path = crate::merkle::inclusion_proof(&leaves, (seq - 1) as usize);
+        Ok(InclusionProof { seq, size, audit_path })
+    }
+
+    /// Consistency proof between sizes `first` and `second` (second defaults to
+    /// `head`). O(N).
+    pub async fn consistency(
+        &self,
+        chain: &str,
+        first: i64,
+        second: Option<i64>,
+    ) -> Result<ConsistencyProof, EvidenceError> {
+        self.require_verified(chain).await?;
+        let head = self.head(chain).await?;
+        let second = second.unwrap_or(head);
+        if first < 1 || first > second || second > head {
+            return Err(EvidenceError::InvalidArgument(format!(
+                "require 1 <= first <= second <= head ({first}, {second}, head={head})"
+            )));
+        }
+        let leaves = self.leaf_hashes(chain, second).await?;
+        let proof = crate::merkle::consistency_proof(&leaves, first as usize);
+        Ok(ConsistencyProof { first, second, proof })
     }
 }
