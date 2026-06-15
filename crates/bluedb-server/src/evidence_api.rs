@@ -352,13 +352,14 @@ pub async fn digest_signed(
     let d = state.evidence(&tenant).await?.digest(&chain).await.map_err(map_evidence_err)?;
     let ts = now_millis();
     let payload = bluedb_evidence::sth_payload(&tenant, &chain, d.size, &d.root, ts);
-    let sig = signer.sign(&payload).await?;
+    let (key_version, sig) = signer.sign(&payload).await?;
     Ok(Json(json!({
         "size": d.size,
         "root_hash": hex32(&d.root),
         "timestamp": ts,
         "alg": signer.alg(),
         "key_id": signer.key_id(),
+        "key_version": key_version,
         "signature": B64.encode(&sig),
     })))
 }
@@ -375,10 +376,12 @@ pub async fn signing_key(
     let signer = state
         .signer()
         .ok_or_else(|| AppError::not_implemented("digest signing is not enabled"))?;
+    let (key_version, pem) = signer.public_key().await?;
     Ok(Json(json!({
         "key_id": signer.key_id(),
         "alg": signer.alg(),
-        "public_key": signer.public_key_pem().await?,
+        "key_version": key_version,
+        "public_key": pem,
     })))
 }
 

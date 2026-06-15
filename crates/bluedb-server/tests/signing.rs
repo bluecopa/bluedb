@@ -1,9 +1,10 @@
 //! End-to-end test of evidence digest signing (Signed Tree Heads).
 //!
-//! Verifies the full HTTP path with the **local** ES256 signer: fetch the
-//! signed digest + the public key, rebuild the canonical `sth_payload`, and
-//! confirm the signature verifies. Also asserts cross-chain replay is rejected
-//! and that a node with signing off returns `501`.
+//! Verifies the full HTTP path with the **test-only** in-process ES256 signer
+//! (injected via `AppState::with_local_signer_for_tests` — never a config
+//! path): fetch the signed digest + the public key, rebuild the canonical
+//! `sth_payload`, and confirm the signature verifies. Also asserts cross-chain
+//! replay is rejected and that a node with signing off returns `501`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,17 +33,14 @@ fn writer(node: &str) -> Arc<WriterController> {
     ))
 }
 
-/// A promoted node with the **local** evidence signer enabled (ephemeral key).
+/// A promoted node with the **test-only** in-process signer enabled (ephemeral
+/// ES256 key). Production never reaches `LocalSigner` from config — `vault` is
+/// the only key-bearing config mode — so the e2e injects it via the
+/// `#[doc(hidden)]` test seam.
 async fn promoted_signing() -> Router {
     use slatedb::object_store::{memory::InMemory, ObjectStore};
-    // `with_evidence_signing` reads BLUEDB_EVIDENCE_SIGNING from the env. This
-    // test binary is the only consumer here; set it before building the state.
-    std::env::set_var("BLUEDB_EVIDENCE_SIGNING", "local");
-    std::env::remove_var("BLUEDB_EVIDENCE_SIGNING_KEY_PEM_FILE"); // → ephemeral key
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let state = AppState::new(store, "bluedb", writer("sign-node"))
-        .with_evidence_signing()
-        .expect("build signer");
+    let state = AppState::new(store, "bluedb", writer("sign-node")).with_local_signer_for_tests();
     state.promote().await.expect("promote");
     build_app(state)
 }
@@ -125,6 +123,7 @@ async fn signed_digest_verifies_end_to_end_and_rejects_replay() {
     let (s, key) = call(&app, "GET", "/evidence/signing-key", Some(tenant), None).await;
     assert_eq!(s, StatusCode::OK, "signing-key: {key}");
     assert_eq!(key["alg"], "ES256");
+    assert!(key["key_version"].is_i64(), "signing-key carries key_version: {key}");
     let pem = key["public_key"].as_str().expect("public_key pem").to_string();
     assert!(pem.contains("BEGIN PUBLIC KEY"), "SPKI PEM: {pem}");
 
@@ -134,6 +133,7 @@ async fn signed_digest_verifies_end_to_end_and_rejects_replay() {
     assert_eq!(sa["size"], 3, "size: {sa}");
     assert_eq!(sa["alg"], "ES256");
     assert_eq!(sa["key_id"], "local-ephemeral");
+    assert!(sa["key_version"].is_i64(), "signed digest carries key_version: {sa}");
     let root_a = sa["root_hash"].as_str().expect("root_hash");
     let ts_a = sa["timestamp"].as_i64().expect("timestamp");
     let sig_a = B64.decode(sa["signature"].as_str().expect("signature")).expect("b64 sig");
