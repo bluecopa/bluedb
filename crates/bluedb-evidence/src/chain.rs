@@ -247,12 +247,16 @@ impl Evidence {
         batch.put(self.keyspace.seq_key(chain), (base + k).to_be_bytes());
 
         // Advance the Merkle frontier on verified chains (same batch — crash-consistent).
+        // Each push's carry-merge emits complete-subtree parents; persist them in the
+        // same batch so O(log N) proofs can read them instead of all leaves.
         if verified {
             let mut frontier = store::get_frontier(&self.substrate, &self.keyspace, chain)
                 .await?
                 .unwrap_or_default();
             for lh in leaves {
-                frontier.push(lh);
+                for (level, index, hash) in frontier.push_emit(lh) {
+                    batch.put(self.keyspace.merkle_node_key(chain, level, index), hash);
+                }
             }
             batch.put(self.keyspace.merkle_key(chain), &store::encode(&frontier)?);
         }
@@ -345,27 +349,6 @@ impl Evidence {
         }
     }
 
-    /// Read the dense leaf hashes for seqs `1..=upto` on a verified chain.
-    /// Errors if a slot is missing or lacks a `leaf_hash` (would indicate a
-    /// non-verified or corrupted chain).
-    async fn leaf_hashes(&self, chain: &str, upto: i64) -> Result<Vec<[u8; 32]>, EvidenceError> {
-        let rows = self.read_range(chain, 1, upto).await?;
-        if rows.len() as i64 != upto {
-            return Err(Self::storage_err(format!(
-                "expected {upto} dense entries for proof, found {}",
-                rows.len()
-            )));
-        }
-        let mut out = Vec::with_capacity(rows.len());
-        for (seq, rec) in rows {
-            let lh = rec
-                .leaf_hash
-                .ok_or_else(|| Self::storage_err(format!("entry {seq} has no leaf_hash")))?;
-            out.push(lh);
-        }
-        Ok(out)
-    }
-
     /// Merkle digest `{ size, root }` for a verified chain. O(log N) — folds the
     /// persisted frontier. Empty/never-appended verified chain → size 0,
     /// `empty_root`.
@@ -378,7 +361,7 @@ impl Evidence {
     }
 
     /// Inclusion proof for `seq` (1-based) against tree size `size` (defaults to
-    /// `head`). O(N) — reads leaf hashes for `1..=size`.
+    /// `head`). O(log N) — assembled from persisted complete-subtree nodes.
     pub async fn inclusion(
         &self,
         chain: &str,
@@ -398,13 +381,19 @@ impl Evidence {
                 "seq {seq} out of range (size={size})"
             )));
         }
-        let leaves = self.leaf_hashes(chain, size).await?;
-        let audit_path = crate::merkle::inclusion_proof(&leaves, (seq - 1) as usize);
+        let audit_path = crate::proof::inclusion(
+            &self.substrate,
+            &self.keyspace,
+            chain,
+            (seq - 1) as u64,
+            size as u64,
+        )
+        .await?;
         Ok(InclusionProof { seq, size, audit_path })
     }
 
     /// Consistency proof between sizes `first` and `second` (second defaults to
-    /// `head`). O(N).
+    /// `head`). O(log N) — assembled from persisted complete-subtree nodes.
     pub async fn consistency(
         &self,
         chain: &str,
@@ -419,8 +408,14 @@ impl Evidence {
                 "require 1 <= first <= second <= head ({first}, {second}, head={head})"
             )));
         }
-        let leaves = self.leaf_hashes(chain, second).await?;
-        let proof = crate::merkle::consistency_proof(&leaves, first as usize);
+        let proof = crate::proof::consistency(
+            &self.substrate,
+            &self.keyspace,
+            chain,
+            first as u64,
+            second as u64,
+        )
+        .await?;
         Ok(ConsistencyProof { first, second, proof })
     }
 
@@ -505,5 +500,61 @@ impl Evidence {
         drop(_lease);
         writer.flush().await.map_err(Self::storage_err)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use bluedb_sql::Database;
+    use slatedb::{object_store::memory::InMemory, Db};
+
+    async fn db() -> Database {
+        let d = Db::open("chain-test", Arc::new(InMemory::new())).await.unwrap();
+        Database::new(Arc::new(d))
+    }
+
+    /// Value-correctness for the persisted nodes: every persisted `(level, index)`
+    /// node equals `merkle_root` of its leaf range over the actual stored leaves.
+    /// In-crate test so it can reach `crate::merkle::{leaf_hash, merkle_root}` and
+    /// `store::get_merkle_node` (all `pub(crate)`).
+    #[tokio::test]
+    async fn persisted_nodes_equal_merkle_root_of_their_leaf_range() {
+        let database = db().await;
+        let ev = Evidence::new(&database, "_");
+        let substrate = database.substrate();
+        let ks = EvidenceKeyspace::new("_");
+        let mut leaves: Vec<[u8; 32]> = Vec::new();
+        for i in 0..16u8 {
+            let payload = vec![i];
+            ev.append("c", vec![EntryInput { etype: "t".into(), payload: payload.clone(), at: String::new(), edges: vec![] }], None)
+                .await
+                .unwrap();
+            leaves.push(crate::merkle::leaf_hash("t", &payload, "", &[]));
+            let size = leaves.len() as u64;
+            // Check every complete subtree fully inside [0, size).
+            for level in 1u8..64 {
+                let span = 1u64 << level;
+                if span > size {
+                    break;
+                }
+                let mut index = 0u64;
+                while (index + 1) * span <= size {
+                    let lo = (index * span) as usize;
+                    let hi = lo + span as usize;
+                    let got = store::get_merkle_node(&substrate, &ks, "c", level, index)
+                        .await
+                        .unwrap()
+                        .unwrap_or_else(|| panic!("node (L{level},{index}) missing at size {size}"));
+                    assert_eq!(
+                        got,
+                        crate::merkle::merkle_root(&leaves[lo..hi]),
+                        "node (L{level},{index}) wrong at size {size}"
+                    );
+                    index += 1;
+                }
+            }
+        }
     }
 }

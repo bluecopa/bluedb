@@ -71,6 +71,20 @@ pub(crate) async fn get_frontier(
     }
 }
 
+/// Point read of a persisted complete-subtree Merkle node, or `None` if absent.
+pub(crate) async fn get_merkle_node(
+    substrate: &Substrate,
+    ks: &EvidenceKeyspace,
+    chain: &str,
+    level: u8,
+    index: u64,
+) -> Result<Option<[u8; 32]>> {
+    match substrate.get(&ks.merkle_node_key(chain, level, index)).await? {
+        Some(b) => Ok(Some(b.as_ref().try_into().context("merkle node must be 32 bytes")?)),
+        None => Ok(None),
+    }
+}
+
 /// Point read of one entry by seq, or `None` if absent.
 pub(crate) async fn get_entry(
     substrate: &Substrate,
@@ -158,6 +172,18 @@ mod tests {
         let bytes = encode(&meta).unwrap();
         let back: ChainMeta = decode(&bytes).unwrap();
         assert_eq!(meta, back);
+    }
+
+    #[tokio::test]
+    async fn get_merkle_node_absent_then_present() {
+        let database = writer_database().await;
+        let substrate = database.substrate();
+        let ks = EvidenceKeyspace::new("acme");
+        assert_eq!(get_merkle_node(&substrate, &ks, "c", 1, 0).await.unwrap(), None);
+        let writer = substrate.require_writer().unwrap();
+        let h = [7u8; 32];
+        writer.put(&ks.merkle_node_key("c", 1, 0), &h).await.unwrap();
+        assert_eq!(get_merkle_node(&substrate, &ks, "c", 1, 0).await.unwrap(), Some(h));
     }
 
     #[tokio::test]

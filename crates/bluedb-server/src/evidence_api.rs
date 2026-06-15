@@ -336,6 +336,57 @@ pub async fn digest(
     Ok(Json(json!({ "size": d.size, "root_hash": hex32(&d.root) })))
 }
 
+// --- GET /evidence/{chain}/digest/signed ------------------------------------
+
+/// `GET /evidence/{chain}/digest/signed` — ES256-signed STH for a verified chain.
+pub async fn digest_signed(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(chain): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    state.authorize(&headers, Scope::DataRead)?;
+    let tenant = state.tenant(&headers)?;
+    let signer = state.signer().ok_or_else(|| {
+        AppError::not_implemented("digest signing is not enabled (set BLUEDB_EVIDENCE_SIGNING)")
+    })?;
+    let d = state.evidence(&tenant).await?.digest(&chain).await.map_err(map_evidence_err)?;
+    let ts = now_millis();
+    let payload = bluedb_evidence::sth_payload(&tenant, &chain, d.size, &d.root, ts);
+    let sig = signer.sign(&payload).await?;
+    Ok(Json(json!({
+        "size": d.size,
+        "root_hash": hex32(&d.root),
+        "timestamp": ts,
+        "alg": signer.alg(),
+        "key_id": signer.key_id(),
+        "signature": B64.encode(&sig),
+    })))
+}
+
+// --- GET /evidence/signing-key ----------------------------------------------
+
+/// `GET /evidence/signing-key` — the SPKI-PEM public key for verifying STHs.
+pub async fn signing_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    state.authorize(&headers, Scope::DataRead)?;
+    let _ = state.tenant(&headers)?; // tenant-scoped auth, though the key is shared
+    let signer = state
+        .signer()
+        .ok_or_else(|| AppError::not_implemented("digest signing is not enabled"))?;
+    Ok(Json(json!({
+        "key_id": signer.key_id(),
+        "alg": signer.alg(),
+        "public_key": signer.public_key_pem().await?,
+    })))
+}
+
+fn now_millis() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+}
+
 // --- GET /evidence/{chain}/proof?seq&size -----------------------------------
 
 #[derive(Deserialize)]

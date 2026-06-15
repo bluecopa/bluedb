@@ -50,6 +50,11 @@ use bluedb_ledger::Ledger;
 mod ledger_api;
 mod evidence_api;
 mod graph_api;
+mod signer;
+
+/// ES256-DER verification helper, re-exported for Rust consumers (and the e2e
+/// test) to verify Signed Tree Heads against a published SPKI-PEM public key.
+pub use signer::verify_es256_der;
 
 use bluedb_lakehouse::{object_store_file_io, LakehouseConfig, LakehouseManager};
 use bluedb_rest::{parse_filters, DeleteRequest, InsertRequest, UpdateRequest};
@@ -229,6 +234,12 @@ struct Inner {
     /// mirrors nothing. The manager owns the per-tenant engines and the shared
     /// seal/compaction loops.
     lakehouse: RwLock<Option<Arc<LakehouseManager>>>,
+    /// Evidence digest signer (Signed Tree Heads). `None` ⇒ signing is off (the
+    /// default); the signed-digest / signing-key endpoints return `501`. Built
+    /// once at startup from the environment via [`AppState::with_evidence_signing`]
+    /// (or injected directly in tests via [`AppState::with_signer`]). The private
+    /// key never lives here in production — the `Vault` backend holds only a token.
+    signer: Option<Arc<signer::EvidenceSigner>>,
 }
 
 impl AppState {
@@ -254,6 +265,7 @@ impl AppState {
                 cdc: CdcConfig::default(),
                 lakehouse_base: String::new(),
                 lakehouse: RwLock::new(None),
+                signer: None,
             }),
         }
     }
@@ -268,6 +280,77 @@ impl AppState {
             inner.lakehouse_base = base.into();
         }
         self
+    }
+
+    /// Install an evidence digest signer. Must be called at startup, before the
+    /// `Arc<Inner>` is shared. `None` ⇒ signing stays off (the default). Used by
+    /// tests to inject a `LocalSigner`; production uses
+    /// [`AppState::with_evidence_signing`] to build it from the environment.
+    pub(crate) fn with_signer(mut self, signer: Option<Arc<signer::EvidenceSigner>>) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.signer = signer;
+        }
+        self
+    }
+
+    /// Build the evidence digest signer from the environment and install it.
+    /// `BLUEDB_EVIDENCE_SIGNING` = `off` (default) | `local` | `vault`:
+    /// - `local`: load `BLUEDB_EVIDENCE_SIGNING_KEY_PEM_FILE` (PKCS#8 PEM); if
+    ///   unset, generate an ephemeral key (dev only, logs a `WARN`).
+    /// - `vault`: `VAULT_ADDR`, `VAULT_TOKEN`, `BLUEDB_EVIDENCE_VAULT_MOUNT`
+    ///   (default `transit`), `BLUEDB_EVIDENCE_VAULT_KEY`.
+    ///
+    /// Signing is **off by default**. Returns an error only on misconfiguration.
+    pub fn with_evidence_signing(self) -> Result<Self, AppError> {
+        use signer::{EvidenceSigner, LocalSigner};
+        let mode = std::env::var("BLUEDB_EVIDENCE_SIGNING").unwrap_or_else(|_| "off".to_string());
+        let built: Option<EvidenceSigner> = match mode.as_str() {
+            "off" | "" => None,
+            "local" => {
+                let s = match std::env::var("BLUEDB_EVIDENCE_SIGNING_KEY_PEM_FILE") {
+                    Ok(path) => {
+                        let pem = std::fs::read_to_string(&path).map_err(|e| {
+                            AppError::internal(format!("read local signing key {path}: {e}"))
+                        })?;
+                        LocalSigner::from_pem(&pem, format!("local:{path}"))?
+                    }
+                    Err(_) => {
+                        eprintln!(
+                            "bluedb-server: WARN evidence signing=local with no \
+                             BLUEDB_EVIDENCE_SIGNING_KEY_PEM_FILE — using an ephemeral key \
+                             (dev only; not stable across restarts, NOT production trust)"
+                        );
+                        LocalSigner::ephemeral()
+                    }
+                };
+                Some(EvidenceSigner::Local(s))
+            }
+            "vault" => {
+                let addr = std::env::var("VAULT_ADDR")
+                    .map_err(|_| AppError::internal("evidence signing=vault: VAULT_ADDR unset"))?;
+                let token = std::env::var("VAULT_TOKEN")
+                    .map_err(|_| AppError::internal("evidence signing=vault: VAULT_TOKEN unset"))?;
+                let mount = std::env::var("BLUEDB_EVIDENCE_VAULT_MOUNT")
+                    .unwrap_or_else(|_| "transit".to_string());
+                let key = std::env::var("BLUEDB_EVIDENCE_VAULT_KEY").map_err(|_| {
+                    AppError::internal("evidence signing=vault: BLUEDB_EVIDENCE_VAULT_KEY unset")
+                })?;
+                Some(EvidenceSigner::Vault(signer::vault::VaultTransitSigner::new(
+                    addr, token, mount, key,
+                )?))
+            }
+            other => {
+                return Err(AppError::internal(format!(
+                    "BLUEDB_EVIDENCE_SIGNING: unknown mode '{other}' (want off|local|vault)"
+                )))
+            }
+        };
+        Ok(self.with_signer(built.map(Arc::new)))
+    }
+
+    /// The evidence digest signer, or `None` if signing is off on this node.
+    pub(crate) fn signer(&self) -> Option<Arc<signer::EvidenceSigner>> {
+        self.inner.signer.clone()
     }
 
     /// Enable (or disable) `POST /admin/sql` (arbitrary SQL, audited). Returns
@@ -645,6 +728,8 @@ pub fn build_app(state: AppState) -> Router {
         .route("/evidence/{chain}/entries/{seq}/redact", post(evidence_api::redact))
         .route("/evidence/{chain}/entries/{seq}", delete(evidence_api::hard_delete))
         .route("/evidence/{chain}/digest", get(evidence_api::digest))
+        .route("/evidence/{chain}/digest/signed", get(evidence_api::digest_signed))
+        .route("/evidence/signing-key", get(evidence_api::signing_key))
         .route("/evidence/{chain}/proof", get(evidence_api::inclusion))
         .route("/evidence/{chain}/consistency", get(evidence_api::consistency))
         // Native graph store (edge maintenance + read-only traversal).
@@ -1125,6 +1210,15 @@ impl AppError {
     pub(crate) fn service_unavailable(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
+            message: message.into(),
+        }
+    }
+
+    /// `501 Not Implemented` — an optional capability (e.g. digest signing) is
+    /// not enabled on this node.
+    pub(crate) fn not_implemented(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_IMPLEMENTED,
             message: message.into(),
         }
     }

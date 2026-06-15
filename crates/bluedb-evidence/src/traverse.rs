@@ -5,7 +5,7 @@
 //! state across its scans; output is sorted (`reachable`) / maximin-unique
 //! (`widest_path`), so it is deterministic for a fixed graph.
 
-use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use bluedb_storage::Substrate;
 
@@ -80,9 +80,66 @@ pub(crate) async fn in_neighbors(
     scan_adjacency(substrate, &ks.graph_in_prefix(graph, dst), floor).await
 }
 
+/// Concurrency cap for level expansion (in-flight neighbor scans).
+const REACHABLE_FANOUT: usize = 16;
+
+/// Scan every node in `nodes` for its out- (and in-, when undirected) neighbors
+/// concurrently, bounded to `REACHABLE_FANOUT` in-flight scans. Returns all
+/// discovered neighbor ids (with duplicates; the caller dedups). Order is
+/// unspecified — the caller sorts, so the final result is deterministic.
+async fn expand_level(
+    substrate: &Substrate,
+    ks: &EvidenceKeyspace,
+    graph: &str,
+    nodes: &[String],
+    floor: i64,
+    directed: bool,
+) -> Result<Vec<String>, EvidenceError> {
+    let mut set: tokio::task::JoinSet<Result<Vec<String>, EvidenceError>> = tokio::task::JoinSet::new();
+    let mut iter = nodes.iter();
+
+    let spawn_one = |set: &mut tokio::task::JoinSet<Result<Vec<String>, EvidenceError>>, node: &str| {
+        let sub = substrate.clone();
+        let ks = ks.clone();
+        let g = graph.to_string();
+        let n = node.to_string();
+        set.spawn(async move {
+            let mut ns: Vec<String> = out_neighbors(&sub, &ks, &g, &n, floor)
+                .await?
+                .into_iter()
+                .map(|(v, _, _)| v)
+                .collect();
+            if !directed {
+                ns.extend(in_neighbors(&sub, &ks, &g, &n, floor).await?.into_iter().map(|(v, _, _)| v));
+            }
+            Ok(ns)
+        });
+    };
+
+    for _ in 0..REACHABLE_FANOUT {
+        match iter.next() {
+            Some(n) => spawn_one(&mut set, n),
+            None => break,
+        }
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    while let Some(joined) = set.join_next().await {
+        let ns = joined
+            .map_err(|e| EvidenceError::Storage(anyhow::anyhow!("traversal join: {e}")))??;
+        out.extend(ns);
+        if let Some(n) = iter.next() {
+            spawn_one(&mut set, n);
+        }
+    }
+    Ok(out)
+}
+
 /// Nodes reachable from any of `from`, traversing only edges with weight ≥
 /// `floor`. Seeds are included. `directed=false` also follows `in` edges.
-/// Output is sorted (order-independent).
+/// Output is sorted (order-independent). Each BFS level is expanded
+/// concurrently (bounded fan-out); the `visited` set keeps the result
+/// identical and deterministic regardless of completion order.
 pub(crate) async fn reachable(
     substrate: &Substrate,
     ks: &EvidenceKeyspace,
@@ -92,25 +149,21 @@ pub(crate) async fn reachable(
     directed: bool,
 ) -> Result<Vec<String>, EvidenceError> {
     let mut visited: HashSet<String> = HashSet::new();
-    let mut queue: VecDeque<String> = VecDeque::new();
+    let mut frontier: Vec<String> = Vec::new();
     for n in from {
         if visited.insert(n.clone()) {
-            queue.push_back(n.clone());
+            frontier.push(n.clone());
         }
     }
-    while let Some(u) = queue.pop_front() {
-        for (v, _w, _t) in out_neighbors(substrate, ks, graph, &u, floor).await? {
+    while !frontier.is_empty() {
+        let neighbors = expand_level(substrate, ks, graph, &frontier, floor, directed).await?;
+        let mut next: Vec<String> = Vec::new();
+        for v in neighbors {
             if visited.insert(v.clone()) {
-                queue.push_back(v);
+                next.push(v);
             }
         }
-        if !directed {
-            for (v, _w, _t) in in_neighbors(substrate, ks, graph, &u, floor).await? {
-                if visited.insert(v.clone()) {
-                    queue.push_back(v);
-                }
-            }
-        }
+        frontier = next;
     }
     let mut out: Vec<String> = visited.into_iter().collect();
     out.sort();

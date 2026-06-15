@@ -1,6 +1,6 @@
 # bluedb — Production Readiness Roadmap
 
-Current state: **M1 (FTS), M2 (SQL), M3 (engine + HTTP service), and the M4 single-writer core are complete**, and three follow-on tracks have merged to `dev`: **HTTP surface & write-path hardening (Spec A)**, **SQL-integrated full-text search (Spec B)**, and the **double-entry ledger** (`bluedb-ledger`) — see the dedicated sections below. `cargo test --workspace` is green (380 tests); `cargo clippy --workspace --all-targets` clean. Remaining is the **M4 deployment layer** (concrete lease store + cross-region replication/orchestration) plus the scoped follow-ups flagged per section (FTS regex `~`, ledger cluster-Jepsen, the docs-site build). Foundations working today:
+Current state: **M1 (FTS), M2 (SQL), M3 (engine + HTTP service), and the M4 single-writer core are complete**, and five follow-on tracks have merged to `dev`: **HTTP surface & write-path hardening (Spec A)**, **SQL-integrated full-text search (Spec B)**, the **double-entry ledger** (`bluedb-ledger`), the **Apache Iceberg lakehouse mirror** (`bluedb-lakehouse`), and the **evidence substrate** (`bluedb-evidence` — verifiable chains + native graph) — see the dedicated sections below. `cargo test --workspace` is green (~900 tests); `cargo clippy --workspace --all-targets` clean; the docs site builds `--strict` clean. Remaining is the **M4 deployment layer** (concrete lease store + cross-region replication/orchestration) plus the scoped follow-ups flagged per section (FTS regex `~`, ledger cluster-Jepsen, evidence external anchoring). Foundations working today:
 - ✅ `BlobStore` seam + `SlateDbBlobStore` (slatedb 0.13); durability proven across `Db` reopen; `BlobStoreMut` write seam; `ChunkedBlobStore` large-value layer.
 - ✅ Vendored Quickwit read path (Bundle/Storage/Hot/Caching directories) on the tantivy fork, bridged to `BlobStore`.
 - ✅ FTS: real indexer, lazy hotcache open, split manifest, multi-split BM25 search; **logical deletes (generation-scoped tombstones), incremental append, same-id update, and merge/compaction** (re-index live docs, physically drop the dead).
@@ -88,6 +88,23 @@ deployment layer behind the `LeaseProvider` seam.
 - [x] **A–G** — TigerBeetle data-plane parity: typed `Account`/`Transfer` (u128), all flags, the full named result-code set in TB's exact validation order, two-phase transfers (pending/post/void) + apply-time timeout expiry, linked chains, balancing, closing, imported events, `id_already_failed` semantics. 107 engine tests.
 - [x] **H** — atomic **SQL projection** (rows dual-written into the SAME `WriteBatch` as the canonical postcard records, via `bluedb_sql::ProjectedTable`) + `/ledger/{accounts,transfers}` batched create (per-item result codes, u128 as JSON strings) + lookups + a Jepsen `ledger` workload (conservation Σdebits=Σcredits + accounting bounds).
 - [ ] Run the Jepsen `ledger` workload on a **live 3-node cluster** against the current group-commit write path *(today: in-process tests + `lein check` only; needs a `docker compose up -d --build` rebuild)*.
+
+---
+
+## Apache Iceberg lakehouse mirror (`bluedb-lakehouse`) — **complete** (merged)
+
+- [x] Continuous CDC mirror of tables into **Apache Iceberg** in the same bucket — exactly-once (CDC entry in the SAME `WriteBatch` as the row), full CRUD via merge-on-read equality deletes, event-driven seal (seconds-fresh), self-authored Iceberg metadata on the published `iceberg-rust` (no fork/`unsafe`), read-only **Iceberg REST catalog** (`/catalog/v1/*`), PRAGMA opt-in/opt-out. Cross-engine read verified by DuckDB.
+- [x] Per-tenant Iceberg namespaces; **composite-PK** mirroring (surrogate key); online **schema-evolution** reconciliation (ADD/DROP/RENAME via stable field-ids); incremental minor + periodic major **compaction**. (PRs #3/#4/#5/#7.)
+- [ ] Follow-ups (per the lakehouse spec): column **type-change** reconciliation, partition-aware bin-packing.
+
+---
+
+## Evidence substrate (`bluedb-evidence`) — **complete** (merged, PR #8); hardening pending PR
+
+- [x] Append-only **verifiable evidence chains**: server-assigned dense gap-free `seq`, idempotency, durability-before-ack, per-chain verified/plain mode; **RFC 6962 Merkle** (digest + inclusion + consistency proofs, client-side verification); **erasure** (redaction crypto-shred keeping `leaf_hash` + plain-chain hard-delete); HTTP `/evidence/*`; multi-tenant.
+- [x] Native **graph store**: directed weighted typed edges with out/in adjacency, **append-with-edges** (graph = reproducible projection of the chain), edges API, **traversal** (`reachable`, `widest_path`), drop-graph; HTTP `/graph/*`.
+- [x] **Hardening (v1.1 — `feat/evidence-hardening`, reviewed-clean, pending PR):** **O(log N)** inclusion/consistency proofs (persisted complete-subtree node store); **parallel** BFS frontier expansion in `reachable`; **KMS-backed digest signing** (ES256 Signed Tree Heads — HashiCorp Vault Transit + a local dev key) for **non-repudiation**.
+- [ ] **External anchoring / witnessing** — level-3 equivocation defense (gossip STHs between consumers, or anchor `{size, root_hash}` outside bluedb); snapshot-consistent traversal; redaction of `type`/`at`.
 
 ---
 

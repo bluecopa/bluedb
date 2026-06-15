@@ -63,7 +63,7 @@ pub(crate) fn leaf_hash(etype: &str, payload: &[u8], at: &str, edges: &[EdgeDelt
 }
 
 /// Largest power of two strictly less than `n`. Requires `n >= 2`.
-fn largest_pow2_lt(n: usize) -> usize {
+pub(crate) fn largest_pow2_lt(n: usize) -> usize {
     debug_assert!(n >= 2);
     let mut k = 1;
     while k << 1 < n {
@@ -73,7 +73,10 @@ fn largest_pow2_lt(n: usize) -> usize {
 }
 
 /// RFC 6962 Merkle Tree Hash over a slice of leaf hashes (the from-scratch
-/// reference; O(N)). Empty → `empty_root`; single → that leaf.
+/// reference; O(N)). Empty → `empty_root`; single → that leaf. Kept as the
+/// in-crate test reference for the storage-backed proofs (test-only since the
+/// production proof path now assembles from persisted nodes).
+#[cfg(test)]
 pub(crate) fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
     match leaves.len() {
         0 => empty_root(),
@@ -86,19 +89,37 @@ pub(crate) fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
 }
 
 impl crate::model::Frontier {
-    /// Fold one new leaf into the frontier (RFC 6962 incremental append): push
-    /// it as a height-0 peak, then carry-merge equal-height peaks. The number of
-    /// merges equals the count of trailing 1-bits in the old size. O(log N).
-    pub(crate) fn push(&mut self, leaf: [u8; 32]) {
+    /// Like [`push`], but returns the complete-subtree parent nodes created by the
+    /// carry-merge, each as `(level, index, hash)` where the node is the root over
+    /// leaves `[index·2^level, (index+1)·2^level)`. Used to persist internal nodes.
+    pub(crate) fn push_emit(&mut self, leaf: [u8; 32]) -> Vec<(u8, u64, [u8; 32])> {
+        let mut emitted = Vec::new();
         let mut carry = leaf;
+        let mut carry_level: u8 = 0;
+        let mut carry_start: u64 = self.size as u64; // leaf offset of the carry's range
         let mut s = self.size;
         while s & 1 == 1 {
             let left = self.peaks.pop().expect("frontier peak underflow");
             carry = node_hash(&left, &carry);
+            carry_start -= 1u64 << carry_level; // left covers 2^carry_level leaves to the left
+            carry_level += 1;
+            let index = carry_start >> carry_level;
+            emitted.push((carry_level, index, carry));
             s >>= 1;
         }
         self.peaks.push(carry);
         self.size += 1;
+        emitted
+    }
+
+    /// Fold one new leaf into the frontier (RFC 6962 incremental append): push
+    /// it as a height-0 peak, then carry-merge equal-height peaks. The number of
+    /// merges equals the count of trailing 1-bits in the old size. O(log N).
+    /// Delegates to [`push_emit`]; kept for the in-crate frontier tests (the
+    /// append path uses `push_emit` directly to persist the merged nodes).
+    #[cfg(test)]
+    pub(crate) fn push(&mut self, leaf: [u8; 32]) {
+        let _ = self.push_emit(leaf);
     }
 
     /// Digest at the current size: "bag the peaks" right→left. O(log N).
@@ -119,7 +140,9 @@ impl crate::model::Frontier {
 
 /// RFC 6962 inclusion proof (PATH(m, D[n])) for the 0-based `index` into
 /// `leaves`. The audit path lists sibling subtree roots bottom-up. O(N).
-/// Panics if `index >= leaves.len()`.
+/// Panics if `index >= leaves.len()`. Test-only reference for the storage-backed
+/// `proof::inclusion`.
+#[cfg(test)]
 pub(crate) fn inclusion_proof(leaves: &[[u8; 32]], index: usize) -> Vec<[u8; 32]> {
     let n = leaves.len();
     assert!(index < n, "inclusion index out of range");
@@ -141,6 +164,8 @@ pub(crate) fn inclusion_proof(leaves: &[[u8; 32]], index: usize) -> Vec<[u8; 32]
 /// RFC 6962 consistency proof that the tree at size `first` is a prefix of the
 /// tree formed by all of `leaves` (size = `leaves.len()`). `first` is a leaf
 /// count, `1 <= first <= leaves.len()`. O(N). `first == 0` → empty proof.
+/// Test-only reference for the storage-backed `proof::consistency`.
+#[cfg(test)]
 pub(crate) fn consistency_proof(leaves: &[[u8; 32]], first: usize) -> Vec<[u8; 32]> {
     if first == 0 {
         return Vec::new();
@@ -148,6 +173,7 @@ pub(crate) fn consistency_proof(leaves: &[[u8; 32]], first: usize) -> Vec<[u8; 3
     subproof(first, leaves, true)
 }
 
+#[cfg(test)]
 fn subproof(m: usize, leaves: &[[u8; 32]], b: bool) -> Vec<[u8; 32]> {
     let n = leaves.len();
     if m == n {
@@ -239,6 +265,27 @@ mod tests {
         let mut h = Sha256::new();
         h.update((i as u64).to_be_bytes());
         h.finalize().into()
+    }
+
+    #[test]
+    fn push_emit_nodes_match_reference_subtree_roots() {
+        use crate::model::Frontier;
+        let leaves: Vec<[u8; 32]> = (0..300).map(leaf_n).collect();
+        let mut f = Frontier::default();
+        for n in 0..leaves.len() {
+            for (level, index, hash) in f.push_emit(leaves[n]) {
+                let lo = (index as usize) << level;
+                let hi = lo + (1usize << level);
+                assert!(hi <= n + 1, "node (L{level},{index}) exceeds appended leaves at size {}", n + 1);
+                assert_eq!(hash, merkle_root(&leaves[lo..hi]), "node (L{level},{index}) wrong at size {}", n + 1);
+            }
+        }
+        // push (delegating) still yields the same root as the reference.
+        let mut g = Frontier::default();
+        for (i, &lh) in leaves.iter().enumerate() {
+            assert_eq!(g.root(), merkle_root(&leaves[..i]));
+            g.push(lh);
+        }
     }
 
     #[test]
