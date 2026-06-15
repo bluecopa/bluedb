@@ -4,14 +4,15 @@
 //! table, into the **same** [`WriteBatch`](slatedb::WriteBatch) as the data (see
 //! [`crate::storage`]'s `commit`), so an entry exists if and only if the data
 //! committed — the exactly-once seam the lakehouse seal loop drains. Entries are
-//! keyed `external_key(TAG_CDC, seq.to_be_bytes())` with a global, monotonic,
+//! keyed `external_key(TAG_CDC, seq.to_be_bytes())` with a per-tenant, monotonic,
 //! 1-based sequence so a byte-ordered scan yields them in commit order.
 //!
-//! Multi-tenant CDC is out of scope for v1: the log lives under the default
-//! tenant only (see [`crate::keyspace::DEFAULT_TENANT`]).
+//! **Multi-tenant.** Each tenant has its own CDC log (under its own key prefix)
+//! and its own sequence space starting at 1; enablement and the opt-out default
+//! are tracked per `(tenant, table)`. The seal signal is global — one loop wakes
+//! and seals every tenant's pending changes.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use gluesql_core::data::Key;
@@ -22,7 +23,7 @@ use tokio::sync::{Mutex, Notify};
 use bluedb_storage::Substrate;
 
 use crate::error::SqlError;
-use crate::keyspace::{prefix_upper_bound, Keyspace, DEFAULT_TENANT, TAG_CDC};
+use crate::keyspace::{prefix_upper_bound, Keyspace, TAG_CDC};
 
 /// A single committed change in CDC-log form. `row` is `Some` for an
 /// insert/update (the new row), `None` for a delete — mirroring
@@ -46,58 +47,62 @@ impl CdcEntry {
     }
 }
 
-/// Per-database CDC control: whether the mirror is on by default, plus the set
-/// of tables whose choice is the **opposite** of that default.
+/// Per-database CDC control, **scoped per tenant**: whether the mirror is on by
+/// default for a tenant, plus the set of `(tenant, table)` pairs whose choice is
+/// the **opposite** of that tenant's default.
 ///
 /// Cloning shares the same inner state (Arc), so a PRAGMA toggle on one
 /// connection is seen by every live connection over the same database. The
-/// effective decision is `default_on XOR overridden(table)`:
+/// effective decision for a `(tenant, table)` is `default_for(tenant) XOR
+/// overridden(tenant, table)`:
 ///
-/// | `default_on` | in `overrides` | mirrored? |
-/// |--------------|----------------|-----------|
+/// | `default_for(tenant)` | in `overrides` | mirrored? |
+/// |-----------------------|----------------|-----------|
 /// | true (opt-out default) | no  | yes |
 /// | true                   | yes | no (explicitly excluded) |
 /// | false (opt-in)         | yes | yes (explicitly included) |
 /// | false                  | no  | no |
-///
-/// Phase 4 wires the PRAGMA that mutates these; Phase 1 just needs `default_on`.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct CdcConfig {
-    /// Tables whose mirror state is the negation of `default_on`.
-    overrides: Arc<RwLock<HashSet<String>>>,
-    /// Mirror tables by default (opt-out). Public so callers/tests can toggle it.
-    pub default_on: Arc<AtomicBool>,
+    /// `(tenant, table)` pairs whose mirror state is the negation of that
+    /// tenant's default.
+    overrides: Arc<RwLock<HashSet<(String, String)>>>,
+    /// Per-tenant opt-out default. An absent tenant defaults to `false` (opt-in).
+    defaults: Arc<RwLock<HashMap<String, bool>>>,
     /// Pinged after a commit writes CDC entries, so the lakehouse seal loop wakes
     /// promptly (event-driven freshness) instead of polling on a fixed interval.
     seal_signal: Arc<Notify>,
 }
 
-impl Default for CdcConfig {
-    fn default() -> Self {
-        Self {
-            overrides: Arc::new(RwLock::new(HashSet::new())),
-            default_on: Arc::new(AtomicBool::new(false)),
-            seal_signal: Arc::new(Notify::new()),
-        }
-    }
-}
-
 impl CdcConfig {
-    /// Should `table` be mirrored? `default_on XOR overridden(table)`.
-    pub fn is_enabled(&self, table: &str) -> bool {
-        let overridden = self.overrides.read().unwrap().contains(table);
-        self.default_on.load(Ordering::Relaxed) ^ overridden
+    /// The opt-out default for `tenant` (false ⇒ opt-in, the initial state).
+    pub fn default_for(&self, tenant: &str) -> bool {
+        self.defaults.read().unwrap().get(tenant).copied().unwrap_or(false)
     }
 
-    /// Force `table` to `enabled`, regardless of the current default — records an
-    /// override iff the request differs from `default_on`. Used by the PRAGMA
-    /// surface (Phase 4).
-    pub fn set_table(&self, table: &str, enabled: bool) {
+    /// Set `tenant`'s opt-out default. Per-table overrides are unaffected — a
+    /// caller that flips the default re-applies its explicit flags via
+    /// [`Self::set_table`] (see the lakehouse engine).
+    pub fn set_default(&self, tenant: &str, on: bool) {
+        self.defaults.write().unwrap().insert(tenant.to_string(), on);
+    }
+
+    /// Should `(tenant, table)` be mirrored? `default_for(tenant) XOR override`.
+    pub fn is_enabled(&self, tenant: &str, table: &str) -> bool {
+        let key = (tenant.to_string(), table.to_string());
+        let overridden = self.overrides.read().unwrap().contains(&key);
+        self.default_for(tenant) ^ overridden
+    }
+
+    /// Force `(tenant, table)` to `enabled`, regardless of the tenant's current
+    /// default — records an override iff the request differs from that default.
+    pub fn set_table(&self, tenant: &str, table: &str, enabled: bool) {
+        let key = (tenant.to_string(), table.to_string());
         let mut set = self.overrides.write().unwrap();
-        if enabled == self.default_on.load(Ordering::Relaxed) {
-            set.remove(table); // matches the default → no override needed
+        if enabled == self.default_for(tenant) {
+            set.remove(&key); // matches the default → no override needed
         } else {
-            set.insert(table.to_string());
+            set.insert(key);
         }
     }
 
@@ -115,29 +120,38 @@ impl CdcConfig {
     }
 }
 
-/// Shared, lazily-seeded global CDC sequence counter (the last seq handed out).
-/// `None` until the first allocation seeds it from the persisted max, so a
-/// freshly promoted writer re-derives it from object storage after failover.
-pub(crate) type CdcSeq = Arc<Mutex<Option<i64>>>;
+/// Shared, lazily-seeded **per-tenant** CDC sequence counters (tenant → last seq
+/// handed out). A tenant absent from the map is seeded from its persisted max on
+/// first allocation, so a freshly promoted writer re-derives each counter from
+/// object storage after failover.
+pub(crate) type CdcSeq = Arc<Mutex<HashMap<String, i64>>>;
 
-/// Allocate the next global CDC sequence (1-based, monotonic). Seeds lazily from
-/// [`max_persisted_cdc_seq`] on first use, then increments in memory under the
-/// shared lock so concurrent commits get distinct, ordered sequences.
-pub(crate) async fn next_cdc_seq(handle: &CdcSeq, substrate: &Substrate) -> Result<i64, SqlError> {
+/// Allocate `tenant`'s next CDC sequence (1-based, monotonic within the tenant).
+/// Seeds lazily from [`max_persisted_cdc_seq`] on first use, then increments in
+/// memory under the shared lock so concurrent commits get distinct, ordered
+/// sequences.
+pub(crate) async fn next_cdc_seq(
+    handle: &CdcSeq,
+    substrate: &Substrate,
+    tenant: &str,
+) -> Result<i64, SqlError> {
     let mut guard = handle.lock().await;
-    let cur = match *guard {
-        Some(n) => n,
-        None => max_persisted_cdc_seq(substrate).await?,
+    let cur = match guard.get(tenant) {
+        Some(n) => *n,
+        None => max_persisted_cdc_seq(substrate, tenant).await?,
     };
     let next = cur + 1;
-    *guard = Some(next);
+    guard.insert(tenant.to_string(), next);
     Ok(next)
 }
 
-/// The largest persisted CDC sequence, or 0 if the log is empty. Scans the
-/// default-tenant CDC namespace and decodes the trailing big-endian seq.
-pub(crate) async fn max_persisted_cdc_seq(substrate: &Substrate) -> Result<i64, SqlError> {
-    let ks = Keyspace::new(DEFAULT_TENANT);
+/// The largest persisted CDC sequence for `tenant`, or 0 if its log is empty.
+/// Scans the tenant's CDC namespace and decodes the trailing big-endian seq.
+pub(crate) async fn max_persisted_cdc_seq(
+    substrate: &Substrate,
+    tenant: &str,
+) -> Result<i64, SqlError> {
+    let ks = Keyspace::new(tenant);
     let prefix = ks.external_prefix(TAG_CDC);
     let end = prefix_upper_bound(&prefix);
     let mut max = 0i64;
@@ -195,20 +209,33 @@ mod tests {
     #[test]
     fn cdc_config_default_off_then_opt_in() {
         let cfg = CdcConfig::default();
-        assert!(!cfg.is_enabled("docs")); // off by default
-        cfg.set_table("docs", true);
-        assert!(cfg.is_enabled("docs"));
-        assert!(!cfg.is_enabled("other"));
+        assert!(!cfg.is_enabled("_", "docs")); // off by default
+        cfg.set_table("_", "docs", true);
+        assert!(cfg.is_enabled("_", "docs"));
+        assert!(!cfg.is_enabled("_", "other"));
     }
 
     #[test]
     fn cdc_config_default_on_then_opt_out() {
         let cfg = CdcConfig::default();
-        cfg.default_on.store(true, Ordering::Relaxed);
-        assert!(cfg.is_enabled("docs")); // on by default
-        cfg.set_table("docs", false);
-        assert!(!cfg.is_enabled("docs")); // explicitly excluded
-        assert!(cfg.is_enabled("other"));
+        cfg.set_default("_", true);
+        assert!(cfg.is_enabled("_", "docs")); // on by default
+        cfg.set_table("_", "docs", false);
+        assert!(!cfg.is_enabled("_", "docs")); // explicitly excluded
+        assert!(cfg.is_enabled("_", "other"));
+    }
+
+    #[test]
+    fn cdc_config_is_isolated_per_tenant() {
+        let cfg = CdcConfig::default();
+        // Enabling a table for tenant A leaves tenant B's identically-named table
+        // untouched; defaults are per-tenant too.
+        cfg.set_table("a", "docs", true);
+        assert!(cfg.is_enabled("a", "docs"));
+        assert!(!cfg.is_enabled("b", "docs"));
+        cfg.set_default("b", true);
+        assert!(cfg.is_enabled("b", "docs"));
+        assert!(!cfg.is_enabled("a", "other")); // tenant a still opt-in
     }
 
     #[test]
@@ -241,7 +268,7 @@ mod tests {
 
     #[test]
     fn seq_decodes_from_key_suffix() {
-        let ks = Keyspace::new(DEFAULT_TENANT);
+        let ks = Keyspace::new(crate::keyspace::DEFAULT_TENANT);
         let key = ks.external_key(TAG_CDC, &42i64.to_be_bytes());
         assert_eq!(cdc_seq_from_key(&key), Some(42));
     }

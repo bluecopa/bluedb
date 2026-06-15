@@ -22,7 +22,9 @@ async fn make_db(name: &str) -> Database {
 }
 
 async fn engine(root: &str, db: Database, cdc: CdcConfig) -> LakehouseEngine {
-    LakehouseEngine::reopen(FileIO::new_with_fs(), root, "main", db, cdc)
+    // The default tenant ("_") — what the `connection_*` helpers write
+    // under; it maps to the Iceberg namespace `default`.
+    LakehouseEngine::reopen(FileIO::new_with_fs(), root, "_", db, cdc)
         .await
         .unwrap()
 }
@@ -77,7 +79,7 @@ async fn registry_survives_reopen() {
     let cdc2 = CdcConfig::default();
     let eng2 = engine(root, db.clone(), cdc2.clone()).await;
     assert_eq!(eng2.mirrored_tables(), vec!["docs".to_string()]);
-    assert!(cdc2.is_enabled("docs"), "registry applied to the fresh CDC control");
+    assert!(cdc2.is_enabled("_", "docs"), "registry applied to the fresh CDC control");
 }
 
 #[tokio::test]
@@ -113,7 +115,7 @@ async fn seal_publishes_final_state_then_gcs() {
     assert_eq!(rows.get(&1).map(String::as_str), Some("c"), "id=1 updated");
 
     // The log is GC'd through the sealed watermark; sealing again is a no-op.
-    assert!(db.scan_cdc(0).await.unwrap().is_empty());
+    assert!(db.scan_cdc("_", 0).await.unwrap().is_empty());
     eng.seal().await.unwrap();
     assert_eq!(read_table(&eng, "docs").await.len(), 1, "no-op seal changes nothing");
 }
@@ -121,7 +123,7 @@ async fn seal_publishes_final_state_then_gcs() {
 /// Does the Iceberg table exist yet (version-hint present)?
 async fn table_exists(root: &str) -> bool {
     FileIO::new_with_fs()
-        .exists(&format!("{root}/main/docs/metadata/version-hint.text"))
+        .exists(&format!("{root}/default/docs/metadata/version-hint.text"))
         .await
         .unwrap()
 }
@@ -183,7 +185,7 @@ async fn enable_backfills_preexisting_rows() {
             .await
             .unwrap();
     }
-    assert!(db.scan_cdc(0).await.unwrap().is_empty(), "no CDC yet");
+    assert!(db.scan_cdc("_", 0).await.unwrap().is_empty(), "no CDC yet");
 
     // Enabling mirrors the existing rows via a backfill scan (not CDC).
     eng.enable_table("docs").await.unwrap();
@@ -207,8 +209,8 @@ async fn compaction_reduces_files_and_preserves_state() {
             .unwrap();
     }
 
-    // Many separate insert+seal cycles → many tiny data files, plus an update
-    // and a delete (→ equality-delete files).
+    // Many separate insert+seal cycles â many tiny data files, plus an update
+    // and a delete (â equality-delete files).
     for i in 1..=12 {
         let mut g = Glue::new(db.connection_with_cdc(cdc.clone()));
         g.execute(&format!("INSERT INTO docs VALUES ({i}, 'v{i}');"))
@@ -276,13 +278,13 @@ async fn pragma_controls_default_and_per_table_and_persists() {
 
 #[tokio::test]
 async fn seals_into_the_same_object_store_as_slatedb() {
-    // One object store backs BOTH SlateDB (the data) and the Iceberg mirror —
+    // One object store backs BOTH SlateDB (the data) and the Iceberg mirror â
     // exactly the production layout a warehouse reads from.
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let db = Database::new(Arc::new(Db::open("bluedb", store.clone()).await.unwrap()));
     let cdc = CdcConfig::default();
     let file_io = object_store_file_io(store.clone(), "");
-    let eng = LakehouseEngine::reopen(file_io, "lakehouse", "main", db.clone(), cdc.clone())
+    let eng = LakehouseEngine::reopen(file_io, "lakehouse", "_", db.clone(), cdc.clone())
         .await
         .unwrap();
     eng.enable_table("docs").await.unwrap();
@@ -308,7 +310,7 @@ async fn seals_into_the_same_object_store_as_slatedb() {
     assert_eq!(rows.get(&2).map(String::as_str), Some("b"));
 
     // The Iceberg files physically live under the `lakehouse/` prefix in the
-    // shared store (metadata.json, manifests, parquet) — what the warehouse reads.
+    // shared store (metadata.json, manifests, parquet) â what the warehouse reads.
     let keys: Vec<String> = store
         .list(Some(&OsPath::from("lakehouse")))
         .map(|m| m.unwrap().location.to_string())
@@ -328,7 +330,7 @@ async fn failover_resumes_mirror_exactly_once() {
     let eng_a = LakehouseEngine::reopen(
         object_store_file_io(store.clone(), ""),
         "lakehouse",
-        "default",
+        "_",
         db_a.clone(),
         cdc_a.clone(),
     )
@@ -354,13 +356,13 @@ async fn failover_resumes_mirror_exactly_once() {
     let eng_b = LakehouseEngine::reopen(
         object_store_file_io(store.clone(), ""),
         "lakehouse",
-        "default",
+        "_",
         db_b.clone(),
         cdc_b.clone(),
     )
     .await
     .unwrap();
-    // The opt-out registry persisted → docs is still mirrored on B.
+    // The opt-out registry persisted â docs is still mirrored on B.
     assert!(eng_b.is_mirrored("docs"), "registry resumed on failover");
 
     // Replay more writes on B, then seal.
@@ -371,7 +373,7 @@ async fn failover_resumes_mirror_exactly_once() {
     }
     eng_b.seal().await.unwrap();
 
-    // Exactly-once: id=1 updated, id=2 carried over from A's snapshot, id=3 new —
+    // Exactly-once: id=1 updated, id=2 carried over from A's snapshot, id=3 new â
     // no rows lost, none duplicated across the failover.
     let rows = read_table(&eng_b, "docs").await;
     assert_eq!(rows.len(), 3, "no loss/dup across failover: {rows:?}");

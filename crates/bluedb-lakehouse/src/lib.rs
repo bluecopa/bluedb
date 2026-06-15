@@ -8,6 +8,7 @@ pub mod catalog;
 pub mod cdc;
 pub mod compaction;
 pub mod engine;
+pub mod manager;
 pub mod objstore_io;
 pub mod schema;
 pub mod writer;
@@ -46,4 +47,5 @@ impl From<serde_json::Error> for LakehouseError {
 /// Convenience result type for the crate.
 pub type Result<T> = std::result::Result<T, LakehouseError>;
 
-pub use engine::LakehouseEngine;
+pub use engine::{namespace_for_tenant, tenant_for_namespace, LakehouseEngine};
+pub use manager::{LakehouseConfig, LakehouseManager};
