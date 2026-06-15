@@ -91,3 +91,28 @@ async fn gcs_fake_round_trip() {
     let store = build_object_store(&cfg).expect("build gcs store");
     slatedb_round_trip(store, "emul-roundtrip-gcs").await;
 }
+
+/// Real-GCS round-trip — the definitive verification of the GCS target, since no
+/// local emulator faithfully serves object_store's GCS *XML* API (fake-gcs is
+/// JSON-only; storage-testbench lacks XML list/delete). Env-gated; **no creds are
+/// committed** — supply a real bucket, a service-account JSON path, and a unique
+/// throwaway prefix:
+///
+/// ```text
+/// BLUEDB_GCS_TEST_BUCKET=my-bucket \
+/// BLUEDB_GCS_TEST_SA=/path/to/sa.json \
+/// BLUEDB_GCS_TEST_PREFIX=bluedb-gcs-roundtrip-test/run1 \
+///   cargo test -p bluedb-server --test objstore_emulators gcs_real_round_trip -- --ignored --nocapture
+/// ```
+///
+/// Delete the prefix afterward (e.g. `gcloud storage rm -r gs://$BUCKET/$PREFIX`).
+#[tokio::test]
+#[ignore = "real GCS — set BLUEDB_GCS_TEST_{BUCKET,SA,PREFIX}"]
+async fn gcs_real_round_trip() {
+    let bucket = std::env::var("BLUEDB_GCS_TEST_BUCKET").expect("set BLUEDB_GCS_TEST_BUCKET");
+    let sa = std::env::var("BLUEDB_GCS_TEST_SA").expect("set BLUEDB_GCS_TEST_SA (service-account JSON path)");
+    let prefix = std::env::var("BLUEDB_GCS_TEST_PREFIX").expect("set BLUEDB_GCS_TEST_PREFIX (unique throwaway prefix)");
+    let cfg = ObjectStoreConfig::Gcs { bucket, service_account: Some(sa) };
+    let store = build_object_store(&cfg).expect("build gcs store");
+    slatedb_round_trip(store, &prefix).await;
+}
