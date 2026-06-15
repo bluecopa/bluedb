@@ -192,3 +192,57 @@ async fn append_persists_complete_subtree_nodes() {
     let expected = n - (n as u64).count_ones() as usize;
     assert_eq!(count_merkle_nodes(&db, "c").await, expected, "node count must equal N - popcount(N)");
 }
+
+/// RFC 6962 inclusion-proof length for 0-based `index` in a tree of `size`
+/// leaves: `inner + border` (the Trillian decomposition). This is O(log N), not
+/// O(N) — it is what the storage-backed proof path must produce.
+fn expected_inclusion_len(index: usize, size: usize) -> usize {
+    let x = (index ^ (size - 1)) as u64;
+    let inner = (64 - x.leading_zeros()) as usize;
+    let border = ((index >> inner) as u64).count_ones() as usize;
+    inner + border
+}
+
+#[tokio::test]
+async fn storage_proofs_are_ologn_reconstruct_root_and_survive_redaction() {
+    let db = harness::memory_db().await;
+    let ev = Evidence::new(&db, "_");
+    // 21 separate appends (not a batch) — exercises many incremental carry-merges.
+    for i in 0..21 {
+        ev.append("v", vec![entry(&format!("e{i}"))], None).await.unwrap();
+    }
+    let d = ev.digest("v").await.unwrap();
+    assert_eq!(d.size, 21);
+
+    let rows = ev.read_range("v", 1, 21).await.unwrap();
+    let stored: Vec<[u8; 32]> = rows.iter().map(|(_, r)| r.leaf_hash.unwrap()).collect();
+
+    // Every inclusion proof: O(log N) length AND reconstructs the digest root.
+    for seq in 1..=21i64 {
+        let inc = ev.inclusion("v", seq, None).await.unwrap();
+        let index = (seq - 1) as usize;
+        assert_eq!(
+            inc.audit_path.len(),
+            expected_inclusion_len(index, 21),
+            "proof for seq {seq} is not O(log N) (RFC 6962 length)"
+        );
+        assert_eq!(
+            root_from_inclusion(stored[index], index, 21, &inc.audit_path),
+            Some(d.root),
+            "inclusion proof for seq {seq} must reconstruct the digest root"
+        );
+    }
+
+    // Redact a middle entry: leaf_hash is retained, so digest and proofs are
+    // unaffected — the entry's existence stays provable while its payload is gone.
+    let before = ev.digest("v").await.unwrap();
+    ev.redact("v", 11).await.unwrap();
+    let after = ev.digest("v").await.unwrap();
+    assert_eq!(before, after, "redaction must not change the digest");
+    let inc = ev.inclusion("v", 11, None).await.unwrap();
+    assert_eq!(
+        root_from_inclusion(stored[10], 10, 21, &inc.audit_path),
+        Some(d.root),
+        "inclusion proof for a redacted entry must still verify"
+    );
+}

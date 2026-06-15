@@ -68,8 +68,12 @@ Transparency / Trillian model — per verified chain:
 - The incremental **frontier** (the ≤ log N perfect-subtree roots covering the
   current size) is persisted under its own key **in the same `WriteBatch`** as the
   entries, so the tree advances atomically with the log and is crash-consistent.
+- The same `WriteBatch` also persists every **complete-subtree node** the
+  frontier's carry-merge forms (tag `0x1F`, keyed by `(level, index)`), amortized
+  O(1) per entry — the standard CT-log space/time tradeoff.
 - `digest` folds the frontier in O(log N). Inclusion and consistency **proofs**
-  are computed **on demand** from the stored leaf hashes.
+  are **O(log N)**: they read the persisted complete-subtree nodes (plus the
+  leaf's own `leaf_hash` for level-0 siblings) instead of scanning all leaves.
 
 **Verification is client-side.** bluedb generates digests and proofs; the
 consumer verifies them with any standard RFC 6962 verifier against a digest it
@@ -248,11 +252,12 @@ are cryptographically verifiable.
 
 ## Limitations (v1)
 
-- **Proofs are O(N), computed on demand.** Inclusion and consistency proofs are
-  recomputed from the stored leaf hashes per request (streamed, memory-bounded) —
-  there is **no persisted internal-node store** yet. Digests stay O(log N) via the
-  frontier. Persisting internal nodes for O(log N) proofs on very large chains is
-  a future optimization.
+- **Proofs are O(log N).** Inclusion and consistency proofs are assembled from a
+  persisted **complete-subtree node store** (tag `0x1F`), written in the same
+  atomic `WriteBatch` as the entries and frontier, so a proof reads O(log N)
+  persisted nodes rather than scanning all leaves. The emitted proofs are
+  byte-identical to the from-scratch RFC 6962 computation. Digests stay O(log N)
+  via the frontier.
 - **Unsigned digests.** See [Trust model](#trust-model) — verifiability against a
   malicious operator needs external anchoring and/or digest signing (deferred).
 - **Redaction blanks the payload only.** `type` and `at` are retained; extending
