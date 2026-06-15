@@ -62,9 +62,11 @@
 //! [`bluedb-fts`]: https://docs.rs/bluedb-fts
 
 mod coerce;
+mod colcat;
 mod connection;
 mod cte;
 mod error;
+mod guardrail;
 mod keyspace;
 mod nullorder;
 mod precheck;
@@ -72,6 +74,7 @@ mod projection;
 mod pushdown;
 mod registry;
 mod rewrite;
+mod schema_rules;
 mod setops;
 mod storage;
 

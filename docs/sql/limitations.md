@@ -14,6 +14,8 @@ works as in standard SQL.
 | **Window functions** (`… OVER (…)`) | `ROW_NUMBER`, `RANK`, running `SUM`, etc. Rejected with a clear error (the engine has no windowing). |
 | **`WITH RECURSIVE`** | Recursive CTEs need iterative evaluation. (Non-recursive `WITH` is supported.) |
 | **Cartesian products** | `CROSS JOIN`, or a comma join with no equi-join key — rejected to avoid materializing the full product. |
+| **Unindexed scans & sorts** | A `WHERE` or `ORDER BY` on a column that is neither the primary key nor indexed is rejected by the [query guardrail](query-guardrail.md) (it would be a full scan / in-memory sort). The error names the exact `CREATE INDEX` to add. A bare `SELECT` (no `WHERE`) is allowed but capped to the first 100 rows in primary-key order. |
+| **Schemaless / PK-less tables** | Every table needs a typed column list **and** a `PRIMARY KEY`; a column-less or key-less `CREATE TABLE` is rejected. |
 | **Multi-column `INTERSECT` / `EXCEPT`** | Single-column only. (Multi-column `UNION` / `UNION ALL` *is* supported.) |
 | **Composite indexes** | Indexes are single-column. |
 | **`SELECT DISTINCT ON (…)`** | Not supported. |

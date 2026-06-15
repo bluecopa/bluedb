@@ -102,6 +102,12 @@ async fn full_crud_round_trip() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    // Index the columns we filter/sort on — the guardrail rejects a filter or
+    // ORDER BY on a non-indexed column (it would be a full scan / memory sort).
+    let (status, _) = sql_admin(&app, "CREATE INDEX users_age ON users (age);").await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = sql_admin(&app, "CREATE INDEX users_name ON users (name);").await;
+    assert_eq!(status, StatusCode::OK);
 
     // INSERT via POST (array of objects).
     let (status, body) = call(

@@ -56,6 +56,7 @@ nav:
   - SQL:
       - Overview: sql/README.md
       - Statements: sql/statements.md
+      - Query guardrail: sql/query-guardrail.md
       - Full-text search: sql/full-text-search.md
       - Query syntax: sql/query-syntax.md
       - Data types: sql/data-types.md

@@ -78,7 +78,11 @@ database). Writes are accepted only by the **active writer**; a replica returns
 
 - **Stateless nodes.** A node's authoritative state is in the object store; nodes
   can be added, killed, or replaced freely.
-- **No DDL/migration tax.** Tables can be schemaless; schema is data, so adding
-  fields needs no migration.
+- **Online schema evolution.** Every table is schema'd with a `PRIMARY KEY`, but
+  evolving one is cheap: ADD/DROP/RENAME column and RENAME TABLE are O(1) metadata
+  ops (stable field-ids + table-ids), never a row rewrite — no migration window.
+- **Bounded reads.** A plan-time [query guardrail](../sql/query-guardrail.md)
+  keeps every read served by the primary key or an index; whole-table analytics
+  goes to the warehouse via the Iceberg mirror, off the OLTP hot path.
 - **Portable.** The substrate targets any S3-compatible store, GCS, or Azure
   Blob.

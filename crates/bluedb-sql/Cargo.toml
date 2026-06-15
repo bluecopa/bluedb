@@ -28,6 +28,10 @@ chrono       = "0.4"
 # SQL rewrite shim (comma-join -> INNER JOIN ON TRUE). Pinned to the exact
 # version gluesql-core 0.19 uses so the AST and re-serialized SQL round-trip.
 sqlparser    = "=0.52.0"
+# Construct the `LIMIT` literal the scan guardrail injects to bound an
+# unfiltered SELECT. Pinned to the exact line gluesql-core 0.19 uses for
+# `ast::Literal::Number(BigDecimal)`, so the AST type matches.
+bigdecimal   = "=0.4.10"
 
 [dev-dependencies]
 tokio = { workspace = true }

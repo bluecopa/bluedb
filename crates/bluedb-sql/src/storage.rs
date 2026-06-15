@@ -108,6 +108,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use bluedb_storage::Substrate;
 
+use crate::colcat::ColumnCatalog;
 use crate::error::SqlError;
 use crate::keyspace::{prefix_upper_bound, Keyspace, DEFAULT_TENANT};
 
@@ -217,6 +218,13 @@ pub struct SlateDbStorage {
     /// can RMW (`/sql`, `PATCH`, `DELETE`); left off for the append/insert path
     /// so it keeps group-committing. See [`SlateDbStorage::serialize_writes`].
     serialize_writes: bool,
+    /// "Strict" bluedb policy mode for user-facing connections: a `Planner::plan`
+    /// pass rejects full-scan / in-memory-sort queries (see [`crate::guardrail`]),
+    /// and `insert_schema` rejects schemaless / PK-less tables (see
+    /// [`crate::schema_rules`]). Off by default so the raw engine and internal /
+    /// conformance paths keep GlueSQL's full behavior; user-facing connections
+    /// enable it (see [`crate::Database::connection_guarded`]).
+    strict: bool,
     /// Optional commit observer (e.g. the FTS live-index maintainer). When set,
     /// data mutations are buffered as decoded [`RowChange`]s and reported via
     /// [`CommitObserver::on_commit`] after the durable commit write. `None` by
@@ -268,6 +276,7 @@ impl SlateDbStorage {
             insert_lock,
             seq,
             serialize_writes: false,
+            strict: false,
             commit_observer: None,
             txn: None,
         }
@@ -280,6 +289,16 @@ impl SlateDbStorage {
     /// group-committing.
     pub fn serialize_writes(mut self) -> Self {
         self.serialize_writes = true;
+        self
+    }
+
+    /// Enable "strict" bluedb policy on this connection: reject full-scan /
+    /// in-memory-sort queries (see [`crate::guardrail`]) and schemaless / PK-less
+    /// table creation (see [`crate::schema_rules`]). Use for user-facing request
+    /// surfaces; leave off for internal/admin connections that legitimately scan
+    /// or need GlueSQL's full schema behavior.
+    pub fn strict(mut self) -> Self {
+        self.strict = true;
         self
     }
 
@@ -320,7 +339,8 @@ impl SlateDbStorage {
     /// committed max the first time a table is touched on this writer (re-derived
     /// after a failover, since it's in-memory).
     async fn allocate_keys(&self, table_name: &str, count: usize) -> Result<i64, SqlError> {
-        let prefix = self.keyspace.data_prefix(table_name);
+        let table_id = self.table_id(table_name).await?;
+        let prefix = self.keyspace.data_prefix(table_id);
         let seq = self.seq.clone();
         let mut map = seq.lock().await;
         let current = match map.get(&prefix).copied() {
@@ -467,13 +487,19 @@ impl SlateDbStorage {
     /// Drain every row of `table_name` in primary-key order, honoring the txn
     /// overlay. Rows come back sorted because storage keys sort by encoded pk.
     async fn collect_rows(&self, table_name: &str) -> Result<Vec<(Key, DataRow)>, SqlError> {
-        let prefix = self.keyspace.data_prefix(table_name);
+        let table_id = self.table_id(table_name).await?;
+        let prefix = self.keyspace.data_prefix(table_id);
         let end = prefix_upper_bound(&prefix);
         let pairs = self.scan_range(prefix, end).await?;
+        let catalog = self.read_catalog(table_name).await?;
         let mut rows = Vec::with_capacity(pairs.len());
         for (_, value) in pairs {
             let stored: StoredRow = decode(&value)?;
-            rows.push((stored.key, stored.row));
+            let row = match &catalog {
+                Some(cat) => cat.to_logical(stored.row),
+                None => stored.row,
+            };
+            rows.push((stored.key, row));
         }
         Ok(rows)
     }
@@ -486,6 +512,64 @@ impl SlateDbStorage {
             Some(bytes) => Ok(Some(decode(&bytes)?)),
             None => Ok(None),
         }
+    }
+
+    /// Read a table's column catalog (the online-ALTER field-id mapping), honoring
+    /// the overlay. `None` means the table was never altered, so rows are stored
+    /// in schema order and need no translation (see [`crate::colcat`]).
+    async fn read_catalog(&self, table_name: &str) -> Result<Option<ColumnCatalog>, SqlError> {
+        let key = self.keyspace.colcat_key(table_name);
+        match self.read_key(&key).await? {
+            Some(bytes) => Ok(Some(decode(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Persist a table's column catalog (written on the first diverging ALTER).
+    async fn write_catalog(
+        &mut self,
+        table_name: &str,
+        catalog: &ColumnCatalog,
+    ) -> Result<(), SqlError> {
+        let key = self.keyspace.colcat_key(table_name);
+        self.write_key(key, encode(catalog)?).await
+    }
+
+    /// Resolve a table's stable id (assigned at CREATE). Data and index keys are
+    /// keyed by this id — not the table name — so it must exist for any table
+    /// that has rows. Reading it is how name→id resolution happens on every data
+    /// path. (One extra point read per op; fine for a spike — cacheable later.)
+    /// The stable id for a table, if it has one (name→id mapping). Public so a
+    /// layer that hand-writes SQL-projection rows (e.g. `bluedb-ledger`) can build
+    /// row keys by id, the same way the engine does.
+    pub async fn resolve_table_id(&self, table_name: &str) -> Result<Option<u64>, SqlError> {
+        match self.read_key(&self.keyspace.tableid_key(table_name)).await? {
+            Some(bytes) => Ok(Some(decode_table_id(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn table_id(&self, table_name: &str) -> Result<u64, SqlError> {
+        self.resolve_table_id(table_name).await?.ok_or_else(|| {
+            SqlError::KeyEncode(format!("no stable id registered for table `{table_name}`"))
+        })
+    }
+
+    /// Return the table's stable id, allocating one (and bumping the per-tenant
+    /// counter) on first call. Used at CREATE time.
+    async fn ensure_table_id(&mut self, table_name: &str) -> Result<u64, SqlError> {
+        let key = self.keyspace.tableid_key(table_name);
+        if let Some(bytes) = self.read_key(&key).await? {
+            return decode_table_id(&bytes);
+        }
+        let seq_key = self.keyspace.tableid_seq_key();
+        let next = match self.read_key(&seq_key).await? {
+            Some(bytes) => decode_table_id(&bytes)? + 1,
+            None => 1,
+        };
+        self.write_key(seq_key, next.to_be_bytes().to_vec()).await?;
+        self.write_key(key, next.to_be_bytes().to_vec()).await?;
+        Ok(next)
     }
 
     // --- Secondary-index helpers. -------------------------------------------
@@ -535,6 +619,7 @@ impl SlateDbStorage {
         if defs.is_empty() {
             return Ok(());
         }
+        let table_id = self.table_id(table_name).await?;
         let columns = match self.read_schema(table_name).await? {
             Some(schema) => Self::schema_columns(&schema),
             None => Vec::new(),
@@ -548,7 +633,7 @@ impl SlateDbStorage {
             let value = Self::index_value(def, cols, row).await?;
             let entry_key = self
                 .keyspace
-                .index_entry_key(table_name, &def.name, &value, pk)?;
+                .index_entry_key(table_id, &def.name, &value, pk)?;
             if insert {
                 self.write_key(entry_key, encode(pk)?).await?;
             } else {
@@ -568,6 +653,14 @@ pub(crate) fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, SqlError> {
 /// Deserialize bytes (JSON) back into a value.
 pub(crate) fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, SqlError> {
     Ok(serde_json::from_slice(bytes)?)
+}
+
+/// Decode a big-endian `u64` table id from its stored 8-byte value.
+pub(crate) fn decode_table_id(bytes: &[u8]) -> Result<u64, SqlError> {
+    let arr: [u8; 8] = bytes
+        .try_into()
+        .map_err(|_| SqlError::KeyEncode("corrupt table id".to_owned()))?;
+    Ok(u64::from_be_bytes(arr))
 }
 
 /// Merge an already-sorted base scan with an already-sorted overlay slice.
@@ -640,11 +733,16 @@ impl Store for SlateDbStorage {
     }
 
     async fn fetch_data(&self, table_name: &str, key: &Key) -> GlueResult<Option<DataRow>> {
-        let storage_key = self.keyspace.row_key(table_name, key)?;
+        let table_id = self.table_id(table_name).await?;
+        let storage_key = self.keyspace.row_key(table_id, key)?;
         match self.read_key(&storage_key).await? {
             Some(bytes) => {
                 let stored: StoredRow = decode(&bytes)?;
-                Ok(Some(stored.row))
+                let row = match self.read_catalog(table_name).await? {
+                    Some(cat) => cat.to_logical(stored.row),
+                    None => stored.row,
+                };
+                Ok(Some(row))
             }
             None => Ok(None),
         }
@@ -659,6 +757,13 @@ impl Store for SlateDbStorage {
 #[async_trait]
 impl StoreMut for SlateDbStorage {
     async fn insert_schema(&mut self, schema: &Schema) -> GlueResult<()> {
+        if self.strict {
+            crate::schema_rules::enforce(schema)?;
+        }
+        // Assign a stable table id on first creation — data and index keys are
+        // keyed by it, so it must exist before any row is written. Idempotent on
+        // re-insert (ALTER re-inserts the schema).
+        self.ensure_table_id(&schema.table_name).await?;
         let key = self.keyspace.schema_key(&schema.table_name);
         self.write_key(key, encode(schema)?).await?;
         // Stamp the table's creation time once, for `GLUE_OBJECTS.CREATED`. Set
@@ -675,16 +780,19 @@ impl StoreMut for SlateDbStorage {
     async fn delete_schema(&mut self, table_name: &str) -> GlueResult<()> {
         // Drop every index entry, every row, then the schema record (which
         // carries the index *definitions*) itself.
+        let table_id = self.table_id(table_name).await?;
         let rows = self.collect_rows(table_name).await?;
         for (key, row) in &rows {
             self.apply_index_entries(table_name, key, row, false).await?;
         }
         for (key, _) in &rows {
-            let storage_key = self.keyspace.row_key(table_name, key)?;
+            let storage_key = self.keyspace.row_key(table_id, key)?;
             self.delete_key(storage_key).await?;
         }
         self.delete_key(self.keyspace.schema_key(table_name)).await?;
         self.delete_key(self.keyspace.meta_key(table_name)).await?;
+        self.delete_key(self.keyspace.colcat_key(table_name)).await?;
+        self.delete_key(self.keyspace.tableid_key(table_name)).await?;
         Ok(())
     }
 
@@ -698,18 +806,25 @@ impl StoreMut for SlateDbStorage {
             return Ok(());
         }
         let mut next = self.allocate_keys(table_name, rows.len()).await?;
+        let table_id = self.table_id(table_name).await?;
+        let catalog = self.read_catalog(table_name).await?;
 
         for row in rows {
             let key = Key::I64(next);
             next += 1;
-            let storage_key = self.keyspace.row_key(table_name, &key)?;
+            let storage_key = self.keyspace.row_key(table_id, &key)?;
+            // Index entries + the commit tap see the *logical* row (schema order).
             self.apply_index_entries(table_name, &key, &row, true)
                 .await?;
-            // Commit tap: buffer the committed insert for the observer (guarded
-            // so the clone only happens when an observer is installed).
             if self.commit_observer.is_some() {
                 self.record_change(table_name, key.clone(), Some(row.clone()));
             }
+            // Persist the *physical* row (online-ALTER slot order) when a catalog
+            // exists; otherwise store as-is (identity).
+            let row = match &catalog {
+                Some(cat) => cat.to_physical(row),
+                None => row,
+            };
             let stored = StoredRow {
                 key: key.clone(),
                 row,
@@ -721,12 +836,19 @@ impl StoreMut for SlateDbStorage {
 
     async fn insert_data(&mut self, table_name: &str, rows: Vec<(Key, DataRow)>) -> GlueResult<()> {
         // Used for keyed inserts and updates (UPDATE re-inserts the same key).
+        let catalog = self.read_catalog(table_name).await?;
+        let table_id = self.table_id(table_name).await?;
         for (key, row) in rows {
             // For UPDATE, the old row's index entries must be removed first.
-            let storage_key = self.keyspace.row_key(table_name, &key)?;
+            let storage_key = self.keyspace.row_key(table_id, &key)?;
             if let Some(bytes) = self.read_key(&storage_key).await? {
                 let old: StoredRow = decode(&bytes)?;
-                self.apply_index_entries(table_name, &key, &old.row, false)
+                // Index removal evaluates against the *logical* old row.
+                let old_row = match &catalog {
+                    Some(cat) => cat.to_logical(old.row),
+                    None => old.row,
+                };
+                self.apply_index_entries(table_name, &key, &old_row, false)
                     .await?;
             } else if let Some(txn) = self.txn.as_mut() {
                 // Fresh keyed insert (absent at our snapshot): remember it so
@@ -740,6 +862,12 @@ impl StoreMut for SlateDbStorage {
             if self.commit_observer.is_some() {
                 self.record_change(table_name, key.clone(), Some(row.clone()));
             }
+            // Persist the *physical* row (online-ALTER slot order) when a catalog
+            // exists; otherwise store as-is (identity).
+            let row = match &catalog {
+                Some(cat) => cat.to_physical(row),
+                None => row,
+            };
             let stored = StoredRow {
                 key: key.clone(),
                 row,
@@ -750,11 +878,17 @@ impl StoreMut for SlateDbStorage {
     }
 
     async fn delete_data(&mut self, table_name: &str, keys: Vec<Key>) -> GlueResult<()> {
+        let catalog = self.read_catalog(table_name).await?;
+        let table_id = self.table_id(table_name).await?;
         for key in keys {
-            let storage_key = self.keyspace.row_key(table_name, &key)?;
+            let storage_key = self.keyspace.row_key(table_id, &key)?;
             if let Some(bytes) = self.read_key(&storage_key).await? {
                 let old: StoredRow = decode(&bytes)?;
-                self.apply_index_entries(table_name, &key, &old.row, false)
+                let old_row = match &catalog {
+                    Some(cat) => cat.to_logical(old.row),
+                    None => old.row,
+                };
+                self.apply_index_entries(table_name, &key, &old_row, false)
                     .await?;
             }
             // Commit tap: buffer the committed delete (row None).
@@ -889,8 +1023,9 @@ impl Index for SlateDbStorage {
         asc: Option<bool>,
         cmp_value: Option<(&IndexOperator, Value)>,
     ) -> GlueResult<RowIter<'a>> {
+        let table_id = self.table_id(table_name).await?;
         // Resolve the scan byte range from the optional comparison.
-        let full_prefix = self.keyspace.index_prefix(table_name, index_name);
+        let full_prefix = self.keyspace.index_prefix(table_id, index_name);
         let full_end = prefix_upper_bound(&full_prefix);
 
         let (start, end) = match &cmp_value {
@@ -901,7 +1036,7 @@ impl Index for SlateDbStorage {
                 // The value-bounded prefix: all entries for exactly this value.
                 let value_prefix = self
                     .keyspace
-                    .index_value_prefix(table_name, index_name, &key)?;
+                    .index_value_prefix(table_id, index_name, &key)?;
                 let value_end = prefix_upper_bound(&value_prefix);
                 match op {
                     IndexOperator::Eq => (
@@ -933,7 +1068,7 @@ impl Index for SlateDbStorage {
         let mut rows: Vec<(Key, DataRow)> = Vec::with_capacity(entries.len());
         for (_, pk_bytes) in entries {
             let pk: Key = decode(&pk_bytes)?;
-            let row_key = self.keyspace.row_key(table_name, &pk)?;
+            let row_key = self.keyspace.row_key(table_id, &pk)?;
             if let Some(bytes) = self.read_key(&row_key).await? {
                 let stored: StoredRow = decode(&bytes)?;
                 rows.push((stored.key, stored.row));
@@ -990,12 +1125,13 @@ impl IndexMut for SlateDbStorage {
         } else {
             Some(columns.as_slice())
         };
+        let table_id = self.table_id(table_name).await?;
         let rows = self.collect_rows(table_name).await?;
         for (pk, row) in &rows {
             let value = Self::index_value(&def, cols, row).await?;
             let entry_key = self
                 .keyspace
-                .index_entry_key(table_name, index_name, &value, pk)?;
+                .index_entry_key(table_id, index_name, &value, pk)?;
             self.write_key(entry_key, encode(pk)?).await?;
         }
 
@@ -1015,7 +1151,8 @@ impl IndexMut for SlateDbStorage {
         }
 
         // Remove all entries for this index.
-        let prefix = self.keyspace.index_prefix(table_name, index_name);
+        let table_id = self.table_id(table_name).await?;
+        let prefix = self.keyspace.index_prefix(table_id, index_name);
         let end = prefix_upper_bound(&prefix);
         for (k, _) in self.scan_range(prefix, end).await? {
             self.delete_key(k).await?;
@@ -1079,7 +1216,154 @@ impl Metadata for SlateDbStorage {
 
 impl CustomFunction for SlateDbStorage {}
 impl CustomFunctionMut for SlateDbStorage {}
-impl AlterTable for SlateDbStorage {}
+// Online schema evolution: ADD/DROP/RENAME COLUMN are O(1) metadata ops — they
+// update the schema (and, for ADD/DROP, the column catalog) without rewriting any
+// rows. The catalog (see [`crate::colcat`]) decouples a column's logical position
+// from its physical slot, so reads/writes translate on the fly. RENAME TABLE
+// (`rename_schema`) keeps GlueSQL's default (eager re-key) for now — table-id
+// indirection makes it O(1). This replaces GlueSQL's default `AlterTable`, whose
+// methods all rewrite every row.
+#[async_trait]
+impl AlterTable for SlateDbStorage {
+    async fn add_column(
+        &mut self,
+        table_name: &str,
+        column_def: &gluesql_core::ast::ColumnDef,
+    ) -> GlueResult<()> {
+        use gluesql_core::error::AlterTableError;
+        let mut schema = self
+            .fetch_schema(table_name)
+            .await?
+            .ok_or_else(|| AlterTableError::TableNotFound(table_name.to_owned()))?;
+        // Resolve the fill value for rows that predate the column (GlueSQL's rule:
+        // a default, else NULL if nullable, else reject).
+        let default_value: Value = match (column_def.default.as_ref(), column_def.nullable) {
+            (Some(default), _) => evaluate_stateless(None, default).await?.try_into()?,
+            (None, true) => Value::Null,
+            (None, false) => {
+                return Err(AlterTableError::DefaultValueRequired(column_def.clone()).into())
+            }
+        };
+        let column_defs = schema
+            .column_defs
+            .as_mut()
+            .ok_or_else(|| AlterTableError::SchemalessTableFound(table_name.to_owned()))?;
+        if column_defs.iter().any(|d| d.name == column_def.name) {
+            return Err(AlterTableError::AlreadyExistingColumn(column_def.name.clone()).into());
+        }
+        let old_ncols = column_defs.len();
+        column_defs.push(column_def.clone());
+
+        let mut catalog = self
+            .read_catalog(table_name)
+            .await?
+            .unwrap_or_else(|| ColumnCatalog::identity(old_ncols));
+        catalog.add_column(default_value);
+        self.insert_schema(&schema).await?;
+        self.write_catalog(table_name, &catalog).await?;
+        Ok(())
+    }
+
+    async fn drop_column(
+        &mut self,
+        table_name: &str,
+        column_name: &str,
+        if_exists: bool,
+    ) -> GlueResult<()> {
+        use gluesql_core::error::AlterTableError;
+        let mut schema = self
+            .fetch_schema(table_name)
+            .await?
+            .ok_or_else(|| AlterTableError::TableNotFound(table_name.to_owned()))?;
+        let column_defs = schema
+            .column_defs
+            .as_mut()
+            .ok_or_else(|| AlterTableError::SchemalessTableFound(table_name.to_owned()))?;
+        let i = match column_defs.iter().position(|d| d.name == column_name) {
+            Some(i) => i,
+            None if if_exists => return Ok(()),
+            None => {
+                return Err(AlterTableError::DroppingColumnNotFound(column_name.to_owned()).into())
+            }
+        };
+        let old_ncols = column_defs.len();
+        column_defs.remove(i);
+
+        let mut catalog = self
+            .read_catalog(table_name)
+            .await?
+            .unwrap_or_else(|| ColumnCatalog::identity(old_ncols));
+        catalog.drop_column(i);
+        self.insert_schema(&schema).await?;
+        self.write_catalog(table_name, &catalog).await?;
+        Ok(())
+    }
+
+    async fn rename_column(
+        &mut self,
+        table_name: &str,
+        old_column_name: &str,
+        new_column_name: &str,
+    ) -> GlueResult<()> {
+        use gluesql_core::error::AlterTableError;
+        let mut schema = self
+            .fetch_schema(table_name)
+            .await?
+            .ok_or_else(|| AlterTableError::TableNotFound(table_name.to_owned()))?;
+        let column_defs = schema
+            .column_defs
+            .as_mut()
+            .ok_or_else(|| AlterTableError::SchemalessTableFound(table_name.to_owned()))?;
+        if column_defs.iter().any(|d| d.name == new_column_name) {
+            return Err(AlterTableError::AlreadyExistingColumn(new_column_name.to_owned()).into());
+        }
+        let col = column_defs
+            .iter_mut()
+            .find(|d| d.name == old_column_name)
+            .ok_or(AlterTableError::RenamingColumnNotFound)?;
+        new_column_name.clone_into(&mut col.name);
+        // Names live only in the schema, not in rows — no row rewrite, no catalog
+        // change.
+        self.insert_schema(&schema).await?;
+        Ok(())
+    }
+
+    async fn rename_schema(&mut self, table_name: &str, new_table_name: &str) -> GlueResult<()> {
+        use gluesql_core::error::AlterTableError;
+        let mut schema = self
+            .fetch_schema(table_name)
+            .await?
+            .ok_or_else(|| AlterTableError::TableNotFound(table_name.to_owned()))?;
+        let table_id = self.table_id(table_name).await?;
+        // O(1): move the per-table singletons (schema record, name→id mapping,
+        // creation-time meta, column catalog) to the new name. Data and index keys
+        // are keyed by `table_id` — unchanged — so not one row or index entry moves.
+        new_table_name.clone_into(&mut schema.table_name);
+        let new_schema_key = self.keyspace.schema_key(new_table_name);
+        self.write_key(new_schema_key, encode(&schema)?).await?;
+        let old_schema_key = self.keyspace.schema_key(table_name);
+        self.delete_key(old_schema_key).await?;
+
+        let new_id_key = self.keyspace.tableid_key(new_table_name);
+        self.write_key(new_id_key, table_id.to_be_bytes().to_vec()).await?;
+        let old_id_key = self.keyspace.tableid_key(table_name);
+        self.delete_key(old_id_key).await?;
+
+        let old_meta = self.keyspace.meta_key(table_name);
+        if let Some(meta) = self.read_key(&old_meta).await? {
+            let new_meta = self.keyspace.meta_key(new_table_name);
+            self.write_key(new_meta, meta).await?;
+            self.delete_key(old_meta).await?;
+        }
+        let old_cat = self.keyspace.colcat_key(table_name);
+        if let Some(cat) = self.read_key(&old_cat).await? {
+            let new_cat = self.keyspace.colcat_key(new_table_name);
+            self.write_key(new_cat, cat).await?;
+            self.delete_key(old_cat).await?;
+        }
+        Ok(())
+    }
+}
 // Override the default planner with two schema-aware passes inserted into
 // gluesql's own plan pipeline (`fetch_schema_map` gives us column types here):
 //   1. `pushdown_equijoins` — the comma-join shim leaves join keys in the
@@ -1106,6 +1390,14 @@ impl Planner for SlateDbStorage {
         let statement = crate::pushdown::pushdown_equijoins(&schema_map, statement);
         crate::pushdown::reject_cross_products(&statement)?;
         let statement = crate::coerce::coerce_comparisons(&schema_map, statement);
+        // On a guarded (user-facing) connection, bound every read: an unfiltered
+        // SELECT is capped to a PK-ordered prefix, and a non-indexed WHERE/ORDER BY
+        // is rejected. Internal/admin connections (`strict == false`) are exempt.
+        let statement = if self.strict {
+            crate::guardrail::bound_or_reject(&schema_map, statement)?
+        } else {
+            statement
+        };
         let statement = plan_primary_key(&schema_map, statement);
         // Secondary-index selection: route eligible `WHERE` predicates to
         // `Index::scan_indexed_data`. The default `Planner::plan` omits this, so

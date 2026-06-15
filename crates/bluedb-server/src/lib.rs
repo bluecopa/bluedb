@@ -311,10 +311,16 @@ impl AppState {
 
     /// A connection to the currently-bound database, or `503` if unbound. Carries
     /// the FTS commit observer so the live index is maintained on every commit.
+    ///
+    /// **Guarded:** every external route runs on a strict connection (the
+    /// scan/sort guardrail + the no-schemaless/PK-required schema regime). There
+    /// is no client bypass — a bare `SELECT` is auto-bounded, a non-indexed
+    /// filter/sort is rejected. Engine-internal work (the ledger projection, FTS
+    /// maintenance) uses the `Database` directly and is unaffected.
     async fn connection(&self) -> Result<SlateDbStorage, AppError> {
         let fts = self.inner.fts.read().await.clone();
         match self.inner.db.read().await.as_ref() {
-            Some(db) => Ok(db.connection().with_commit_observer(fts)),
+            Some(db) => Ok(db.connection_guarded().with_commit_observer(fts)),
             None => Err(AppError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 message: "node has no database yet (no writer has been promoted)".to_string(),
@@ -322,15 +328,16 @@ impl AppState {
         }
     }
 
-    /// Like [`Self::connection`] but the connection serializes autocommit writes
-    /// (see [`bluedb_sql::Database::connection_serialized`]). Used by the routes
-    /// that can run a single-statement read-modify-write (`/sql`, `PATCH`,
-    /// `DELETE`) so concurrent RMWs can't lose an update.
+    /// Like [`Self::connection`] but the connection also serializes autocommit
+    /// writes (see [`bluedb_sql::Database::connection_serialized_guarded`]). Used
+    /// by the routes that can run a single-statement read-modify-write (`/sql`,
+    /// `/admin/sql`, `PATCH`, `DELETE`) so concurrent RMWs can't lose an update.
+    /// Guarded for the same reason as [`Self::connection`].
     pub(crate) async fn connection_serialized(&self) -> Result<SlateDbStorage, AppError> {
         let fts = self.inner.fts.read().await.clone();
         match self.inner.db.read().await.as_ref() {
             Some(db) => Ok(db
-                .connection_serialized()
+                .connection_serialized_guarded()
                 .with_commit_observer(fts)),
             None => Err(AppError {
                 status: StatusCode::SERVICE_UNAVAILABLE,

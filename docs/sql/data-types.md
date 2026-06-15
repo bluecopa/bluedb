@@ -19,9 +19,8 @@
 | `UUID` | 128-bit UUID |
 
 !!! note
-    `LIST`, `MAP`, and `POINT` values are also supported (mainly for
-    schemaless rows and the list/map functions); they are niche and not covered
-    in depth here.
+    `LIST`, `MAP`, and `POINT` values are also supported (for the list/map/geo
+    functions); they are niche and not covered in depth here.
 
 ## Accepted aliases (normalized)
 
