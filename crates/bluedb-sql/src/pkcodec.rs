@@ -47,8 +47,6 @@ fn push_order_preserving(out: &mut Vec<u8>, bytes: &[u8]) {
 /// Every component is escaped+terminated — including the last — so the boundary
 /// after each is unambiguous (unlike a row's single trailing PK, which needs no
 /// terminator because nothing follows it).
-// Wired into the INSERT/predicate rewrite in Phase 2; proven standalone here.
-#[allow(dead_code)]
 pub(crate) fn encode_composite_key(components: &[Key]) -> Result<Vec<u8>, SqlError> {
     let mut out = Vec::new();
     for component in components {

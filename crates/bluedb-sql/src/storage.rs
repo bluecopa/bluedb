@@ -626,6 +626,30 @@ impl SlateDbStorage {
         self.write_key(key, encode(catalog)?).await
     }
 
+    /// Read a table's composite-primary-key catalog (the user PK columns behind
+    /// the `__bluedb_pk` surrogate). `None` for single-column-PK tables.
+    pub(crate) async fn read_pk_catalog(
+        &self,
+        table_name: &str,
+    ) -> Result<Option<crate::compositepk::PkCatalog>, SqlError> {
+        let key = self.keyspace.pkcat_key(table_name);
+        match self.read_key(&key).await? {
+            Some(bytes) => Ok(Some(decode(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Persist a table's composite-primary-key catalog (written at CREATE TABLE,
+    /// before the rewritten DDL runs). A durable, immediate write (no open txn).
+    pub(crate) async fn write_pk_catalog(
+        &mut self,
+        table_name: &str,
+        catalog: &crate::compositepk::PkCatalog,
+    ) -> Result<(), SqlError> {
+        let key = self.keyspace.pkcat_key(table_name);
+        self.write_key(key, encode(catalog)?).await
+    }
+
     /// Resolve a table's stable id (assigned at CREATE). Data and index keys are
     /// keyed by this id — not the table name — so it must exist for any table
     /// that has rows. Reading it is how name→id resolution happens on every data
@@ -883,6 +907,7 @@ impl StoreMut for SlateDbStorage {
         self.delete_key(self.keyspace.schema_key(table_name)).await?;
         self.delete_key(self.keyspace.meta_key(table_name)).await?;
         self.delete_key(self.keyspace.colcat_key(table_name)).await?;
+        self.delete_key(self.keyspace.pkcat_key(table_name)).await?;
         self.delete_key(self.keyspace.tableid_key(table_name)).await?;
         Ok(())
     }
@@ -1492,6 +1517,12 @@ impl AlterTable for SlateDbStorage {
             let new_cat = self.keyspace.colcat_key(new_table_name);
             self.write_key(new_cat, cat).await?;
             self.delete_key(old_cat).await?;
+        }
+        let old_pkcat = self.keyspace.pkcat_key(table_name);
+        if let Some(pkcat) = self.read_key(&old_pkcat).await? {
+            let new_pkcat = self.keyspace.pkcat_key(new_table_name);
+            self.write_key(new_pkcat, pkcat).await?;
+            self.delete_key(old_pkcat).await?;
         }
         Ok(())
     }
