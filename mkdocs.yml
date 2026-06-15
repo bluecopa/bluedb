@@ -69,6 +69,9 @@ nav:
       - Iceberg mirror: lakehouse/iceberg-mirror.md
   - Ledger:
       - Overview: api/ledger.md
+  - Evidence:
+      - Evidence chains: evidence/chains.md
+      - Native graph store: evidence/graph.md
   - Guarantees:
       - Consistency model: guarantees/consistency.md
       - Transactions & isolation: guarantees/transactions.md

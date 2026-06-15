@@ -17,6 +17,7 @@ bluedb-rest    = { path = "crates/bluedb-rest" }
 bluedb-engine  = { path = "crates/bluedb-engine" }
 bluedb-ha      = { path = "crates/bluedb-ha" }
 bluedb-lakehouse = { path = "crates/bluedb-lakehouse" }
+bluedb-evidence  = { path = "crates/bluedb-evidence" }
 
 # --- external ---
 # tantivy MUST match the exact rev quickwit-oss/quickwit@main pins — the
@@ -37,3 +38,5 @@ bytes        = { version = "1", features = ["serde"] }
 time         = { version = "0.3", features = ["std", "formatting", "macros"] }
 tracing      = "0.1"
 tempfile     = "3"
+sha2         = "0.10"
+base64       = "0.22"

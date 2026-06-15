@@ -578,6 +578,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "bluedb-evidence"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "bluedb-sql",
+ "bluedb-storage",
+ "postcard",
+ "serde",
+ "sha2 0.10.9",
+ "slatedb",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "bluedb-fts"
 version = "0.0.0"
 dependencies = [
@@ -661,7 +676,9 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
  "bluedb-engine",
+ "bluedb-evidence",
  "bluedb-ha",
  "bluedb-lakehouse",
  "bluedb-ledger",
@@ -902,7 +919,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6f8d983286843e49675a4b7a2d174efe136dc93a18d69130dd18198a6c167601"
 dependencies = [
  "cfg-if",
- "cpufeatures",
+ "cpufeatures 0.3.0",
  "rand_core 0.10.1",
 ]
 
@@ -1047,6 +1064,15 @@ dependencies = [
  "libc",
  "num_cpus",
  "winapi",
+]
+
+[[package]]
+name = "cpufeatures"
+version = "0.2.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "59ed5838eebb26a2bb2e58f6d5b5316989ae9d08bab10e0e6d103e656d1b0280"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -3283,7 +3309,7 @@ dependencies = [
  "md-5 0.11.0",
  "memchr",
  "rand 0.10.1",
- "sha2",
+ "sha2 0.11.0",
  "stringprep",
 ]
 
@@ -4148,12 +4174,23 @@ dependencies = [
 
 [[package]]
 name = "sha2"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "digest 0.10.7",
+]
+
+[[package]]
+name = "sha2"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "446ba717509524cb3f22f17ecc096f10f4822d76ab5c0b9822c5f9c284e825f4"
 dependencies = [
  "cfg-if",
- "cpufeatures",
+ "cpufeatures 0.3.0",
  "digest 0.11.3",
 ]
 

@@ -87,7 +87,7 @@ pub use compositepk::{prepare as prepare_composite_pk, PkCatalog, PK_COL};
 pub use connection::Database;
 pub use cte::{inline_ctes, inline_views, parse_create_view, parse_drop_view};
 pub use error::SqlError;
-pub use keyspace::{Keyspace, DEFAULT_TENANT, TAG_CDC, TAG_EXTERNAL_BASE};
+pub use keyspace::{prefix_upper_bound, Keyspace, DEFAULT_TENANT, TAG_CDC, TAG_EXTERNAL_BASE};
 pub use lakehouse::{parse_lakehouse_pragma, LhPragma};
 pub use nullorder::{parse_default_null_order, rewrite_null_order};
 pub use precheck::unsupported_reason;

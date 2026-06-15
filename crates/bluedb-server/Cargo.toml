@@ -10,11 +10,12 @@ name = "bluedb-server"
 path = "src/main.rs"
 
 [dependencies]
-bluedb-engine = { workspace = true }
-bluedb-sql    = { workspace = true }
-bluedb-ledger = { workspace = true }
-bluedb-rest   = { workspace = true }
+bluedb-engine    = { workspace = true }
+bluedb-sql       = { workspace = true }
+bluedb-ledger    = { workspace = true }
+bluedb-rest      = { workspace = true }
 bluedb-lakehouse = { workspace = true }
+bluedb-evidence  = { workspace = true }
 # `postgres` feature so the deployable binary can use the Postgres lease arbiter
 # for real multi-node election (BLUEDB_LEASE_PG_URL).
 bluedb-ha     = { workspace = true, features = ["postgres"] }
@@ -29,6 +30,7 @@ tokio         = { workspace = true }
 serde         = { workspace = true }
 serde_json    = { workspace = true }
 anyhow        = { workspace = true }
+base64        = { workspace = true }
 
 [dev-dependencies]
 tower          = { version = "0.5", features = ["util"] }
