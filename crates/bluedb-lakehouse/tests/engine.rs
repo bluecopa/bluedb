@@ -190,3 +190,53 @@ async fn enable_backfills_preexisting_rows() {
     assert_eq!(rows.len(), 3);
     assert_eq!(rows.get(&2).map(String::as_str), Some("b"));
 }
+
+#[tokio::test]
+async fn compaction_reduces_files_and_preserves_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    let db = make_db("compact").await;
+    let cdc = CdcConfig::default();
+    let eng = engine(root, db.clone(), cdc.clone()).await;
+    eng.enable_table("docs").await.unwrap();
+    {
+        let mut g = Glue::new(db.connection_serialized());
+        g.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT);")
+            .await
+            .unwrap();
+    }
+
+    // Many separate insert+seal cycles → many tiny data files, plus an update
+    // and a delete (→ equality-delete files).
+    for i in 1..=12 {
+        let mut g = Glue::new(db.connection_with_cdc(cdc.clone()));
+        g.execute(&format!("INSERT INTO docs VALUES ({i}, 'v{i}');"))
+            .await
+            .unwrap();
+        drop(g);
+        eng.seal().await.unwrap();
+    }
+    {
+        let mut g = Glue::new(db.connection_with_cdc(cdc.clone()));
+        g.execute("UPDATE docs SET body='updated' WHERE id=1;")
+            .await
+            .unwrap();
+        g.execute("DELETE FROM docs WHERE id=2;").await.unwrap();
+    }
+    eng.seal().await.unwrap();
+
+    let before = eng.data_file_count("docs").await.unwrap();
+    assert!(before > 5, "expected many small files, got {before}");
+
+    eng.compact("docs").await.unwrap();
+
+    let after = eng.data_file_count("docs").await.unwrap();
+    assert!(after < before, "compaction should reduce file count ({after} < {before})");
+
+    // Correctness vs the expected final state: id=2 deleted, id=1 updated.
+    let rows = read_table(&eng, "docs").await;
+    assert_eq!(rows.len(), 11, "12 inserted, 1 deleted");
+    assert_eq!(rows.get(&1).map(String::as_str), Some("updated"));
+    assert_eq!(rows.get(&2), None);
+    assert_eq!(rows.get(&7).map(String::as_str), Some("v7"));
+}

@@ -290,6 +290,50 @@ impl LakehouseEngine {
         .await
     }
 
+    /// Compact a mirrored table's Iceberg files (memory-bounded streaming
+    /// rewrite; see [`LakehouseWriter::compact`]). No-op for ≤1 data file.
+    pub async fn compact(&self, table: &str) -> Result<()> {
+        let schema = self.fetch_schema(table).await?;
+        let mut writer = self.writer_for(table, &schema, &[]).await?;
+        let watermark = writer.current_watermark().unwrap_or(0);
+        writer.compact(watermark).await
+    }
+
+    /// Number of live data files in a table's current Iceberg state.
+    pub async fn data_file_count(&self, table: &str) -> Result<usize> {
+        let schema = self.fetch_schema(table).await?;
+        self.writer_for(table, &schema, &[]).await?.data_file_count().await
+    }
+
+    /// Spawn a throttled background worker that compacts mirrored tables whose
+    /// data-file count exceeds `min_files`, once per `interval`. Compaction is
+    /// memory-bounded regardless of backlog, so this just bounds read
+    /// amplification (file count).
+    pub fn spawn_compaction_worker(
+        self: Arc<Self>,
+        interval: Duration,
+        min_files: usize,
+    ) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                for table in self.mirrored_tables() {
+                    match self.data_file_count(&table).await {
+                        Ok(n) if n > min_files => {
+                            if let Err(err) = self.compact(&table).await {
+                                eprintln!("lakehouse: compaction of '{table}' failed: {err}");
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            eprintln!("lakehouse: data_file_count('{table}') failed: {err}")
+                        }
+                    }
+                }
+            }
+        })
+    }
+
     /// Fetch a table's gluesql schema through a read connection.
     pub async fn fetch_schema(&self, table: &str) -> Result<gluesql_core::data::Schema> {
         self.try_fetch_schema(table)

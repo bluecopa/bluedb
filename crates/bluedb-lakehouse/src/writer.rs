@@ -242,8 +242,9 @@ impl LakehouseWriter {
             .map_err(|e| LakehouseError::Iceberg(format!("record batch: {e}")))
     }
 
-    /// Write one Parquet data file from `batch`, returning its [`DataFile`].
-    async fn write_data_file(&self, batch: RecordBatch) -> Result<DataFile> {
+    /// A fresh rolling data-file writer (caps each output file at the target
+    /// size). Used both for a single upsert batch and for streaming compaction.
+    async fn new_data_file_writer(&self) -> Result<impl IcebergWriter> {
         let parquet =
             ParquetWriterBuilder::new(WriterProperties::builder().build(), self.schema.clone());
         let rolling = RollingFileWriterBuilder::new_with_default_file_size(
@@ -256,7 +257,12 @@ impl LakehouseWriter {
                 DataFileFormat::Parquet,
             ),
         );
-        let mut writer = DataFileWriterBuilder::new(rolling).build(None).await?;
+        Ok(DataFileWriterBuilder::new(rolling).build(None).await?)
+    }
+
+    /// Write one Parquet data file from `batch`, returning its [`DataFile`].
+    async fn write_data_file(&self, batch: RecordBatch) -> Result<DataFile> {
+        let mut writer = self.new_data_file_writer().await?;
         writer.write(batch).await?;
         let files = writer.close().await?;
         files
@@ -340,28 +346,101 @@ impl LakehouseWriter {
     }
 
     /// Self-author a snapshot publishing all pending data/delete files, tagging
-    /// it with `watermark`. No-op when nothing is pending.
+    /// it with `watermark`. No-op when nothing is pending. The new snapshot
+    /// carries forward the parent's manifests (incremental merge-on-read).
     pub async fn commit_snapshot(&mut self, watermark: i64) -> Result<()> {
         if self.pending_data.is_empty() && self.pending_deletes.is_empty() {
             return Ok(());
         }
+        self.commit_internal(watermark, false).await
+    }
+
+    /// Number of **live data files** in the current table state (across the
+    /// current snapshot's manifests). Used to decide whether compaction is worth
+    /// running and to assert it reduced file count.
+    pub async fn data_file_count(&self) -> Result<usize> {
+        let Some(snapshot) = self.metadata.current_snapshot() else {
+            return Ok(0);
+        };
+        let metadata_ref = Arc::new(self.metadata.clone());
+        let list = snapshot.load_manifest_list(&self.file_io, &metadata_ref).await?;
+        let mut count = 0;
+        for mf in list.entries() {
+            let manifest = mf.load_manifest(&self.file_io).await?;
+            for entry in manifest.entries() {
+                if entry.is_alive() && entry.content_type() == DataContentType::Data {
+                    count += 1;
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    /// **Compaction** (spec §5.1): re-materialize the table's merged-on-read
+    /// state into fresh, larger data files and publish a `Replace` snapshot that
+    /// references only those files (old data + equality-delete files become
+    /// unreferenced and GC-eligible).
+    ///
+    /// Memory-bounded **independent of table size**: rows stream out of
+    /// iceberg-rust's own reader (which applies equality deletes) one
+    /// [`RecordBatch`] at a time, and the rolling writer caps each output file —
+    /// so peak memory ≈ one batch + one target-sized output file. (v1 rewrites
+    /// the whole table; incremental bin-packing is a future optimization.)
+    pub async fn compact(&mut self, watermark: i64) -> Result<()> {
+        use futures::TryStreamExt;
+
+        if self.data_file_count().await? <= 1 {
+            return Ok(()); // nothing to gain
+        }
+
+        // Stream the current merged state and re-write it through one rolling
+        // writer (so output rolls into target-sized files automatically).
+        let table = self.to_table()?;
+        let mut stream = table.scan().build()?.to_arrow().await?;
+        let mut rolling = self.new_data_file_writer().await?;
+        let mut wrote_any = false;
+        while let Some(batch) = stream.try_next().await? {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            rolling.write(batch).await?;
+            wrote_any = true;
+        }
+        let new_files = rolling.close().await?;
+        if !wrote_any {
+            return Ok(());
+        }
+
+        self.pending_data = new_files;
+        self.pending_deletes.clear();
+        self.commit_internal(watermark, true).await
+    }
+
+    /// Author one snapshot from the pending data/delete files. When `replace`,
+    /// the manifest list contains ONLY the new files (a compaction `Replace`);
+    /// otherwise it carries the parent's manifests forward (incremental
+    /// append/overwrite). Applies the table updates to our hosted metadata and
+    /// publishes the next `metadata.json`.
+    async fn commit_internal(&mut self, watermark: i64, replace: bool) -> Result<()> {
         let snapshot_id = fresh_snapshot_id(&self.metadata);
         let next_seq = self.metadata.next_sequence_number();
         let parent_id = self.metadata.current_snapshot_id();
         let schema = self.metadata.current_schema().clone();
         let partition_spec = self.metadata.default_partition_spec().as_ref().clone();
 
-        // Carry forward the manifests still live in the parent snapshot.
         let mut manifests: Vec<ManifestFile> = Vec::new();
-        if let Some(parent) = self.metadata.current_snapshot() {
-            let metadata_ref = Arc::new(self.metadata.clone());
-            let list = parent
-                .load_manifest_list(&self.file_io, &metadata_ref)
-                .await?;
-            manifests.extend(list.entries().iter().cloned());
+        // Incremental commits carry forward the parent's manifests; a Replace
+        // (compaction) starts fresh, dropping the compacted-away files.
+        if !replace {
+            if let Some(parent) = self.metadata.current_snapshot() {
+                let metadata_ref = Arc::new(self.metadata.clone());
+                let list = parent
+                    .load_manifest_list(&self.file_io, &metadata_ref)
+                    .await?;
+                manifests.extend(list.entries().iter().cloned());
+            }
         }
 
-        // New data manifest (if any data files this commit).
         if !self.pending_data.is_empty() {
             let data_files = std::mem::take(&mut self.pending_data);
             let path = format!("{}/{snapshot_id}-data.avro", self.metadata_dir());
@@ -381,7 +460,6 @@ impl LakehouseWriter {
             manifests.push(mw.write_manifest_file().await?);
         }
 
-        // New equality-delete manifest (if any delete files this commit).
         if !self.pending_deletes.is_empty() {
             let delete_files = std::mem::take(&mut self.pending_deletes);
             let path = format!("{}/{snapshot_id}-deletes.avro", self.metadata_dir());
@@ -403,7 +481,6 @@ impl LakehouseWriter {
             manifests.push(mw.write_manifest_file().await?);
         }
 
-        // Manifest list referencing all (carried-forward + new) manifests.
         let manifest_list_path = format!("{}/snap-{snapshot_id}.avro", self.metadata_dir());
         let mut mlw = ManifestListWriter::v2(
             self.file_io.new_output(&manifest_list_path)?,
@@ -414,8 +491,9 @@ impl LakehouseWriter {
         mlw.add_manifests(manifests.into_iter())?;
         mlw.close().await?;
 
-        // Snapshot pointing at the manifest list, carrying the watermark.
-        let operation = if self.metadata.current_snapshot().is_none() {
+        let operation = if replace {
+            Operation::Replace
+        } else if self.metadata.current_snapshot().is_none() {
             Operation::Append
         } else {
             Operation::Overwrite
@@ -437,8 +515,6 @@ impl LakehouseWriter {
             .with_timestamp_ms(now_ms())
             .build();
 
-        // Apply AddSnapshot + SetSnapshotRef to the metadata ourselves (our
-        // hosted catalog), then publish the next metadata.json.
         let current_md_loc = format!("{}/v{}.metadata.json", self.metadata_dir(), self.version);
         let result = self
             .metadata
