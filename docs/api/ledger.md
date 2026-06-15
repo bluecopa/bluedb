@@ -36,8 +36,8 @@ curl -s -X POST localhost:8081/ledger/accounts \
 ```json
 {
   "results": [
-    {"index": 0, "id": "1", "result": "ok"},
-    {"index": 1, "id": "2", "result": "ok"}
+    {"index": 0, "id": "1", "result": "created"},
+    {"index": 1, "id": "2", "result": "created"}
   ]
 }
 ```
@@ -74,7 +74,7 @@ curl -s -X POST localhost:8081/ledger/transfers \
 ```
 
 ```json
-{ "results": [ {"index": 0, "id": "10", "result": "ok"} ] }
+{ "results": [ {"index": 0, "id": "10", "result": "created"} ] }
 ```
 
 Fields: `id`, `debit_account_id`, `credit_account_id`, `amount`, and `ledger`
@@ -107,12 +107,12 @@ chain fails, the whole chain is rolled back (the others report
 
 ### Result codes
 
-`result` is the snake_case TigerBeetle result code. `ok` means the item applied;
-anything else explains the rejection. A few common ones:
+`result` is the snake_case TigerBeetle result code. `created` means the item was
+applied (the success code); anything else explains the rejection. A few common ones:
 
 | Result | Meaning |
 |--------|---------|
-| `ok` | Applied |
+| `created` | Applied — the account/transfer was created |
 | `linked_event_failed` | Rolled back because another item in its linked chain failed |
 | `exists` | An identical record with this id already exists (idempotent replay) |
 | `exceeds_credits` / `exceeds_debits` | Would violate an account's must-not-exceed flag |
