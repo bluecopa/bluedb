@@ -125,7 +125,11 @@ curl -s -X POST localhost:8081/graph/lineage/reachable \
 
 Body `{"from": [...], "floor"?, "directed"?}`. The **seed nodes are included** in
 the result (a node reaches itself); `floor` defaults to no floor; `directed`
-defaults to `true`; output is **sorted** (order-independent). Scope: `data:read`.
+defaults to `true`; output is **sorted** (order-independent). Each BFS level is
+expanded **concurrently** (bounded fan-out, default 16 in-flight scans), so
+latency tracks graph *diameter* rather than node count; the `visited` set dedups
+regardless of completion order, so the result is identical and deterministic.
+Scope: `data:read`.
 
 ### `POST /graph/{graph}/widest-path` — max-bottleneck path
 
@@ -175,9 +179,11 @@ matching `tenant:<name>` binding (a `superuser` token reaches any).
   concurrent with a long traversal may be partially visible. For a graph that
   isn't changing under the traversal the result is deterministic (`reachable`
   sorts; `widest_path`'s maximin is unique).
-- **Sequential frontier expansion.** BFS expands a level's neighbor scans one at
-  a time; the parallel frontier expansion described in the design (to make
-  latency track graph *diameter* rather than node count) is not yet implemented.
+- **`widest_path` frontier is sequential.** `reachable` now expands each BFS
+  level concurrently (bounded fan-out, default 16), so its latency tracks graph
+  *diameter* rather than node count. `widest_path` keeps its sequential
+  priority-queue (maximin Dijkstra) frontier — its best-first ordering is
+  inherently serial, so parallelizing it is low-value and deferred.
 - **`widest_path` scans ascending.** It uses a max-heap maximin Dijkstra over the
   forward-ordered index rather than the descending best-first scan with an early
   cutoff; the result is identical, the cutoff micro-optimization is deferred.

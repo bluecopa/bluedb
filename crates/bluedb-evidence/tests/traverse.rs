@@ -74,6 +74,39 @@ async fn reachable_unknown_seed_returns_itself() {
 }
 
 #[tokio::test]
+async fn reachable_wide_fanout_then_converge() {
+    let database = db().await;
+    let g = Graph::new(&database, "_");
+    // root -> c0..c19 (wide level), each ci -> sink.
+    let mut edges = Vec::new();
+    for i in 0..20 {
+        edges.push(EdgeUpsert { src: "root".into(), dst: format!("c{i}"), weight: 1, etype: String::new() });
+        edges.push(EdgeUpsert { src: format!("c{i}"), dst: "sink".into(), weight: 1, etype: String::new() });
+    }
+    g.upsert("g", &edges, Merge::Set).await.unwrap();
+    let r = g.reachable("g", &["root".into()], i64::MIN, true).await.unwrap();
+    let mut expected: Vec<String> = vec!["root".into(), "sink".into()];
+    for i in 0..20 { expected.push(format!("c{i}")); }
+    expected.sort();
+    assert_eq!(r, expected);
+}
+
+#[tokio::test]
+async fn reachable_diamond_dedups_shared_child() {
+    let database = db().await;
+    let g = Graph::new(&database, "_");
+    // A->B, A->C, B->D, C->D  (D reached via two parents in one level)
+    g.upsert("g", &[
+        EdgeUpsert { src: "A".into(), dst: "B".into(), weight: 1, etype: String::new() },
+        EdgeUpsert { src: "A".into(), dst: "C".into(), weight: 1, etype: String::new() },
+        EdgeUpsert { src: "B".into(), dst: "D".into(), weight: 1, etype: String::new() },
+        EdgeUpsert { src: "C".into(), dst: "D".into(), weight: 1, etype: String::new() },
+    ], Merge::Set).await.unwrap();
+    let r = g.reachable("g", &["A".into()], i64::MIN, true).await.unwrap();
+    assert_eq!(r, vec!["A", "B", "C", "D"]); // D appears once
+}
+
+#[tokio::test]
 async fn widest_path_picks_max_bottleneck() {
     let database = db().await;
     build(&database).await;
