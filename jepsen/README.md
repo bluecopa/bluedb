@@ -19,12 +19,15 @@ checker proves two things across failover:
 Best for durability / no-lost-update under failover.
 
 **`list-append` — Elle list-append.** Each Jepsen transaction is a `BEGIN; …;
-COMMIT;` of appends + reads over several keys, sent as one `POST /sql` so it runs
-as one explicit transaction on the active writer. Elle reconstructs the
-transaction dependency graph from the observed reads and flags any
-serializability anomaly (G0/G1/G2, write skew, lost update). Checked against
+COMMIT;` of appends + reads over several keys, sent as one `POST /admin/sql` so it
+runs as one explicit transaction on the active writer (`/sql` takes a single
+statement; `/admin/sql` is the multi-statement/transaction surface). Elle
+reconstructs the transaction dependency graph from the observed reads and flags
+any serializability anomaly (G0/G1/G2, write skew, lost update). Checked against
 `--consistency serializable` (default) or `strict-serializable` (also adds
-real-time order). Exercises the explicit-transaction path under concurrency.
+real-time order). Exercises the explicit-transaction path under concurrency. See
+its namespace docstring for the data model (surrogate `id = k*stride + position`
+primary key, writer-stamped position, PK-range ordered reads).
 
 **`counter` — lost-update probe.** Concurrent autocommit `UPDATE cnt SET n=n+1`
 (a single-statement read-modify-write), checked with `jepsen.checker/counter`:
@@ -76,14 +79,37 @@ and **Java 21+** on `$PATH` (a transitive dep needs `java.util.SequencedCollecti
 JDK 17 fails to load it). Leiningen is vendored at `bin/lein`.
 
 > **Schema-regime note.** The merged schema regime removed schemaless table
-> auto-create and caps a single read at 100 rows. The **`set`** workload is ported
-> for this: its client drops+creates `jset (v INTEGER PRIMARY KEY)` once per run
-> (via `POST /schema/tables` — `/admin/sql` is disabled in the compose image) and
-> `read-set` keyset-paginates over the PK. **`list-append` / `counter` / `unique`
-> / `ledger` are NOT yet ported** — each needs its tables created with a PK, and
-> `list-append` needs a redesign because it assumed `SELECT … WHERE k = ?` returns
-> insertion order, which is no longer true under PK-clustered (index-organized)
-> storage. Run `set` only until they're ported.
+> auto-create and caps a single read at 100 rows. Two workloads are ported for it:
+>
+> - **`set`** — its client drops+creates `jset (v INTEGER PRIMARY KEY)` once per
+>   run (via `POST /schema/tables`) and `read-set` keyset-paginates over the PK.
+> - **`list-append`** — one row per element with a surrogate primary key
+>   `id = k*stride + position`. Elle's appended values are unique only *within* a
+>   key, so `v` can't be the PK; the encoding also clusters a key's rows into one
+>   contiguous PK range *in append order*, so reads are PK-range scans (no
+>   secondary index, no in-memory sort the guardrail would reject). The writer
+>   stamps `position` via `INSERT … SELECT COALESCE((SELECT COUNT(*) …),0)`. Its
+>   explicit `BEGIN…COMMIT` transactions use **`POST /admin/sql`**; the compose
+>   image sets `BLUEDB_ENABLE_ADMIN_SQL=1` so that surface is available. (Full
+>   rationale in `src/bluedb/jepsen/list_append.clj`.)
+>
+> **`counter` / `unique` / `ledger` are NOT yet ported** — each needs its tables
+> created with a PK first (and the ledger has its own API). Run `set` and
+> `list-append` until they are.
+>
+> **Parallel runs / a second cluster.** To run two sessions without contending
+> for one stack, bring up the isolated `bluedb2` cluster (node ports 8091–8093,
+> its own minio/postgres) and point Jepsen at it via env:
+>
+> ```bash
+> docker compose -f docker-compose.bluedb2.yml up -d
+> BLUEDB_JEPSEN_PROJECT=bluedb2 BLUEDB_JEPSEN_BASE_PORT=8091 \
+>   ./bin/lein run test --workload list-append --nemesis none --time-limit 60 \
+>     --concurrency 10 --node node1 --node node2 --node node3
+> ```
+>
+> `BLUEDB_JEPSEN_PROJECT`/`BLUEDB_JEPSEN_BASE_PORT` default to `bluedb`/`8081`, so
+> omitting them targets the primary stack exactly as before.
 >
 > **zsh:** the `NODES="--node …"` + unquoted `$NODES` pattern below word-splits in
 > bash but **not in zsh** (it becomes one arg → "Unknown option"). On zsh, pass
