@@ -13,8 +13,8 @@ Add a new native subsystem, the crate **`bluedb-evidence`**, that turns bluedb i
 
 - an **append-only, densely-sequenced, byte-exact event log** ("evidence chain"), per `(tenant, chain)`;
 - **cryptographic verifiability** of that chain (RFC 6962 Merkle tree: digest + inclusion + consistency proofs) — *irrepudiability*;
-- a per-chain **`verified` mode** and **redaction-in-place**, so the same substrate also serves *repudiability* and **GDPR/CCPA right-to-erasure**;
-- a native **graph store + traversal** — adjacency-indexed weighted edges (HelixDB-style out/in edge indexes) with `reachable` and `widest_path`, replacing the SQL engine's missing `WITH RECURSIVE`;
+- a per-chain **`verified` mode** with **redaction** (and **hard-delete** on plain chains), so the same substrate serves both *irrepudiability* and *repudiability* / **GDPR/CCPA right-to-erasure**;
+- a native **graph store + traversal** — adjacency-indexed weighted edges (HelixDB-style out/in edge indexes) with `reachable` and `widest_path`; an append can **carry the edges it justifies**, so one atomic write updates both the chain and the graph (no separate fold pass) — replacing the SQL engine's missing `WITH RECURSIVE`;
 - **as-of scratch** namespacing for horizon/as-of replay;
 - a native **axum HTTP surface** for all of the above, tenant-scoped.
 
@@ -27,14 +27,14 @@ It mirrors the **`bluedb-ledger`** subsystem's shape: native records via postcar
 **Deliberately extended (explicit user decisions, 2026-06-15):**
 
 1. **Cryptographic verification in bluedb** — the requirements §5 said "no hashing in bluedb" and R3 put hashing entirely in the consumer. We **override** that: bluedb maintains an RFC 6962 Merkle tree over entries and serves digest/inclusion/consistency proofs. Byte-exactness is preserved — bluedb hashes a *length-framed copy* of the exact bytes and never alters what is stored or returned. The consumer's own content hashing (if any) still works, independently.
-2. **Erasure / deletion** — the requirements §5 said "no event mutation or deletion APIs." We **override** that with **redaction-in-place** (below): a payload can be erased while the seq slot and (on verified chains) the entry's leaf hash are retained, so dense sequencing, replay determinism, and proofs all survive.
+2. **Erasure / deletion** — the requirements §5 said "no event mutation or deletion APIs." We **override** that with two forms keyed to the chain's mode: **redaction-in-place** (any chain — erase the payload, keep the seq slot and, on verified chains, the leaf hash, so sequencing, replay, and proofs survive) and **hard-delete** (plain chains only — remove the slot entirely, gaps allowed, for genuine deniability-of-existence). A verified chain cannot hard-delete without breaking its own consistency proof; a plain chain can, because it makes no completeness promise. seq still *orders and addresses* in both modes — it only carries cryptographic weight (gap-free + Merkle) on a verified chain.
 3. **Native graph store** — R4 described traversal as reading the *consumer's* projection rows via a full row-scan. We **override** that: `bluedb-evidence` owns an **adjacency-indexed edge store** (out-edge + in-edge indexes keyed by source/target node, HelixDB-style), so neighbor lookup is a bounded prefix range scan, not an O(E) table scan. The consumer writes edges through a native edges API (or folds the log into it); traversal walks only the subgraph it touches. This trades R4's "traverse any table" for real traversal performance (§8).
 
 These three are the whole reason the primitive is more than "an append log": it is an *irrepudiable-by-default, erasure-capable* evidence chain with a *traversable* graph beside it.
 
 ## 3. Scope
 
-- **M1 — Evidence chain core + Merkle** (R1, R2, R3, R6, R8 + HTTP slice): append, reads, per-chain mode, redaction, the Merkle tree and proof endpoints.
+- **M1 — Evidence chain core + Merkle** (R1, R2, R3, R6, R8 + HTTP slice): append (optionally carrying edges, §6.4/§8.3), reads, per-chain mode, redaction + hard-delete, the Merkle tree and proof endpoints.
 - **M2 — Native graph store + traversal** (R4): adjacency-indexed edges (edges API), `reachable`, `widest_path`.
 - **M3 — As-of scratch** (R5).
 - **M4 — out of scope** (absorbing domain semantics). Do not start.
@@ -58,7 +58,7 @@ New crate **`bluedb-evidence`** with focused modules:
 
 | Module | Responsibility |
 |---|---|
-| `chain` | append, reads, per-chain seq counter, idempotency, per-chain mode, redaction (R1, R2, R3, R6) |
+| `chain` | append (optionally carrying edge-deltas), reads, per-chain seq counter, idempotency, per-chain mode, redaction + hard-delete (R1, R2, R3, R6) |
 | `merkle` | RFC 6962 leaf/node hashing, incremental frontier, digest, inclusion + consistency proofs |
 | `graph` | native adjacency store (out/in edge indexes), edges API, `reachable`, `widest_path` (R4) |
 | `scratch` | as-of name-prefix namespacing for chains/graphs/tables (R5) |
@@ -98,9 +98,12 @@ struct EntryRecord {
     r#type: String,        // opaque tag, stored verbatim
     payload: Vec<u8>,      // opaque bytes, stored verbatim (empty when redacted)
     at: String,            // optional, stored verbatim, never defaulted/generated (R6)
+    edges: Vec<EdgeDelta>, // edge-deltas this event justified (empty if none); replayed to rebuild the graph
     leaf_hash: Option<[u8; 32]>, // Some on verified chains, retained across redaction
     redacted: bool,
 }
+struct EdgeDelta { graph: String, src: String, dst: String, weight: i64, etype: String, op: EdgeOp }
+enum EdgeOp { Upsert { merge: Merge }, Delete }   // Merge = Set | Max
 struct IdemRecord { base_seq: i64, seqs: Vec<i64>, fingerprint: [u8; 32] }
 struct Frontier  { size: i64, peaks: Vec<[u8; 32]> }   // RFC 6962 perfect-subtree roots
 struct ChainMeta { verified: bool }                     // mode, set at creation
@@ -124,13 +127,13 @@ Endpoint accepts a single event object **or an array** (batch); single = array-o
 3. Read the seq counter `base` (0 if absent).
 4. **Idempotency** (if `idem_key` present): read `IdemRecord`. Matching key + matching `fingerprint` → return the original `{base_seq, seqs}` with **no write, no flush**. Matching key + different fingerprint → `409 E_IDEM_CONFLICT`. (`fingerprint = SHA256` over the framed bytes of the whole batch — *byte-identity only, not canonicalization*.)
 5. Assign `seqs = [base+1 .. base+K]`.
-6. For each entry, build `EntryRecord`; on a verified chain compute `leaf_hash` (§7.1).
+6. For each entry, build `EntryRecord` (including any `edges[]` it carries); on a verified chain compute `leaf_hash` over the framed entry **including its edge-deltas** (§7.1).
 7. On a verified chain, read the `Frontier`, fold in the K leaf hashes (§7.2) → new `Frontier`.
-8. Build one `WriteBatch`: put K `EntryRecord`s + updated counter (`base+K`) + `IdemRecord` (if any) + updated `Frontier` (verified) + `ChainMeta` (if newly created).
+8. Build one `WriteBatch`: put K `EntryRecord`s + updated counter (`base+K`) + `IdemRecord` (if any) + updated `Frontier` (verified) + `ChainMeta` (if newly created) + **the graph-store mutations for every entry's `edges[]`** (canonical + out + in per §8.3; an upsert that changes an existing edge's weight reads the canonical and deletes the stale out/in first — read-your-own-writes covers same-batch reads). Chain and graph advance **atomically — exactly-once**.
 9. `write_with_options(batch, await_durable:false)` → `drop(lease)` → `flush()` (durability-before-ack + group-commit, exactly as `ledger.rs:223–231`).
 10. Return `{ base_seq: base, seqs }`.
 
-**Invariants:** seq is writer-side, stored-counter (not scan-MAX), read-modify-written inside the same serialized batch → **gap-free, monotonic, contiguous within a batch, never reused**; a discarded batch burns no seq; durability-before-ack. `base_seq` = max_seq **before** the batch; first new entry is `base_seq + 1`.
+**Invariants:** seq is writer-side, stored-counter (not scan-MAX), read-modify-written inside the same serialized batch → **gap-free, monotonic, contiguous within a batch, never reused**; a discarded batch burns no seq; durability-before-ack. `base_seq` = max_seq **before** the batch; first new entry is `base_seq + 1`. Because each entry stores its `edges[]`, **replaying the chain reconstructs the graph** (and any as-of graph) — the graph is a reproducible projection, not separate truth.
 
 ### 6.5 Read path (R2)
 
@@ -140,16 +143,22 @@ Endpoint accepts a single event object **or an array** (batch); single = array-o
 - Reads use a point-in-time snapshot → repeatable, identical on writer and replicas (R6).
 - A **redacted** entry returns `{ seq, type, at, redacted: true }` with **no `payload_b64`** (and `leaf_hash` if verified).
 
-### 6.6 Redaction-in-place (erasure)
+### 6.6 Erasure — redaction & hard-delete
 
-`POST /evidence/{chain}/entries/{seq}/redact`:
+Two erasure forms, keyed to the chain's mode. Both are destructive and irreversible → require `schema:admin` (or `superuser`), not `data:write`.
+
+**Redaction (any chain)** — `POST /evidence/{chain}/entries/{seq}/redact`:
 
 1. Acquire lease; read the `EntryRecord` at `seq` (404 if absent).
-2. Blank `payload` (→ empty), set `redacted = true`. **Keep** `seq`, `type`, `at`, and `leaf_hash`.
-3. One `WriteBatch` put; durable flush. The counter and `Frontier` are **unchanged** — on a verified chain the retained `leaf_hash` means the **digest and all proofs still verify**; the payload preimage is simply gone (crypto-shred / redactable Merkle).
-4. Idempotent: redacting an already-redacted entry returns `200`.
+2. Blank `payload` (→ empty), set `redacted = true`. **Keep** `seq`, `type`, `at`, `edges`, and `leaf_hash`.
+3. One `WriteBatch` put; durable flush. The counter and `Frontier` are **unchanged** — on a verified chain the retained `leaf_hash` means the **digest and all proofs still verify**; only the payload preimage is gone (crypto-shred / redactable Merkle).
+4. Idempotent (re-redact → `200`). Dense seq (R1) and replay structure (R6) are preserved — content erased, **existence still provable**. v1 redacts `payload` only (extending to `type`/`at` is a future option; proofs are unaffected because `leaf_hash` is retained).
 
-Dense seq (R1) and replay (R6) are preserved because the slot remains; only the content is erased. **Auth:** redaction is destructive and irreversible → requires `schema:admin` (or `superuser`), not `data:write`. v1 redacts the `payload` only; extending to `type`/`at` is a documented future option (proofs are unaffected either way because `leaf_hash` is retained).
+**Hard-delete (plain chains only)** — `DELETE /evidence/{chain}/entries/{seq}`:
+
+1. Verified chain → `409 E_VERIFIED_NO_DELETE` (dropping a slot would break the consistency proof).
+2. Plain chain → remove the `EntryRecord` slot (and, per a request flag defaulting to **yes**, retract the entry's `edges[]` from the graph). The seq counter does **not** decrement → a **gap** appears; reads skip it, paging tolerates it.
+3. This is genuine **deniability-of-existence** — the only mode that can claim an entry never was. Replaying the chain after a hard-delete no longer reproduces the deleted event's effects (by design — erasure on a repudiable log). seq here is purely an ordering/addressing key, not a completeness guarantee.
 
 ## 7. Component — Merkle verification (`merkle`)
 
@@ -157,7 +166,7 @@ RFC 6962 (the Certificate Transparency / Trillian model; what QLDB does internal
 
 ### 7.1 Hashing
 
-- **Leaf:** `leaf_hash = SHA256(0x00 ‖ frame(type, payload, at))`, where `frame = varint(len(type)) ‖ type ‖ varint(len(payload)) ‖ payload ‖ varint(len(at)) ‖ at` — a length-delimited copy of the **exact** bytes (no normalization; covers all three fields so the proof attests the whole entry).
+- **Leaf:** `leaf_hash = SHA256(0x00 ‖ frame(type, payload, at, edges))`, where `frame` length-delimits `type`, `payload`, `at`, and a canonical encoding of the entry's `edges[]` (each field length-prefixed; edges sorted by `(graph, src, dst, etype, op)`) — a copy of the **exact** bytes (no payload normalization), so the proof attests the whole entry **including the edge-deltas it justified**.
 - **Node:** `SHA256(0x01 ‖ left ‖ right)`.
 - **Empty tree digest:** `SHA256(<empty>)`.
 
@@ -204,6 +213,8 @@ Continuing the evidence tags (chains used `0x17–0x1B`):
 - **upsert** — `PUT /graph/{graph}/edges` `{ edges: [{src, dst, weight, type?}], merge?: "set"|"max" }` (default `"set"`). For each edge, in one `WriteBatch`: read the canonical `(graph,src,dst,type)`; if it exists, **delete its old `out`/`in` entries** (old weight) before writing the new canonical + `out` + `in`. `merge:"max"` keeps `max(old, new)`. Atomic, durable-before-ack.
 - **delete** — `DELETE /graph/{graph}/edges` `{ edges: [{src, dst, type?}] }` — read canonical, delete canonical + `out` + `in`, one `WriteBatch`. (The graph is a rebuildable projection, so this is ordinary maintenance, not log erasure → `data:write`, not `schema:admin`.)
 
+These two are the **bulk / rebuild** path (and scratch / as-of replay). The **hot path is append-with-edges** (§6.4): an event carries the `edges[]` it justifies and bluedb applies this exact canonical+out+in maintenance in the *same* `WriteBatch` as the chain entry — so the graph is a reproducible projection of the chain, and a standalone edge write is only for edges with no originating event (bulk import, rebuild, scratch).
+
 Nodes are implicit (the union of `src`/`dst`); an explicit isolated-node set is a documented future option, not v1.
 
 ### 8.4 Traversal (read-only, one snapshot)
@@ -241,11 +252,12 @@ Native axum routes in `evidence_api.rs`, alongside `/ledger/*`. **Wire format: b
 | Logical (requirements) | Endpoint | Scope |
 |---|---|---|
 | create chain (mode) | `PUT /evidence/{chain}` `{verified?}` | `data:write` + `tenant:` |
-| `append` | `POST /evidence/{chain}/entries` `{events:[{type,payload_b64,at?}], idem_key?}` → `{base_seq, seqs}` | `data:write` + `tenant:` |
+| `append` (+edges) | `POST /evidence/{chain}/entries` `{events:[{type,payload_b64,at?,edges?:[{graph,src,dst,weight,type?,op?}]}], idem_key?}` → `{base_seq, seqs}` | `data:write` + `tenant:` |
 | `max_seq` | `GET /evidence/{chain}/head` → `{seq}` | `data:read` + `tenant:` |
 | `read_range` | `GET /evidence/{chain}/entries?from&to` | `data:read` + `tenant:` |
 | `read_from` | `GET /evidence/{chain}/entries?after&limit` | `data:read` + `tenant:` |
-| (erasure) | `POST /evidence/{chain}/entries/{seq}/redact` | `schema:admin` + `tenant:` |
+| (redact) | `POST /evidence/{chain}/entries/{seq}/redact` (any chain) | `schema:admin` + `tenant:` |
+| (hard-delete) | `DELETE /evidence/{chain}/entries/{seq}` (plain only; verified → `409`) | `schema:admin` + `tenant:` |
 | (digest) | `GET /evidence/{chain}/digest` → `{size, root_hash}` | `data:read` + `tenant:` |
 | (inclusion proof) | `GET /evidence/{chain}/proof?seq&size` | `data:read` + `tenant:` |
 | (consistency proof) | `GET /evidence/{chain}/consistency?from&to` | `data:read` + `tenant:` |
@@ -256,7 +268,7 @@ Native axum routes in `evidence_api.rs`, alongside `/ledger/*`. **Wire format: b
 | `create_scratch` | `POST /scratch` → `{scratch_id}` | `data:write` + `tenant:` |
 | `drop_scratch` | `DELETE /scratch/{scratch_id}` | `data:write` + `tenant:` |
 
-**Errors** via the existing `AppError` (`crates/bluedb-server/src/lib.rs:986`). Named errors: `E_IDEM_CONFLICT` → 409; `E_CHAIN_MODE_CONFLICT` → 409; `E_NOT_VERIFIED` (proof on a plain chain) → 400; entry/chain not found → 404; over-limit payload → 413 (reuse the server's request-body limit; add an explicit `BYTEA` cap only if none exists).
+**Errors** via the existing `AppError` (`crates/bluedb-server/src/lib.rs:986`). Named errors: `E_IDEM_CONFLICT` → 409; `E_CHAIN_MODE_CONFLICT` → 409; `E_NOT_VERIFIED` (proof on a plain chain) → 400; `E_VERIFIED_NO_DELETE` (hard-delete on a verified chain) → 409; entry/chain not found → 404; over-limit payload → 413 (reuse the server's request-body limit; add an explicit `BYTEA` cap only if none exists).
 
 ## 11. Deliberately NOT built (YAGNI / out of scope)
 
@@ -280,7 +292,9 @@ In the new crate (unit/integration) + HTTP e2e in `bluedb-server`. Each requirem
 - **Byte fidelity (through HTTP):** adversarial payloads — unsorted-key JSON, mixed whitespace, multi-byte unicode, a non-UTF-8 byte sequence — round-trip with identical bytes and identical SHA-256; over-limit payload rejected.
 - **Merkle:** golden vectors for leaf/node/root hashes vs. an RFC 6962 reference; inclusion + consistency proofs verify with an independent verifier; digest matches a from-scratch recomputation; **redaction keeps proofs valid** (redact an entry → its inclusion proof and the chain's consistency proof still verify against the unchanged digest).
 - **Mode:** plain chain does no Merkle work and returns `E_NOT_VERIFIED` on proof endpoints; re-`PUT` with a conflicting mode → `E_CHAIN_MODE_CONFLICT`.
-- **Redaction:** redacted entry returns no payload, keeps seq/type/at; `head` and dense seq unchanged; replay over the chain is still gap-free.
+- **Redaction:** redacted entry returns no payload, keeps seq/type/at/edges; `head` and dense seq unchanged; replay structure still gap-free; on a verified chain its inclusion + the chain's consistency proof still verify against the unchanged digest.
+- **Hard-delete:** on a plain chain `DELETE …/entries/{seq}` removes the slot → reads show a **gap** there, `head` unchanged; default flag also retracts the entry's edges from the graph; on a verified chain it returns `E_VERIFIED_NO_DELETE` and the entry remains.
+- **Append-with-edges (atomicity + reproducibility):** an append carrying `edges[]` updates chain + graph in **one** batch — kill-after-ack shows both or neither; replaying `read_range(1, head)` and applying each entry's `edges[]` reconstructs the live graph exactly (graph is a reproducible projection); on a verified chain the edge-deltas are covered by the inclusion proof.
 - **Graph store:** edge upsert writes canonical + out + in; re-upsert updates the weight (and `merge:max` keeps the larger), deleting the stale-weight out/in entries first; delete removes all three; out/in prefix scans return a node's neighbors ordered by weight **without scanning the edge set** (assert via a scan-count or that an unrelated node's edges are never read).
 - **Graph traversal:** golden vectors (the requirements' 4-node cyclic graph `A→B(5) B→D(3) A→C(2) D→A(4)`: `reachable(from={A}, floor=3) → [A,B,D]`; `widest_path(A,D) → {connected:true, bottleneck:3}`; `widest_path(A,C)`/unreachable → `{connected:false}`); then property tests vs. reference BFS-at-floor and reference maximin on random graphs (cycles, parallel edges via distinct types, ties), deterministic across runs and edge-insertion orders.
 - **Scratch:** projections folded into a scratch from `read_range(1, N)` match the live projections truncated at `N`; create+drop leaves `head` and live state unchanged.
@@ -296,4 +310,5 @@ In the new crate (unit/integration) + HTTP e2e in `bluedb-server`. Each requirem
 - **Crash-durability fixture:** may not exist in the harness → durability acceptance becomes an integration gate (§12).
 - **Body-size limit:** confirm the server's existing request-body limit and its over-limit error; add an explicit cap only if absent.
 - **Graph adjacency consistency:** every edge upsert/delete must keep the canonical edge and its `out`/`in` entries in lock-step within one `WriteBatch` — a re-upsert must delete the old-weight `out`/`in` before writing the new, or stale adjacency leaks. Cover in tests (§12 graph store).
-- **Edges-through-us coupling:** the consumer now writes edges via the evidence edges API (not an arbitrary SQL table) — a deliberate departure from R4 (§2, extension 3). A bulk import from an existing edge table is a possible convenience, deferred.
+- **Edges-through-us coupling:** edges are written through bluedb — normally **atomically with the justifying append** (§6.4), or via the standalone edges API for bulk/rebuild — not read from an arbitrary SQL table (deliberate departure from R4, §2 extension 3). A bulk import from an existing edge table is a deferred convenience.
+- **Hard-delete vs. replay:** hard-delete on a plain chain intentionally changes what replay reconstructs (it's erasure). The consumer must understand a plain chain is not a faithful-forever record — that's the repudiability trade. Verified chains never hard-delete, so their replay stays faithful (modulo redacted payloads).
