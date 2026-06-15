@@ -334,8 +334,17 @@ impl LakehouseEngine {
         schema: &gluesql_core::data::Schema,
         sample_rows: &[&[gluesql_core::data::Value]],
     ) -> Result<LakehouseWriter> {
-        let (iceberg_schema, pk_field_id) = table_to_iceberg(schema, sample_rows)?;
-        let sort_field_ids = self.sort_field_ids(table, schema, pk_field_id).await?;
+        let slots = self
+            .db
+            .connection_for_tenant(&self.tenant)
+            .column_slots(table)
+            .await
+            .map_err(LakehouseError::Sql)?;
+        let (iceberg_schema, pk_field_id) =
+            table_to_iceberg(schema, sample_rows, slots.as_deref())?;
+        let sort_field_ids = self
+            .sort_field_ids(table, schema, pk_field_id, slots.as_deref())
+            .await?;
         LakehouseWriter::open(
             self.file_io.clone(),
             &self.root,
@@ -351,12 +360,14 @@ impl LakehouseEngine {
     /// The Iceberg field-ids the table's data is sorted by (declared as the sort
     /// order at creation). For a composite-PK table these are the user component
     /// columns (resolved from the Pk catalog); otherwise the single PK. Field-ids
-    /// are positional in gluesql schema order (matching [`table_to_iceberg`]).
+    /// are slot-based (`slot + 1`, identity when no catalog), matching
+    /// [`table_to_iceberg`], so the sort order survives `ALTER`.
     async fn sort_field_ids(
         &self,
         table: &str,
         schema: &gluesql_core::data::Schema,
         pk_field_id: i32,
+        slots: Option<&[u32]>,
     ) -> Result<Vec<i32>> {
         let components = self
             .db
@@ -372,9 +383,17 @@ impl LakehouseEngine {
             .as_ref()
             .map(|defs| defs.iter().map(|c| c.name.as_str()).collect())
             .unwrap_or_default();
+        // Component field-id = slot(pos) + 1 (identity when no catalog), so the
+        // sort order stays stable across ALTER.
+        let field_id_of = |pos: usize| -> i32 {
+            match slots {
+                Some(s) => s[pos] as i32 + 1,
+                None => pos as i32 + 1,
+            }
+        };
         Ok(components
             .iter()
-            .filter_map(|c| names.iter().position(|n| n == c).map(|i| i as i32 + 1))
+            .filter_map(|c| names.iter().position(|n| n == c).map(field_id_of))
             .collect())
     }
 

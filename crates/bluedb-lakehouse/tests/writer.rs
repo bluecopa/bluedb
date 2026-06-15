@@ -127,3 +127,73 @@ async fn watermark_round_trips_in_snapshot_summary() {
     assert_eq!(w2.current_watermark(), Some(42));
     assert_eq!(read_back(&w2).await.get(&1).map(String::as_str), Some("a"));
 }
+
+/// `id BIGINT PK, body TEXT, extra INT` — `docs_schema` plus an added column.
+fn docs_schema_plus_extra() -> Schema {
+    Schema::builder()
+        .with_schema_id(0)
+        .with_identifier_field_ids(vec![1])
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::optional(2, "body", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::optional(3, "extra", Type::Primitive(PrimitiveType::Int)).into(),
+        ])
+        .build()
+        .unwrap()
+}
+
+fn field_names(writer: &LakehouseWriter) -> Vec<String> {
+    writer
+        .to_table()
+        .unwrap()
+        .metadata()
+        .current_schema()
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|f| f.name.clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn reopen_with_added_column_evolves_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+
+    // Create + seal a row under [id, body].
+    let mut w = LakehouseWriter::open_local(root, "main", "docs", docs_schema(), 1)
+        .await
+        .unwrap();
+    w.upsert(&[row(1, "a")]).await.unwrap();
+    w.commit_snapshot(1).await.unwrap();
+    assert_eq!(field_names(&w), vec!["id", "body"]);
+    drop(w);
+
+    // Reopen with [id, body, extra] — `extra` added. open() reconciles.
+    let w2 = LakehouseWriter::open_local(root, "main", "docs", docs_schema_plus_extra(), 1)
+        .await
+        .unwrap();
+    assert_eq!(field_names(&w2), vec!["id", "body", "extra"]);
+    // Old row still reads back (extra is null for it).
+    assert_eq!(read_back(&w2).await.get(&1).map(String::as_str), Some("a"));
+}
+
+#[tokio::test]
+async fn reopen_with_unchanged_schema_is_noop() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+
+    let mut w = LakehouseWriter::open_local(root, "main", "docs", docs_schema(), 1)
+        .await
+        .unwrap();
+    w.upsert(&[row(1, "a")]).await.unwrap();
+    w.commit_snapshot(7).await.unwrap();
+    drop(w);
+
+    // Reopen with the identical schema: no schema commit, version unchanged.
+    let w2 = LakehouseWriter::open_local(root, "main", "docs", docs_schema(), 1)
+        .await
+        .unwrap();
+    assert_eq!(field_names(&w2), vec!["id", "body"]);
+    assert_eq!(w2.current_watermark(), Some(7));
+}

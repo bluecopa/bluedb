@@ -124,6 +124,10 @@ database). Writes are accepted only by the **active writer**; a replica returns
 - **Online schema evolution.** Every table is schema'd with a `PRIMARY KEY`, but
   evolving one is cheap: ADD/DROP/RENAME column and RENAME TABLE are O(1) metadata
   ops (stable field-ids + table-ids), never a row rewrite — no migration window.
+  The same stable per-column id (the column-catalog *slot*) is what the
+  [Iceberg mirror](../lakehouse/iceberg-mirror.md#schema-evolution) maps to an
+  Iceberg field-id, so `ALTER` reconciles into the warehouse view without a
+  rewrite there either.
 - **Index-organized storage.** Every table is clustered by its primary key (no
   heap, no `ROWID`) — PK reads are contiguous range scans, and that same ordering
   seals to Parquet with no re-sort. See [Storage model](#storage-model-index-organized-tables).

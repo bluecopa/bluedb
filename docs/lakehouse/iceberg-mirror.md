@@ -165,6 +165,31 @@ cargo test -p bluedb-lakehouse --test duckdb_compat -- --ignored      # data fil
 cargo test -p bluedb-server   --test catalog_compat -- --ignored      # REST catalog
 ```
 
+## Schema evolution
+
+`ALTER TABLE` on a mirrored table is reconciled into Iceberg automatically. Each
+column carries a **stable Iceberg field-id** derived from its bluedb column
+catalog slot (an id allocated once and never reused), so the mirror evolves the
+table instead of rewriting it:
+
+- **ADD COLUMN** appears as a new Iceberg field on the next seal; rows written
+  before the add read back as `NULL` (or the column's default).
+- **DROP COLUMN** removes the field from the current Iceberg schema. Old data
+  files are still readable — Iceberg projects them through the current schema by
+  field-id, so the remaining columns stay correctly aligned (no data rewrite).
+- **RENAME COLUMN** keeps the field-id and changes only the name, so warehouse
+  queries use the new name with no rewrite.
+- **RENAME TABLE** is an O(1) metadata op and unaffected.
+
+The mirror self-authors a standard Iceberg schema-evolution commit (a new schema
+version) before the next data snapshot, so warehouse readers just see a normal
+evolving Iceberg v2 table.
+
+**Not yet reconciled:** changing a column's *type*, and adding a `LIST`/`MAP`
+column to an already-materialized table. Dropping a primary-key (or composite-key
+component) column is **rejected** — it is the merge-on-read identity and the
+clustering key.
+
 ## Type mapping
 
 gluesql column types map to Iceberg types (see the
@@ -200,10 +225,8 @@ All optional; sensible defaults shown.
 
 ## Limitations (v1)
 
-- **Schema evolution on a mirrored table** (ADD/DROP/RENAME column) is not yet
-  reconciled into Iceberg — the mirror keeps the schema the table had at first
-  seal. Field-id reconciliation (emitting an Iceberg schema update before the
-  data snapshot) is the planned follow-up; until then, avoid `ALTER` on a
-  mirrored table.
+- **Schema evolution** reconciles ADD/DROP/RENAME column (see
+  [Schema evolution](#schema-evolution)); changing a column's *type* and adding a
+  `LIST`/`MAP` column to an already-materialized table are not yet reconciled.
 - **Compaction rewrites the whole table** per run (correct and memory-bounded);
   incremental bin-packed compaction is a planned optimization.

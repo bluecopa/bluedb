@@ -123,18 +123,22 @@ impl LakehouseWriter {
             let md_path = format!("{table_root}/metadata/v{version}.metadata.json");
             let bytes = file_io.new_input(&md_path)?.read().await?;
             let metadata: TableMetadata = serde_json::from_slice(&bytes)?;
-            let schema = metadata.current_schema().clone();
-            Ok(Self {
+            let mut writer = Self {
                 file_io,
                 table_root,
                 table_ident,
-                schema,
+                schema: metadata.current_schema().clone(),
                 pk_field_id,
                 metadata,
                 version,
                 pending_data: Vec::new(),
                 pending_deletes: Vec::new(),
-            })
+            };
+            // Reconcile any ALTER since the last seal into the Iceberg schema,
+            // self-authoring a schema-only metadata commit. No-op when unchanged
+            // (the common path), so an untouched table pays only a comparison.
+            writer.evolve_schema_to(&schema).await?;
+            Ok(writer)
         } else {
             let creation = TableCreation::builder()
                 .name(table.to_string())
@@ -160,6 +164,32 @@ impl LakehouseWriter {
             writer.write_metadata(0).await?;
             Ok(writer)
         }
+    }
+
+    /// If `desired` differs from the current Iceberg schema, evolve to it by
+    /// self-authoring a schema-only metadata version (`add_current_schema`) and
+    /// adopt the evolved schema for subsequent writes. No-op when equal — the
+    /// common (never-altered) path, so an unchanged table pays only a comparison.
+    ///
+    /// The evolved schema's field order is the current logical column order, so
+    /// the positional record-batch construction in [`Self::rows_to_record_batch`]
+    /// stays correct after the ALTER.
+    async fn evolve_schema_to(&mut self, desired: &IcebergSchema) -> Result<()> {
+        let Some(evolved) = reconcile_schema(self.metadata.current_schema(), desired)? else {
+            return Ok(());
+        };
+        let current_md_loc = format!("{}/v{}.metadata.json", self.metadata_dir(), self.version);
+        let result = self
+            .metadata
+            .clone()
+            .into_builder(Some(current_md_loc))
+            .add_current_schema(evolved)?
+            .build()?;
+        self.metadata = result.metadata;
+        self.version += 1;
+        self.schema = self.metadata.current_schema().clone();
+        self.write_metadata(self.version).await?;
+        Ok(())
     }
 
     /// Stage an upsert of `rows` (insert or new version of an existing key).
@@ -592,6 +622,77 @@ fn sort_order_on(field_ids: &[i32]) -> Result<SortOrder> {
         .map_err(|e| LakehouseError::Iceberg(format!("building sort order: {e}")))
 }
 
+/// Evolve the persisted Iceberg schema `current` toward the freshly-computed
+/// `desired` (slot-based field-ids, current logical column order). Reuse-by-id:
+/// a desired field whose id already exists in `current` carries the persisted
+/// field's *type* forward (preserving nested list/map child ids), changing only
+/// the name when it differs; a desired id absent from `current` is a brand-new
+/// column (taken verbatim); a current id absent from `desired` is a dropped
+/// column (omitted).
+///
+/// The result's field order is `desired`'s order (the current logical order), so
+/// the writer's positional record-batch construction stays correct. Returns
+/// `None` when the evolved schema is field-for-field identical to `current` (the
+/// never-altered / no-op case), so the caller emits no schema commit.
+fn reconcile_schema(
+    current: &IcebergSchema,
+    desired: &IcebergSchema,
+) -> Result<Option<IcebergSchema>> {
+    use iceberg::spec::NestedField;
+
+    let evolved: Vec<_> = desired
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|d| match current.field_by_id(d.id) {
+            // Reuse the persisted field (its type, incl. nested ids); rename if
+            // the name changed, and honor the desired requiredness.
+            Some(existing) => {
+                let mut f = NestedField::new(
+                    existing.id,
+                    d.name.clone(),
+                    existing.field_type.as_ref().clone(),
+                    d.required,
+                );
+                f.doc = existing.doc.clone();
+                f.initial_default = existing.initial_default.clone();
+                f.write_default = existing.write_default.clone();
+                Arc::new(f)
+            }
+            // Brand-new column: take the desired field verbatim.
+            None => d.clone(),
+        })
+        .collect();
+
+    let rebuilt = IcebergSchema::builder()
+        .with_schema_id(current.schema_id())
+        .with_identifier_field_ids(desired.identifier_field_ids().collect::<Vec<_>>())
+        .with_fields(evolved)
+        .build()
+        .map_err(|e| LakehouseError::Schema(format!("reconciling schema: {e}")))?;
+
+    if schemas_equivalent(current, &rebuilt) {
+        Ok(None)
+    } else {
+        Ok(Some(rebuilt))
+    }
+}
+
+/// Two schemas are equivalent for reconcile purposes when their top-level fields
+/// match by (id, name, required, type) in the same order. (Schema-id is equal by
+/// construction, so we compare the struct fields, not the whole schema.)
+fn schemas_equivalent(a: &IcebergSchema, b: &IcebergSchema) -> bool {
+    let fa = a.as_struct().fields();
+    let fb = b.as_struct().fields();
+    fa.len() == fb.len()
+        && fa.iter().zip(fb.iter()).all(|(x, y)| {
+            x.id == y.id
+                && x.name == y.name
+                && x.required == y.required
+                && x.field_type == y.field_type
+        })
+}
+
 /// Wall-clock milliseconds since the Unix epoch.
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -736,5 +837,81 @@ fn to_i64(v: &Value) -> Option<i64> {
         Value::U16(n) => Some(*n as i64),
         Value::U32(n) => Some(*n as i64),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod reconcile_tests {
+    use super::reconcile_schema;
+    use iceberg::spec::{NestedField, NestedFieldRef, PrimitiveType, Schema as IcebergSchema, Type};
+
+    fn field(id: i32, name: &str, req: bool) -> NestedField {
+        let ty = Type::Primitive(PrimitiveType::String);
+        if req {
+            NestedField::required(id, name, ty)
+        } else {
+            NestedField::optional(id, name, ty)
+        }
+    }
+
+    fn schema(pk: i32, fields: Vec<NestedField>) -> IcebergSchema {
+        let fields: Vec<NestedFieldRef> = fields.into_iter().map(|f| f.into()).collect();
+        IcebergSchema::builder()
+            .with_schema_id(0)
+            .with_identifier_field_ids(vec![pk])
+            .with_fields(fields)
+            .build()
+            .unwrap()
+    }
+
+    fn names(s: &IcebergSchema) -> Vec<(i32, String)> {
+        s.as_struct()
+            .fields()
+            .iter()
+            .map(|f| (f.id, f.name.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn identical_schema_is_noop() {
+        let cur = schema(1, vec![field(1, "id", true), field(2, "a", false)]);
+        let des = schema(1, vec![field(1, "id", true), field(2, "a", false)]);
+        assert!(reconcile_schema(&cur, &des).unwrap().is_none());
+    }
+
+    #[test]
+    fn add_column_appends_field() {
+        let cur = schema(1, vec![field(1, "id", true), field(2, "a", false)]);
+        let des = schema(
+            1,
+            vec![field(1, "id", true), field(2, "a", false), field(3, "c", false)],
+        );
+        let out = reconcile_schema(&cur, &des).unwrap().unwrap();
+        assert_eq!(
+            names(&out),
+            vec![(1, "id".into()), (2, "a".into()), (3, "c".into())]
+        );
+    }
+
+    #[test]
+    fn drop_column_removes_field_keeping_ids() {
+        // current [id(1), a(2), b(3)] → desired drops `a` → [id(1), b(3)].
+        let cur = schema(
+            1,
+            vec![field(1, "id", true), field(2, "a", false), field(3, "b", false)],
+        );
+        let des = schema(1, vec![field(1, "id", true), field(3, "b", false)]);
+        let out = reconcile_schema(&cur, &des).unwrap().unwrap();
+        assert_eq!(names(&out), vec![(1, "id".into()), (3, "b".into())]);
+    }
+
+    #[test]
+    fn rename_keeps_id_changes_name() {
+        let cur = schema(1, vec![field(1, "id", true), field(2, "a", false)]);
+        let des = schema(1, vec![field(1, "id", true), field(2, "alpha", false)]);
+        let out = reconcile_schema(&cur, &des).unwrap().unwrap();
+        assert_eq!(names(&out), vec![(1, "id".into()), (2, "alpha".into())]);
+        // The reused field keeps its id (2) — Iceberg rename, not re-add.
+        assert_eq!(out.as_struct().fields()[1].id, 2);
     }
 }

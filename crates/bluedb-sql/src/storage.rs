@@ -646,6 +646,14 @@ impl SlateDbStorage {
         Ok(self.read_pk_catalog(table_name).await?.map(|c| c.columns))
     }
 
+    /// The stable physical slot of each current logical column (in schema
+    /// order), or `None` for a never-altered table (identity: slot == position).
+    /// The lakehouse mirror derives Iceberg field-ids as `slot + 1`, so a column
+    /// keeps its field-id across ADD/DROP/RENAME. Mirrors [`Self::pk_columns`].
+    pub async fn column_slots(&self, table_name: &str) -> Result<Option<Vec<u32>>, SqlError> {
+        Ok(self.read_catalog(table_name).await?.map(|c| c.slots))
+    }
+
     /// Persist a table's composite-primary-key catalog (written at CREATE TABLE,
     /// before the rewritten DDL runs). A durable, immediate write (no open txn).
     pub(crate) async fn write_pk_catalog(
@@ -1450,6 +1458,26 @@ impl AlterTable for SlateDbStorage {
                 return Err(AlterTableError::DroppingColumnNotFound(column_name.to_owned()).into())
             }
         };
+        // A key column is the merge-on-read identity and the clustering key —
+        // dropping it would orphan the lakehouse equality-delete identifier and
+        // the sort order, and is meaningless for an index-organized table. Reject
+        // it (mirrors the UPDATE-of-key-column non-goal).
+        let dropping_single_pk = column_defs[i]
+            .unique
+            .as_ref()
+            .is_some_and(|u| u.is_primary);
+        let dropping_component = self
+            .read_pk_catalog(table_name)
+            .await?
+            .is_some_and(|cat| cat.columns.iter().any(|c| c.as_str() == column_name));
+        if dropping_single_pk || dropping_component || column_name == crate::compositepk::PK_COL {
+            return Err(SqlError::CompositePk(format!(
+                "cannot DROP COLUMN `{column_name}`: it is part of the PRIMARY KEY \
+                 (drop is rejected — change the key by recreating the table)"
+            ))
+            .into());
+        }
+
         let old_ncols = column_defs.len();
         column_defs.remove(i);
 
