@@ -150,7 +150,7 @@ When [authorization](../operations/admin.md) is enabled, bind a token to one or
 more tenants with a `tenant:<name>` scope; the token can then act only on those
 tenants (a `superuser` token reaches any). A token with no `tenant:` binding may
 reach only the default tenant — so existing single-tenant token configs keep
-working unchanged. See [Configuration](../deployment/configuration.md#api-surface--authorization).
+working unchanged. See [Configuration](../deployment/configuration.md#api-surface-authorization).
 
 ### Cross-engine compatibility
 
