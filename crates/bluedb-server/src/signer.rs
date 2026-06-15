@@ -48,14 +48,6 @@ pub(crate) struct LocalSigner {
 }
 
 impl LocalSigner {
-    /// Load from a PKCS#8 PEM private key file, or generate an ephemeral key.
-    #[allow(dead_code)]
-    pub(crate) fn from_pem(pem: &str, key_id: String) -> Result<Self, AppError> {
-        use p256::pkcs8::DecodePrivateKey;
-        let key = SigningKey::from_pkcs8_pem(pem)
-            .map_err(|e| AppError::internal(format!("invalid local signing key: {e}")))?;
-        Ok(Self { key, key_id })
-    }
     /// Generate an ephemeral key (dev only — not stable across restarts).
     pub(crate) fn ephemeral() -> Self {
         // CSPRNG-seeded; uses the OS RNG.

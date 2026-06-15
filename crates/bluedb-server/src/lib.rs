@@ -184,6 +184,13 @@ fn writer_settings() -> Settings {
     settings
 }
 
+/// Required-env helper for `BLUEDB_EVIDENCE_SIGNING=vault`: a missing var is a
+/// clear misconfiguration error rather than a silent fallback.
+fn req_env(var: &str) -> Result<String, AppError> {
+    std::env::var(var)
+        .map_err(|_| AppError::internal(format!("BLUEDB_EVIDENCE_SIGNING=vault requires {var}")))
+}
+
 /// Shared service state. Cheap to clone (an `Arc` to the inner state).
 #[derive(Clone)]
 pub struct AppState {
@@ -293,59 +300,46 @@ impl AppState {
         self
     }
 
-    /// Build the evidence digest signer from the environment and install it.
-    /// `BLUEDB_EVIDENCE_SIGNING` = `off` (default) | `local` | `vault`:
-    /// - `local`: load `BLUEDB_EVIDENCE_SIGNING_KEY_PEM_FILE` (PKCS#8 PEM); if
-    ///   unset, generate an ephemeral key (dev only, logs a `WARN`).
-    /// - `vault`: `VAULT_ADDR`, `VAULT_TOKEN`, `BLUEDB_EVIDENCE_VAULT_MOUNT`
-    ///   (default `transit`), `BLUEDB_EVIDENCE_VAULT_KEY`.
+    /// Build the evidence digest signer from the environment. Production never
+    /// holds key material: signing is `off` (default) or `vault` (HashiCorp
+    /// Vault Transit — the private key stays in the KMS). The in-process
+    /// `LocalSigner` is a TEST fixture only ([`AppState::with_local_signer_for_tests`]),
+    /// never selectable from config.
     ///
-    /// Signing is **off by default**. Returns an error only on misconfiguration.
+    /// `BLUEDB_EVIDENCE_SIGNING` = `off` (default) | `vault`. For `vault`:
+    /// `VAULT_ADDR`, `VAULT_TOKEN`, `BLUEDB_EVIDENCE_VAULT_MOUNT` (default
+    /// `transit`), `BLUEDB_EVIDENCE_VAULT_KEY` (transit `ecdsa-p256` key).
     pub fn with_evidence_signing(self) -> Result<Self, AppError> {
-        use signer::{EvidenceSigner, LocalSigner};
+        use signer::EvidenceSigner;
         let mode = std::env::var("BLUEDB_EVIDENCE_SIGNING").unwrap_or_else(|_| "off".to_string());
         let built: Option<EvidenceSigner> = match mode.as_str() {
-            "off" | "" => None,
-            "local" => {
-                let s = match std::env::var("BLUEDB_EVIDENCE_SIGNING_KEY_PEM_FILE") {
-                    Ok(path) => {
-                        let pem = std::fs::read_to_string(&path).map_err(|e| {
-                            AppError::internal(format!("read local signing key {path}: {e}"))
-                        })?;
-                        LocalSigner::from_pem(&pem, format!("local:{path}"))?
-                    }
-                    Err(_) => {
-                        eprintln!(
-                            "bluedb-server: WARN evidence signing=local with no \
-                             BLUEDB_EVIDENCE_SIGNING_KEY_PEM_FILE — using an ephemeral key \
-                             (dev only; not stable across restarts, NOT production trust)"
-                        );
-                        LocalSigner::ephemeral()
-                    }
-                };
-                Some(EvidenceSigner::Local(s))
-            }
+            "off" => None,
             "vault" => {
-                let addr = std::env::var("VAULT_ADDR")
-                    .map_err(|_| AppError::internal("evidence signing=vault: VAULT_ADDR unset"))?;
-                let token = std::env::var("VAULT_TOKEN")
-                    .map_err(|_| AppError::internal("evidence signing=vault: VAULT_TOKEN unset"))?;
+                let addr = req_env("VAULT_ADDR")?;
+                let token = req_env("VAULT_TOKEN")?;
                 let mount = std::env::var("BLUEDB_EVIDENCE_VAULT_MOUNT")
                     .unwrap_or_else(|_| "transit".to_string());
-                let key = std::env::var("BLUEDB_EVIDENCE_VAULT_KEY").map_err(|_| {
-                    AppError::internal("evidence signing=vault: BLUEDB_EVIDENCE_VAULT_KEY unset")
-                })?;
+                let key = req_env("BLUEDB_EVIDENCE_VAULT_KEY")?;
                 Some(EvidenceSigner::Vault(signer::vault::VaultTransitSigner::new(
                     addr, token, mount, key,
                 )?))
             }
             other => {
                 return Err(AppError::internal(format!(
-                    "BLUEDB_EVIDENCE_SIGNING: unknown mode '{other}' (want off|local|vault)"
-                )))
+                    "BLUEDB_EVIDENCE_SIGNING: unknown mode '{other}' (want off|vault)"
+                )));
             }
         };
         Ok(self.with_signer(built.map(Arc::new)))
+    }
+
+    /// TEST ONLY: attach an in-process `LocalSigner` (ephemeral key). Not a
+    /// production path — production signing is configured via
+    /// [`AppState::with_evidence_signing`] (`off`/`vault`). Hidden from docs.
+    #[doc(hidden)]
+    pub fn with_local_signer_for_tests(self) -> Self {
+        let s = signer::EvidenceSigner::Local(signer::LocalSigner::ephemeral());
+        self.with_signer(Some(Arc::new(s)))
     }
 
     /// The evidence digest signer, or `None` if signing is off on this node.
