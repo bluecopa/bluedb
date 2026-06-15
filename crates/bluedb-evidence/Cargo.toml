@@ -1,0 +1,20 @@
+[package]
+name = "bluedb-evidence"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bluedb-storage = { workspace = true }
+bluedb-sql     = { workspace = true }
+slatedb        = { workspace = true }
+serde          = { workspace = true }
+postcard       = { workspace = true }
+thiserror      = { workspace = true }
+anyhow         = { workspace = true }
+tokio          = { workspace = true }
+sha2           = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
