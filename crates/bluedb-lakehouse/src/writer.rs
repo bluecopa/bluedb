@@ -22,7 +22,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow_array::{
     ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array,
-    RecordBatch, StringArray,
+    LargeBinaryArray, RecordBatch, StringArray,
 };
 use arrow_schema::DataType as ArrowDataType;
 use bytes::Bytes;
@@ -32,8 +32,9 @@ use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::io::FileIO;
 use iceberg::spec::{
     DataContentType, DataFile, DataFileFormat, ManifestFile, ManifestListWriter,
-    ManifestWriterBuilder, Operation, Schema as IcebergSchema, SchemaRef, Snapshot,
-    SnapshotReference, SnapshotRetention, Summary, TableMetadata, MAIN_BRANCH,
+    ManifestWriterBuilder, NullOrder, Operation, Schema as IcebergSchema, SchemaRef, Snapshot,
+    SnapshotReference, SnapshotRetention, SortDirection, SortField, SortOrder, Summary,
+    TableMetadata, Transform, MAIN_BRANCH,
 };
 use iceberg::table::Table;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
@@ -88,11 +89,18 @@ impl LakehouseWriter {
         pk_field_id: i32,
     ) -> Result<Self> {
         let file_io = FileIO::new_with_fs();
-        Self::open(file_io, root, namespace, table, schema, pk_field_id).await
+        Self::open(file_io, root, namespace, table, schema, pk_field_id, &[pk_field_id]).await
     }
 
     /// Open the table at `<root>/<namespace>/<table>`: load it from
     /// `version-hint.text` if present, else create it (writing `v0.metadata.json`).
+    ///
+    /// On creation the table declares an Iceberg **sort order** on
+    /// `sort_field_ids` (ascending). The seal writes rows in primary-key order
+    /// (the `BTreeMap` collapse), so the data genuinely is sorted by these
+    /// columns — for a composite key, the user component columns; otherwise the
+    /// single PK. This lets warehouses prune files on those columns. An empty
+    /// slice declares no sort order.
     pub async fn open(
         file_io: FileIO,
         root: &str,
@@ -100,6 +108,7 @@ impl LakehouseWriter {
         table: &str,
         schema: IcebergSchema,
         pk_field_id: i32,
+        sort_field_ids: &[i32],
     ) -> Result<Self> {
         let table_root = format!("{root}/{namespace}/{table}");
         let table_ident = TableIdent::from_strs([namespace, table])?;
@@ -131,6 +140,7 @@ impl LakehouseWriter {
                 .name(table.to_string())
                 .location(table_root.clone())
                 .schema(schema)
+                .sort_order(sort_order_on(sort_field_ids)?)
                 .build();
             let metadata = iceberg::spec::TableMetadataBuilder::from_table_creation(creation)?
                 .build()?
@@ -324,11 +334,18 @@ impl LakehouseWriter {
 
     /// Build a full-table-schema RecordBatch carrying the primary keys (other
     /// columns null). The equality-delete writer projects it down to the PK.
+    ///
+    /// Non-PK fields are forced **nullable** in this batch's Arrow schema: they
+    /// are filled with NULL placeholders (the writer projects them away), so a
+    /// `NOT NULL` non-PK column — e.g. a composite-key component — would
+    /// otherwise fail `RecordBatch` validation even though those values are
+    /// discarded.
     fn keys_to_delete_batch(&self, keys: &[&Key]) -> Result<RecordBatch> {
-        let arrow_schema = Arc::new(schema_to_arrow_schema(&self.schema)?);
+        let full = schema_to_arrow_schema(&self.schema)?;
         let pk_values: Vec<Value> = keys.iter().map(|k| key_to_value(k)).collect();
-        let mut columns: Vec<ArrayRef> = Vec::with_capacity(arrow_schema.fields().len());
-        for field in arrow_schema.fields() {
+        let mut fields = Vec::with_capacity(full.fields().len());
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(full.fields().len());
+        for field in full.fields() {
             let is_pk = field
                 .metadata()
                 .get(parquet::arrow::PARQUET_FIELD_ID_META_KEY)
@@ -339,9 +356,19 @@ impl LakehouseWriter {
             } else {
                 vec![&Value::Null; keys.len()]
             };
+            // Keep the PK field as-is; relax every other field to nullable.
+            fields.push(if is_pk {
+                field.clone()
+            } else {
+                Arc::new(field.as_ref().clone().with_nullable(true))
+            });
             columns.push(build_arrow_column(field.data_type(), &cells)?);
         }
-        RecordBatch::try_new(arrow_schema, columns)
+        let schema = Arc::new(arrow_schema::Schema::new_with_metadata(
+            fields,
+            full.metadata().clone(),
+        ));
+        RecordBatch::try_new(schema, columns)
             .map_err(|e| LakehouseError::Iceberg(format!("delete batch: {e}")))
     }
 
@@ -545,6 +572,26 @@ impl LakehouseWriter {
     }
 }
 
+/// An ascending Iceberg sort order over `field_ids` (identity transform,
+/// nulls-first). Empty → the unsorted order.
+fn sort_order_on(field_ids: &[i32]) -> Result<SortOrder> {
+    if field_ids.is_empty() {
+        return Ok(SortOrder::unsorted_order());
+    }
+    let mut builder = SortOrder::builder();
+    for &id in field_ids {
+        builder.with_sort_field(SortField {
+            source_id: id,
+            transform: Transform::Identity,
+            direction: SortDirection::Ascending,
+            null_order: NullOrder::First,
+        });
+    }
+    builder
+        .build_unbound()
+        .map_err(|e| LakehouseError::Iceberg(format!("building sort order: {e}")))
+}
+
 /// Wall-clock milliseconds since the Unix epoch.
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -645,6 +692,17 @@ fn build_arrow_column(arrow_dt: &ArrowDataType, cells: &[&Value]) -> Result<Arra
                     _ => None,
                 })
                 .collect::<BinaryArray>(),
+        ),
+        // iceberg-rust maps Iceberg `binary` to Arrow `LargeBinary` — used by the
+        // composite-PK surrogate column (`__bluedb_pk BYTEA`) and any BYTEA column.
+        ArrowDataType::LargeBinary => Arc::new(
+            cells
+                .iter()
+                .map(|v| match v {
+                    Value::Bytea(b) => Some(b.clone()),
+                    _ => None,
+                })
+                .collect::<LargeBinaryArray>(),
         ),
         other => {
             return Err(LakehouseError::Schema(format!(

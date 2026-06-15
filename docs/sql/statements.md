@@ -35,6 +35,44 @@ Options:
 CREATE TABLE adults AS SELECT * FROM users WHERE age >= 18;
 ```
 
+### Composite primary keys
+
+A multi-column `PRIMARY KEY (a, b, …)` is supported:
+
+```sql
+CREATE TABLE memberships (
+    org_id  INTEGER,
+    user_id INTEGER,
+    role    TEXT,
+    PRIMARY KEY (org_id, user_id)
+);
+```
+
+The component columns are forced `NOT NULL`. Point, **leading-prefix**, range,
+and **row-value keyset** lookups all use the key — the same shapes a Postgres
+multicolumn index serves, so they pass the [query guardrail](query-guardrail.md):
+
+```sql
+SELECT role FROM memberships WHERE org_id = 1 AND user_id = 7;   -- point
+SELECT *    FROM memberships WHERE org_id = 1 ORDER BY org_id, user_id;  -- prefix
+SELECT *    FROM memberships WHERE org_id = 1 AND user_id > 100;         -- range
+SELECT *    FROM memberships WHERE (org_id, user_id) > (1, 100)
+            ORDER BY org_id, user_id LIMIT 50;                          -- keyset page
+```
+
+Component values may be **inline literals or bound `$N` parameters**, so the
+PostgREST-style `/tables` data plane works too. A value is coerced to its
+column's type, so the key encodes identically however it was supplied (`org_id =
+1` and a `"1"` data-plane param resolve to the same key).
+
+Internally the composite key is backed by a single hidden surrogate column; it
+is never returned (`SELECT *` shows only your columns) and is the identity column
+for the [Iceberg mirror](../lakehouse/iceberg-mirror.md).
+
+!!! note "v1 limitation"
+    **`UPDATE` of a key column** is rejected (it changes the row's identity —
+    delete and re-insert instead).
+
 !!! note
     Parameterized and vendor type spellings are accepted and
     normalized: `VARCHAR(100)` → `TEXT`, `DOUBLE` → `FLOAT`, `BIGINT`/`UHUGEINT`

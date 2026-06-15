@@ -124,6 +124,10 @@ const TAG_COLCAT: u8 = 0x05;
 const TAG_TABLEID: u8 = 0x06;
 /// Tag byte for the per-tenant monotonic table-id counter (single key).
 const TAG_TABLEID_SEQ: u8 = 0x07;
+/// Tag byte for a table's **composite-primary-key catalog** (the user PK column
+/// names that map to the hidden `__bluedb_pk` surrogate). Absent for
+/// single-column-PK tables. Looked up by exact key per table, never prefix-scanned.
+const TAG_PKCAT: u8 = 0x08;
 
 /// Tag floor for namespaces owned by layers *above* bluedb-sql (e.g.
 /// `bluedb-ledger`). bluedb-sql's own tags (`TAG_SCHEMA`/`TAG_DATA`/`TAG_INDEX`)
@@ -236,6 +240,14 @@ impl Keyspace {
     pub fn colcat_key(&self, table_name: &str) -> Vec<u8> {
         let name = table_name.as_bytes();
         let mut key = self.tagged(TAG_COLCAT, name.len());
+        key.extend_from_slice(name);
+        key
+    }
+
+    /// Encode the storage key for a table's composite-primary-key catalog.
+    pub fn pkcat_key(&self, table_name: &str) -> Vec<u8> {
+        let name = table_name.as_bytes();
+        let mut key = self.tagged(TAG_PKCAT, name.len());
         key.extend_from_slice(name);
         key
     }

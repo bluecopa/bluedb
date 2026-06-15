@@ -64,6 +64,7 @@
 mod cdc;
 mod coerce;
 mod colcat;
+mod compositepk;
 mod connection;
 mod cte;
 mod error;
@@ -71,6 +72,7 @@ mod guardrail;
 mod keyspace;
 mod lakehouse;
 mod nullorder;
+mod pkcodec;
 mod precheck;
 mod projection;
 mod pushdown;
@@ -81,6 +83,7 @@ mod setops;
 mod storage;
 
 pub use cdc::{collapse_lww, CdcConfig, CdcEntry, CollapsedChanges};
+pub use compositepk::{prepare as prepare_composite_pk, PkCatalog, PK_COL};
 pub use connection::Database;
 pub use cte::{inline_ctes, inline_views, parse_create_view, parse_drop_view};
 pub use error::SqlError;
