@@ -1038,7 +1038,9 @@ impl Transaction for SlateDbStorage {
                 // sequence. Because it rides the one atomic `WriteBatch`, a CDC
                 // entry is durable iff its data row is — exactly-once capture for
                 // the seal loop. Default-tenant only for v1 (see `crate::cdc`).
+                let mut cdc_to_signal = None;
                 if let Some(cdc) = self.cdc.clone() {
+                    let mut wrote_cdc = false;
                     for ch in &txn.changes {
                         if !cdc.is_enabled(&ch.table) {
                             continue;
@@ -1051,9 +1053,18 @@ impl Transaction for SlateDbStorage {
                         };
                         let cdc_key = self.keyspace.external_key(TAG_CDC, &seq.to_be_bytes());
                         batch.put(&cdc_key, &entry.encode()?);
+                        wrote_cdc = true;
+                    }
+                    if wrote_cdc {
+                        cdc_to_signal = Some(cdc);
                     }
                 }
                 self.writer()?.write(batch).await.map_err(SqlError::from)?;
+                // Wake the lakehouse seal loop now that mirror-enabled changes are
+                // durable (event-driven freshness).
+                if let Some(cdc) = cdc_to_signal {
+                    cdc.signal_seal();
+                }
                 // Commit tap: the durable write succeeded → report the buffered
                 // changes. An observer thus never sees a change that didn't commit.
                 if let Some(obs) = self.commit_observer.as_ref() {

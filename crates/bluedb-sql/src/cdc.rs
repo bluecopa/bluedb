@@ -17,7 +17,7 @@ use std::sync::{Arc, RwLock};
 use gluesql_core::data::Key;
 use gluesql_core::store::DataRow;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 use bluedb_storage::Substrate;
 
@@ -67,6 +67,9 @@ pub struct CdcConfig {
     overrides: Arc<RwLock<HashSet<String>>>,
     /// Mirror tables by default (opt-out). Public so callers/tests can toggle it.
     pub default_on: Arc<AtomicBool>,
+    /// Pinged after a commit writes CDC entries, so the lakehouse seal loop wakes
+    /// promptly (event-driven freshness) instead of polling on a fixed interval.
+    seal_signal: Arc<Notify>,
 }
 
 impl Default for CdcConfig {
@@ -74,6 +77,7 @@ impl Default for CdcConfig {
         Self {
             overrides: Arc::new(RwLock::new(HashSet::new())),
             default_on: Arc::new(AtomicBool::new(false)),
+            seal_signal: Arc::new(Notify::new()),
         }
     }
 }
@@ -95,6 +99,19 @@ impl CdcConfig {
         } else {
             set.insert(table.to_string());
         }
+    }
+
+    /// Signal that mirror-enabled changes just committed — wakes one waiter on
+    /// [`Self::wait_for_changes`]. Called by the commit path after the durable
+    /// write.
+    pub fn signal_seal(&self) {
+        self.seal_signal.notify_one();
+    }
+
+    /// Wait until the next [`Self::signal_seal`]. A permit set before this is
+    /// awaited returns immediately, so commits are never missed.
+    pub async fn wait_for_changes(&self) {
+        self.seal_signal.notified().await;
     }
 }
 

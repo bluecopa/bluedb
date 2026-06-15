@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use bluedb_lakehouse::LakehouseEngine;
@@ -114,4 +115,51 @@ async fn seal_publishes_final_state_then_gcs() {
     assert!(db.scan_cdc(0).await.unwrap().is_empty());
     eng.seal().await.unwrap();
     assert_eq!(read_docs(&eng).await.len(), 1, "no-op seal changes nothing");
+}
+
+/// Does the Iceberg table exist yet (version-hint present)?
+async fn table_exists(root: &str) -> bool {
+    FileIO::new_with_fs()
+        .exists(&format!("{root}/main/docs/metadata/version-hint.text"))
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn seal_loop_fires_on_commit_and_skips_idle() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap().to_string();
+    let db = make_db("loop").await;
+    let cdc = CdcConfig::default();
+    let eng = Arc::new(engine(&root, db.clone(), cdc.clone()).await);
+    eng.enable_table("docs").await.unwrap();
+    {
+        let mut g = Glue::new(db.connection_serialized());
+        g.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT);")
+            .await
+            .unwrap();
+    }
+
+    let handle = eng.clone().spawn_seal_loop(Duration::from_millis(50), Duration::from_millis(500));
+
+    // Idle (no mirror-enabled commits): the loop blocks, no snapshot appears.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(!table_exists(&root).await, "idle table must not be sealed");
+
+    // A commit wakes the loop; the row appears within a few debounce windows.
+    {
+        let mut g = Glue::new(db.connection_with_cdc(cdc.clone()));
+        g.execute("INSERT INTO docs VALUES (1,'a');").await.unwrap();
+    }
+    let mut sealed = false;
+    for _ in 0..60 {
+        if table_exists(&root).await && read_docs(&eng).await.get(&1).map(String::as_str) == Some("a")
+        {
+            sealed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    handle.abort();
+    assert!(sealed, "seal loop should publish the row shortly after commit");
 }

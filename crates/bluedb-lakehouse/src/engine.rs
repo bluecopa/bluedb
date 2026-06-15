@@ -10,9 +10,12 @@
 //! mirror set. The event-driven seal loop and compaction land in later tasks.
 
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use bluedb_sql::{collapse_lww, CdcConfig, Database};
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use gluesql_core::store::{DataRow, Store};
 use iceberg::io::FileIO;
 use serde::{Deserialize, Serialize};
@@ -136,6 +139,40 @@ impl LakehouseEngine {
             .filter(|(_, on)| **on)
             .map(|(t, _)| t.clone())
             .collect()
+    }
+
+    /// Spawn the event-driven, debounced seal loop. It blocks until a
+    /// mirror-enabled commit signals new changes, coalesces a burst for up to
+    /// `debounce` (but never delays a steady stream past `max_interval`), then
+    /// seals once. An idle table never produces a snapshot — the loop simply
+    /// waits. Replaces any fixed-interval scheduler.
+    pub fn spawn_seal_loop(
+        self: Arc<Self>,
+        debounce: Duration,
+        max_interval: Duration,
+    ) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                // Block (cheaply) until the first change of a quiet period.
+                self.cdc.wait_for_changes().await;
+                // Coalesce a burst: keep extending by `debounce` as long as new
+                // changes keep arriving, capped at `max_interval` from the first.
+                let deadline = Instant::now() + max_interval;
+                loop {
+                    tokio::select! {
+                        _ = self.cdc.wait_for_changes() => {
+                            if Instant::now() >= deadline {
+                                break;
+                            }
+                        }
+                        _ = tokio::time::sleep(debounce) => break,
+                    }
+                }
+                if let Err(err) = self.seal().await {
+                    eprintln!("lakehouse: seal failed: {err}");
+                }
+            }
+        })
     }
 
     /// Drain the CDC log into Iceberg: collapse changes last-writer-wins per
