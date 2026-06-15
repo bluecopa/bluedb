@@ -75,6 +75,20 @@ Prereqs: the cluster must be **up** (`docker compose up -d` from the repo root)
 and **Java 21+** on `$PATH` (a transitive dep needs `java.util.SequencedCollection`;
 JDK 17 fails to load it). Leiningen is vendored at `bin/lein`.
 
+> **Schema-regime note.** The merged schema regime removed schemaless table
+> auto-create and caps a single read at 100 rows. The **`set`** workload is ported
+> for this: its client drops+creates `jset (v INTEGER PRIMARY KEY)` once per run
+> (via `POST /schema/tables` — `/admin/sql` is disabled in the compose image) and
+> `read-set` keyset-paginates over the PK. **`list-append` / `counter` / `unique`
+> / `ledger` are NOT yet ported** — each needs its tables created with a PK, and
+> `list-append` needs a redesign because it assumed `SELECT … WHERE k = ?` returns
+> insertion order, which is no longer true under PK-clustered (index-organized)
+> storage. Run `set` only until they're ported.
+>
+> **zsh:** the `NODES="--node …"` + unquoted `$NODES` pattern below word-splits in
+> bash but **not in zsh** (it becomes one arg → "Unknown option"). On zsh, pass
+> the `--node node1 --node node2 --node node3` flags literally.
+
 ```bash
 cd jepsen
 export LEIN_HOME="$PWD/.lein"

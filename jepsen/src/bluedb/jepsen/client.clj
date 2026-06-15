@@ -13,6 +13,11 @@
   (:require [bluedb.jepsen.http :as h]
             [jepsen.client :as client]))
 
+;; Reset the set table exactly once per JVM/test run (the first client to call
+;; `setup!` wins the CAS). Schemaless auto-create was removed, so the table must
+;; be created with a primary key — and dropped first so a re-run starts empty.
+(defonce ^:private table-ready (atom false))
+
 (defn- refresh-leader!
   "Discover the current active writer and cache it in the shared atom."
   [leader]
@@ -40,7 +45,11 @@
   client/Client
   (open! [this _test _node] this)
 
-  (setup! [_this _test])
+  (setup! [_this _test]
+    ;; First client bootstraps a fresh `jset (v INTEGER PRIMARY KEY)` on the
+    ;; active writer (schema regime requires an explicit PK'd table).
+    (when (compare-and-set! table-ready false true)
+      (h/reset-set-table!)))
 
   (invoke! [_this _test op]
     (case (:f op)
