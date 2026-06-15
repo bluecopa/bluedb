@@ -10,5 +10,5 @@ mod store;
 pub mod chain;
 
 // pub use chain::{Appended, EntryInput, Evidence};
-// pub use error::EvidenceError;
+pub use error::EvidenceError;
 pub use model::{ChainMeta, EdgeDelta, EdgeOp, EntryRecord, IdemRecord, Merge};
