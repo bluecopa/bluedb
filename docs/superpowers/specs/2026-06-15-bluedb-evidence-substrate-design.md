@@ -39,7 +39,7 @@ These three are the whole reason the primitive is more than "an append log": it 
 - **M3 — As-of scratch** (R5).
 - **M4 — out of scope** (absorbing domain semantics). Do not start.
 
-**Phase-0 prerequisite (not built here):** the **shared tenant seam** — `X-Bluedb-Tenant` header → `connection_for_tenant(tenant)`, `Keyspace::new(tenant)` parameterization, and a `tenant:<name>` authz pseudo-scope (default tenant `"_"`). This is built by the separate **lakehouse multi-tenancy** workstream. **Evidence implementation is gated on that seam landing on `dev`** — the evidence branch consumes it and does not build it.
+**Phase-0 prerequisite — ✅ LANDED on `dev`** (lakehouse-MT PR #4, merge `674ed2d`; this branch is rebased on it). The **shared tenant seam** is in the tree and evidence **consumes** it (does not build it): `X-Bluedb-Tenant` resolution (`crates/bluedb-server/src/lib.rs:309`), `connection_for_tenant(tenant)` (`crates/bluedb-sql/src/connection.rs:189`), `Keyspace::new(tenant)` (`crates/bluedb-sql/src/keyspace.rs:160`), `tenant:<name>` authz + `Authz::allows_tenant` (`crates/bluedb-server/src/authz.rs:66`); `crates/bluedb-server/tests/multitenant.rs` is a reference e2e. Default tenant `"_"`. **Coding is unblocked.**
 
 ## 4. Verified assumptions (confirmed in code, 2026-06-15)
 
@@ -304,7 +304,7 @@ In the new crate (unit/integration) + HTTP e2e in `bluedb-server`. Each requirem
 
 ## 13. Open risks / flags
 
-- **Tenant seam dependency:** evidence coding cannot start until the shared seam lands on `dev` (§3).
+- ~~**Tenant seam dependency**~~ — **RESOLVED:** the seam landed on `dev` (PR #4, merge `674ed2d`) and this branch is rebased on it (§3). Coding unblocked.
 - **Proof cost in v1:** O(N) per proof (no node store). Fine for moderate chains; flag if a consumer needs proofs over very large chains → add the node store.
 - **Operator trust:** unsigned digests need external anchoring for true irrepudiability (§7.4); documented, signing deferred.
 - **Crash-durability fixture:** may not exist in the harness → durability acceptance becomes an integration gate (§12).
