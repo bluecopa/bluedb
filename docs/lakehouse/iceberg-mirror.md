@@ -102,6 +102,22 @@ The mirror is **read-only from the warehouse side**: writes always go through
 bluedb's SQL/REST surface and flow to Iceberg automatically. Don't write to the
 Iceberg tables directly.
 
+### Cross-engine compatibility
+
+The tables are written through the published `apache/iceberg-rust` and verified
+**by an independent engine, not our own writer**: the test suite has DuckDB's
+Iceberg extension read a self-authored table — including the equality-delete
+merge-on-read result — and read a table *through the REST catalog* end-to-end.
+Because the metadata is standard Iceberg v2 with fully-qualified storage URIs,
+any Iceberg-v2 reader (Spark, Trino, Snowflake, BigQuery, Databricks, DuckDB)
+should read it. Run the cross-engine checks (needs `python3` + the DuckDB
+iceberg extension):
+
+```bash
+cargo test -p bluedb-lakehouse --test duckdb_compat -- --ignored      # data files
+cargo test -p bluedb-server   --test catalog_compat -- --ignored      # REST catalog
+```
+
 ## Type mapping
 
 gluesql column types map to Iceberg types (see the
