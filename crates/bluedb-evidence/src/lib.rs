@@ -5,6 +5,7 @@
 
 mod error;
 mod keyspace;
+mod merkle;
 mod model;
 mod store;
 pub mod chain;
