@@ -2,6 +2,8 @@
 //! runs evidence append and read operations inside that database's active
 //! writer. Mirrors the `bluedb-ledger` subsystem shape.
 
+use std::collections::HashMap;
+
 use bluedb_sql::{Database, WriteLease};
 use bluedb_storage::Substrate;
 use sha2::{Digest as Sha2Digest, Sha256};
@@ -9,6 +11,7 @@ use slatedb::config::WriteOptions;
 use slatedb::WriteBatch;
 
 use crate::error::EvidenceError;
+use crate::graph::apply_edge_delta;
 use crate::keyspace::EvidenceKeyspace;
 use crate::model::{ChainMeta, EdgeDelta, EntryRecord, IdemRecord};
 use crate::store;
@@ -208,8 +211,10 @@ impl Evidence {
             );
         }
 
-        // Write each entry record — compute leaf_hash on verified chains.
+        // Write each entry record — compute leaf_hash on verified chains; collect
+        // edges to apply to the graph store in this same batch.
         let mut leaves: Vec<[u8; 32]> = Vec::new();
+        let mut all_edges: Vec<EdgeDelta> = Vec::new();
         for (entry, &seq) in entries.into_iter().zip(&seqs) {
             let mut rec = EntryRecord {
                 etype: entry.etype,
@@ -224,7 +229,18 @@ impl Evidence {
                 rec.leaf_hash = Some(lh);
                 leaves.push(lh);
             }
+            all_edges.extend(rec.edges.iter().cloned());
             batch.put(self.keyspace.entry_key(chain, seq), &store::encode(&rec)?);
+        }
+
+        // Materialize the graph projection for every entry's edges, in this batch.
+        // One shared overlay across all entries gives read-your-own-writes when
+        // several deltas touch the same edge identity within the batch.
+        if !all_edges.is_empty() {
+            let mut overlay: HashMap<Vec<u8>, Option<i64>> = HashMap::new();
+            for d in &all_edges {
+                apply_edge_delta(&self.substrate, &self.keyspace, &mut batch, &mut overlay, d).await?;
+            }
         }
 
         // Advance the sequence counter.
