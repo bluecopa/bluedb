@@ -179,4 +179,16 @@ impl Graph {
         writer.flush().await.map_err(Self::storage_err)?;
         Ok(())
     }
+
+    /// Nodes reachable from `from` over edges with weight ≥ `floor`. Seeds are
+    /// included; output sorted. `directed=false` also follows in-edges.
+    pub async fn reachable(
+        &self,
+        graph: &str,
+        from: &[String],
+        floor: i64,
+        directed: bool,
+    ) -> Result<Vec<String>, EvidenceError> {
+        crate::traverse::reachable(&self.substrate, &self.keyspace, graph, from, floor, directed).await
+    }
 }

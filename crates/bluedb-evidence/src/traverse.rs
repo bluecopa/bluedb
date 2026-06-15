@@ -5,6 +5,8 @@
 //! state across its scans; output is sorted (`reachable`) / maximin-unique
 //! (`widest_path`), so it is deterministic for a fixed graph.
 
+use std::collections::{HashSet, VecDeque};
+
 use bluedb_storage::Substrate;
 
 use crate::error::EvidenceError;
@@ -76,6 +78,43 @@ pub(crate) async fn in_neighbors(
     floor: i64,
 ) -> Result<Vec<(String, i64, String)>, EvidenceError> {
     scan_adjacency(substrate, &ks.graph_in_prefix(graph, dst), floor).await
+}
+
+/// Nodes reachable from any of `from`, traversing only edges with weight ≥
+/// `floor`. Seeds are included. `directed=false` also follows `in` edges.
+/// Output is sorted (order-independent).
+pub(crate) async fn reachable(
+    substrate: &Substrate,
+    ks: &EvidenceKeyspace,
+    graph: &str,
+    from: &[String],
+    floor: i64,
+    directed: bool,
+) -> Result<Vec<String>, EvidenceError> {
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<String> = VecDeque::new();
+    for n in from {
+        if visited.insert(n.clone()) {
+            queue.push_back(n.clone());
+        }
+    }
+    while let Some(u) = queue.pop_front() {
+        for (v, _w, _t) in out_neighbors(substrate, ks, graph, &u, floor).await? {
+            if visited.insert(v.clone()) {
+                queue.push_back(v);
+            }
+        }
+        if !directed {
+            for (v, _w, _t) in in_neighbors(substrate, ks, graph, &u, floor).await? {
+                if visited.insert(v.clone()) {
+                    queue.push_back(v);
+                }
+            }
+        }
+    }
+    let mut out: Vec<String> = visited.into_iter().collect();
+    out.sort();
+    Ok(out)
 }
 
 #[cfg(test)]
