@@ -589,6 +589,29 @@ impl LakehouseEngine {
         Ok(())
     }
 
+    /// Load the current sealed [`iceberg::table::Table`] for `table`, for use
+    /// by the analytical query engine (DataFusion over sealed Iceberg snapshots).
+    /// Returns `None` if the table has not been sealed (materialized) yet.
+    pub async fn current_iceberg_table(
+        &self,
+        table: &str,
+    ) -> Result<Option<iceberg::table::Table>> {
+        let Some(schema) = self.try_fetch_schema(table).await? else {
+            return Ok(None);
+        };
+        // writer_for loads the existing Iceberg metadata (version-hint.text) if it
+        // exists, or creates a new empty table — we only want the former case.
+        let hint = format!(
+            "{}/{}/{}/metadata/version-hint.text",
+            self.root, self.namespace, table
+        );
+        if !self.file_io.exists(&hint).await? {
+            return Ok(None);
+        }
+        let writer = self.writer_for(table, &schema, &[]).await?;
+        Ok(Some(writer.to_table()?))
+    }
+
     /// Fetch a table's gluesql schema through a read connection.
     pub async fn fetch_schema(&self, table: &str) -> Result<gluesql_core::data::Schema> {
         self.try_fetch_schema(table)

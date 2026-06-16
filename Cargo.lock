@@ -822,6 +822,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "bluedb-query"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow-array",
+ "bluedb-lakehouse",
+ "bluedb-sql",
+ "datafusion",
+ "gluesql-core",
+ "iceberg",
+ "iceberg-datafusion",
+ "slatedb",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "bluedb-rest"
 version = "0.0.0"
 dependencies = [

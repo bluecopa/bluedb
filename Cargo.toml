@@ -18,6 +18,7 @@ bluedb-engine  = { path = "crates/bluedb-engine" }
 bluedb-ha      = { path = "crates/bluedb-ha" }
 bluedb-lakehouse = { path = "crates/bluedb-lakehouse" }
 bluedb-evidence  = { path = "crates/bluedb-evidence" }
+bluedb-query     = { path = "crates/bluedb-query" }
 
 # --- external ---
 # tantivy MUST match the exact rev quickwit-oss/quickwit@main pins — the
