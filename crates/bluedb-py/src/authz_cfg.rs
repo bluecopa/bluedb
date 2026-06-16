@@ -1,6 +1,6 @@
 //! Translate Python-supplied auth config into a server `Authz` plus the default
 //! bearer token (if any) that `db.headers()` should auto-inject.
-use bluedb_server::authz::{Authz, Scope};
+use bluedb_server::authz::Authz;
 
 /// Default superuser token value when auth is on and no token is supplied.
 pub const DEFAULT_TOKEN: &str = "bluedb-test-superuser";
@@ -13,6 +13,9 @@ pub enum AuthzSpec {
     /// One superuser token, auto-injected by `db.headers()` (the default).
     DefaultSuperuser { token: String },
     /// Custom token -> items, each item a scope or `tenant:<name>`.
+    /// Token strings and tenant names must not contain `=`, `,`, or `;`
+    /// (they are re-serialized into the `tok=scope,..;..` form parsed by
+    /// `Authz::parse_env`, which tokenizes on those characters).
     Map(Vec<(String, Vec<String>)>),
     /// Raw `tok=scope,..;tok2=..` string (prod parity).
     RawEnv(String),
@@ -58,6 +61,7 @@ impl AuthzSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bluedb_server::authz::Scope;
 
     #[test]
     fn default_is_superuser_with_token() {
