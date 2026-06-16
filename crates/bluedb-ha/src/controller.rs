@@ -13,10 +13,13 @@
 //!    writing before its lease could be handed to someone else; and a failed
 //!    renew (lease lost) immediately flips the node Passive.
 //!
-//! The lease `epoch` (a fencing token) rides along for the storage layer:
-//! SlateDB's own `writer_epoch` CAS fences a stale former writer that slips
-//! past the logical gate, so the two layers compose into hard single-writer
-//! safety.
+//! The lease `epoch` is a monotonic election fencing token (it advances on each
+//! genuine hand-off; see [`crate::lease`]). It is reported by `GET /admin/status`
+//! and used for lease renewal — it is NOT threaded into SlateDB. The storage
+//! layer is fenced *independently*: SlateDB maintains its OWN `writer_epoch`,
+//! bumped from its persisted manifest on every writer `Db` open, and CAS-fences
+//! any lower-epoch writer that slips past the logical gate. The two counters are
+//! unrelated; they compose only in that each layer admits at most one writer.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

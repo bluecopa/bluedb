@@ -210,6 +210,16 @@ struct Inner {
     /// Whether `POST /admin/sql` is enabled. Off by default; set via
     /// [`AppState::with_admin_sql_enabled`] or `BLUEDB_ENABLE_ADMIN_SQL=1`.
     admin_sql_enabled: AtomicBool,
+    /// Whether [`Inner::db`] currently holds the **writer** `Db` (vs a replica
+    /// reader or nothing). Set `true` only after [`AppState::promote`] installs the
+    /// writer `Db`, and back to `false` whenever a reader is bound
+    /// ([`AppState::attach_reader`]). The lease can be `Active` (in-memory) a beat
+    /// *before* the writer `Db` is opened and swapped in — during that window the
+    /// node still holds the pre-failover reader, so "active" must mean *lease held
+    /// AND writer bound* or a routing client would read stale replica data from a
+    /// node advertising itself as the writer. Gates [`AppState::require_active`] and
+    /// the role reported by `GET /admin/status`.
+    writer_bound: AtomicBool,
     /// Bearer-token → scopes map. Unset = open mode (all requests allowed).
     /// Set once at startup via [`AppState::with_authz`].
     authz: OnceLock<Arc<authz::Authz>>,
@@ -266,6 +276,7 @@ impl AppState {
                 writer,
                 db: RwLock::new(None),
                 admin_sql_enabled: AtomicBool::new(false),
+                writer_bound: AtomicBool::new(false),
                 authz: OnceLock::new(),
                 fts: RwLock::new(FtsEngine::new()),
                 seal_handle: Mutex::new(None),
@@ -440,6 +451,15 @@ impl AppState {
         // same object store as the SQL data.
         let database = Database::new(Arc::new(db));
         *self.inner.db.write().await = Some(database.clone());
+        // The writer `Db` is now the bound handle — only here does this node
+        // become a *truthful* active writer. Releasing the flag with `Release`
+        // pairs with the `Acquire` loads in `require_active`/`admin_status`, so a
+        // node never advertises "active" (and never serves writer-gated traffic)
+        // while still bound to the pre-failover reader. Set before the FTS /
+        // lakehouse reopen below: those are auxiliary to SQL read/write
+        // correctness, so a failure there must not strand a usable writer as
+        // passive.
+        self.inner.writer_bound.store(true, Ordering::Release);
 
         // Best-effort: ensure the ledger's SQL projection tables exist so
         // `/ledger/*` reads (and `SELECT ... FROM ledger_accounts`) work. A
@@ -554,6 +574,10 @@ impl AppState {
     /// Bind (or rebind) this node as a read replica following the writer's
     /// manifest. If the database doesn't exist yet, leaves the node unbound.
     pub async fn attach_reader(&self) {
+        // Binding a reader (or nothing) means this node is no longer the writer:
+        // clear the flag FIRST so no concurrent request observes "active + bound"
+        // against a handle that is about to become a replica reader.
+        self.inner.writer_bound.store(false, Ordering::Release);
         let bound = DbReader::builder(self.inner.db_path.clone(), self.inner.object_store.clone())
             .build()
             .await
@@ -667,9 +691,12 @@ impl AppState {
         }
     }
 
-    /// Reject a mutating request unless this node is the active writer.
+    /// Reject a mutating request unless this node is the active writer **and** has
+    /// its writer `Db` bound (not still the pre-failover reader — see
+    /// [`Inner::writer_bound`]). The `Acquire` load pairs with the `Release` store
+    /// in [`AppState::promote`]/[`AppState::attach_reader`].
     pub(crate) fn require_active(&self) -> Result<(), AppError> {
-        if self.inner.writer.is_active() {
+        if self.inner.writer.is_active() && self.inner.writer_bound.load(Ordering::Acquire) {
             Ok(())
         } else {
             Err(AppError {
@@ -931,8 +958,12 @@ async fn delete_rows(
 // --- admin / high-availability control --------------------------------------
 
 /// `GET /admin/status` — this node's writer role, fencing epoch, lease expiry.
+/// Reports `active` only when the lease is held **and** the writer `Db` is bound,
+/// so a routing client never targets a node that holds the lease but is still
+/// serving from the pre-failover reader (see [`Inner::writer_bound`]).
 async fn admin_status(State(state): State<AppState>) -> Json<Value> {
-    Json(status_json(&state.inner.writer.status()))
+    let writer_bound = state.inner.writer_bound.load(Ordering::Acquire);
+    Json(status_json_effective(&state.inner.writer.status(), writer_bound))
 }
 
 /// `POST /admin/promote` — acquire the lease + open the writer database.
@@ -959,6 +990,26 @@ fn status_json(status: &Status) -> Value {
     json!({
         "node_id": status.node_id,
         "role": status.role.as_str(),
+        "epoch": status.epoch,
+        "lease_expires_at_millis": status.lease_expires_at_millis,
+    })
+}
+
+/// Like [`status_json`] but downgrades a node that holds the lease yet has not
+/// installed its writer `Db` (`writer_bound == false`) from `active` to `passive`.
+/// During the failover window between acquiring the lease and swapping in the
+/// writer `Db`, the node is still bound to the pre-failover reader; advertising it
+/// as `active` would let a routing client serve stale reads from it (the root
+/// cause of the counter lost-acked-increment finding under `kill`).
+fn status_json_effective(status: &Status, writer_bound: bool) -> Value {
+    let role = if status.role.as_str() == "active" && !writer_bound {
+        "passive"
+    } else {
+        status.role.as_str()
+    };
+    json!({
+        "node_id": status.node_id,
+        "role": role,
         "epoch": status.epoch,
         "lease_expires_at_millis": status.lease_expires_at_millis,
     })

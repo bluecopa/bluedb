@@ -17,6 +17,10 @@
             [clj-http.client :as http]
             [cheshire.core :as json]))
 
+;; Reset `u` once per run (the first client to win the CAS bootstraps it). The
+;; schema regime needs an explicit PK'd table and no longer auto-creates one.
+(defonce ^:private table-ready (atom false))
+
 (defn- insert! [node id]
   (http/post (str (h/base node) "/tables/u")
              {:body (json/generate-string {:id id})
@@ -45,7 +49,10 @@
 (defrecord UniqueClient [leader]
   client/Client
   (open! [this _test _node] this)
-  (setup! [_this _test])
+
+  (setup! [_this _test]
+    (when (compare-and-set! table-ready false true)
+      (h/reset-unique-table!)))
 
   (invoke! [_this _test op]
     (let [node (h/target leader)

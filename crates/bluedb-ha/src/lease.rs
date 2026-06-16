@@ -4,10 +4,12 @@
 //! Exactly one node may hold the lease at a time. Each time the lease changes
 //! hands (a new acquisition after the previous holder's lease expired or was
 //! released) the `epoch` — a monotonically increasing **fencing token** —
-//! advances. Renewing your own live lease keeps the same epoch. The epoch is
-//! what composes with SlateDB's own `writer_epoch` CAS fencing: a newly-promoted
-//! node carries a strictly higher epoch, so a stale former writer that tries to
-//! act is fenced out at the storage layer.
+//! advances. Renewing your own live lease keeps the same epoch. This epoch
+//! fences at the *lease* layer (a stale holder can no longer renew). The storage
+//! layer is fenced *independently* by SlateDB's own `writer_epoch`, which SlateDB
+//! bumps from its persisted manifest on every writer `Db` open — this lease
+//! `epoch` is not threaded into SlateDB. The two compose only in that each admits
+//! at most one writer; neither counter is derived from the other.
 //!
 //! [`LeaseProvider`] is the seam. The in-memory [`LocalLeaseProvider`] backs a
 //! single process (and the tests). A production deployment implements it over a

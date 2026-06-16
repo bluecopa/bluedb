@@ -267,6 +267,38 @@ async fn promote_enables_writes_and_demote_disables_them() {
     assert_eq!(body, json!([{ "id": 1, "v": 10 }]), "reads continue while passive");
 }
 
+#[tokio::test]
+async fn lease_held_but_writer_db_unbound_reports_passive_and_refuses_writes() {
+    // Reproduce the failover window INSIDE `promote()`: the lease is acquired (the
+    // controller goes Active) a beat BEFORE the writer `Db` is opened and swapped
+    // into `inner.db`. A node in this window is still bound to its pre-failover
+    // reader, so it must NOT advertise itself as the active writer — otherwise a
+    // routing client (e.g. the Jepsen counter) latches it as leader and serves
+    // stale reads from the lagging reader, the root cause of the lost-acked-
+    // increment finding under `kill`. "Active" must mean *lease held AND writer
+    // Db bound*.
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let state = node("gap", store, Arc::new(LocalLeaseProvider::new()))
+        .with_admin_sql_enabled(true);
+    // Take the lease at the controller level ONLY — deliberately skip
+    // `AppState::promote`, which is what would bind the writer `Db`.
+    state.writer().promote().await.expect("acquire lease");
+    let app = build_app(state);
+
+    // Despite holding the lease, status downgrades to passive (no writer Db yet).
+    let (status, body) = call(&app, "GET", "/admin/status", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["role"],
+        json!("passive"),
+        "lease held but writer Db unbound must report passive, not active"
+    );
+
+    // And writer-gated traffic is refused (`require_active` sees the unbound writer).
+    let (status, _) = call(&app, "POST", "/tables/t", Some(json!({ "id": 1, "v": 10 }))).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
 // --- new surface-enforcement tests ------------------------------------------
 
 /// `POST /sql` must reject DDL (CREATE TABLE) with 400.
