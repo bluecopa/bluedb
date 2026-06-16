@@ -4,7 +4,7 @@ name: testkit-wheels
 # toolchain. PyO3 is compiled with `abi3-py39`, so one wheel per platform covers
 # CPython 3.9+. Wheels are attached to the GitHub Release for a `testkit-v*` tag.
 #
-# Targets: Linux x86_64 (manylinux), Linux aarch64 (cross), macOS Apple Silicon.
+# Targets: Linux x86_64 (manylinux), Linux aarch64 (native arm64 runner), macOS Apple Silicon.
 # To cut a release: bump `version` in crates/bluedb-py/{Cargo.toml,pyproject.toml},
 # then `git tag testkit-vX.Y.Z && git push origin testkit-vX.Y.Z`.
 
@@ -35,10 +35,10 @@ jobs:
             manylinux: auto
             smoke: true
           - name: linux-aarch64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04-arm   # native arm64 (free on public repos): no cross-asm, ring builds cleanly
             target: aarch64
-            manylinux: '2014'
-            smoke: false   # cross-compiled; cannot run on the x86 host
+            manylinux: auto
+            smoke: true   # runs natively on the arm64 host
           - name: macos-arm64
             runner: macos-14
             target: aarch64
