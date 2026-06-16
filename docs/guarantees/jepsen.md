@@ -41,9 +41,15 @@ across promotions.
       one PK range *in append order*); the read is a PK-range scan. Its explicit
       `BEGIN…COMMIT` transactions run through `POST /admin/sql`.
 
-    The **`counter`**, **`unique`**, and **`ledger`** workloads still need the same
-    port (a PK'd table created up front) before they can be re-run; their earlier
-    green results predate the schema regime — treat them as pending re-validation.
+    The **`counter`** and **`unique`** workloads have since been ported too (each
+    creates its PK'd table up front in `setup!` and drives the writer via the
+    JSON `/sql` + `/tables` surfaces), plus a new **`dur`** probe (a grow-only set
+    written through the `/sql` autocommit path — counter's exact write path — with
+    identifiable elements, to time any acked-write loss). See Results.
+
+    The **`ledger`** workload still needs the same port before it can be re-run;
+    its earlier green result predates the schema regime — treat it as pending
+    re-validation.
 
 ## Faults (nemesis)
 
@@ -92,6 +98,21 @@ Injected against the Compose stack via the `docker` CLI:
   observed a single consistent cut; the sink was never dropped, even under
   `pause` (which freezes a traversal between scans, straddling a swap). This
   demonstrates [snapshot-consistent traversal](../evidence/graph.md#consistency).
+- **`counter` re-verification + a failover fix (2026-06-16):** ported to the
+  schema regime, the `counter` × `kill` run first surfaced a real **failover
+  read-staleness** bug — *not* a lost write. A just-promoted node briefly
+  advertised `role: "active"` (it had the lease) while still bound to its
+  pre-failover replica `Db`, and `GET /tables` reads are not writer-gated, so a
+  client following the leader read the lagging replica and saw the counter
+  *below* its acknowledged count (~45% of runs). The fix makes a node report
+  `active` only once its writer `Db` is installed (see
+  [Read consistency](consistency.md#routing-across-failover) and
+  [Active-passive HA](../ha/active-passive.md)). After the fix, `counter` × `kill`
+  is **`:valid? true`** with **no lost updates across ~22 runs** (from ~45%
+  failing). A standalone SlateDB reproducer
+  (`crates/bluedb-storage/tests/hotkey_recovery.rs`) independently confirmed the
+  storage layer never loses a durable (`await_durable=true`) write across an
+  abrupt crash + reopen, which had ruled out a durability cause.
 
 The dependency-fault results (`arbiter` / `storage` / `disk-full`) above were
 established before the schema regime landed; they are being re-run as the

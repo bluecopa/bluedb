@@ -34,12 +34,23 @@ write):
    `safety_margin` of expiry, so it can't write into a window where another node
    might promote.
 
-2. **Storage fencing (mechanism)** — SlateDB stamps every durable write with the
-   writer's `epoch` and uses a compare-and-set. A node with a stale epoch
+2. **Storage fencing (mechanism)** — SlateDB stamps every durable write with a
+   `writer_epoch` and uses a compare-and-set. A node with a stale epoch
    physically cannot commit. Even a brief two-writers belief produces no
    divergence: only the current epoch wins.
 
 Policy decides quickly; mechanism is the backstop that makes mistakes safe.
+
+!!! note "Two independent epochs"
+    The lease `epoch` (policy) and SlateDB's `writer_epoch` (mechanism) are
+    **separate monotonic counters**, not one value threaded through. The lease
+    epoch advances in the arbiter on each genuine hand-off and fences *lease
+    renewal*; SlateDB bumps its own `writer_epoch` from its persisted manifest
+    every time a writer `Db` is opened and fences *durable writes*. They are not
+    derived from each other — they compose only in that each independently admits
+    at most one writer. (The failover diagram's `epoch N → N+1` is the lease
+    epoch; SlateDB's storage epoch advances on its own whenever the new writer
+    opens its `Db`.)
 
 ## Failover sequence
 
@@ -81,6 +92,15 @@ stateDiagram-v2
 
 A node only writes while `is_active` — and `is_active` goes false the moment the
 lease is within `safety_margin` of expiry, *before* anyone else could take it.
+
+!!! note "`active` means lease held **and** writer `Db` installed"
+    Promotion acquires the lease *first*, then opens and swaps in the writer
+    `Db`. A node reports `active` (and accepts writer-gated traffic) only after
+    that swap — during the brief gap it still holds its pre-failover replica
+    view, so it reports `passive`. This keeps `/admin/status` honest: a client
+    routing to "the active node" never reaches one that holds the lease but is
+    still serving a stale replica. See
+    [Read consistency](../guarantees/consistency.md#routing-across-failover).
 
 ## Configuration
 
