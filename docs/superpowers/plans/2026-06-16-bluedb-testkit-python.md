@@ -653,13 +653,15 @@ fn _bluedb_testkit(m: &Bound<'_, PyModule>) -> PyResult<()> {
 } // mod py
 ```
 
-- [ ] **Step 2: Verify both the core and the PyO3 layer build**
+- [ ] **Step 2: Verify both the core and the PyO3 layer**
 
-Run: `cargo test -p bluedb-py 2>&1 && cargo build -p bluedb-py --features python 2>&1`
-Expected: the 7 core tests pass (default features, no PyO3); the `--features python`
-build compiles the PyO3 layer. The `--features python` build needs a linkable
-libpython on PATH — if it fails to link, that's an environment concern, not a code
-bug; the wheel is built via maturin (Task 5) which handles linking.
+Run: `cargo test -p bluedb-py 2>&1 && cargo check -p bluedb-py --features python 2>&1`
+Expected: the 7 core tests pass (default features, no PyO3); `cargo check --features python`
+type-checks the PyO3 layer (validates the `#[pyclass]`/`#[pymethods]`/`#[pymodule]`
+macros and argument types) **without linking libpython** — so it works regardless of
+whether a linkable libpython is present. The real link + run is proven by maturin in
+Task 5. (`cargo check` still runs PyO3's build script, which only needs a `python3`
+interpreter on PATH to read the ABI config — present on this machine.)
 
 - [ ] **Step 3: Commit**
 
