@@ -6,14 +6,32 @@ no S3, no Docker, no subprocess. **Authenticated by default.**
 
 ## Install
 
-`bluedb-testkit` is distributed as a pre-built wheel — it is **not** published to
-public PyPI. Add it as a dev dependency from your internal package index, or
-install a wheel built from source (see below):
+`bluedb-testkit` ships as **pre-built abi3 wheels** — no Rust toolchain needed to
+install — attached to GitHub Releases (it is **not** on public PyPI). Wheels are
+provided for **Linux x86_64**, **Linux aarch64**, and **macOS Apple Silicon**, and
+work on CPython **3.9+** (one abi3 wheel per platform).
+
+Install the wheel for your platform from a `testkit-v*` release:
 
 ```bash
-pip install bluedb-testkit                      # from an internal index
-# or, from a locally built wheel:
-pip install target/wheels/bluedb_testkit-*.whl
+pip install \
+  https://github.com/bluecopa/bluedb/releases/download/testkit-v0.1.0/bluedb_testkit-0.1.0-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+```
+
+Or point pip at a release as a find-links source (so it auto-selects the right
+wheel for the host platform):
+
+```bash
+pip install bluedb-testkit \
+  --find-links https://github.com/bluecopa/bluedb/releases/expanded_assets/testkit-v0.1.0
+```
+
+**Cutting a release:** bump `version` in `crates/bluedb-py/{Cargo.toml,pyproject.toml}`,
+then push a tag — the `testkit-wheels` CI builds all three platforms and attaches the
+wheels:
+
+```bash
+git tag testkit-v0.1.0 && git push origin testkit-v0.1.0
 ```
 
 ## Use

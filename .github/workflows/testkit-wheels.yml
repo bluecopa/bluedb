@@ -1,0 +1,109 @@
+name: testkit-wheels
+
+# Build prebuilt abi3 wheels for `bluedb-testkit` so consumers install with NO Rust
+# toolchain. PyO3 is compiled with `abi3-py39`, so one wheel per platform covers
+# CPython 3.9+. Wheels are attached to the GitHub Release for a `testkit-v*` tag.
+#
+# Targets: Linux x86_64 (manylinux), Linux aarch64 (cross), macOS Apple Silicon.
+# To cut a release: bump `version` in crates/bluedb-py/{Cargo.toml,pyproject.toml},
+# then `git tag testkit-vX.Y.Z && git push origin testkit-vX.Y.Z`.
+
+on:
+  push:
+    tags:
+      - 'testkit-v*'
+  pull_request:
+    paths:
+      - 'crates/bluedb-py/**'
+      - '.github/workflows/testkit-wheels.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runner: ubuntu-latest
+            target: x86_64
+            manylinux: auto
+            smoke: true
+          - name: linux-aarch64
+            runner: ubuntu-latest
+            target: aarch64
+            manylinux: '2014'
+            smoke: false   # cross-compiled; cannot run on the x86 host
+          - name: macos-arm64
+            runner: macos-14
+            target: aarch64
+            manylinux: ''
+            smoke: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'   # host Python for the smoke step; abi3 floor is py39 via pyo3
+
+      - name: Build abi3 wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          rust-toolchain: stable
+          # maturin reads crates/bluedb-py/pyproject.toml, whose
+          # [tool.maturin] features = ["python", "pyo3/extension-module"] turn on PyO3.
+          args: --release --manifest-path crates/bluedb-py/Cargo.toml --out dist
+
+      - name: Smoke-test the wheel (install with no Rust, run the real server)
+        if: ${{ matrix.smoke }}
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip httpx
+          python -m pip install --no-index --find-links dist bluedb-testkit
+          python - <<'PY'
+          import httpx
+          from bluedb_testkit import serve, DEFAULT_TOKEN
+          with serve() as db:
+              assert db.token == DEFAULT_TOKEN, db.token
+              assert httpx.get(db.url("/health")).status_code == 200
+              assert httpx.get(db.url("/tables/_ci_")).status_code == 401
+              print("wheel smoke ok:", db.base_url)
+          PY
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.name }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  release:
+    name: attach wheels to GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/testkit-v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # create/update the release and upload assets
+    steps:
+      - name: Download all wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+
+      - name: List wheels
+        run: ls -l dist
+
+      - name: Publish wheels to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.whl
+          fail_on_unmatched_files: true
