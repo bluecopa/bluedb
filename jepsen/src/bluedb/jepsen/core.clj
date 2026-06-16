@@ -30,6 +30,7 @@
       --concurrency 10 --node node1 --node node2 --node node3"
   (:require [bluedb.jepsen.client :as bc]
             [bluedb.jepsen.counter :as bcnt]
+            [bluedb.jepsen.dur :as bd]
             [bluedb.jepsen.evidence :as ev]
             [bluedb.jepsen.graph :as gr]
             [bluedb.jepsen.http :as h]
@@ -76,6 +77,17 @@
   "Grow-only set: infinite stream of unique-int adds + a final whole-set read."
   [_opts]
   {:client          (bc/set-client)
+   :generator       (map (fn [v] {:type :invoke :f :add :value v}) (range))
+   :final-generator (gen/each-thread {:type :invoke :f :read})
+   :checker         (checker/set-full {:linearizable? false})})
+
+(defn- dur-workload
+  "Durability probe: identical to `set` but writes through the /sql autocommit
+  path (counter's path) and logs each ack (DUR-ACK v/node/t). Same `set-full`
+  no-lost-writes checker — used to reproduce and time the acked-write loss seen
+  under `kill`."
+  [_opts]
+  {:client          (bd/client)
    :generator       (map (fn [v] {:type :invoke :f :add :value v}) (range))
    :final-generator (gen/each-thread {:type :invoke :f :read})
    :checker         (checker/set-full {:linearizable? false})})
@@ -220,6 +232,7 @@
                      "ledger"      ledger-workload
                      "evidence"    evidence-workload
                      "graph"       graph-workload
+                     "dur"         dur-workload
                      set-workload)
                    opts)]
     (merge tests/noop-test
@@ -263,10 +276,10 @@
     :validate [#{"kill" "partition" "partition-half" "skew" "pause"
                  "arbiter" "arbiter-hard" "storage" "disk-full" "mix" "chaos" "none"}
                "unknown nemesis"]]
-   [nil "--workload NAME" "Workload: set | list-append | counter | unique | ledger | evidence | graph"
+   [nil "--workload NAME" "Workload: set | list-append | counter | unique | ledger | evidence | graph | dur"
     :default "set"
-    :validate [#{"set" "list-append" "counter" "unique" "ledger" "evidence" "graph"}
-               "must be set, list-append, counter, unique, ledger, evidence, or graph"]]
+    :validate [#{"set" "list-append" "counter" "unique" "ledger" "evidence" "graph" "dur"}
+               "must be set, list-append, counter, unique, ledger, evidence, graph, or dur"]]
    [nil "--consistency MODEL" "list-append model: serializable | strict-serializable"
     :default "serializable"
     :validate [#{"serializable" "strict-serializable"}

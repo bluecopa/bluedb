@@ -8,16 +8,25 @@
   both read the same n and both wrote n+1.
 
   This is the workload that probes the known gap: autocommit single-statement
-  RMWs are only safe if they serialize, which is what the `--serialize-writes`
-  /sql path (used here) provides."
+  RMWs are only safe if they serialize, which bluedb's writer does for the /sql
+  autocommit path (it serializes autocommit read-modify-writes)."
   (:require [bluedb.jepsen.http :as h]
             [jepsen.client :as client]
             [clj-http.client :as http]
             [cheshire.core :as json]))
 
+;; Reset `cnt` once per run (the first client to win the CAS bootstraps it). The
+;; schema regime needs an explicit PK'd table, seeded to a known zero.
+(defonce ^:private table-ready (atom false))
+
 (defn- update! [node delta]
+  ;; /sql takes a JSON {sql} body and exactly one statement. This autocommit
+  ;; UPDATE is a self-contained read-modify-write on the PK (WHERE id = 1 is
+  ;; PK-served, so the guardrail allows it); the writer serializes such RMWs.
   (http/post (str (h/base node) "/sql")
-             {:body (format "UPDATE cnt SET n = n + %d WHERE id = 1;" delta)
+             {:body (json/generate-string
+                     {:sql (format "UPDATE cnt SET n = n + %d WHERE id = 1;" delta)})
+              :content-type :json
               :throw-exceptions false
               :socket-timeout 8000
               :connection-timeout 2000}))
@@ -41,7 +50,10 @@
 (defrecord CounterClient [leader]
   client/Client
   (open! [this _test _node] this)
-  (setup! [_this _test])
+
+  (setup! [_this _test]
+    (when (compare-and-set! table-ready false true)
+      (h/reset-counter-table!)))
 
   (invoke! [_this _test op]
     (let [node (h/target leader)]

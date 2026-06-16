@@ -54,6 +54,22 @@
   []
   (some (fn [n] (when (= "active" (:role (status n))) n)) (keys ports)))
 
+(defn wait-active-node
+  "Poll for an active writer for up to `timeout-ms`, returning the node name or
+  nil if none appears in time. A per-run table reset MUST target a writer: just
+  after the previous run's `kill` faults the cluster can briefly have no writer,
+  and a reset that silently no-ops there would leak the prior run's table state
+  into this run (e.g. the counter starts non-zero, so reads exceed this run's
+  acknowledged increments). Waiting makes back-to-back runs self-isolating."
+  ([] (wait-active-node 30000))
+  ([timeout-ms]
+   (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
+     (loop []
+       (or (active-node)
+           (when (< (System/currentTimeMillis) deadline)
+             (Thread/sleep 500)
+             (recur)))))))
+
 ;; --- leader-aware routing (shared by the workload clients) -----------------
 
 (defn make-leader
@@ -98,9 +114,10 @@
 
 (defn reset-set-table!
   "Drop + recreate the grow-only-set table on the active writer so each run starts
-  from an empty table with the required primary key. No-op if no writer is found."
+  from an empty table with the required primary key. Waits for a writer so the
+  drop+recreate can't silently no-op and leak the prior run's rows."
   []
-  (when-let [node (active-node)]
+  (when-let [node (wait-active-node)]
     (drop-table! node)
     (create-table! node)
     node))
@@ -113,6 +130,60 @@
     (http/delete (str (base node) "/schema/tables/" table) short-opts)
     (catch Exception _ nil)))
 
+(defn reset-counter-table!
+  "Drop + recreate `cnt (id INTEGER PRIMARY KEY, n INTEGER)` and seed row (1, 0)
+  on the active writer, so a counter run starts from a known zero (the schema
+  regime needs an explicit PK'd table and no longer auto-creates one).
+
+  Waits for a writer (the cluster may be recovering from a prior run's `kill`)
+  and VERIFIES the seed reads back 0 before returning — a silent no-op or an
+  unverified seed would leak the prior run's accumulated counter into this run,
+  so the checker would see reads above this run's acknowledged increments. Throws
+  if it can't establish a zeroed table, so a contaminated run fails fast at setup
+  rather than mid-analysis."
+  []
+  (let [node (or (wait-active-node)
+                 (throw (ex-info "counter reset: no active writer appeared" {})))]
+    (drop-table-named! node "cnt")
+    (http/post (str (base node) "/schema/tables")
+               (assoc short-opts
+                      :content-type :json
+                      :body (json/generate-string
+                             {:name "cnt"
+                              :columns [{:name "id" :type "INTEGER" :primary_key true}
+                                        {:name "n" :type "INTEGER"}]})))
+    (http/post (str (base node) "/tables/cnt")
+               (assoc short-opts
+                      :content-type :json
+                      :body (json/generate-string {:id 1 :n 0})))
+    ;; Read back through the writer to confirm the seed took and no stale value
+    ;; survived the drop/recreate.
+    (let [r (http/get (str (base node) "/tables/cnt?id=eq.1")
+                      (assoc short-opts :socket-timeout 5000))
+          n (when (= 200 (:status r))
+              (some-> (json/parse-string (:body r) true) first :n))]
+      (when (not= 0 n)
+        (throw (ex-info "counter reset: seed did not read back as 0"
+                        {:node node :read n}))))
+    node))
+
+(defn reset-unique-table!
+  "Drop + recreate `u (id INTEGER PRIMARY KEY)` on the active writer so each run
+  starts empty (ids are never reused within a run, so the duplicate-insert
+  checker stays sound). Waits for a writer so the reset can't silently no-op."
+  []
+  (when-let [node (wait-active-node)]
+    (drop-table-named! node "u")
+    (try
+      (http/post (str (base node) "/schema/tables")
+                 (assoc short-opts
+                        :content-type :json
+                        :body (json/generate-string
+                               {:name "u"
+                                :columns [{:name "id" :type "INTEGER" :primary_key true}]})))
+      (catch Exception _ nil))
+    node))
+
 (defn reset-la-table!
   "Drop + recreate the list-append table on the active writer:
   `la (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)`. One row per appended
@@ -121,9 +192,10 @@
   *within* a key, so `v` alone can't be the PK) and, crucially, clusters a key's
   rows into one contiguous primary-key range *in append order*. That makes the
   read a PK-range scan ordered by the PK — no secondary index and no in-memory
-  sort, which the guardrail would otherwise reject. No-op if no writer found."
+  sort, which the guardrail would otherwise reject. Waits for a writer so the
+  reset can't silently no-op and leak the prior run's rows."
   []
-  (when-let [node (active-node)]
+  (when-let [node (wait-active-node)]
     (drop-table-named! node "la")
     (try
       (http/post (str (base node) "/schema/tables")
@@ -146,6 +218,20 @@
                     :socket-timeout 5000
                     :content-type :json
                     :body (json/generate-string {:v v}))))
+
+(defn add-via-sql!
+  "Insert `v` into jset through the **/sql autocommit** path (JSON {sql}), i.e.
+  the exact write path the counter workload uses — same `SlateDbStorage::commit`
+  → `Db::write(await_durable=true)`. Used by the durability probe so a lost write
+  is identifiable by its unique `v` (unlike counter's anonymous increments).
+  Returns the ring response, or throws on connection/timeout errors."
+  [node v]
+  (http/post (str (base node) "/sql")
+             (assoc short-opts
+                    :socket-timeout 5000
+                    :content-type :json
+                    :body (json/generate-string
+                           {:sql (format "INSERT INTO jset (v) VALUES (%d);" v)}))))
 
 (def ^:private page-size
   "Bounded-reads guardrail caps a single read at 100 rows, so the final-read
