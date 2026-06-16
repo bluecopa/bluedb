@@ -14,6 +14,8 @@ parquet = "57"
 tokio = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
+chrono = "0.4"
+rust_decimal = "1"
 # metadata.json (TableMetadata) (de)serialization for our self-hosted catalog,
 # and the durable mirror registry.
 serde = { workspace = true }
