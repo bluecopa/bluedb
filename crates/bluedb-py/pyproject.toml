@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "bluedb-testkit"
-version = "0.0.0"
+version = "0.1.0"
 description = "In-process, test-only bluedb for Python integration tests."
 requires-python = ">=3.9"
 classifiers = ["Private :: Do Not Upload"]
