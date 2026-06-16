@@ -747,34 +747,48 @@ def serve(**kwargs):
         handle.stop()
 ```
 
-- [ ] **Step 2: Build the extension into the Python env**
+- [ ] **Step 2: Set up a venv and build the extension into it**
 
-Run (in a venv with maturin):
+Create a project-local venv (kept out of git) and install the build/test deps,
+then `maturin develop` (which builds with `features = ["python", "pyo3/extension-module"]`
+from `pyproject.toml` — extension-module uses dynamic lookup, so no libpython link
+issue). Create `crates/bluedb-py/.gitignore` containing `/.venv/` first.
+
 ```bash
-cd crates/bluedb-py && pip install maturin httpx pytest && maturin develop
+python3 -m venv crates/bluedb-py/.venv
+crates/bluedb-py/.venv/bin/pip install -q --upgrade pip maturin httpx pytest
+crates/bluedb-py/.venv/bin/maturin develop --manifest-path crates/bluedb-py/Cargo.toml
 ```
 Expected: `🛠 Installed bluedb-testkit` (the extension imports as `bluedb_testkit`).
+This is the first build with PyO3 enabled; allow a generous timeout (~600000 ms).
 
-- [ ] **Step 3: Smoke-test from Python**
+- [ ] **Step 3: Smoke-test from Python (server up + auth, both directions)**
 
-Run:
+This probes `/health` and the auth gate — it does NOT depend on any particular SQL
+dialect (real query-path validation is Task 7).
+
 ```bash
-cd crates/bluedb-py && python -c "
-from bluedb_testkit import serve
+crates/bluedb-py/.venv/bin/python -c "
+from bluedb_testkit import serve, DEFAULT_TOKEN
 import httpx
 with serve() as db:
-    r = httpx.post(db.url('/sql'), headers=db.headers(), json={'sql':'SELECT 1','params':[]})
-    print(db.base_url, r.status_code)
-    assert r.status_code == 200, r.text
-print('ok')
+    assert db.base_url.startswith('http://127.0.0.1:'), db.base_url
+    assert db.token == DEFAULT_TOKEN, db.token
+    assert httpx.get(db.url('/health')).status_code == 200
+    # authenticated request passes the authz gate (404/200/400 all fine, just not 401/403)
+    authed = httpx.get(db.url('/tables/_smoke_missing_'), headers=db.headers())
+    assert authed.status_code not in (401, 403), authed.status_code
+    # unauthenticated request is rejected (auth is enforced by default)
+    assert httpx.get(db.url('/tables/_smoke_missing_')).status_code == 401
+    print(db.base_url, 'ok')
 "
 ```
-Expected: prints a `127.0.0.1:<port>` URL, `200`, then `ok`.
+Expected: prints a `http://127.0.0.1:<port> ok` line with no assertion error.
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add crates/bluedb-py/python/bluedb_testkit/__init__.py
+git add crates/bluedb-py/python/bluedb_testkit/__init__.py crates/bluedb-py/.gitignore
 git commit -m "feat(testkit): Python Handle + serve() context manager"
 ```
 
