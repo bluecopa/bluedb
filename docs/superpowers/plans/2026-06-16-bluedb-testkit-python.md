@@ -22,7 +22,12 @@
 - `crates/bluedb-py/python/tests/test_testkit.py` — Python integration tests.
 - `crates/bluedb-py/README.md` — usage + build notes.
 
-**Workspace note:** `crates/*` glob auto-includes `bluedb-py`. It is a PyO3 crate, so `cargo build --workspace` on a machine without Python dev headers will fail on this crate only — use `cargo build --workspace --exclude bluedb-py` there. No root `Cargo.toml` edit is required (path deps + existing workspace deps cover everything).
+**Workspace note:** `crates/*` glob auto-includes `bluedb-py`. PyO3 is behind the
+optional `python` feature (off by default), so `cargo build --workspace` /
+`cargo test --workspace` build the pure-Rust core with **no libpython dependency** —
+the existing all-Rust workflow is unaffected. Only `maturin` (or `--features python`)
+pulls in PyO3. No root `Cargo.toml` edit is required (path deps + existing workspace
+deps cover everything).
 
 ---
 
@@ -55,7 +60,13 @@ slatedb       = { workspace = true }
 tokio         = { workspace = true }
 anyhow        = { workspace = true }
 axum          = { version = "0.8", features = ["http2"] }
-pyo3          = { version = "0.22", features = ["abi3-py39"] }
+pyo3          = { version = "0.22", features = ["abi3-py39"], optional = true }
+
+[features]
+default = []
+# `maturin` enables this (+ pyo3/extension-module) when building the wheel.
+# Default builds omit PyO3 entirely, so `cargo build`/`cargo test` need no libpython.
+python = ["dep:pyo3"]
 
 [dev-dependencies]
 ureq = "2"
@@ -84,7 +95,7 @@ bluedb_testkit = "bluedb_testkit.pytest_plugin"
 [tool.maturin]
 module-name = "bluedb_testkit._bluedb_testkit"
 python-source = "python"
-features = ["pyo3/extension-module"]
+features = ["python", "pyo3/extension-module"]
 ```
 
 - [ ] **Step 3: Write a minimal `src/lib.rs`**
@@ -92,12 +103,19 @@ features = ["pyo3/extension-module"]
 ```rust
 //! `bluedb-testkit` — a PyO3 wheel that embeds the real bluedb-server axum app
 //! in the Python test process. See `docs/superpowers/specs/2026-06-16-bluedb-testkit-python-design.md`.
-use pyo3::prelude::*;
+//!
+//! The PyO3 surface lives behind the `python` feature (enabled by maturin) so the
+//! pure-Rust core compiles and tests without libpython.
 
-#[pymodule]
-fn _bluedb_testkit(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add("DEFAULT_TOKEN", "bluedb-test-superuser")?;
-    Ok(())
+#[cfg(feature = "python")]
+mod py {
+    use pyo3::prelude::*;
+
+    #[pymodule]
+    fn _bluedb_testkit(m: &Bound<'_, PyModule>) -> PyResult<()> {
+        m.add("DEFAULT_TOKEN", "bluedb-test-superuser")?;
+        Ok(())
+    }
 }
 ```
 
@@ -233,16 +251,17 @@ mod tests {
 
 - [ ] **Step 2: Declare the module in `lib.rs`**
 
-Add near the top of `crates/bluedb-py/src/lib.rs`, after the doc comment:
+Add `mod authz_cfg;` at the crate root (ungated — the core must compile/test
+without the `python` feature), after the doc comment and before `mod py`:
 
 ```rust
 mod authz_cfg;
 ```
 
-And update the `DEFAULT_TOKEN` export to reuse the constant:
+And update the `DEFAULT_TOKEN` export inside `mod py` to reuse the constant:
 
 ```rust
-    m.add("DEFAULT_TOKEN", authz_cfg::DEFAULT_TOKEN)?;
+        m.add("DEFAULT_TOKEN", crate::authz_cfg::DEFAULT_TOKEN)?;
 ```
 
 - [ ] **Step 3: Run the tests to verify they pass**
@@ -471,7 +490,7 @@ mod tests {
 
 - [ ] **Step 2: Declare the module in `lib.rs`**
 
-Add after `mod authz_cfg;`:
+Add `mod embedded;` at the crate root (ungated), after `mod authz_cfg;`:
 
 ```rust
 mod embedded;
@@ -480,7 +499,10 @@ mod embedded;
 - [ ] **Step 3: Run the tests to verify they pass**
 
 Run: `cargo test -p bluedb-py 2>&1`
-Expected: the 4 `authz_cfg` tests plus the 3 `embedded` tests pass. (If a link error mentioning Python symbols appears, ensure `extension-module` is NOT in `Cargo.toml` features — it must come only from maturin; see Task 1.)
+Expected: the 4 `authz_cfg` tests plus the 3 `embedded` tests pass. Default features
+exclude PyO3, so no libpython is involved. The first build compiles the full
+`bluedb-server` dependency tree (slatedb, tantivy, axum) — allow a generous timeout
+(e.g. 600000 ms).
 
 - [ ] **Step 4: Commit**
 
@@ -498,18 +520,27 @@ git commit -m "feat(testkit): EmbeddedServer boots real app on runtime thread"
 
 - [ ] **Step 1: Replace `src/lib.rs` body with the full PyO3 surface**
 
+The two core modules stay declared at the crate root (ungated) so `cargo test`
+still builds them; everything that touches PyO3 lives inside `#[cfg(feature = "python")] mod py`.
+
 ```rust
 //! `bluedb-testkit` — a PyO3 wheel that embeds the real bluedb-server axum app
 //! in the Python test process. See
 //! `docs/superpowers/specs/2026-06-16-bluedb-testkit-python-design.md`.
-use pyo3::prelude::*;
-use pyo3::types::PyDict;
+//!
+//! The PyO3 surface lives behind the `python` feature (enabled by maturin) so the
+//! pure-Rust core (`authz_cfg`, `embedded`) compiles and tests without libpython.
 
 mod authz_cfg;
 mod embedded;
 
-use authz_cfg::{AuthzSpec, DEFAULT_TOKEN};
-use embedded::{EmbeddedConfig, EmbeddedServer};
+#[cfg(feature = "python")]
+mod py {
+use pyo3::prelude::*;
+use pyo3::types::PyDict;
+
+use crate::authz_cfg::{AuthzSpec, DEFAULT_TOKEN};
+use crate::embedded::{EmbeddedConfig, EmbeddedServer};
 
 /// A running in-process bluedb, bound to an ephemeral loopback port.
 #[pyclass]
@@ -614,12 +645,17 @@ fn _bluedb_testkit(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("DEFAULT_TOKEN", DEFAULT_TOKEN)?;
     Ok(())
 }
+
+} // mod py
 ```
 
-- [ ] **Step 2: Verify it builds**
+- [ ] **Step 2: Verify both the core and the PyO3 layer build**
 
-Run: `cargo build -p bluedb-py 2>&1 && cargo test -p bluedb-py 2>&1`
-Expected: builds; the 7 core tests still pass (PyO3 layer is compiled but not exercised by Rust tests).
+Run: `cargo test -p bluedb-py 2>&1 && cargo build -p bluedb-py --features python 2>&1`
+Expected: the 7 core tests pass (default features, no PyO3); the `--features python`
+build compiles the PyO3 layer. The `--features python` build needs a linkable
+libpython on PATH — if it fails to link, that's an environment concern, not a code
+bug; the wheel is built via maturin (Task 5) which handles linking.
 
 - [ ] **Step 3: Commit**
 
@@ -965,5 +1001,5 @@ git commit -m "docs(testkit): usage + build notes"
 
 - **Spec coverage:** in-process axum boot (Task 3), default auth + opt-down/sideways (Tasks 2,4,7), thin Python surface `serve()`/`url()`/`headers()` (Task 5), pytest fixtures function+session (Task 6), isolation/xdist (Tasks 3,7), packaging maturin wheel (Tasks 1,8), out-of-scope items untouched (no HA/lakehouse wiring). Covered.
 - **flush_interval_ms** is honored via the existing `BLUEDB_FLUSH_INTERVAL_MS` env read at writer-open (process-global; documented limitation, fine for xdist's per-process workers).
-- **PyO3/maturin testing gotcha:** `extension-module` is supplied only by maturin (`[tool.maturin] features`), never in `Cargo.toml`, so `cargo test -p bluedb-py` links normally.
+- **PyO3/maturin testing gotcha:** PyO3 is an optional dep behind the `python` feature (off by default); maturin enables `python` + `pyo3/extension-module`. So `cargo test -p bluedb-py` builds the pure-Rust core with no libpython, and the extension is built only by maturin (or `--features python`).
 - **Type consistency:** `EmbeddedConfig`/`AuthzSpec` field and variant names match across `authz_cfg.rs`, `embedded.rs`, and `lib.rs`; `Handle.headers()` sentinel semantics match the README.
