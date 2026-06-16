@@ -387,9 +387,9 @@ impl AppState {
         if authz.allows(token, required) {
             Ok(())
         } else if token.is_none() {
-            Err(AppError { status: StatusCode::UNAUTHORIZED, message: "missing or malformed bearer token".into() })
+            Err(AppError::plain(StatusCode::UNAUTHORIZED, "missing or malformed bearer token"))
         } else {
-            Err(AppError { status: StatusCode::FORBIDDEN, message: "insufficient scope".into() })
+            Err(AppError::plain(StatusCode::FORBIDDEN, "insufficient scope"))
         }
     }
 
@@ -401,10 +401,10 @@ impl AppState {
         if authz.allows_tenant(bearer_token(headers), tenant) {
             Ok(())
         } else {
-            Err(AppError {
-                status: StatusCode::FORBIDDEN,
-                message: format!("token not authorized for tenant '{tenant}'"),
-            })
+            Err(AppError::plain(
+                StatusCode::FORBIDDEN,
+                format!("token not authorized for tenant '{tenant}'"),
+            ))
         }
     }
 
@@ -609,10 +609,9 @@ impl AppState {
                 .strict()
                 .with_cdc(self.inner.cdc.clone())
                 .with_commit_observer(fts)),
-            None => Err(AppError {
-                status: StatusCode::SERVICE_UNAVAILABLE,
-                message: "node has no database yet (no writer has been promoted)".to_string(),
-            }),
+            None => Err(AppError::service_unavailable(
+                "node has no database yet (no writer has been promoted)",
+            )),
         }
     }
 
@@ -635,6 +634,28 @@ impl AppState {
         Ok(())
     }
 
+    /// Return the last CDC sequence assigned to `tenant` on this writer (the
+    /// in-memory counter after the most recent CDC commit). Returns 0 when no
+    /// CDC write has yet been stamped for this tenant. Used to populate
+    /// `X-Bluedb-Watermark` on write responses.
+    pub(crate) async fn write_watermark(&self, tenant: &str) -> i64 {
+        match self.inner.db.read().await.as_ref() {
+            Some(db) => db.last_cdc_seq(tenant).await,
+            None => 0,
+        }
+    }
+
+    /// The sealed Iceberg watermark for `tenant`: the max CDC sequence durably
+    /// committed to Iceberg for this tenant. Returns 0 when nothing has been
+    /// sealed yet. Used to populate `X-Bluedb-Watermark` on read responses and
+    /// to check `X-Bluedb-Min-Watermark` freshness constraints.
+    pub(crate) async fn sealed_watermark(&self, tenant: &str) -> i64 {
+        match self.inner.lakehouse.read().await.as_ref() {
+            Some(manager) => manager.sealed_watermark(tenant).await,
+            None => 0,
+        }
+    }
+
     /// Like [`Self::connection`] but the connection also serializes autocommit
     /// writes (see [`bluedb_sql::SlateDbStorage::serialize_writes`]). Used by the
     /// routes that can run a single-statement read-modify-write (`/sql`,
@@ -649,10 +670,9 @@ impl AppState {
                 .strict()
                 .with_cdc(self.inner.cdc.clone())
                 .with_commit_observer(fts)),
-            None => Err(AppError {
-                status: StatusCode::SERVICE_UNAVAILABLE,
-                message: "node has no database yet (no writer has been promoted)".to_string(),
-            }),
+            None => Err(AppError::service_unavailable(
+                "node has no database yet (no writer has been promoted)",
+            )),
         }
     }
 
@@ -663,10 +683,9 @@ impl AppState {
     async fn ledger(&self) -> Result<Ledger, AppError> {
         match self.inner.db.read().await.as_ref() {
             Some(db) => Ok(Ledger::new(db)),
-            None => Err(AppError {
-                status: StatusCode::SERVICE_UNAVAILABLE,
-                message: "node has no database yet (no writer has been promoted)".to_string(),
-            }),
+            None => Err(AppError::service_unavailable(
+                "node has no database yet (no writer has been promoted)",
+            )),
         }
     }
 
@@ -699,13 +718,10 @@ impl AppState {
         if self.inner.writer.is_active() && self.inner.writer_bound.load(Ordering::Acquire) {
             Ok(())
         } else {
-            Err(AppError {
-                status: StatusCode::SERVICE_UNAVAILABLE,
-                message: format!(
-                    "node '{}' is passive (not the active writer)",
-                    self.inner.writer.node_id()
-                ),
-            })
+            Err(AppError::plain(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("node '{}' is passive (not the active writer)", self.inner.writer.node_id()),
+            ))
         }
     }
 }
@@ -814,16 +830,59 @@ fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
         .and_then(|v| v.strip_prefix("Bearer "))
 }
 
+/// Build an `X-Bluedb-Watermark: <tenant>:<seq>` header map.
+///
+/// Skips the header when `seq == 0` on normal (success) responses — a zero
+/// watermark means no CDC writes happened yet (CDC is off, or this was a
+/// DDL-only request) and omitting it avoids a misleading `<tenant>:0`.
+///
+/// For error responses (e.g. the freshness 503) use [`watermark_headers_always`]
+/// which emits the header even for 0 so the client learns the current sealed seq.
+fn watermark_headers(tenant: &str, seq: i64) -> axum::http::HeaderMap {
+    if seq > 0 {
+        watermark_headers_always(tenant, seq)
+    } else {
+        axum::http::HeaderMap::new()
+    }
+}
+
+/// Like [`watermark_headers`] but always emits the header, including `seq == 0`.
+/// Used on error responses where 0 is a meaningful "nothing sealed yet" signal.
+fn watermark_headers_always(tenant: &str, seq: i64) -> axum::http::HeaderMap {
+    let mut map = axum::http::HeaderMap::new();
+    let value = format!("{tenant}:{seq}");
+    if let Ok(v) = axum::http::HeaderValue::from_str(&value) {
+        map.insert("x-bluedb-watermark", v);
+    }
+    map
+}
+
+/// Parse the `X-Bluedb-Min-Watermark` request header.
+///
+/// Accepts both `<seq>` (bare integer, applies to the request's tenant) and
+/// `<tenant>:<seq>` (ignores the tenant portion — the server always uses the
+/// request's `X-Bluedb-Tenant` for scope). Returns `None` when the header is
+/// absent or unparseable (no freshness gate applied).
+fn parse_min_watermark(headers: &axum::http::HeaderMap) -> Option<i64> {
+    let raw = headers.get("x-bluedb-min-watermark")?.to_str().ok()?;
+    // Accept "<seq>" or "<tenant>:<seq>".
+    let seq_str = raw.find(':').map_or(raw, |i| &raw[i + 1..]);
+    seq_str.trim().parse::<i64>().ok()
+}
+
 async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
 }
 
 /// `POST /sql` — one parameterized non-DDL statement (SELECT/INSERT/UPDATE/DELETE).
+///
+/// Mutating statements (INSERT/UPDATE/DELETE) return `X-Bluedb-Watermark: <tenant>:<seq>`
+/// so the client knows which CDC sequence this write reached.
 async fn exec_sql(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Json(req): Json<SqlRequest>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<impl IntoResponse, AppError> {
     state.authorize(&headers, authz::Scope::DataQuery)?;
     let tenant = state.tenant(&headers)?;
     state.require_active()?;
@@ -836,7 +895,7 @@ async fn exec_sql(
                     .apply_pragma(&tenant, pragma)
                     .await
                     .map_err(|e| AppError::internal(format!("lakehouse pragma: {e}")))?;
-                return Ok(Json(json!({ "ok": true, "pragma": "lakehouse_mirror" })));
+                return Ok((axum::http::HeaderMap::new(), Json(json!({ "ok": true, "pragma": "lakehouse_mirror" }))));
             }
             None => return Err(AppError::internal("lakehouse manager not bound")),
         }
@@ -846,7 +905,8 @@ async fn exec_sql(
     // Route through the FTS engine: it rewrites `@@`/`ts_rank` against the live
     // segment when a fulltext index is declared, else runs the SQL unchanged.
     let payloads = state.fts().await.execute_fts(&mut glue, &req.sql, &params).await?;
-    Ok(Json(payloads_to_json(payloads)))
+    let wm = state.write_watermark(&tenant).await;
+    Ok((watermark_headers(&tenant, wm), Json(payloads_to_json(payloads))))
 }
 
 /// `POST /admin/sql` — arbitrary SQL (DDL/txns/multi). Off by default; audited.
@@ -857,10 +917,7 @@ async fn admin_sql(
 ) -> Result<Json<Value>, AppError> {
     state.authorize(&headers, authz::Scope::Superuser)?;
     if !state.inner.admin_sql_enabled.load(Ordering::Relaxed) {
-        return Err(AppError {
-            status: StatusCode::NOT_FOUND,
-            message: "admin SQL endpoint is disabled".to_string(),
-        });
+        return Err(AppError::not_found("admin SQL endpoint is disabled"));
     }
     let tenant = state.tenant(&headers)?;
     state.require_active()?;
@@ -872,26 +929,54 @@ async fn admin_sql(
 }
 
 /// `GET /tables/{table}?<filters>` — PostgREST SELECT (served by writer or replica).
+///
+/// **Freshness gate:** if the request carries `X-Bluedb-Min-Watermark: <seq>` and
+/// the Iceberg-sealed watermark for this tenant is below `<seq>`, the handler
+/// returns `503 Service Unavailable` with the current sealed watermark in
+/// `X-Bluedb-Watermark` so the client knows how far behind the mirror is.
+/// Otherwise it serves the request and echoes the sealed watermark.
 async fn select(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Path(table): Path<String>,
     RawQuery(query): RawQuery,
-) -> Result<Json<Value>, AppError> {
+) -> Result<impl IntoResponse, AppError> {
     state.authorize(&headers, authz::Scope::DataRead)?;
     let tenant = state.tenant(&headers)?;
+
+    // Freshness gate: if the client requested a min-watermark, check it now.
+    let sealed = state.sealed_watermark(&tenant).await;
+    if let Some(min) = parse_min_watermark(&headers) {
+        if min > sealed {
+            // Not-yet-fresh: tell the client what we currently have, then 503.
+            // Always emit the header here, even if sealed == 0, so the client
+            // learns the actual sealed-watermark (0 = nothing sealed yet).
+            let wm_hdrs = watermark_headers_always(&tenant, sealed);
+            return Err(AppError::plain(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "read-your-writes freshness not yet satisfied: \
+                     requested min-watermark {min}, sealed watermark {sealed}"
+                ),
+            ).with_headers(wm_hdrs));
+        }
+    }
+
     let mut glue = Glue::new(state.connection(&tenant).await?);
     let payloads = rest_sql::execute_query_str(&mut glue, &table, query.as_deref().unwrap_or("")).await?;
-    Ok(Json(payloads_to_json(payloads)))
+    Ok((watermark_headers(&tenant, sealed), Json(payloads_to_json(payloads))))
 }
 
 /// `POST /tables/{table}` — INSERT (JSON object → autocommit; array → one txn batch).
+///
+/// Returns `X-Bluedb-Watermark: <tenant>:<seq>` so the caller can pass it back
+/// as `X-Bluedb-Min-Watermark` on a subsequent read to enforce read-your-writes.
 async fn insert(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Path(table): Path<String>,
     Json(body): Json<Value>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<impl IntoResponse, AppError> {
     state.authorize(&headers, authz::Scope::DataWrite)?;
     let tenant = state.tenant(&headers)?;
     state.require_active()?;
@@ -905,23 +990,27 @@ async fn insert(
             .iter()
             .filter_map(|p| if let Payload::Insert(n) = p { Some(*n) } else { None })
             .sum();
-        Ok(Json(json!({ "inserted": total })))
+        let wm = state.write_watermark(&tenant).await;
+        Ok((watermark_headers(&tenant, wm), Json(json!({ "inserted": total }))))
     } else {
         // Single row: autocommit on the group-commit connection (concurrent fast path).
         let mut glue = Glue::new(state.connection(&tenant).await?);
         let payloads = rest_sql::execute_insert(&mut glue, &req).await?;
-        Ok(Json(payloads_to_json(payloads)))
+        let wm = state.write_watermark(&tenant).await;
+        Ok((watermark_headers(&tenant, wm), Json(payloads_to_json(payloads))))
     }
 }
 
 /// `PATCH /tables/{table}?<filters>` — UPDATE (JSON assignments body).
+///
+/// Returns `X-Bluedb-Watermark` for read-your-writes freshness tracking.
 async fn update(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Path(table): Path<String>,
     RawQuery(query): RawQuery,
     Json(assignments): Json<Map<String, Value>>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<impl IntoResponse, AppError> {
     state.authorize(&headers, authz::Scope::DataWrite)?;
     let tenant = state.tenant(&headers)?;
     state.require_active()?;
@@ -934,16 +1023,19 @@ async fn update(
     // UPDATE is a read-modify-write; serialize so concurrent ones can't lose.
     let mut glue = Glue::new(state.connection_serialized(&tenant).await?);
     let payloads = rest_sql::execute_update(&mut glue, &req).await?;
-    Ok(Json(payloads_to_json(payloads)))
+    let wm = state.write_watermark(&tenant).await;
+    Ok((watermark_headers(&tenant, wm), Json(payloads_to_json(payloads))))
 }
 
 /// `DELETE /tables/{table}?<filters>` — DELETE.
+///
+/// Returns `X-Bluedb-Watermark` for read-your-writes freshness tracking.
 async fn delete_rows(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Path(table): Path<String>,
     RawQuery(query): RawQuery,
-) -> Result<Json<Value>, AppError> {
+) -> Result<impl IntoResponse, AppError> {
     state.authorize(&headers, authz::Scope::DataWrite)?;
     let tenant = state.tenant(&headers)?;
     state.require_active()?;
@@ -952,7 +1044,8 @@ async fn delete_rows(
     // DELETE reads the rows it removes; serialize for the same reason as UPDATE.
     let mut glue = Glue::new(state.connection_serialized(&tenant).await?);
     let payloads = rest_sql::execute_delete(&mut glue, &req).await?;
-    Ok(Json(payloads_to_json(payloads)))
+    let wm = state.write_watermark(&tenant).await;
+    Ok((watermark_headers(&tenant, wm), Json(payloads_to_json(payloads))))
 }
 
 // --- admin / high-availability control --------------------------------------
@@ -1218,64 +1311,61 @@ mod insert_routing {
 // --- errors -----------------------------------------------------------------
 
 /// An HTTP error: a status plus a message rendered as `{"error": ...}`.
+/// Extra headers (e.g. `X-Bluedb-Watermark` on a freshness 503) can be
+/// attached via [`AppError::with_headers`].
 #[derive(Debug)]
 pub struct AppError {
     status: StatusCode,
     message: String,
+    extra_headers: Option<axum::http::HeaderMap>,
 }
 
 impl AppError {
+    /// Build a plain error without extra headers.
+    fn plain(status: StatusCode, message: impl Into<String>) -> Self {
+        Self { status, message: message.into(), extra_headers: None }
+    }
+
+    /// Attach extra response headers to this error (e.g. `X-Bluedb-Watermark`
+    /// on a freshness `503`). Consumes and returns `Self` for chaining.
+    pub(crate) fn with_headers(mut self, headers: axum::http::HeaderMap) -> Self {
+        self.extra_headers = Some(headers);
+        self
+    }
+
     pub(crate) fn bad_request(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            message: message.into(),
-        }
+        Self::plain(StatusCode::BAD_REQUEST, message)
     }
 
     pub(crate) fn internal(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: message.into(),
-        }
+        Self::plain(StatusCode::INTERNAL_SERVER_ERROR, message)
     }
 
     pub(crate) fn not_found(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::NOT_FOUND,
-            message: message.into(),
-        }
+        Self::plain(StatusCode::NOT_FOUND, message)
     }
 
     pub(crate) fn conflict(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::CONFLICT,
-            message: message.into(),
-        }
+        Self::plain(StatusCode::CONFLICT, message)
     }
 
     pub(crate) fn service_unavailable(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            message: message.into(),
-        }
+        Self::plain(StatusCode::SERVICE_UNAVAILABLE, message)
     }
 
     /// `501 Not Implemented` — an optional capability (e.g. digest signing) is
     /// not enabled on this node.
     pub(crate) fn not_implemented(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::NOT_IMPLEMENTED,
-            message: message.into(),
-        }
+        Self::plain(StatusCode::NOT_IMPLEMENTED, message)
     }
 
     /// Map a lease error: another node holds it → `409 Conflict`; otherwise `500`.
     fn from_ha(err: HaError) -> Self {
         match err {
-            HaError::LeaseHeldByAnother => Self {
-                status: StatusCode::CONFLICT,
-                message: "cannot promote: the lease is held by another node".to_string(),
-            },
+            HaError::LeaseHeldByAnother => Self::plain(
+                StatusCode::CONFLICT,
+                "cannot promote: the lease is held by another node",
+            ),
             HaError::Provider(err) => Self::internal(err.to_string()),
         }
     }
@@ -1287,16 +1377,16 @@ impl From<EngineError> for AppError {
             EngineError::Rest(_) | EngineError::Sql(_) | EngineError::Rejected(_) => StatusCode::BAD_REQUEST,
             EngineError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        Self {
-            status,
-            message: err.to_string(),
-        }
+        Self::plain(status, err.to_string())
     }
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let body: BTreeMap<&str, String> = [("error", self.message)].into_iter().collect();
-        (self.status, Json(body)).into_response()
+        match self.extra_headers {
+            None => (self.status, Json(body)).into_response(),
+            Some(extra) => (self.status, extra, Json(body)).into_response(),
+        }
     }
 }
