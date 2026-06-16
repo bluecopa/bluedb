@@ -40,6 +40,11 @@ impl AuthzSpec {
                 Ok((Some(authz), Some(token.clone())))
             }
             AuthzSpec::Map(entries) => {
+                if entries.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "authz map is empty; pass authz=False for open mode, or include at least one token"
+                    ));
+                }
                 let raw = entries
                     .iter()
                     .map(|(tok, items)| format!("{tok}={}", items.join(",")))
@@ -97,5 +102,10 @@ mod tests {
     fn bad_scope_errors() {
         let spec = AuthzSpec::Map(vec![("x".into(), vec!["data:bogus".into()])]);
         assert!(spec.resolve().is_err());
+    }
+
+    #[test]
+    fn empty_map_errors() {
+        assert!(AuthzSpec::Map(vec![]).resolve().is_err());
     }
 }

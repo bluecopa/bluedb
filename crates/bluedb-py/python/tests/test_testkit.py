@@ -70,3 +70,12 @@ def test_open_mode_needs_no_token():
 def test_instances_are_isolated():
     with serve() as a, serve() as b:
         assert a.base_url != b.base_url
+
+
+def test_evidence_signing_knob_toggles_endpoint():
+    with serve() as db:  # default: no signer
+        off = httpx.get(db.url("/evidence/signing-key"), headers=db.headers())
+        assert off.status_code == 501, off.status_code
+    with serve(evidence_signing=True) as db:
+        on = httpx.get(db.url("/evidence/signing-key"), headers=db.headers())
+        assert on.status_code == 200, on.status_code

@@ -58,9 +58,11 @@ impl TestServer {
     }
 
     /// Stop the server and join its thread. Idempotent.
-    fn stop(&mut self) {
+    fn stop(&mut self, py: Python<'_>) {
         if let Some(mut s) = self.inner.take() {
-            s.shutdown();
+            // The joined thread is pure Rust (no Python access), so release the
+            // GIL while it drains so other Python threads aren't blocked.
+            py.allow_threads(move || s.shutdown());
         }
     }
 
@@ -71,11 +73,12 @@ impl TestServer {
     #[pyo3(signature = (_exc_type=None, _exc_value=None, _traceback=None))]
     fn __exit__(
         &mut self,
+        py: Python<'_>,
         _exc_type: Option<Py<PyAny>>,
         _exc_value: Option<Py<PyAny>>,
         _traceback: Option<Py<PyAny>>,
     ) -> bool {
-        self.stop();
+        self.stop(py);
         false
     }
 }
