@@ -359,11 +359,15 @@ impl EmbeddedServer {
                     }
                     let object_store = Arc::new(InMemory::new());
                     let lease = Arc::new(LocalLeaseProvider::new());
+                    // No HA renewal loop runs here, and the controller self-fences
+                    // (goes Passive) once within `margin` of lease expiry. A single
+                    // in-process writer never contends, so we use a long TTL to keep
+                    // the node Active for the whole test session.
                     let writer = Arc::new(WriterController::new(
                         "testkit-node",
                         lease,
                         Arc::new(SystemClock),
-                        Duration::from_secs(15),
+                        Duration::from_secs(3600),
                         Duration::from_secs(5),
                     ));
                     let mut state = AppState::new(object_store, db_path, writer)

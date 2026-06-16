@@ -66,7 +66,9 @@ multi-thread tokio runtime:
 `start()` blocks the calling Python thread until the listener is bound (handshake
 over a channel), then returns with `base_url = "http://127.0.0.1:<port>"`
 populated. The HA background tick loop is **omitted** — a single in-process writer
-holding a `LocalLeaseProvider` lease never needs renewal/failover for tests.
+never contends. Because the `WriterController` self-fences (goes Passive) once
+within its safety margin of lease expiry, the writer is opened with a **long TTL**
+(e.g. 3600 s) so it stays Active for the whole test session without a renewal task.
 
 `flush_interval_ms` is currently read from `BLUEDB_FLUSH_INTERVAL_MS` at
 writer-open time (`bluedb-server` `writer_settings`). The testkit sets that env
