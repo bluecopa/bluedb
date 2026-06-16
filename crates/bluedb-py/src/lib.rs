@@ -4,13 +4,15 @@
 //! The PyO3 surface lives behind the `python` feature (enabled by maturin) so the
 //! pure-Rust core compiles and tests without libpython.
 
+pub mod authz_cfg;
+
 #[cfg(feature = "python")]
 mod py {
     use pyo3::prelude::*;
 
     #[pymodule]
     fn _bluedb_testkit(m: &Bound<'_, PyModule>) -> PyResult<()> {
-        m.add("DEFAULT_TOKEN", "bluedb-test-superuser")?;
+        m.add("DEFAULT_TOKEN", crate::authz_cfg::DEFAULT_TOKEN)?;
         Ok(())
     }
 }
