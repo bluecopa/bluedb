@@ -48,7 +48,7 @@ impl TestServer {
             flush_interval_ms,
         };
         let server = py
-            .allow_threads(|| EmbeddedServer::start(cfg))
+            .detach(|| EmbeddedServer::start(cfg))
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         Ok(TestServer {
             base_url: server.base_url().to_string(),
@@ -60,9 +60,9 @@ impl TestServer {
     /// Stop the server and join its thread. Idempotent.
     fn stop(&mut self, py: Python<'_>) {
         if let Some(mut s) = self.inner.take() {
-            // The joined thread is pure Rust (no Python access), so release the
-            // GIL while it drains so other Python threads aren't blocked.
-            py.allow_threads(move || s.shutdown());
+            // The joined thread is pure Rust (no Python access), so detach from
+            // the interpreter while it drains so other Python threads aren't blocked.
+            py.detach(move || s.shutdown());
         }
     }
 
@@ -102,7 +102,7 @@ fn parse_authz(py: Python<'_>, authz: Option<Py<PyAny>>, token: Option<String>) 
     if let Ok(s) = b.extract::<String>() {
         return Ok(AuthzSpec::RawEnv(s));
     }
-    if let Ok(d) = b.downcast::<PyDict>() {
+    if let Ok(d) = b.cast::<PyDict>() {
         let mut entries = Vec::with_capacity(d.len());
         for (k, v) in d.iter() {
             let tok: String = k.extract()?;
