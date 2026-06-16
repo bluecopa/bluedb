@@ -16,6 +16,9 @@ bluedb-ledger    = { workspace = true }
 bluedb-rest      = { workspace = true }
 bluedb-lakehouse = { workspace = true }
 bluedb-evidence  = { workspace = true }
+bluedb-query     = { path = "../bluedb-query" }
+arrow-json       = "57"
+arrow-array      = "57"
 # `postgres` feature so the deployable binary can use the Postgres lease arbiter
 # for real multi-node election (BLUEDB_LEASE_PG_URL).
 bluedb-ha     = { workspace = true, features = ["postgres"] }

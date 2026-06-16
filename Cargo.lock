@@ -851,6 +851,8 @@ name = "bluedb-server"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "arrow-array",
+ "arrow-json",
  "axum",
  "base64",
  "bluedb-engine",
@@ -858,6 +860,7 @@ dependencies = [
  "bluedb-ha",
  "bluedb-lakehouse",
  "bluedb-ledger",
+ "bluedb-query",
  "bluedb-rest",
  "bluedb-sql",
  "gluesql-core",

@@ -1,14 +1,15 @@
-//! Phase 1 — Watermark surfacing tests.
+//! Phase 1 + Phase 2.2 — Watermark surfacing tests.
 //!
-//! Verifies the three behaviors of the `X-Bluedb-Watermark` /
-//! `X-Bluedb-Min-Watermark` contract:
+//! Verifies the `X-Bluedb-Watermark` / `X-Bluedb-Min-Watermark` contract:
 //!
 //! (a) A write returns `X-Bluedb-Watermark: <tenant>:<seq>` with a
 //!     monotonically-increasing seq.
-//! (b) A read with `X-Bluedb-Min-Watermark ≤ sealed` serves and reports the
-//!     sealed watermark in `X-Bluedb-Watermark`.
-//! (c) A read with `X-Bluedb-Min-Watermark > sealed` returns 503 + the current
-//!     sealed watermark in `X-Bluedb-Watermark`.
+//! (b) A read (`GET /tables`) with `X-Bluedb-Min-Watermark` is served from
+//!     SlateDB regardless — SlateDB is always at least as fresh as the seal, so
+//!     the freshness gate does NOT apply here.
+//! (c) An analytical query (`POST /sql` routed to Iceberg) with
+//!     `X-Bluedb-Min-Watermark > sealed` returns 503 + the current sealed
+//!     watermark in `X-Bluedb-Watermark`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -218,10 +219,14 @@ async fn read_with_min_watermark_at_most_sealed_serves_and_echoes_watermark() {
     assert!(sealed_seq >= 0, "sealed seq should be non-negative");
 }
 
-// ----- test (c): read with X-Bluedb-Min-Watermark > sealed returns 503 -----
+// ----- test (b corrected): GET /tables with X-Bluedb-Min-Watermark > sealed still serves -----
+//
+// SlateDB is always at least as fresh as the Iceberg seal, so the freshness gate
+// does NOT apply to the OLTP read path. A min-watermark larger than the sealed
+// watermark must NOT 503 here — it is served and succeeds.
 
 #[tokio::test]
-async fn read_with_min_watermark_above_sealed_returns_503() {
+async fn get_tables_with_min_watermark_above_sealed_still_serves() {
     let state = make_state().await;
     let app = build_app(state.clone());
 
@@ -249,14 +254,13 @@ async fn read_with_min_watermark_above_sealed_returns_503() {
         Some(&future_seq.to_string()),
         None,
     ).await;
-    assert_eq!(
-        rr.status,
-        StatusCode::SERVICE_UNAVAILABLE,
-        "min > sealed should return 503, got {} {:?}", rr.status, rr.body
+    // P2.2 correction: GET /tables reads from SlateDB, not Iceberg, so the
+    // freshness gate must NOT 503 here — the data IS available from SlateDB.
+    assert!(
+        rr.status.is_success(),
+        "GET /tables with min > sealed must succeed (SlateDB is fresher than the seal): {} {:?}",
+        rr.status, rr.body
     );
-    // The response should still tell the client what the current sealed watermark is.
-    let wm_hdr = rr.headers.get("x-bluedb-watermark");
-    assert!(wm_hdr.is_some(), "503 should include X-Bluedb-Watermark indicating current sealed seq");
 }
 
 // ----- test: per-tenant scoping -----
@@ -301,4 +305,118 @@ async fn watermark_is_scoped_per_tenant() {
     // Both should be 1 for their first writes.
     assert_eq!(seq_ta, 1, "ta first write seq should be 1");
     assert_eq!(seq_tb, 1, "tb first write seq should be 1 (independent counter)");
+}
+
+// ----- Phase 2.2 tests -----
+
+// Helper: enable the lakehouse mirror, create a table, insert rows, seal.
+// Returns the sealed watermark seq (obtained from the response headers after
+// a dummy GET that echoes the sealed watermark).
+async fn setup_analytical_table(state: &AppState, app: &axum::Router) -> i64 {
+    // Turn on the lakehouse mirror.
+    let r = call_full(app, "POST", "/sql", None, None,
+        Some(json!({"sql": "PRAGMA lakehouse_mirror = on"}))).await;
+    assert!(r.status.is_success(), "pragma: {} {:?}", r.status, r.body);
+
+    // Create table: `products (id INTEGER PK, name TEXT, score INTEGER)`.
+    // score is NOT indexed — filters on it will be guardrail-rejected and
+    // routed to the analytical path.
+    let r = call_full(app, "POST", "/admin/sql", None, None,
+        Some(json!({"sql": "CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)"}))).await;
+    assert!(r.status.is_success(), "create: {} {:?}", r.status, r.body);
+
+    // Insert rows via /sql.
+    for (id, name, score) in [(1, "alpha", 90), (2, "beta", 40), (3, "gamma", 75)] {
+        let r = call_full(app, "POST", "/sql", None, None,
+            Some(json!({"sql": format!("INSERT INTO products VALUES ({id}, '{name}', {score})")}))).await;
+        assert!(r.status.is_success(), "insert {id}: {} {:?}", r.status, r.body);
+    }
+
+    // Seal so the Iceberg snapshot exists.
+    state.seal_now().await.expect("seal");
+
+    // Read the sealed watermark from the response header of a GET /tables request.
+    let r = call_full(app, "GET", "/tables/products", None, None, None).await;
+    assert!(r.status.is_success(), "GET products: {} {:?}", r.status, r.body);
+    parse_watermark_header(&r.headers).map(|(_, seq)| seq).unwrap_or(0)
+}
+
+// ----- test: guardrail-rejected SELECT is routed to the analytical path -----
+//
+// A filter on a non-indexed column (`score`) would be rejected by the guardrail
+// when running against SlateDB. After P2.2 the handler routes it to DataFusion
+// over the sealed Iceberg snapshot and returns correct rows.
+
+#[tokio::test]
+async fn guardrail_rejected_select_routed_to_analytical_path_returns_correct_rows() {
+    let state = make_state().await;
+    let app = build_app(state.clone());
+
+    setup_analytical_table(&state, &app).await;
+
+    // Query: filter on `score` (non-indexed) + ORDER BY `score` (non-indexed).
+    // The guardrail rejects this on the SlateDB path.
+    let r = call_full(
+        &app, "POST", "/sql", None, None,
+        Some(json!({"sql": "SELECT id, name FROM products WHERE score > 50 ORDER BY score DESC"})),
+    ).await;
+    assert!(
+        r.status.is_success(),
+        "guardrail-rejected query should be routed to Iceberg and succeed: {} {:?}",
+        r.status, r.body
+    );
+
+    // Expect rows with score > 50: alpha (90) and gamma (75), in DESC order.
+    let rows = r.body.as_array().expect("response is an array of rows");
+    assert_eq!(rows.len(), 2, "expected 2 rows with score > 50, got {rows:?}");
+
+    // alpha (90) first, gamma (75) second (DESC by score).
+    let names: Vec<&str> = rows.iter()
+        .map(|row| row["name"].as_str().unwrap_or("?"))
+        .collect();
+    assert_eq!(names, vec!["alpha", "gamma"], "rows should be alpha then gamma (score DESC): {names:?}");
+}
+
+// ----- test: analytical path honors X-Bluedb-Min-Watermark -----
+//
+// The freshness gate on the analytical path: when min > sealed, the handler
+// must return 503. When min <= sealed it serves normally.
+
+#[tokio::test]
+async fn analytical_path_honors_min_watermark() {
+    let state = make_state().await;
+    let app = build_app(state.clone());
+
+    let sealed = setup_analytical_table(&state, &app).await;
+
+    // (a) min <= sealed: must succeed.
+    let r_ok = call_full(
+        &app, "POST", "/sql", None, Some("0"),
+        Some(json!({"sql": "SELECT id, name FROM products WHERE score > 50 ORDER BY score DESC"})),
+    ).await;
+    assert!(
+        r_ok.status.is_success(),
+        "analytical path with min=0 (<=sealed) must succeed: {} {:?}",
+        r_ok.status, r_ok.body
+    );
+    // Response should echo the sealed watermark.
+    let wm = r_ok.headers.get("x-bluedb-watermark");
+    assert!(wm.is_some(), "analytical response must include X-Bluedb-Watermark");
+
+    // (b) min > sealed: must return 503 with X-Bluedb-Watermark.
+    let future_seq = sealed + 1_000_000;
+    let r_503 = call_full(
+        &app, "POST", "/sql", None, Some(&future_seq.to_string()),
+        Some(json!({"sql": "SELECT id, name FROM products WHERE score > 50 ORDER BY score DESC"})),
+    ).await;
+    assert_eq!(
+        r_503.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "analytical path with min > sealed must 503: {} {:?}",
+        r_503.status, r_503.body
+    );
+    assert!(
+        r_503.headers.get("x-bluedb-watermark").is_some(),
+        "503 from analytical path must include X-Bluedb-Watermark"
+    );
 }

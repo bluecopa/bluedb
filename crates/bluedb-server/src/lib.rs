@@ -46,6 +46,7 @@ mod schema;
 use bluedb_engine::{rest_sql, EngineError, FtsEngine};
 use bluedb_ha::{HaError, Status, WriterController};
 use bluedb_ledger::Ledger;
+use arrow_array::RecordBatch;
 
 mod ledger_api;
 mod evidence_api;
@@ -870,6 +871,166 @@ fn parse_min_watermark(headers: &axum::http::HeaderMap) -> Option<i64> {
     seq_str.trim().parse::<i64>().ok()
 }
 
+// --- analytical read path helpers ------------------------------------------
+
+/// True if `err` is a guardrail-reject error from the scan/sort guardrail
+/// (`bluedb_sql::guardrail`). The guardrail emits `Error::StorageMsg` with a
+/// message starting `"rejected: "` which surfaces as `EngineError::Sql` whose
+/// `Display` rendering includes `"rejected: query on"` (non-indexed filter) or
+/// `"rejected: ORDER BY"` / `"rejected: in-memory sort on"` (non-indexed sort).
+/// GlueSQL wraps these as `"sql: storage: rejected: ..."`.
+fn is_guardrail_reject(err: &EngineError) -> bool {
+    match err {
+        EngineError::Sql(e) => {
+            let msg = e.to_string();
+            msg.contains("rejected: query on")
+                || msg.contains("rejected: ORDER BY")
+                || msg.contains("rejected: in-memory sort on")
+        }
+        _ => false,
+    }
+}
+
+/// Extract the single-table name from a SQL SELECT statement.
+///
+/// Uses sqlparser (via gluesql) to parse. Returns `Some(table_name)` for a
+/// single-table SELECT with no joins; `None` for anything else (multi-table,
+/// non-SELECT, parse failure). We deliberately do NOT use a bare string search
+/// because the guardrail already parsed the statement — this is just extracting
+/// the table name safely.
+fn extract_single_table_name(sql: &str) -> Option<String> {
+    use gluesql_core::sqlparser::ast::{
+        SetExpr, Statement, TableFactor, TableWithJoins,
+    };
+    let parsed = gluesql_core::parse_sql::parse(sql).ok()?;
+    if parsed.len() != 1 {
+        return None;
+    }
+    let query = match &parsed[0] {
+        Statement::Query(q) => q,
+        _ => return None,
+    };
+    let select = match query.body.as_ref() {
+        SetExpr::Select(s) => s,
+        _ => return None,
+    };
+    if select.from.len() != 1 {
+        return None;
+    }
+    let twj: &TableWithJoins = &select.from[0];
+    if !twj.joins.is_empty() {
+        return None;
+    }
+    match &twj.relation {
+        TableFactor::Table { name, .. } => {
+            name.0.last().map(|ident| ident.value.clone())
+        }
+        _ => None,
+    }
+}
+
+/// Convert a slice of Arrow [`RecordBatch`]es into a JSON array of row-objects,
+/// matching the shape of the existing read endpoints (`[{"col": val, ...}, ...]`).
+///
+/// Arrow scalar types map to JSON as follows:
+/// - Null → `null`
+/// - Boolean → JSON bool
+/// - Integer (i8/i16/i32/i64/u8/u16/u32/u64) → JSON number
+/// - Float (f32/f64) → JSON number (NaN/Inf → null)
+/// - Utf8 / LargeUtf8 → JSON string
+/// - Date32 → JSON number (days-since-epoch, matches what bluedb inserts)
+/// - Decimal128 → JSON string (preserves precision across the HTTP boundary)
+/// - Everything else → JSON string via `format!("{:?}", ...)`
+fn record_batches_to_json(batches: &[RecordBatch]) -> Value {
+    use arrow_array::Array;
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::{
+        Int8Type, Int16Type, Int32Type, Int64Type,
+        UInt8Type, UInt16Type, UInt32Type, UInt64Type,
+        Float32Type, Float64Type, Date32Type, Decimal128Type,
+    };
+
+    let mut rows: Vec<Value> = Vec::new();
+    for batch in batches {
+        let schema = batch.schema();
+        let n = batch.num_rows();
+        for row_idx in 0..n {
+            let mut obj = Map::new();
+            for (col_idx, field) in schema.fields().iter().enumerate() {
+                let col = batch.column(col_idx);
+                let val: Value = if col.is_null(row_idx) {
+                    Value::Null
+                } else {
+                    let dt = field.data_type();
+                    // Match on the data type name to avoid importing arrow_schema.
+                    let dt_str = format!("{dt:?}");
+                    if dt_str.starts_with("Boolean") {
+                        if let Some(a) = col.as_any().downcast_ref::<arrow_array::BooleanArray>() {
+                            Value::Bool(a.value(row_idx))
+                        } else { Value::Null }
+                    } else if dt_str.starts_with("Int8") {
+                        json!(col.as_primitive::<Int8Type>().value(row_idx))
+                    } else if dt_str.starts_with("Int16") {
+                        json!(col.as_primitive::<Int16Type>().value(row_idx))
+                    } else if dt_str.starts_with("Int32") {
+                        json!(col.as_primitive::<Int32Type>().value(row_idx))
+                    } else if dt_str.starts_with("Int64") {
+                        json!(col.as_primitive::<Int64Type>().value(row_idx))
+                    } else if dt_str.starts_with("UInt8") {
+                        json!(col.as_primitive::<UInt8Type>().value(row_idx))
+                    } else if dt_str.starts_with("UInt16") {
+                        json!(col.as_primitive::<UInt16Type>().value(row_idx))
+                    } else if dt_str.starts_with("UInt32") {
+                        json!(col.as_primitive::<UInt32Type>().value(row_idx))
+                    } else if dt_str.starts_with("UInt64") {
+                        json!(col.as_primitive::<UInt64Type>().value(row_idx))
+                    } else if dt_str.starts_with("Float32") {
+                        let v = col.as_primitive::<Float32Type>().value(row_idx);
+                        serde_json::Number::from_f64(v as f64).map(Value::Number).unwrap_or(Value::Null)
+                    } else if dt_str.starts_with("Float64") {
+                        let v = col.as_primitive::<Float64Type>().value(row_idx);
+                        serde_json::Number::from_f64(v).map(Value::Number).unwrap_or(Value::Null)
+                    } else if dt_str.starts_with("Utf8") || dt_str.starts_with("LargeUtf8") {
+                        if let Some(a) = col.as_any().downcast_ref::<arrow_array::StringArray>() {
+                            Value::String(a.value(row_idx).to_string())
+                        } else if let Some(a) = col.as_any().downcast_ref::<arrow_array::LargeStringArray>() {
+                            Value::String(a.value(row_idx).to_string())
+                        } else { Value::Null }
+                    } else if dt_str.starts_with("Date32") {
+                        let days = col.as_primitive::<Date32Type>().value(row_idx);
+                        json!(days)
+                    } else if dt_str.starts_with("Decimal128") {
+                        // Extract scale from the type string "Decimal128(prec, scale)".
+                        let scale: u32 = dt_str
+                            .trim_start_matches("Decimal128(")
+                            .trim_end_matches(')')
+                            .split(',')
+                            .nth(1)
+                            .and_then(|s| s.trim().parse::<u32>().ok())
+                            .unwrap_or(0);
+                        let raw = col.as_primitive::<Decimal128Type>().value(row_idx);
+                        let s = if scale == 0 {
+                            format!("{raw}")
+                        } else {
+                            let divisor = 10i128.pow(scale);
+                            let whole = raw / divisor;
+                            let frac = (raw % divisor).unsigned_abs();
+                            format!("{whole}.{frac:0>width$}", width = scale as usize)
+                        };
+                        Value::String(s)
+                    } else {
+                        // Fallback: display the array element as debug string.
+                        Value::String(format!("{:?}", col.slice(row_idx, 1)))
+                    }
+                };
+                obj.insert(field.name().clone(), val);
+            }
+            rows.push(Value::Object(obj));
+        }
+    }
+    Value::Array(rows)
+}
+
 async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
 }
@@ -878,6 +1039,16 @@ async fn health() -> Json<Value> {
 ///
 /// Mutating statements (INSERT/UPDATE/DELETE) return `X-Bluedb-Watermark: <tenant>:<seq>`
 /// so the client knows which CDC sequence this write reached.
+///
+/// **Analytical fallback (P2.2):** when a SELECT is rejected by the scan/sort
+/// guardrail (non-indexed filter or in-memory sort), the handler automatically
+/// routes it to the analytical path — `bluedb_query::query_sql` over the
+/// tenant's sealed Iceberg snapshot. Only single-table SELECTs are routed;
+/// multi-table SELECTs return the original guardrail-reject (noted in the error).
+///
+/// **Freshness gate on the analytical path:** `X-Bluedb-Min-Watermark` is
+/// checked against the sealed Iceberg watermark. If `min > sealed`, the handler
+/// returns `503` with the current sealed watermark in `X-Bluedb-Watermark`.
 async fn exec_sql(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -904,9 +1075,56 @@ async fn exec_sql(
     let mut glue = Glue::new(state.connection_serialized(&tenant).await?);
     // Route through the FTS engine: it rewrites `@@`/`ts_rank` against the live
     // segment when a fulltext index is declared, else runs the SQL unchanged.
-    let payloads = state.fts().await.execute_fts(&mut glue, &req.sql, &params).await?;
-    let wm = state.write_watermark(&tenant).await;
-    Ok((watermark_headers(&tenant, wm), Json(payloads_to_json(payloads))))
+    let result = state.fts().await.execute_fts(&mut glue, &req.sql, &params).await;
+
+    match result {
+        Ok(payloads) => {
+            let wm = state.write_watermark(&tenant).await;
+            Ok((watermark_headers(&tenant, wm), Json(payloads_to_json(payloads))))
+        }
+        Err(ref err) if is_guardrail_reject(err) => {
+            // Guardrail-reject: route to the analytical path (DataFusion over Iceberg).
+            // Only single-table SELECTs are routed; multi-table → return the original error.
+            let Some(table) = extract_single_table_name(&req.sql) else {
+                return Err(AppError::bad_request(format!(
+                    "{err} (multi-table or non-SELECT queries cannot be routed to the analytical path)"
+                )));
+            };
+
+            // Freshness gate: analytical reads serve sealed Iceberg data, so check
+            // X-Bluedb-Min-Watermark here (not on the SlateDB OLTP path).
+            let sealed = state.sealed_watermark(&tenant).await;
+            if let Some(min) = parse_min_watermark(&headers) {
+                if min > sealed {
+                    let wm_hdrs = watermark_headers_always(&tenant, sealed);
+                    return Err(AppError::plain(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!(
+                            "read-your-writes freshness not yet satisfied: \
+                             requested min-watermark {min}, sealed watermark {sealed}"
+                        ),
+                    ).with_headers(wm_hdrs));
+                }
+            }
+
+            // Get the per-tenant lakehouse engine.
+            let manager = state.lakehouse().await.ok_or_else(|| {
+                AppError::internal("analytical path unavailable: lakehouse manager not bound")
+            })?;
+            let engine = manager
+                .engine_for(&tenant)
+                .await
+                .map_err(|e| AppError::internal(format!("get lakehouse engine: {e}")))?;
+
+            let batches = bluedb_query::query_sql(&engine, &table, &req.sql)
+                .await
+                .map_err(|e| AppError::bad_request(format!("analytical query: {e}")))?;
+
+            let wm_hdrs = watermark_headers(&tenant, sealed);
+            Ok((wm_hdrs, Json(record_batches_to_json(&batches))))
+        }
+        Err(err) => Err(AppError::from(err)),
+    }
 }
 
 /// `POST /admin/sql` — arbitrary SQL (DDL/txns/multi). Off by default; audited.
@@ -930,11 +1148,13 @@ async fn admin_sql(
 
 /// `GET /tables/{table}?<filters>` — PostgREST SELECT (served by writer or replica).
 ///
-/// **Freshness gate:** if the request carries `X-Bluedb-Min-Watermark: <seq>` and
-/// the Iceberg-sealed watermark for this tenant is below `<seq>`, the handler
-/// returns `503 Service Unavailable` with the current sealed watermark in
-/// `X-Bluedb-Watermark` so the client knows how far behind the mirror is.
-/// Otherwise it serves the request and echoes the sealed watermark.
+/// Echoes the current Iceberg-sealed watermark in `X-Bluedb-Watermark` on every
+/// response so clients can track mirror freshness. The freshness gate
+/// (`X-Bluedb-Min-Watermark`) is intentionally **not** applied here: this path
+/// reads from SlateDB, which is always at least as fresh as the Iceberg seal,
+/// so a min-watermark constraint on the seal would incorrectly 503 queries that
+/// the OLTP store can actually satisfy. The freshness gate belongs on the
+/// analytical path (`POST /sql` guardrail-routed queries that read from Iceberg).
 async fn select(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -944,24 +1164,7 @@ async fn select(
     state.authorize(&headers, authz::Scope::DataRead)?;
     let tenant = state.tenant(&headers)?;
 
-    // Freshness gate: if the client requested a min-watermark, check it now.
     let sealed = state.sealed_watermark(&tenant).await;
-    if let Some(min) = parse_min_watermark(&headers) {
-        if min > sealed {
-            // Not-yet-fresh: tell the client what we currently have, then 503.
-            // Always emit the header here, even if sealed == 0, so the client
-            // learns the actual sealed-watermark (0 = nothing sealed yet).
-            let wm_hdrs = watermark_headers_always(&tenant, sealed);
-            return Err(AppError::plain(
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!(
-                    "read-your-writes freshness not yet satisfied: \
-                     requested min-watermark {min}, sealed watermark {sealed}"
-                ),
-            ).with_headers(wm_hdrs));
-        }
-    }
-
     let mut glue = Glue::new(state.connection(&tenant).await?);
     let payloads = rest_sql::execute_query_str(&mut glue, &table, query.as_deref().unwrap_or("")).await?;
     Ok((watermark_headers(&tenant, sealed), Json(payloads_to_json(payloads))))
