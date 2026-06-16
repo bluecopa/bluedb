@@ -1,1 +1,6 @@
 /.venv/
+
+# maturin develop drops the built extension + bytecode into the source tree
+__pycache__/
+*.so
+.pytest_cache/
