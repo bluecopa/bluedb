@@ -5,6 +5,7 @@
 //! pure-Rust core compiles and tests without libpython.
 
 pub mod authz_cfg;
+mod embedded;
 
 #[cfg(feature = "python")]
 mod py {
