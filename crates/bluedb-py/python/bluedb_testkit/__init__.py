@@ -8,6 +8,8 @@ Example:
         httpx.post(db.url("/sql"), headers=db.headers(),
                    json={"sql": "SELECT 1", "params": []})
 """
+from __future__ import annotations
+
 from contextlib import contextmanager
 
 from ._bluedb_testkit import DEFAULT_TOKEN, TestServer
@@ -30,7 +32,7 @@ class Handle:
         return self._server.base_url
 
     @property
-    def token(self):
+    def token(self) -> str | None:
         return self._server.token
 
     def url(self, path: str) -> str:
