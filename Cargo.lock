@@ -859,11 +859,20 @@ name = "bluedb-spike-htap"
 version = "0.0.0"
 dependencies = [
  "arrow",
+ "async-trait",
+ "bluedb-lakehouse",
+ "bluedb-sql",
+ "bytes",
  "datafusion",
+ "foyer",
  "futures",
+ "gluesql-core",
  "iceberg",
  "iceberg-datafusion",
+ "object_store",
  "parquet",
+ "serde_json",
+ "slatedb",
  "tempfile",
  "tokio",
 ]

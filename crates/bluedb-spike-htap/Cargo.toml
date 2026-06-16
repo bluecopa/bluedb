@@ -26,3 +26,28 @@ parquet = "57"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tempfile = { workspace = true }
 futures = "0.3"
+
+[dev-dependencies]
+# Slice-2 read-latency harness (`tests/read_latency_gcs.rs`): a foyer-backed
+# CachingObjectStore wrapping a MeasuredStore wrapping REAL GCS, proving the
+# HTAP qualifier (cache MISS = GCS-bound vs cache HIT = local foyer read).
+#
+# foyer is ALREADY in the workspace via SlateDB; pin to the SAME version (0.22.3)
+# so cargo unifies on ONE foyer rather than introducing a second copy. SlateDB
+# pulls foyer with `features = ["serde"]`, so feature-unification turns on
+# foyer's serde-based blanket `Code` impl — String keys + Vec<u8> values
+# (de)serialize via bincode for the disk tier with NO hand-rolled `Code`.
+foyer = { version = "=0.22.3", features = ["serde"] }
+# Build the `grid` Iceberg table on GCS via the real lakehouse engine + drive it
+# through gluesql (crib from `bluedb-lakehouse/tests/seal_latency_gcs.rs`).
+bluedb-lakehouse = { workspace = true }
+bluedb-sql = { workspace = true }
+gluesql-core = "=0.19.0"
+slatedb = { workspace = true }
+# Deserialize the cold-loaded Iceberg table's metadata.json into TableMetadata.
+serde_json = "1"
+# Real GCS object store (needs the `gcp` feature; pinned to the workspace-resolved
+# 0.12.5 so the `Arc<dyn ObjectStore>` unifies with the lakehouse FileIO bridge).
+object_store = { version = "=0.12.5", features = ["gcp"] }
+async-trait = "0.1"
+bytes = { version = "1", features = ["serde"] }
