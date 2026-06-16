@@ -1,0 +1,21 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "bluedb-testkit"
+version = "0.0.0"
+description = "In-process, test-only bluedb for Python integration tests."
+requires-python = ">=3.9"
+classifiers = ["Private :: Do Not Upload"]
+
+[project.optional-dependencies]
+test = ["pytest", "httpx"]
+
+[project.entry-points.pytest11]
+bluedb_testkit = "bluedb_testkit.pytest_plugin"
+
+[tool.maturin]
+module-name = "bluedb_testkit._bluedb_testkit"
+python-source = "python"
+features = ["python", "pyo3/extension-module"]

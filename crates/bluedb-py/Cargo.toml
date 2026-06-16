@@ -1,0 +1,28 @@
+[package]
+name = "bluedb-py"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+description = "Python-embeddable, test-only bluedb instance (PyO3 wheel: bluedb-testkit)."
+
+[lib]
+name = "_bluedb_testkit"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bluedb-server = { path = "../bluedb-server" }
+bluedb-ha     = { path = "../bluedb-ha" }
+slatedb       = { workspace = true }
+tokio         = { workspace = true }
+anyhow        = { workspace = true }
+axum          = { version = "0.8", features = ["http2"] }
+pyo3          = { version = "0.22", features = ["abi3-py39"], optional = true }
+
+[features]
+default = []
+# `maturin` enables this (+ pyo3/extension-module) when building the wheel.
+# Default builds omit PyO3 entirely, so `cargo build`/`cargo test` need no libpython.
+python = ["dep:pyo3"]
+
+[dev-dependencies]
+ureq = "2"
