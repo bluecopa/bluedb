@@ -219,6 +219,19 @@ impl LakehouseManager {
             .find(|e| e.namespace() == ns)
     }
 
+    /// The sealed Iceberg watermark for `tenant`: the max CDC sequence durably
+    /// committed to Iceberg for that tenant, or 0 if the tenant has no sealed
+    /// snapshots yet (e.g. CDC is off or the first seal hasn't fired).
+    ///
+    /// Used by HTAP read-path freshness checks: a client's `X-Bluedb-Min-Watermark`
+    /// header is compared against this before serving analytical reads.
+    pub async fn sealed_watermark(&self, tenant: &str) -> i64 {
+        match self.engines.read().await.get(tenant) {
+            Some(engine) => engine.sealed_watermark().await,
+            None => 0,
+        }
+    }
+
     /// Stop the background loops (called on demote; the next promote reopens).
     pub fn shutdown(&self) {
         for h in self.handles.lock().unwrap().drain(..) {

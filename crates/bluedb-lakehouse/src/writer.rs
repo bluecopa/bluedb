@@ -21,11 +21,13 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow_array::{
-    ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array,
-    LargeBinaryArray, RecordBatch, StringArray,
+    ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
+    Int32Array, Int64Array, LargeBinaryArray, RecordBatch, StringArray, Time64MicrosecondArray,
+    TimestampMicrosecondArray,
 };
-use arrow_schema::DataType as ArrowDataType;
+use arrow_schema::{DataType as ArrowDataType, TimeUnit};
 use bytes::Bytes;
+use chrono::Timelike;
 use gluesql_core::data::{Key, Value};
 use gluesql_core::store::DataRow;
 use iceberg::arrow::schema_to_arrow_schema;
@@ -1026,6 +1028,88 @@ fn build_arrow_column(arrow_dt: &ArrowDataType, cells: &[&Value]) -> Result<Arra
                 })
                 .collect::<LargeBinaryArray>(),
         ),
+        // iceberg-rust maps Iceberg `decimal(p,s)` to Arrow `Decimal128(p,s)`.
+        // gluesql stores rust_decimal::Decimal with its own scale; we rescale
+        // to the target scale before extracting the i128 mantissa.
+        ArrowDataType::Decimal128(precision, scale) => {
+            let target_scale = *scale as u32;
+            let raw: Vec<Option<i128>> = cells
+                .iter()
+                .map(|v| match v {
+                    Value::Decimal(d) => {
+                        let mut d = *d;
+                        d.rescale(target_scale);
+                        Some(d.mantissa())
+                    }
+                    _ => None,
+                })
+                .collect();
+            let arr = raw
+                .into_iter()
+                .collect::<Decimal128Array>()
+                .with_precision_and_scale(*precision, *scale)
+                .map_err(|e| LakehouseError::Schema(format!("decimal array: {e}")))?;
+            Arc::new(arr)
+        }
+        // iceberg-rust maps Iceberg `date` to Arrow `Date32` (days since epoch).
+        // chrono's NaiveDate::signed_duration_since gives a Duration; .num_days()
+        // converts to i32.
+        ArrowDataType::Date32 => {
+            let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+            Arc::new(
+                cells
+                    .iter()
+                    .map(|v| match v {
+                        Value::Date(d) => {
+                            Some(d.signed_duration_since(epoch).num_days() as i32)
+                        }
+                        _ => None,
+                    })
+                    .collect::<Date32Array>(),
+            )
+        }
+        // iceberg-rust maps Iceberg `timestamp` to Arrow `Timestamp(Microsecond, None)`.
+        // gluesql stores NaiveDateTime; we compute microseconds since Unix epoch.
+        ArrowDataType::Timestamp(TimeUnit::Microsecond, None) => {
+            Arc::new(
+                cells
+                    .iter()
+                    .map(|v| match v {
+                        Value::Timestamp(dt) => {
+                            let secs = dt.and_utc().timestamp();
+                            let subsec_micros = dt.and_utc().timestamp_subsec_micros() as i64;
+                            secs.checked_mul(1_000_000)
+                                .and_then(|s| s.checked_add(subsec_micros))
+                        }
+                        _ => None,
+                    })
+                    .collect::<TimestampMicrosecondArray>(),
+            )
+        }
+        // iceberg-rust maps Iceberg `time` to Arrow `Time64(Microsecond)`.
+        // gluesql stores NaiveTime; microseconds since midnight.
+        ArrowDataType::Time64(TimeUnit::Microsecond) => {
+            Arc::new(
+                cells
+                    .iter()
+                    .map(|v| match v {
+                        Value::Time(t) => {
+                            let h = t.hour() as i64;
+                            let m = t.minute() as i64;
+                            let s = t.second() as i64;
+                            let micros = t.nanosecond() as i64 / 1_000;
+                            Some(
+                                h * 3_600_000_000
+                                    + m * 60_000_000
+                                    + s * 1_000_000
+                                    + micros,
+                            )
+                        }
+                        _ => None,
+                    })
+                    .collect::<Time64MicrosecondArray>(),
+            )
+        }
         other => {
             return Err(LakehouseError::Schema(format!(
                 "arrow column type {other:?} not supported by the v1 writer yet"

@@ -503,6 +503,32 @@ impl LakehouseEngine {
         &self.tenant
     }
 
+    /// The CDC watermark that is durably sealed into Iceberg for this tenant.
+    ///
+    /// Every seal pass stamps the same max-CDC-seq into all tables it touches
+    /// (see [`Self::seal`] and [`crate::writer::LakehouseWriter::commit_snapshot`]),
+    /// so any sealed table's `current_watermark()` equals the tenant watermark.
+    /// This method returns the max watermark across all materialized tables, or 0
+    /// if none have been sealed yet.
+    ///
+    /// Used by the HTAP read tier to check freshness against a client's
+    /// `X-Bluedb-Min-Watermark` request header.
+    pub async fn sealed_watermark(&self) -> i64 {
+        let tables: Vec<String> = {
+            self.state.read().unwrap().materialized.iter().cloned().collect()
+        };
+        let mut max = 0i64;
+        for table in tables {
+            let Ok(schema) = self.try_fetch_schema(&table).await else { continue; };
+            let Some(schema) = schema else { continue; };
+            let Ok(writer) = self.writer_for(&table, &schema, &[]).await else { continue; };
+            if let Some(wm) = writer.current_watermark() {
+                max = max.max(wm);
+            }
+        }
+        max
+    }
+
     /// The current `metadata.json` location for a sealed table, or `None` if the
     /// table has no Iceberg table yet. Read-only — creates nothing.
     pub async fn table_metadata_location(&self, table: &str) -> Result<Option<String>> {

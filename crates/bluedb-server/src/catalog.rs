@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::HeaderMap;
 use axum::Json;
 use serde_json::{json, Value};
 
@@ -23,10 +23,9 @@ use crate::{authz, AppError, AppState};
 
 /// The active mirror manager, or `503` on a passive node.
 async fn manager(state: &AppState) -> Result<Arc<LakehouseManager>, AppError> {
-    state.lakehouse().await.ok_or_else(|| AppError {
-        status: StatusCode::SERVICE_UNAVAILABLE,
-        message: "lakehouse catalog unavailable (node is not the active writer)".into(),
-    })
+    state.lakehouse().await.ok_or_else(|| AppError::service_unavailable(
+        "lakehouse catalog unavailable (node is not the active writer)",
+    ))
 }
 
 /// `GET /catalog/v1/config` — catalog defaults/overrides (empty for v1).
