@@ -851,6 +851,7 @@ dependencies = [
  "gluesql-core",
  "iceberg",
  "iceberg-datafusion",
+ "serde_json",
  "slatedb",
  "tempfile",
  "tokio",
