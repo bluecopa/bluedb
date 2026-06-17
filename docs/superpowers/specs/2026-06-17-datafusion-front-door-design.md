@@ -213,6 +213,21 @@ not standard-SQL gaps — the DuckDB corpus is a DuckDB-idiom yardstick, so this
 a floor. (Aggregate, for reference: DataFusion 28.8% accept / 1,681 PASS vs
 GlueSQL 33.8% / 1,983, both capped by the shared write-path ceiling.)
 
+**Why not 100% on reads** (the 2,361 read rejections, from the query-only
+`READ-PATH REJECTIONS` ranking): ~80% are DuckDB-only features DataFusion is
+*correct* to reject — parser errors for DuckDB syntax (`MATERIALIZED` CTEs,
+`PIVOT`, `SELECT * EXCLUDE/REPLACE`) = 777; the DuckDB function library
+(`list_value`, `typeof`, `struct_*`, `histogram`, `array_value`); exotic types
+(`HUGEINT`, `BLOB`, `GEOMETRY`); the `rowid` pseudo-column. ~115 are an EXPLAIN
+routing artifact (routed to GlueSQL, which rejects it). **Only ~150 (~6%) are
+genuine DataFusion v52 limits** worth tracking: some correlated `ScalarSubquery`/
+`Exists` shapes don't decorrelate ("Physical plan does not support …"), `> ANY`
+(only `= ANY`), `DISTINCT ON`, and a `simplify_expressions` optimizer hiccup. The
+458 wrong-results are mostly result *ordering* (no `ORDER BY`) and formatting
+(`true`/`false` vs `1`/`0`, float precision), not wrong answers. Net: 100% is
+unreachable on a DuckDB-idiom corpus by construction; the genuine engine gaps are
+a thin, named set, and the curated `df/` gate proves the mainstream dialect.
+
 ### Still deferred (flagged)
 
 - **Secondary-index pushdown** — non-PK indexed predicates currently take the
