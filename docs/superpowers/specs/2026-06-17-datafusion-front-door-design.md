@@ -228,6 +228,22 @@ genuine DataFusion v52 limits** worth tracking: some correlated `ScalarSubquery`
 unreachable on a DuckDB-idiom corpus by construction; the genuine engine gaps are
 a thin, named set, and the curated `df/` gate proves the mainstream dialect.
 
+**Postgres-dialect cross-check (CockroachDB `logic_test`, internal only — not a
+published claim).** Ran 610 Cockroach files through `--engine df`. A Postgres
+corpus did *worse*, not better: read-path 11.2% accept / 45.1% correct (vs
+DuckDB's 34.5% / 63.3%). Two reasons — 55% of files (335/610) don't parse
+(Cockroach sqllogictest extensions: `subtest`, `user`, `colnames`, config
+conditionals), and the reads that run lean on the **full Postgres surface
+DataFusion deliberately omits**: types (JSONB 127, JSON, TIMETZ 42, INET 34),
+functions (`jsonb_path_query` 352, `to_number`, `format`, PostGIS `st_*`,
+`to_char(numeric)` 103), `SHOW`/`FETCH`/`CALL` statements, and UDFs
+(`CREATE FUNCTION`). The insight: a "Postgres corpus" is **not** a cleaner fit —
+DataFusion implements an *analytical subset* of Postgres, so Cockroach's
+PG-transactional surface overlaps it *less* than DuckDB's analytical core does.
+Relevant gaps worth noting for Postgres-origin users: no JSON/JSONB,
+`to_char(numeric)`, `format()`, `to_number()`. Both corpora point at the same
+ceiling — the engine surface, not the front door.
+
 ### Still deferred (flagged)
 
 - **Secondary-index pushdown** — non-PK indexed predicates currently take the
