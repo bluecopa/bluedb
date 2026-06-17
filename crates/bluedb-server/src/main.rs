@@ -21,6 +21,24 @@
 //!   unset, an in-process lease (single writer) is used.
 //! - `BLUEDB_NODE_ID` (default `node-0`), `BLUEDB_LEASE_TTL_SECS` (15),
 //!   `BLUEDB_LEASE_MARGIN_SECS` (5).
+//! - `BLUEDB_ADVERTISE_ADDR` — this node's externally-reachable base URL (e.g.
+//!   `http://bluedb-0.bluedb.default.svc:8080`), published to the node registry so
+//!   other nodes can resolve `node_id → URL`. Defaults to `http://<BLUEDB_ADDR>`
+//!   when unset (fine for a single host / local dev; set explicitly behind a
+//!   Service/LB). Foundation for the later cross-node redirect + affinity routing.
+//! - Node registry backend (cross-node discovery). `BLUEDB_NODE_REGISTRY_TTL_SECS`
+//!   (default 3× the lease TTL) bounds liveness for the in-memory + Postgres
+//!   backends. The backend is selected with this precedence:
+//!   1. **Kubernetes** — if running in-cluster (`KUBERNETES_SERVICE_HOST` set) AND
+//!      the binary was built `--features kubernetes`. Liveness comes from the K8s
+//!      API (Ready endpoints of the coordinator Service), so there is no heartbeat
+//!      loop. `BLUEDB_K8S_NAMESPACE` (default `default`), `BLUEDB_K8S_SERVICE`
+//!      (default `bluedb`), `BLUEDB_K8S_PORT` (default the `BLUEDB_ADDR` port).
+//!   2. **Postgres** — else if `BLUEDB_LEASE_PG_URL` is set, a shared `bluedb_nodes`
+//!      table (reuses the lease's Postgres). A heartbeat loop refreshes this node's
+//!      row every `BLUEDB_LEASE_TTL_SECS/3`.
+//!   3. **In-memory** — else a single-process registry (heartbeat loop runs but
+//!      only this node is ever discoverable). Single-node / local default.
 //! - `BLUEDB_START_PASSIVE` — start as a read replica and wait for the HA loop
 //!   (or `POST /admin/promote`) to take the lease; default bootstraps to writer.
 //! - `BLUEDB_FLUSH_INTERVAL_MS` — WAL flush interval in ms (default 25). Set at
@@ -79,7 +97,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use bluedb_ha::{LeaseProvider, LocalLeaseProvider, PostgresLeaseProvider, SystemClock, WriterController};
+use bluedb_ha::{
+    InMemoryNodeRegistry, LeaseProvider, LocalLeaseProvider, NodeRegistry, PostgresLeaseProvider,
+    PostgresNodeRegistry, SystemClock, WriterController,
+};
 use bluedb_server::{authz::Authz, build_app, objstore, AppState};
 
 /// Default DRAM cache capacity for the analytical (Iceberg/Parquet) read tier.
@@ -95,6 +116,69 @@ fn parse_analytical_cache_bytes() -> usize {
 
 fn env_secs(key: &str, default: u64) -> Duration {
     Duration::from_secs(std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default))
+}
+
+/// This node's externally-reachable base URL, published to the node registry.
+///
+/// `BLUEDB_ADVERTISE_ADDR` when set; otherwise `http://<BLUEDB_ADDR>` (the bind
+/// address). The fallback is correct for a single host / local dev — behind a
+/// Service or load balancer set `BLUEDB_ADVERTISE_ADDR` to the routable address.
+fn advertise_url(bind_addr: &str) -> String {
+    std::env::var("BLUEDB_ADVERTISE_ADDR")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| format!("http://{bind_addr}"))
+}
+
+/// The port other nodes reach this coordinator on (for the K8s registry's URL
+/// derivation): `BLUEDB_K8S_PORT`, else the port parsed from `bind_addr`, else 8080.
+#[cfg(feature = "kubernetes")]
+fn coordinator_port(bind_addr: &str) -> u16 {
+    std::env::var("BLUEDB_K8S_PORT")
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok())
+        .or_else(|| bind_addr.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()))
+        .unwrap_or(8080)
+}
+
+/// Select + build the node-registry backend with documented precedence:
+/// Kubernetes (in-cluster + built with the feature) → Postgres (PG URL set) →
+/// in-memory. Returns the registry plus whether the caller must run a heartbeat
+/// loop (true for in-memory/Postgres; false for K8s, where readiness is the
+/// heartbeat). `pg_url` is the already-read `BLUEDB_LEASE_PG_URL` (reused so the
+/// registry shares the lease's Postgres).
+async fn build_node_registry(
+    pg_url: Option<&str>,
+    registry_ttl: Duration,
+    _bind_addr: &str,
+) -> anyhow::Result<(Arc<dyn NodeRegistry>, bool)> {
+    // 1. Kubernetes — only when in-cluster AND compiled with the feature.
+    #[cfg(feature = "kubernetes")]
+    {
+        if bluedb_ha::in_cluster() {
+            let namespace =
+                std::env::var("BLUEDB_K8S_NAMESPACE").unwrap_or_else(|_| "default".to_string());
+            let service = std::env::var("BLUEDB_K8S_SERVICE").unwrap_or_else(|_| "bluedb".to_string());
+            let port = coordinator_port(_bind_addr);
+            eprintln!(
+                "bluedb-server: node registry = kubernetes (service '{service}' in '{namespace}', port {port})"
+            );
+            let reg = bluedb_ha::K8sNodeRegistry::connect(namespace, service, port).await?;
+            // No heartbeat loop: K8s readiness is the liveness signal.
+            return Ok((Arc::new(reg), false));
+        }
+    }
+
+    // 2. Postgres — shared bluedb_nodes table, reusing the lease's PG URL.
+    if let Some(url) = pg_url {
+        eprintln!("bluedb-server: node registry = postgres (bluedb_nodes)");
+        let reg = PostgresNodeRegistry::connect(url, registry_ttl).await?;
+        return Ok((Arc::new(reg), true));
+    }
+
+    // 3. In-memory — single-process default.
+    eprintln!("bluedb-server: node registry = in-memory (single node)");
+    Ok((Arc::new(InMemoryNodeRegistry::new(registry_ttl)), true))
 }
 
 #[tokio::main]
@@ -127,13 +211,17 @@ async fn main() -> anyhow::Result<()> {
         object_store.clone()
     };
 
+    // Read the Postgres URL once — shared by the lease arbiter AND the node
+    // registry (the registry's bluedb_nodes table lives in the same Postgres).
+    let pg_url = std::env::var("BLUEDB_LEASE_PG_URL").ok().filter(|s| !s.trim().is_empty());
+
     // Lease arbiter: shared Postgres for real multi-node HA, else in-process.
-    let lease: Arc<dyn LeaseProvider> = match std::env::var("BLUEDB_LEASE_PG_URL") {
-        Ok(url) => {
+    let lease: Arc<dyn LeaseProvider> = match &pg_url {
+        Some(url) => {
             eprintln!("bluedb-server: lease arbiter = postgres");
-            Arc::new(PostgresLeaseProvider::connect(&url, db_path.clone()).await?)
+            Arc::new(PostgresLeaseProvider::connect(url, db_path.clone()).await?)
         }
-        Err(_) => {
+        None => {
             eprintln!("bluedb-server: lease arbiter = in-process (single writer)");
             Arc::new(LocalLeaseProvider::new())
         }
@@ -151,10 +239,24 @@ async fn main() -> anyhow::Result<()> {
     let admin_sql_enabled = std::env::var("BLUEDB_ENABLE_ADMIN_SQL")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+
+    // This node's externally-reachable URL + the node-registry backend. The URL
+    // is published to the registry so other nodes can later resolve `node_id → URL`
+    // (cross-node redirect / affinity routing — neither built yet). The registry
+    // ttl defaults to 3× the lease ttl (≈ a few missed heartbeats before a node is
+    // dropped). Built before the state's `Arc` is shared so `with_node_registry`'s
+    // `Arc::get_mut` succeeds.
+    let bind_addr = std::env::var("BLUEDB_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+    let advertise = advertise_url(&bind_addr);
+    let registry_ttl = env_secs("BLUEDB_NODE_REGISTRY_TTL_SECS", ttl.as_secs().saturating_mul(3).max(1));
+    let (node_registry, needs_heartbeat) =
+        build_node_registry(pg_url.as_deref(), registry_ttl, &bind_addr).await?;
+
     let mut state = AppState::new(object_store, db_path, writer)
         .with_analytical_cache(lakehouse_store)
-        .with_admin_sql_enabled(admin_sql_enabled)
-        .with_lakehouse_base(lakehouse_base);
+        .with_lakehouse_base(lakehouse_base)
+        .with_node_registry(node_registry.clone())
+        .with_admin_sql_enabled(admin_sql_enabled);
     if let Ok(raw) = std::env::var("BLUEDB_AUTHZ_TOKENS") {
         let authz = Authz::parse_env(&raw).expect("invalid BLUEDB_AUTHZ_TOKENS");
         state = state.with_authz(authz);
@@ -186,10 +288,29 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // Node-registry heartbeat loop: publish `(node_id, advertise_url)` on a timer
+    // well under the registry TTL so this node stays in `live_nodes()`. Skipped
+    // for the K8s backend (`needs_heartbeat == false`), where readiness is the
+    // heartbeat. The interval matches the lease-renew cadence (ttl/3).
+    if needs_heartbeat {
+        let hb_registry = node_registry.clone();
+        let hb_node_id = node_id.clone();
+        let hb_url = advertise.clone();
+        eprintln!("bluedb-server: registering as '{hb_node_id}' at {hb_url}");
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(tick);
+            loop {
+                ticker.tick().await; // fires immediately on the first tick → register at once
+                if let Err(err) = hb_registry.heartbeat(&hb_node_id, &hb_url).await {
+                    eprintln!("bluedb-server: node-registry heartbeat failed: {err}");
+                }
+            }
+        });
+    }
+
     let app = build_app(state);
-    let addr = std::env::var("BLUEDB_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    eprintln!("bluedb-server: listening on http://{addr}");
+    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+    eprintln!("bluedb-server: listening on http://{bind_addr}");
     axum::serve(listener, app).await?;
     Ok(())
 }

@@ -6,9 +6,13 @@ license.workspace = true
 description = "Single-writer high-availability for bluedb: a lease/fencing-token abstraction + a self-fencing writer controller."
 
 [features]
-# Opt-in Postgres-backed lease arbiter (the HA shared lease store). Off by
-# default so the core crate stays dependency-light.
+# Opt-in Postgres-backed lease arbiter + node registry (the HA shared stores).
+# Off by default so the core crate stays dependency-light.
 postgres = ["dep:tokio-postgres"]
+# Opt-in Kubernetes-native node registry (liveness from the K8s API, via kube-rs).
+# Off by default AND on non-K8s builds so the heavy kube/k8s-openapi deps are
+# never pulled unless explicitly requested.
+kubernetes = ["dep:kube", "dep:k8s-openapi"]
 
 [dependencies]
 tokio         = { workspace = true }
@@ -16,6 +20,14 @@ async-trait   = { workspace = true }
 anyhow        = { workspace = true }
 thiserror     = { workspace = true }
 tokio-postgres = { version = "0.7", optional = true }
+# Kubernetes node-registry deps — ONLY compiled under the `kubernetes` feature.
+# `kube` brings the typed client over the workspace's existing rustls/hyper
+# stack (no openssl); `k8s-openapi` provides the typed API objects (Pod /
+# EndpointSlice) and MUST pin exactly one Kubernetes API version via a feature
+# (`latest` tracks the newest the pinned k8s-openapi supports). The kube↔
+# k8s-openapi versions are paired (kube 0.99 ⇒ k8s-openapi 0.24).
+kube = { version = "0.99", optional = true, default-features = false, features = ["client", "rustls-tls"] }
+k8s-openapi = { version = "0.24", optional = true, features = ["latest"] }
 
 [dev-dependencies]
 # (none beyond the above)

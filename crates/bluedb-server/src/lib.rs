@@ -44,7 +44,7 @@ pub mod objstore;
 mod schema;
 
 use bluedb_engine::{rest_sql, EngineError, FtsEngine};
-use bluedb_ha::{HaError, Status, WriterController};
+use bluedb_ha::{HaError, NodeRegistry, Status, WriterController};
 use bluedb_ledger::Ledger;
 use arrow_array::RecordBatch;
 
@@ -264,6 +264,13 @@ struct Inner {
     /// (or injected directly in tests via [`AppState::with_signer`]). The private
     /// key never lives here in production — the `Vault` backend holds only a token.
     signer: Option<Arc<signer::EvidenceSigner>>,
+    /// Node registry: cross-node discovery of live coordinators and their
+    /// externally-reachable URLs, keyed by `node_id`. `None` until set at startup
+    /// via [`AppState::with_node_registry`] (`main` picks the backend). Foundation
+    /// for the later cross-node redirect (resolving the writer's URL via
+    /// `url_for(lease.holder)`) and affinity routing — neither built yet. Kept as
+    /// the deployment-selected backend (in-memory / Postgres / Kubernetes).
+    node_registry: Option<Arc<dyn NodeRegistry>>,
 }
 
 impl AppState {
@@ -294,8 +301,28 @@ impl AppState {
                 lakehouse_base: String::new(),
                 lakehouse: RwLock::new(None),
                 signer: None,
+                node_registry: None,
             }),
         }
+    }
+
+    /// Install the node registry (cross-node discovery). Must be called at
+    /// startup, before the `Arc<Inner>` is shared; `main` picks the backend
+    /// (in-memory / Postgres / Kubernetes). No-op once the state is shared. When
+    /// unset, discovery is unavailable (single-node / tests).
+    pub fn with_node_registry(mut self, registry: Arc<dyn NodeRegistry>) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.node_registry = Some(registry);
+        }
+        self
+    }
+
+    /// The node registry, if one was installed. Discovery of live coordinators
+    /// and their URLs (`live_nodes` / `url_for`). The later cross-node redirect
+    /// will resolve the writer's URL via `url_for(self.writer().node_id())` once
+    /// the lease holder is known; that consumer is not built yet.
+    pub fn node_registry(&self) -> Option<&Arc<dyn NodeRegistry>> {
+        self.inner.node_registry.as_ref()
     }
 
     /// Override the object store handed to the lakehouse/Iceberg mirror with a

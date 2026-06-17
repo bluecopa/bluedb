@@ -37,9 +37,19 @@ mod controller;
 mod lease;
 #[cfg(feature = "postgres")]
 mod postgres;
+mod registry;
+#[cfg(feature = "postgres")]
+mod registry_postgres;
+#[cfg(feature = "kubernetes")]
+mod registry_k8s;
 
 pub use clock::{Clock, SystemClock, TestClock};
 pub use controller::{HaError, Role, Status, WriterController};
 pub use lease::{Lease, LeaseProvider, LocalLeaseProvider};
 #[cfg(feature = "postgres")]
 pub use postgres::{PostgresLeaseProvider, LEASE_TABLE_DDL};
+pub use registry::{InMemoryNodeRegistry, NodeRegistry};
+#[cfg(feature = "postgres")]
+pub use registry_postgres::{PostgresNodeRegistry, NODES_TABLE_DDL};
+#[cfg(feature = "kubernetes")]
+pub use registry_k8s::{in_cluster, K8sNodeRegistry};
