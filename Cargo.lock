@@ -699,6 +699,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "bluedb-cache"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "foyer",
+ "futures",
+ "object_store",
+ "tokio",
+]
+
+[[package]]
 name = "bluedb-engine"
 version = "0.0.0"
 dependencies = [
