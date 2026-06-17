@@ -1,0 +1,33 @@
+# Common table expressions (SQL-99) — GlueSQL rejects the WITH clause; the
+# DataFusion front door plans them, including CTEs joined back to a base table.
+
+statement ok
+CREATE TABLE c (id INTEGER PRIMARY KEY, v INTEGER)
+
+statement ok
+INSERT INTO c VALUES (1,10),(2,20),(3,30),(4,40)
+
+# Single CTE.
+query I
+WITH evens AS (SELECT id FROM c WHERE id % 2 = 0) SELECT id FROM evens ORDER BY id
+----
+2
+4
+
+# CTE joined to the base table.
+query II
+WITH hi AS (SELECT id, v FROM c WHERE v >= 30)
+SELECT c.id, hi.v FROM c JOIN hi ON c.id = hi.id ORDER BY c.id
+----
+3 30
+4 40
+
+# Two CTEs combined.
+query I
+WITH lo AS (SELECT id FROM c WHERE id <= 2), hi AS (SELECT id FROM c WHERE id >= 3)
+SELECT id FROM lo UNION ALL SELECT id FROM hi ORDER BY id
+----
+1
+2
+3
+4

@@ -10,9 +10,17 @@
 
 use std::sync::Arc;
 
+use arrow_array::{
+    Array, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
+    Int8Array, LargeStringArray, RecordBatch, StringArray, UInt16Array, UInt32Array, UInt64Array,
+    UInt8Array,
+};
 use async_trait::async_trait;
-use bluedb_sql::SlateDbStorage;
+use bluedb_lakehouse::{object_store_file_io, LakehouseEngine};
+use bluedb_query::query_via_catalog;
+use bluedb_sql::{CdcConfig, Database, SlateDbStorage};
 use gluesql_core::prelude::{Glue, Payload, Value};
+use slatedb::object_store::ObjectStore;
 use slatedb::config::Settings;
 use slatedb::object_store::memory::InMemory;
 use slatedb::Db;
@@ -251,5 +259,156 @@ fn value_to_string(v: &Value) -> String {
         Value::F64(x) => x.to_string(),
         Value::Str(s) => s.clone(),
         other => format!("{other:?}"),
+    }
+}
+
+// ───────────────────────── DataFusion front-door backend ─────────────────────
+//
+// The second sqllogictest backend drives bluedb's **read front door** exactly as
+// the server does: a single top-level `SELECT` is planned + executed by DataFusion
+// over the `BluedbSchemaProvider` (joins / window functions / aggregates / CTEs /
+// set operations), while writes + DDL stay on the GlueSQL path. Point a corpus at
+// this backend to measure the analytical read dialect — the features GlueSQL
+// cannot serve and the front-door flip now does.
+
+/// A DataFusion / engine error, surfaced to sqllogictest as the backend `Error`.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct DfError(pub String);
+
+/// One sqllogictest "connection" for the read front door: a fresh in-memory
+/// SlateDB shared by a GlueSQL write connection and a [`LakehouseEngine`] whose
+/// tables DataFusion reads. Each `.slt` file gets its own, so files never share
+/// schema or rows.
+pub struct DataFusionTester {
+    db: Database,
+    eng: Arc<LakehouseEngine>,
+}
+
+impl DataFusionTester {
+    /// Open a brand-new in-memory engine: SlateDB → `Database` (GlueSQL writes) +
+    /// `LakehouseEngine` (DataFusion reads), both over the one object store.
+    pub async fn connect() -> Result<Self, DfError> {
+        // 1ms flush (vs SlateDB's 100ms default) keeps serial corpus loads fast;
+        // harness-only, does not touch bluedb-sql.
+        let settings = Settings {
+            flush_interval: Some(Duration::from_millis(1)),
+            ..Default::default()
+        };
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let raw = Db::builder("bluedb-slt-df", store.clone())
+            .with_settings(settings)
+            .build()
+            .await
+            .map_err(|e| DfError(format!("open slatedb: {e}")))?;
+        let db = Database::new(Arc::new(raw));
+        let file_io = object_store_file_io(store.clone(), "");
+        let eng =
+            LakehouseEngine::reopen(file_io, "lakehouse", "_", db.clone(), CdcConfig::default())
+                .await
+                .map_err(|e| DfError(format!("open lakehouse engine: {e}")))?;
+        Ok(Self {
+            db,
+            eng: Arc::new(eng),
+        })
+    }
+}
+
+#[async_trait]
+impl AsyncDB for DataFusionTester {
+    type Error = DfError;
+    type ColumnType = DefaultColumnType;
+
+    async fn run(&mut self, sql: &str) -> Result<DBOutput<Self::ColumnType>, Self::Error> {
+        // SET/PRAGMA session knobs: no-op (don't cascade-fail the rest of a file).
+        if is_ignorable_setting(sql) {
+            return Ok(DBOutput::StatementComplete(0));
+        }
+        if is_read(sql) {
+            // The read front door: DataFusion over the bluedb schema provider —
+            // the same entry point the server's `POST /sql` uses for SELECTs.
+            let batches = query_via_catalog(self.eng.clone(), sql, &[])
+                .await
+                .map_err(|e| DfError(e.to_string()))?;
+            return Ok(render_batches(&batches));
+        }
+        // Writes + DDL stay on the GlueSQL path, on the shared SlateDB.
+        let mut glue = Glue::new(self.db.connection_serialized());
+        let mut payloads = glue
+            .execute(sql)
+            .await
+            .map_err(|e| DfError(e.to_string()))?;
+        match payloads.pop() {
+            Some(p) => Ok(payload_to_output(p)),
+            None => Ok(DBOutput::StatementComplete(0)),
+        }
+    }
+
+    async fn shutdown(&mut self) {}
+
+    fn engine_name(&self) -> &str {
+        "datafusion-frontdoor"
+    }
+}
+
+/// Classify a statement as a read the same way the server's `/sql` front door does
+/// (`is_read_query`): a single top-level `SELECT`/`Query` goes to DataFusion;
+/// everything else (DDL / DML / SET) goes to the GlueSQL write path.
+fn is_read(sql: &str) -> bool {
+    use gluesql_core::sqlparser::ast::Statement;
+    match gluesql_core::parse_sql::parse(sql) {
+        Ok(stmts) if stmts.len() == 1 => matches!(stmts[0], Statement::Query(_)),
+        _ => false,
+    }
+}
+
+/// Render DataFusion result batches into sqllogictest's row/cell strings. The
+/// column count comes from the first batch; the [`lenient_validator`] makes the
+/// value comparison numeric-aware, so `11` and `11.0` match.
+fn render_batches(batches: &[RecordBatch]) -> DBOutput<DefaultColumnType> {
+    let width = batches.first().map(RecordBatch::num_columns).unwrap_or(0);
+    let mut rows = Vec::new();
+    for b in batches {
+        for r in 0..b.num_rows() {
+            let row = (0..b.num_columns())
+                .map(|c| render_cell(b.column(c).as_ref(), r))
+                .collect();
+            rows.push(row);
+        }
+    }
+    DBOutput::Rows {
+        types: vec![DefaultColumnType::Any; width],
+        rows,
+    }
+}
+
+/// Render one Arrow cell as the single token sqllogictest compares. Covers the
+/// scalar types the read dialect produces; other types fall back to a tagged
+/// debug form (a known rendering gap until a corpus needs them).
+fn render_cell(col: &dyn Array, i: usize) -> String {
+    use arrow_schema::DataType as Dt;
+    if col.is_null(i) {
+        return "NULL".to_string();
+    }
+    macro_rules! val {
+        ($t:ty) => {
+            col.as_any().downcast_ref::<$t>().unwrap().value(i)
+        };
+    }
+    match col.data_type() {
+        Dt::Boolean => val!(BooleanArray).to_string(),
+        Dt::Int8 => val!(Int8Array).to_string(),
+        Dt::Int16 => val!(Int16Array).to_string(),
+        Dt::Int32 => val!(Int32Array).to_string(),
+        Dt::Int64 => val!(Int64Array).to_string(),
+        Dt::UInt8 => val!(UInt8Array).to_string(),
+        Dt::UInt16 => val!(UInt16Array).to_string(),
+        Dt::UInt32 => val!(UInt32Array).to_string(),
+        Dt::UInt64 => val!(UInt64Array).to_string(),
+        Dt::Float32 => val!(Float32Array).to_string(),
+        Dt::Float64 => val!(Float64Array).to_string(),
+        Dt::Utf8 => val!(StringArray).to_string(),
+        Dt::LargeUtf8 => val!(LargeStringArray).to_string(),
+        other => format!("<{other:?}>"),
     }
 }

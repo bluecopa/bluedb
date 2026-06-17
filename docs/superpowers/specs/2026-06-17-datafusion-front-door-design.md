@@ -152,14 +152,37 @@ capable / more standard); writes are unchanged:
   query-guardrail,functions,expressions,query-syntax}.md`, `docs/index.md`,
   `docs/concepts/architecture.md`, `README.md`.
 
+### Read-dialect conformance harness (built 2026-06-17)
+
+A second sqllogictest backend, `DataFusionTester`, was added to `bluedb-sqltest`
+alongside the existing `GlueTester`. It drives the **read front door** exactly as
+the server does: a single top-level `SELECT` is planned + executed by DataFusion
+through `query_via_catalog` (the `BluedbSchemaProvider`), while writes/DDL run on
+the GlueSQL path — the same `is_read_query` split as `POST /sql`.
+
+- **Gated corpus** — `crates/bluedb-sqltest/df/*.slt` (basic, windows, cte, joins,
+  setops, aggregates, subquery, scalar, nulls, coercion) runs as a must-pass
+  `cargo test` (`tests/datafusion_conformance.rs`). Every record is hand-verified
+  against DataFusion semantics; the suite is green. This is the regression gate
+  proving the analytical dialect GlueSQL cannot serve.
+- **Coverage report** — the `conformance` binary gained `--engine glue|df`, so the
+  broad external SQLite/DuckDB corpus (`fetch_corpus.sh`) can be measured through
+  the DataFusion path too. On the 5 seed files the contrast is the flip itself:
+  GlueSQL accepts 27/30 (window/CTE rejected), DataFusion accepts 30/30.
+- **Divergence found + pinned** — `WHERE <decimal-col> = '9.99'` (decimal vs a
+  *quoted* number) matches on the old GlueSQL coerce shim but **not** on the
+  DataFusion front door (it coerces int-vs-string and decimal-vs-numeric, but not
+  decimal-vs-quoted-string). Captured in `df/coercion.slt`. A narrow edge; whether
+  to replicate the shim on the read path is a product decision, not a blocker.
+
 ### Still deferred (flagged)
 
 - **Secondary-index pushdown** — non-PK indexed predicates currently take the
   merge path (correct, not point-fast). Perf follow-up.
-- **Full DataFusion-dialect conformance corpus** — the existing storage
-  conformance suite (205) runs through the unchanged write/GlueSQL path; a
-  dedicated read-dialect sqllogictest corpus against DataFusion is a separate
-  harness, not built. The server + query suites are the current read-path proof.
+- **Broad read-dialect re-baseline** — the gated `df/` corpus is curated; running
+  the full external corpus through `--engine df` for a headline coverage number
+  (and triaging the PK-regime rejects, since the external corpus assumes PK-less
+  tables) is follow-on.
 - **PG-wire** (`datafusion-postgres`) — out of scope.
 - **HA-302 cross-node redirect** — a non-writer still 503s on a fresher-than-
   sealed read (no writer-URL resolution yet).

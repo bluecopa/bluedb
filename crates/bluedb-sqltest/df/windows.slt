@@ -1,0 +1,44 @@
+# Window functions (SQL:2003) — GlueSQL rejects WINDOW at translation time; the
+# DataFusion front door executes them correctly.
+
+statement ok
+CREATE TABLE s (id INTEGER PRIMARY KEY, grp TEXT, v INTEGER)
+
+statement ok
+INSERT INTO s VALUES (1,'a',10),(2,'a',20),(3,'b',30),(4,'b',40)
+
+# Running SUM ordered by id.
+query II
+SELECT id, SUM(v) OVER (ORDER BY id) FROM s ORDER BY id
+----
+1 10
+2 30
+3 60
+4 100
+
+# ROW_NUMBER by descending v.
+query II
+SELECT id, ROW_NUMBER() OVER (ORDER BY v DESC) FROM s ORDER BY id
+----
+1 4
+2 3
+3 2
+4 1
+
+# Partitioned running SUM.
+query TII
+SELECT grp, id, SUM(v) OVER (PARTITION BY grp ORDER BY id) FROM s ORDER BY grp, id
+----
+a 1 10
+a 2 30
+b 3 30
+b 4 70
+
+# LAG with a default for the first row of the window.
+query II
+SELECT id, LAG(v, 1, 0) OVER (ORDER BY id) FROM s ORDER BY id
+----
+1 0
+2 10
+3 20
+4 30

@@ -948,7 +948,11 @@ name = "bluedb-sqltest"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "arrow-array",
+ "arrow-schema",
  "async-trait",
+ "bluedb-lakehouse",
+ "bluedb-query",
  "bluedb-sql",
  "gluesql-core",
  "slatedb",

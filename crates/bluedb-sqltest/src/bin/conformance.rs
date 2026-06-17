@@ -19,7 +19,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use bluedb_sqltest::GlueTester;
+use bluedb_sqltest::{lenient_validator, DataFusionTester, GlueTester};
 use sqllogictest::{parse_file, DefaultColumnType, Record, Runner};
 
 enum Cat {
@@ -121,11 +121,58 @@ struct Tally {
     other: usize,
 }
 
+/// One corpus run's full result, so the per-engine run loop (a macro, since the
+/// two backends are distinct concrete types) can hand a single value back.
+struct Report {
+    t: Tally,
+    backlog: BTreeMap<String, usize>,
+    wrong_examples: Vec<String>,
+    other_examples: Vec<String>,
+    wrong_hashed: usize,
+    parse_errors: usize,
+}
+
+/// Which backend to score the corpus against.
+#[derive(Clone, Copy)]
+enum Engine {
+    /// GlueSQL write / storage path (the baseline).
+    Glue,
+    /// DataFusion read front door — every SELECT via `query_via_catalog`.
+    DataFusion,
+}
+
+impl Engine {
+    fn label(self) -> &'static str {
+        match self {
+            Engine::Glue => "gluesql-slatedb (write/storage path)",
+            Engine::DataFusion => "datafusion front door (read path)",
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let dir = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "crates/bluedb-sqltest/slt".to_string());
+    // Args: an optional corpus DIR (positional) and `--engine glue|df` (default
+    // glue). `--engine df` runs every single-SELECT through the DataFusion front
+    // door; non-SELECT records still run on the GlueSQL write path. Note the
+    // DataFusion path requires a PRIMARY KEY on every table, so PK-less corpus
+    // tables surface as rejects — an honest regime constraint, not a dialect gap.
+    let mut dir: Option<String> = None;
+    let mut engine = Engine::Glue;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--engine" => {
+                engine = match args.next().unwrap_or_default().as_str() {
+                    "df" | "datafusion" => Engine::DataFusion,
+                    "glue" | "gluesql" => Engine::Glue,
+                    other => anyhow::bail!("unknown --engine '{other}' (want glue|df)"),
+                };
+            }
+            other => dir = Some(other.to_string()),
+        }
+    }
+    let dir = dir.unwrap_or_else(|| "crates/bluedb-sqltest/slt".to_string());
 
     let mut files = Vec::new();
     collect(Path::new(&dir), &mut files);
@@ -134,93 +181,132 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("no .slt/.test files found under {dir}");
     }
 
-    let mut t = Tally::default();
-    let mut parse_errors = 0usize;
-    let mut backlog: BTreeMap<String, usize> = BTreeMap::new();
-    let mut wrong_examples: Vec<String> = Vec::new();
-    let mut other_examples: Vec<String> = Vec::new();
-    let mut wrong_hashed = 0usize;
+    // The per-file scoring loop is identical for both backends, but `Runner` is
+    // generic over the concrete connection type, so a macro stamps it out for each
+    // (cleaner than boxing an `AsyncDB` across the async boundary). `$make` is a
+    // fresh connection factory, re-evaluated per file.
+    macro_rules! run_all {
+        ($make:expr) => {{
+            let mut t = Tally::default();
+            let mut parse_errors = 0usize;
+            let mut backlog: BTreeMap<String, usize> = BTreeMap::new();
+            let mut wrong_examples: Vec<String> = Vec::new();
+            let mut other_examples: Vec<String> = Vec::new();
+            let mut wrong_hashed = 0usize;
 
-    for file in &files {
-        let records = match parse_file::<DefaultColumnType>(file) {
-            Ok(records) => records,
-            Err(e) => {
-                parse_errors += 1;
-                eprintln!("parse error: {} :: {e}", file.display());
-                continue;
-            }
-        };
+            for file in &files {
+                let records = match parse_file::<DefaultColumnType>(file) {
+                    Ok(records) => records,
+                    Err(e) => {
+                        parse_errors += 1;
+                        eprintln!("parse error: {} :: {e}", file.display());
+                        continue;
+                    }
+                };
 
-        // Fresh engine per file so files never see each other's state.
-        let mut runner = Runner::new(|| async { GlueTester::connect().await });
-        // The DuckDB corpus mixes tab-separated-row and one-value-per-line result
-        // layouts; accept either so correct-but-differently-laid-out results count.
-        runner.with_validator(bluedb_sqltest::lenient_validator);
+                // Fresh engine per file so files never see each other's state.
+                let mut runner = Runner::new($make);
+                // The DuckDB corpus mixes tab-separated-row and one-value-per-line
+                // result layouts; accept either so correct-but-differently-laid-out
+                // results count.
+                runner.with_validator(lenient_validator);
 
-        for record in records {
-            // Only statements and queries are scored; everything else (control,
-            // conditions, comments, hash-threshold, ...) is still applied so the
-            // runner state stays correct.
-            let scored_sql = match &record {
-                Record::Statement { sql, .. } | Record::Query { sql, .. } => Some(sql.clone()),
-                _ => None,
-            };
-            let outcome = runner.run_async(record).await;
-            let Some(sql) = scored_sql else { continue };
-
-            match outcome {
-                Ok(_) => t.pass += 1,
-                Err(e) => {
-                    let msg = e.to_string();
-                    match classify(&msg) {
-                        Cat::WrongResult => {
-                            t.wrong += 1;
-                            // Hashed results (corpus uses hash-threshold 8) need
-                            // byte-exact value formatting to match; literal-block
-                            // mismatches are more likely just rendering/order.
-                            if msg.contains("hashing") {
-                                wrong_hashed += 1;
-                            }
-                            if wrong_examples.len() < 12 {
-                                // Capture the value diff (lines after "[Diff]"),
-                                // ANSI stripped, so we can see expected (-) vs
-                                // actual (+) and tell rendering from real bugs.
-                                let diff: String = strip_ansi(&msg)
-                                    .lines()
-                                    .skip_while(|l| !l.contains("[Diff]"))
-                                    .skip(1)
-                                    .take(6)
-                                    .collect::<Vec<_>>()
-                                    .join("  ");
-                                wrong_examples.push(format!(
-                                    "{}\n      {}",
-                                    one_line(&sql),
-                                    diff.chars().take(200).collect::<String>()
-                                ));
-                            }
+                for record in records {
+                    // Only statements and queries are scored; everything else
+                    // (control, conditions, comments, hash-threshold, ...) is still
+                    // applied so the runner state stays correct.
+                    let scored_sql = match &record {
+                        Record::Statement { sql, .. } | Record::Query { sql, .. } => {
+                            Some(sql.clone())
                         }
-                        Cat::Unsupported => {
-                            t.unsupported += 1;
-                            *backlog.entry(feature_key(&msg)).or_default() += 1;
-                        }
-                        Cat::Cascade => t.cascade += 1,
-                        Cat::Other => {
-                            t.other += 1;
-                            if other_examples.len() < 8 {
-                                other_examples.push(format!("{}  ::  {}", one_line(&sql), feature_key(&msg)));
+                        _ => None,
+                    };
+                    let outcome = runner.run_async(record).await;
+                    let Some(sql) = scored_sql else { continue };
+
+                    match outcome {
+                        Ok(_) => t.pass += 1,
+                        Err(e) => {
+                            let msg = e.to_string();
+                            match classify(&msg) {
+                                Cat::WrongResult => {
+                                    t.wrong += 1;
+                                    // Hashed results (corpus uses hash-threshold 8)
+                                    // need byte-exact value formatting to match;
+                                    // literal-block mismatches are more likely just
+                                    // rendering/order.
+                                    if msg.contains("hashing") {
+                                        wrong_hashed += 1;
+                                    }
+                                    if wrong_examples.len() < 12 {
+                                        // Capture the value diff (lines after
+                                        // "[Diff]"), ANSI stripped, so we can see
+                                        // expected (-) vs actual (+) and tell
+                                        // rendering from real bugs.
+                                        let diff: String = strip_ansi(&msg)
+                                            .lines()
+                                            .skip_while(|l| !l.contains("[Diff]"))
+                                            .skip(1)
+                                            .take(6)
+                                            .collect::<Vec<_>>()
+                                            .join("  ");
+                                        wrong_examples.push(format!(
+                                            "{}\n      {}",
+                                            one_line(&sql),
+                                            diff.chars().take(200).collect::<String>()
+                                        ));
+                                    }
+                                }
+                                Cat::Unsupported => {
+                                    t.unsupported += 1;
+                                    *backlog.entry(feature_key(&msg)).or_default() += 1;
+                                }
+                                Cat::Cascade => t.cascade += 1,
+                                Cat::Other => {
+                                    t.other += 1;
+                                    if other_examples.len() < 8 {
+                                        other_examples.push(format!(
+                                            "{}  ::  {}",
+                                            one_line(&sql),
+                                            feature_key(&msg)
+                                        ));
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
-        }
+
+            Report {
+                t,
+                backlog,
+                wrong_examples,
+                other_examples,
+                wrong_hashed,
+                parse_errors,
+            }
+        }};
     }
+
+    let Report {
+        t,
+        backlog,
+        wrong_examples,
+        other_examples,
+        wrong_hashed,
+        parse_errors,
+    } = match engine {
+        Engine::Glue => run_all!(|| async { GlueTester::connect().await }),
+        Engine::DataFusion => run_all!(|| async { DataFusionTester::connect().await }),
+    };
 
     let scored = t.pass + t.unsupported + t.wrong + t.cascade + t.other;
     let accepted = t.pass + t.wrong;
     let rejected = t.unsupported + t.other;
 
     println!("\n========== STANDARD-SQL CONFORMANCE BASELINE ==========");
+    println!("engine: {}", engine.label());
     println!("files: {}   (parse errors: {parse_errors})", files.len());
     println!("scored records (statements + queries): {scored}");
     println!();

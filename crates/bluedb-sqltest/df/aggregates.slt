@@ -1,0 +1,46 @@
+# Aggregation — GROUP BY / HAVING / COUNT / SUM / AVG / MIN / MAX / DISTINCT
+# through the DataFusion front door.
+
+statement ok
+CREATE TABLE g (id INTEGER PRIMARY KEY, grp TEXT, v INTEGER)
+
+statement ok
+INSERT INTO g VALUES (1,'a',10),(2,'a',20),(3,'b',30),(4,'b',40),(5,'b',50)
+
+# GROUP BY with COUNT + SUM.
+query TII
+SELECT grp, COUNT(*), SUM(v) FROM g GROUP BY grp ORDER BY grp
+----
+a 2 30
+b 3 120
+
+# AVG produces a floating result.
+query TR
+SELECT grp, AVG(v) FROM g GROUP BY grp ORDER BY grp
+----
+a 15
+b 40
+
+# HAVING filters groups.
+query TI
+SELECT grp, SUM(v) FROM g GROUP BY grp HAVING SUM(v) > 100 ORDER BY grp
+----
+b 120
+
+# COUNT(DISTINCT).
+query I
+SELECT COUNT(DISTINCT grp) FROM g
+----
+2
+
+# MIN / MAX.
+query II
+SELECT MIN(v), MAX(v) FROM g
+----
+10 50
+
+# Global aggregate (no GROUP BY).
+query I
+SELECT SUM(v) FROM g
+----
+150
