@@ -30,7 +30,9 @@ use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
 use iceberg_datafusion::IcebergStaticTableProvider;
 
+mod catalog;
 mod provider;
+pub use catalog::BluedbSchemaProvider;
 pub use provider::{BluedbTableProvider, ProviderStats};
 
 /// Run `sql` against the current sealed Iceberg snapshot of `table` using
