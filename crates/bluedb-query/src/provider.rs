@@ -34,6 +34,11 @@ use datafusion::scalar::ScalarValue;
 use gluesql_core::data::Key;
 use iceberg_datafusion::IcebergStaticTableProvider;
 
+/// The composite-PK surrogate column name (mirrors `bluedb_sql::compositepk::PK_COL`).
+/// Hidden from the provider's user-facing schema and projected out of results,
+/// while the merge still references it internally for the anti-join.
+const SURROGATE_PK: &str = "__bluedb_pk";
+
 /// Per-provider counters proving which read path each scan took.
 #[derive(Default, Debug)]
 pub struct ProviderStats {
@@ -79,16 +84,31 @@ impl BluedbTableProvider {
     /// once. Errors if the table does not exist or has no single-column primary
     /// key (PK-less tables are rejected — the pushdown / merge keys on the PK).
     pub async fn try_new(engine: Arc<LakehouseEngine>, table: &str) -> anyhow::Result<Self> {
-        let schema = engine
+        let full_schema = engine
             .arrow_schema_for(table)
             .await?
             .ok_or_else(|| anyhow::anyhow!("table '{table}' does not exist"))?;
         let pk_name = engine.pk_column_name(table).await?;
-        let pk_type = schema
+        let pk_type = full_schema
             .field_with_name(&pk_name)
             .map_err(|e| anyhow::anyhow!("pk column '{pk_name}' not in schema: {e}"))?
             .data_type()
             .clone();
+        // Hide the composite-PK surrogate from the user-facing schema.
+        let schema: SchemaRef = if full_schema.fields().iter().any(|f| f.name() == SURROGATE_PK) {
+            let fields: Vec<_> = full_schema
+                .fields()
+                .iter()
+                .filter(|f| f.name() != SURROGATE_PK)
+                .cloned()
+                .collect();
+            Arc::new(arrow_schema::Schema::new_with_metadata(
+                fields,
+                full_schema.metadata().clone(),
+            ))
+        } else {
+            full_schema
+        };
         Ok(Self {
             engine,
             table: table.to_string(),
@@ -184,17 +204,22 @@ impl BluedbTableProvider {
             }
         };
 
-        // Apply DataFusion's projection (indices into our schema) and limit.
-        let merged = match projection {
-            Some(idxs) => {
-                let names: Vec<&str> = idxs
-                    .iter()
-                    .map(|i| self.schema.field(*i).name().as_str())
-                    .collect();
-                merged.select_columns(&names)?
-            }
-            None => merged,
+        // Project to the provider's user-facing columns (indices into our
+        // schema) — this also drops the composite-PK surrogate the union carries
+        // internally — then apply the limit.
+        let names: Vec<&str> = match projection {
+            Some(idxs) => idxs
+                .iter()
+                .map(|i| self.schema.field(*i).name().as_str())
+                .collect(),
+            None => self
+                .schema
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect(),
         };
+        let merged = merged.select_columns(&names)?;
         let merged = match limit {
             Some(n) => merged.limit(0, Some(n))?,
             None => merged,

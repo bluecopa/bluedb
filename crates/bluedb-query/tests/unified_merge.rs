@@ -299,6 +299,38 @@ async fn ryw_union_on_composite_pk_table() {
     );
 }
 
+/// Claim 3b: `SELECT *` on a composite-PK table hides the internal
+/// `__bluedb_pk` surrogate column — the user sees only their declared columns.
+#[tokio::test]
+async fn composite_select_star_hides_surrogate() {
+    let (db, cdc, eng) = make_engine().await;
+    eng.enable_table("t").await.unwrap();
+    {
+        let mut g = Glue::new(db.connection_serialized());
+        exec_cpk(
+            &mut g,
+            "CREATE TABLE t (a INTEGER, b TEXT, v INTEGER, PRIMARY KEY (a, b))",
+        )
+        .await;
+    }
+    {
+        let mut g = Glue::new(db.connection_with_cdc(cdc.clone()));
+        exec_cpk(&mut g, "INSERT INTO t (a, b, v) VALUES (1, 'x', 10)").await;
+    }
+    eng.seal().await.unwrap();
+
+    let batches = query_sql_unified(eng.clone(), "t", "SELECT * FROM t")
+        .await
+        .expect("composite SELECT * should succeed");
+    let schema = batches[0].schema();
+    let cols: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+    assert_eq!(
+        cols,
+        vec!["a".to_string(), "b".to_string(), "v".to_string()],
+        "SELECT * must hide the __bluedb_pk surrogate: {cols:?}"
+    );
+}
+
 /// Claim 4: a PK-less table is rejected — the merge has no key to anti-join on.
 #[tokio::test]
 async fn merged_record_batch_errors_on_pk_less_table() {
