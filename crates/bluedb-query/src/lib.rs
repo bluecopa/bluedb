@@ -141,7 +141,7 @@ pub async fn query_sql_fresh(
 /// - `table` does not exist, or has no single-column primary key.
 /// - `sql` is malformed, or DataFusion / Iceberg I/O fails.
 pub async fn query_sql_unified(
-    engine: &LakehouseEngine,
+    engine: Arc<LakehouseEngine>,
     table: &str,
     sql: &str,
 ) -> anyhow::Result<Vec<RecordBatch>> {
@@ -149,29 +149,22 @@ pub async fn query_sql_unified(
 }
 
 /// Like [`query_sql_unified`] but registers **several** tables, so `sql` may JOIN
-/// across them. Each table is read as its own read-your-writes union; DataFusion
-/// then plans the join / window / aggregate over the merged providers — the
-/// mechanism by which multi-table and window-function support "fall out" of the
-/// front-door flip (GlueSQL handles neither correctly).
-///
-/// First cut: each merged table is registered as an in-memory provider (the
-/// spike's stand-in for the pushdown-capable `TableProvider`). The PK fast-path
-/// (predicate pushdown straight to the row store) is the next spike step.
+/// across them. Each table is registered as a [`BluedbTableProvider`]; DataFusion
+/// then plans the join / window / aggregate over them — the mechanism by which
+/// multi-table and window-function support "fall out" of the front-door flip
+/// (GlueSQL handles neither correctly). The provider serves each table as the
+/// streaming Iceberg ∪ unsealed-tail union (or a row-store point read for a PK
+/// filter).
 pub async fn query_sql_unified_multi(
-    engine: &LakehouseEngine,
+    engine: Arc<LakehouseEngine>,
     tables: &[&str],
     sql: &str,
 ) -> anyhow::Result<Vec<RecordBatch>> {
     let ctx = SessionContext::new();
     for &table in tables {
-        let batch = engine
-            .merged_record_batch(table)
+        let provider = BluedbTableProvider::try_new(engine.clone(), table)
             .await
-            .with_context(|| format!("building unified read of '{table}'"))?
-            .ok_or_else(|| anyhow!("table '{table}' does not exist"))?;
-        let schema = batch.schema();
-        let provider = MemTable::try_new(schema, vec![vec![batch]])
-            .with_context(|| format!("building merged provider for '{table}'"))?;
+            .with_context(|| format!("building provider for '{table}'"))?;
         ctx.register_table(table, Arc::new(provider))
             .with_context(|| format!("registering '{table}' in DataFusion session"))?;
     }

@@ -5,15 +5,17 @@
 //!   - a `pk = <literal>` filter → a point read from the row store (SlateDB,
 //!     always fresh), **never touching Iceberg** — the OLTP fast path that keeps
 //!     PK reads cheap after the front-door flip;
-//!   - anything else → the exact read-your-writes union (Iceberg ∪ unsealed CDC
-//!     tail) via [`LakehouseEngine::merged_record_batch`] — the OLAP path.
+//!   - anything else → the exact read-your-writes union, built as a **streaming**
+//!     plan: the sealed Iceberg snapshot streams from Parquet, anti-joined
+//!     against the unsealed CDC tail's touched keys, `UNION ALL` the tail's
+//!     upserts. Only the small tail is held in memory — the bulk never is.
+//!
+//! The anti-join is expressed as SQL `NOT IN`, so it is key-type-agnostic: a
+//! single-column PK and the composite-PK `__bluedb_pk BYTEA` surrogate are
+//! handled the same way.
 //!
 //! A [`ProviderStats`] counter records which path each scan took, so a test can
 //! prove a PK read skips Iceberg.
-//!
-//! Spike scope: the row-store side and the merge side each materialize into an
-//! in-memory provider before handing back to DataFusion; a streaming
-//! `ExecutionPlan` (and secondary-index pushdown) is the productionization.
 
 use std::any::Any;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -27,8 +29,10 @@ use datafusion::datasource::MemTable;
 use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
 use gluesql_core::data::Key;
+use iceberg_datafusion::IcebergStaticTableProvider;
 
 /// Per-provider counters proving which read path each scan took.
 #[derive(Default, Debug)]
@@ -43,7 +47,7 @@ impl ProviderStats {
         self.fast_path.load(Ordering::Relaxed)
     }
 
-    /// Scans served by the Iceberg ∪ unsealed-tail merge path.
+    /// Scans served by the streaming Iceberg ∪ unsealed-tail merge path.
     pub fn merge_path(&self) -> usize {
         self.merge_path.load(Ordering::Relaxed)
     }
@@ -51,7 +55,7 @@ impl ProviderStats {
 
 /// A DataFusion [`TableProvider`] over one bluedb table that forks per predicate:
 /// PK equality → row-store point read (fresh, skips Iceberg); everything else →
-/// the read-your-writes Iceberg ∪ tail merge.
+/// the streaming read-your-writes Iceberg ∪ tail merge.
 pub struct BluedbTableProvider {
     engine: Arc<LakehouseEngine>,
     table: String,
@@ -92,6 +96,82 @@ impl BluedbTableProvider {
     /// provider in `Arc<dyn TableProvider>` to observe routing from a test.
     pub fn stats_handle(&self) -> Arc<ProviderStats> {
         self.stats.clone()
+    }
+
+    /// The OLAP path: a streaming plan unioning the sealed Iceberg snapshot (read
+    /// columnar from Parquet) with the unsealed CDC tail, anti-joined on the PK.
+    async fn scan_merge(
+        &self,
+        projection: Option<&Vec<usize>>,
+        limit: Option<usize>,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let merge_err = |ctx: &str, e: String| DataFusionError::Execution(format!("{ctx}: {e}"));
+        let inner = SessionContext::new();
+
+        // Tail: upserts + the touched-key set (both small, in-memory).
+        let (upserts, touched) = self
+            .engine
+            .unsealed_delta(&self.table)
+            .await
+            .map_err(|e| merge_err("unsealed delta", e.to_string()))?;
+        inner.register_table(
+            "__dup",
+            Arc::new(MemTable::try_new(upserts.schema(), vec![vec![upserts]])?),
+        )?;
+        inner.register_table(
+            "__dk",
+            Arc::new(MemTable::try_new(touched.schema(), vec![vec![touched]])?),
+        )?;
+
+        // Bulk: the sealed Iceberg snapshot streams from Parquet (no whole-table
+        // materialization). Absent until the first seal.
+        let has_iceberg = match self
+            .engine
+            .current_iceberg_table(&self.table)
+            .await
+            .map_err(|e| merge_err("load iceberg", e.to_string()))?
+        {
+            Some(t) => {
+                let p = IcebergStaticTableProvider::try_new_from_table(t)
+                    .await
+                    .map_err(|e| merge_err("iceberg provider", e.to_string()))?;
+                inner.register_table("__ice", Arc::new(p))?;
+                true
+            }
+            None => false,
+        };
+
+        let pk = &self.pk_name;
+        // Iceberg rows whose PK is NOT touched by the tail, UNION ALL the tail's
+        // surviving upserts. `NOT IN` is key-type-agnostic (int / utf8 / the
+        // composite-PK BYTEA surrogate alike).
+        let merged = if has_iceberg {
+            let ice = inner
+                .sql(&format!(
+                    "SELECT * FROM __ice WHERE \"{pk}\" NOT IN (SELECT \"{pk}\" FROM __dk)"
+                ))
+                .await?;
+            ice.union(inner.table("__dup").await?)?
+        } else {
+            inner.table("__dup").await?
+        };
+
+        // Apply DataFusion's projection (indices into our schema) and limit.
+        let merged = match projection {
+            Some(idxs) => {
+                let names: Vec<&str> = idxs
+                    .iter()
+                    .map(|i| self.schema.field(*i).name().as_str())
+                    .collect();
+                merged.select_columns(&names)?
+            }
+            None => merged,
+        };
+        let merged = match limit {
+            Some(n) => merged.limit(0, Some(n))?,
+            None => merged,
+        };
+        merged.create_physical_plan().await
     }
 }
 
@@ -135,31 +215,20 @@ impl TableProvider for BluedbTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        let batch = match filters.iter().find_map(|f| pk_eq_key(f, &self.pk_name)) {
-            Some(key) => {
-                // OLTP fast path: point-read the row store, skip Iceberg.
-                self.stats.fast_path.fetch_add(1, Ordering::Relaxed);
-                self.engine
-                    .record_batch_for_pk(&self.table, key)
-                    .await
-                    .map_err(|e| DataFusionError::Execution(format!("pk fast path: {e}")))?
-            }
-            None => {
-                // OLAP path: exact read-your-writes union (Iceberg ∪ tail).
-                self.stats.merge_path.fetch_add(1, Ordering::Relaxed);
-                self.engine
-                    .merged_record_batch(&self.table)
-                    .await
-                    .map_err(|e| DataFusionError::Execution(format!("merge path: {e}")))?
-                    .ok_or_else(|| {
-                        DataFusionError::Execution(format!("table '{}' does not exist", self.table))
-                    })?
-            }
-        };
-        let mem = MemTable::try_new(self.schema.clone(), vec![vec![batch]])?;
-        // Non-PK filters are reported Unsupported, so DataFusion applies them in a
-        // FilterExec above this scan; nothing is pushed into the in-memory source.
-        mem.scan(state, projection, &[], limit).await
+        if let Some(key) = filters.iter().find_map(|f| pk_eq_key(f, &self.pk_name)) {
+            // OLTP fast path: point-read the row store, skip Iceberg.
+            self.stats.fast_path.fetch_add(1, Ordering::Relaxed);
+            let batch = self
+                .engine
+                .record_batch_for_pk(&self.table, key)
+                .await
+                .map_err(|e| DataFusionError::Execution(format!("pk fast path: {e}")))?;
+            let mem = MemTable::try_new(self.schema.clone(), vec![vec![batch]])?;
+            return mem.scan(state, projection, &[], limit).await;
+        }
+        // OLAP path: the streaming Iceberg ∪ tail merge.
+        self.stats.merge_path.fetch_add(1, Ordering::Relaxed);
+        self.scan_merge(projection, limit).await
     }
 }
 
@@ -183,8 +252,8 @@ fn pk_eq_key(filter: &Expr, pk_name: &str) -> Option<Key> {
     scalar_to_key(lit)
 }
 
-/// Convert a DataFusion literal to a gluesql primary [`Key`] (spike: the common
-/// single-column PK types).
+/// Convert a DataFusion literal to a gluesql primary [`Key`] (the common
+/// single-column PK types; composite-PK point reads fall to the merge path).
 fn scalar_to_key(v: &ScalarValue) -> Option<Key> {
     match v {
         ScalarValue::Int64(Some(n)) => Some(Key::I64(*n)),

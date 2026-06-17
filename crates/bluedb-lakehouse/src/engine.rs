@@ -749,6 +749,40 @@ impl LakehouseEngine {
         Ok(Some(merged))
     }
 
+    /// The unsealed CDC tail of `table` as Arrow, for the streaming analytical
+    /// merge: `(upserts, touched_keys)` — the upsert rows (full table schema) and
+    /// a batch whose primary-key column carries every key touched since the last
+    /// seal (the anti-join set: upserts *and* tombstones). Both are bounded by the
+    /// seal cadence. Errors if `table` has no single-column primary key.
+    ///
+    /// Unlike [`Self::merged_record_batch`] (which eagerly reads and concatenates
+    /// the whole Iceberg snapshot), this returns only the small delta — the
+    /// caller streams the Iceberg bulk separately and joins.
+    pub async fn unsealed_delta(
+        &self,
+        table: &str,
+    ) -> Result<(arrow_array::RecordBatch, arrow_array::RecordBatch)> {
+        let schema = self.fetch_schema(table).await?;
+        single_pk_index(&schema)?;
+        let writer = self.writer_for(table, &schema, &[]).await?;
+        let sealed_seq = writer.current_watermark().unwrap_or(0);
+        let entries = self
+            .db
+            .scan_cdc(&self.tenant, sealed_seq)
+            .await
+            .map_err(LakehouseError::Sql)?;
+        let mut collapsed = collapse_lww(entries);
+        let changes = collapsed.remove(table).unwrap_or_default();
+        let touched: Vec<&gluesql_core::data::Key> = changes.keys().collect();
+        let touched_batch = writer.keys_to_delete_batch(&touched)?;
+        let upsert_rows: Vec<(gluesql_core::data::Key, DataRow)> = changes
+            .iter()
+            .filter_map(|(k, row)| row.clone().map(|r| (k.clone(), r)))
+            .collect();
+        let upserts = writer.rows_to_record_batch(&upsert_rows)?;
+        Ok((upserts, touched_batch))
+    }
+
     /// The Arrow schema of `table` (the schema shared by the seal path and the
     /// Iceberg read-back), or `None` if the table does not exist. Errors if the
     /// table has no single-column primary key.

@@ -385,7 +385,7 @@ impl LakehouseWriter {
     /// `NOT NULL` non-PK column — e.g. a composite-key component — would
     /// otherwise fail `RecordBatch` validation even though those values are
     /// discarded.
-    fn keys_to_delete_batch(&self, keys: &[&Key]) -> Result<RecordBatch> {
+    pub fn keys_to_delete_batch(&self, keys: &[&Key]) -> Result<RecordBatch> {
         let full = schema_to_arrow_schema(&self.schema)?;
         let pk_values: Vec<Value> = keys.iter().map(|k| key_to_value(k)).collect();
         let mut fields = Vec::with_capacity(full.fields().len());
