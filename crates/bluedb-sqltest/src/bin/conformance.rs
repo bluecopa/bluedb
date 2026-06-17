@@ -37,8 +37,10 @@ fn classify(msg: &str) -> Cat {
         Cat::WrongResult
     } else if m.contains("unsupported") || m.contains("not supported") {
         Cat::Unsupported
-    } else if m.contains("table not found") || m.contains("does not exist") || m.contains("not exists") {
+    } else if m.contains("not found") || m.contains("does not exist") || m.contains("not exists") {
         // Downstream of an earlier failed CREATE/INSERT — not a feature gap.
+        // DataFusion words it "table 'x' not found" (name between the words), so
+        // match the looser "not found" rather than the literal "table not found".
         Cat::Cascade
     } else {
         Cat::Other

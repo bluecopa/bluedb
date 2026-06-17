@@ -290,6 +290,10 @@ pub struct DfError(pub String);
 pub struct DataFusionTester {
     db: Database,
     eng: Arc<LakehouseEngine>,
+    /// `CREATE VIEW` definitions (CTE-inlined body) captured and inlined into
+    /// later reads — neither GlueSQL nor the front door persists views, exactly
+    /// as `GlueTester` handles them.
+    views: std::collections::HashMap<String, String>,
 }
 
 impl DataFusionTester {
@@ -317,6 +321,7 @@ impl DataFusionTester {
         Ok(Self {
             db,
             eng: Arc::new(eng),
+            views: std::collections::HashMap::new(),
         })
     }
 }
@@ -327,17 +332,33 @@ impl AsyncDB for DataFusionTester {
     type ColumnType = DefaultColumnType;
 
     async fn run(&mut self, sql: &str) -> Result<DBOutput<Self::ColumnType>, Self::Error> {
-        // SET/PRAGMA session knobs: no-op (don't cascade-fail the rest of a file).
-        if is_ignorable_setting(sql) {
+        // SET/PRAGMA session knobs (incl. `default_null_order`): no-op. DataFusion
+        // orders NULLs in the query itself, so a session default is a harmless
+        // no-op here — and rejecting it would cascade-fail the rest of a file.
+        if is_ignorable_setting(sql) || bluedb_sql::parse_default_null_order(sql).is_some() {
+            return Ok(DBOutput::StatementComplete(0));
+        }
+        // GlueSQL and the front door have no views: capture `CREATE VIEW` bodies
+        // (CTE-inlined) and inline references into later reads; swallow `DROP VIEW`.
+        if let Some((name, body)) = bluedb_sql::parse_create_view(sql) {
+            self.views.insert(name, bluedb_sql::inline_ctes(&body));
+            return Ok(DBOutput::StatementComplete(0));
+        }
+        if let Some(names) = bluedb_sql::parse_drop_view(sql) {
+            for name in names {
+                self.views.remove(&name);
+            }
             return Ok(DBOutput::StatementComplete(0));
         }
         if is_read(sql) {
             // The read front door: DataFusion over the bluedb schema provider —
-            // the same path the server's `POST /sql` uses for SELECTs. Keyless
-            // corpus tables (which the product rejects at its DDL surface) are
-            // materialized as in-memory tables here so the read can still be
-            // planned — harness only; see `CorpusSchemaProvider`.
-            let batches = query_via_corpus(self.eng.clone(), self.db.clone(), sql)
+            // the same path the server's `POST /sql` uses for SELECTs. Views are
+            // inlined first (no view support below); keyless corpus tables (which
+            // the product rejects at its DDL surface) are materialized as in-memory
+            // tables so the read can still be planned — harness only; see
+            // `CorpusSchemaProvider`.
+            let sql = bluedb_sql::inline_views(sql, &self.views);
+            let batches = query_via_corpus(self.eng.clone(), self.db.clone(), &sql)
                 .await
                 .map_err(|e| DfError(e.to_string()))?;
             return Ok(render_batches(&batches));
@@ -419,6 +440,10 @@ fn render_cell(col: &dyn Array, i: usize) -> String {
         Dt::Float64 => val!(Float64Array).to_string(),
         Dt::Utf8 => val!(StringArray).to_string(),
         Dt::LargeUtf8 => val!(LargeStringArray).to_string(),
+        // An all-null / typed-null column (e.g. `BIT_AND(NULL)`): every cell is
+        // null, which the `is_null` guard above already renders, but the column's
+        // own type is `Null` — render it as NULL rather than a debug tag.
+        Dt::Null => "NULL".to_string(),
         other => format!("<{other:?}>"),
     }
 }
