@@ -839,6 +839,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrow-array",
+ "bluedb-cache",
  "bluedb-lakehouse",
  "bluedb-sql",
  "datafusion",
@@ -868,6 +869,7 @@ dependencies = [
  "arrow-schema",
  "axum",
  "base64",
+ "bluedb-cache",
  "bluedb-engine",
  "bluedb-evidence",
  "bluedb-ha",

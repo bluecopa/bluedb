@@ -201,6 +201,12 @@ pub struct AppState {
 struct Inner {
     /// Object store + SlateDB path the writer/reader open against.
     object_store: Arc<dyn ObjectStore>,
+    /// Object store handed to the lakehouse/Iceberg mirror.  Normally the same
+    /// `Arc` as `object_store`, but on nodes whose `BLUEDB_ANALYTICAL_CACHE_BYTES`
+    /// is non-zero it is a `CachingObjectStore` wrapping a clone of the raw store
+    /// (so SlateDB — which has its own internal foyer block cache — is never
+    /// double-cached, while Iceberg files benefit from the DRAM read cache).
+    lakehouse_object_store: Arc<dyn ObjectStore>,
     db_path: String,
     /// Single-writer lease controller (HA election + self-fencing).
     writer: Arc<WriterController>,
@@ -272,6 +278,9 @@ impl AppState {
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
+                // lakehouse_object_store defaults to the raw store; callers that
+                // want the analytical read cache call `with_analytical_cache`.
+                lakehouse_object_store: object_store.clone(),
                 object_store,
                 db_path: db_path.into(),
                 writer,
@@ -287,6 +296,17 @@ impl AppState {
                 signer: None,
             }),
         }
+    }
+
+    /// Override the object store handed to the lakehouse/Iceberg mirror with a
+    /// pre-built (e.g. `CachingObjectStore`-wrapped) store.  Must be called at
+    /// startup, before `Arc<Inner>` is shared (`main` does this).  Silently
+    /// ignored after the state is shared.
+    pub fn with_analytical_cache(mut self, store: Arc<dyn ObjectStore>) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.lakehouse_object_store = store;
+        }
+        self
     }
 
     /// Set the fully-qualified storage base URI the lakehouse mirror publishes
@@ -496,7 +516,9 @@ impl AppState {
         } else {
             format!("{base}/{}", lakehouse_root())
         };
-        let file_io = object_store_file_io(self.inner.object_store.clone(), base);
+        // Use the lakehouse-specific store (may be a CachingObjectStore wrapper
+        // when BLUEDB_ANALYTICAL_CACHE_BYTES is set); SlateDB keeps the raw store.
+        let file_io = object_store_file_io(self.inner.lakehouse_object_store.clone(), base);
         // Stop a prior manager (re-promote) before opening a fresh one.
         if let Some(old) = self.inner.lakehouse.write().await.take() {
             old.shutdown();

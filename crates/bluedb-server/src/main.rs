@@ -82,6 +82,17 @@ use std::time::Duration;
 use bluedb_ha::{LeaseProvider, LocalLeaseProvider, PostgresLeaseProvider, SystemClock, WriterController};
 use bluedb_server::{authz::Authz, build_app, objstore, AppState};
 
+/// Default DRAM cache capacity for the analytical (Iceberg/Parquet) read tier.
+/// `BLUEDB_ANALYTICAL_CACHE_BYTES=0` disables the cache entirely.
+const DEFAULT_ANALYTICAL_CACHE_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
+
+fn parse_analytical_cache_bytes() -> usize {
+    std::env::var("BLUEDB_ANALYTICAL_CACHE_BYTES")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_ANALYTICAL_CACHE_BYTES)
+}
+
 fn env_secs(key: &str, default: u64) -> Duration {
     Duration::from_secs(std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default))
 }
@@ -94,6 +105,27 @@ async fn main() -> anyhow::Result<()> {
     // warehouse can resolve them); the FileIO strips it back to object-store keys.
     let lakehouse_base = objstore_cfg.base_uri();
     let object_store = objstore::build_object_store(&objstore_cfg)?;
+
+    // Analytical read cache: wrap a clone of the raw store with CachingObjectStore
+    // so DataFusion/Iceberg Parquet reads are served from DRAM on repeated queries.
+    // SlateDB keeps the raw `object_store` (it manages its own foyer block cache
+    // internally; double-caching it would waste DRAM without benefit).
+    let analytical_cache_bytes = parse_analytical_cache_bytes();
+    let lakehouse_store = if analytical_cache_bytes > 0 {
+        eprintln!(
+            "bluedb-server: analytical read cache = {} MiB DRAM",
+            analytical_cache_bytes / (1024 * 1024)
+        );
+        let cached = bluedb_cache::CachingObjectStoreBuilder::new(object_store.clone())
+            .dram_bytes(analytical_cache_bytes)
+            .build()
+            .await
+            .map_err(|e| anyhow::anyhow!("build analytical cache: {e}"))?;
+        Arc::new(cached) as Arc<dyn slatedb::object_store::ObjectStore>
+    } else {
+        eprintln!("bluedb-server: analytical read cache = disabled");
+        object_store.clone()
+    };
 
     // Lease arbiter: shared Postgres for real multi-node HA, else in-process.
     let lease: Arc<dyn LeaseProvider> = match std::env::var("BLUEDB_LEASE_PG_URL") {
@@ -120,6 +152,7 @@ async fn main() -> anyhow::Result<()> {
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     let mut state = AppState::new(object_store, db_path, writer)
+        .with_analytical_cache(lakehouse_store)
         .with_admin_sql_enabled(admin_sql_enabled)
         .with_lakehouse_base(lakehouse_base);
     if let Ok(raw) = std::env::var("BLUEDB_AUTHZ_TOKENS") {

@@ -17,6 +17,7 @@ bluedb-rest      = { workspace = true }
 bluedb-lakehouse = { workspace = true }
 bluedb-evidence  = { workspace = true }
 bluedb-query     = { path = "../bluedb-query" }
+bluedb-cache     = { path = "../bluedb-cache" }
 arrow-json       = "57"
 arrow-array      = "57"
 arrow-schema     = "57"
