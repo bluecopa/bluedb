@@ -157,8 +157,8 @@ capable / more standard); writes are unchanged:
 A second sqllogictest backend, `DataFusionTester`, was added to `bluedb-sqltest`
 alongside the existing `GlueTester`. It drives the **read front door** exactly as
 the server does: a single top-level `SELECT` is planned + executed by DataFusion
-through `query_via_catalog` (the `BluedbSchemaProvider`), while writes/DDL run on
-the GlueSQL path — the same `is_read_query` split as `POST /sql`.
+over the `BluedbSchemaProvider`, while writes/DDL run on the GlueSQL path — the
+same `is_read_query` split as `POST /sql`.
 
 - **Gated corpus** — `crates/bluedb-sqltest/df/*.slt` (basic, windows, cte, joins,
   setops, aggregates, subquery, scalar, nulls, coercion) runs as a must-pass
@@ -174,15 +174,26 @@ the GlueSQL path — the same `is_read_query` split as `POST /sql`.
   DataFusion front door (it coerces int-vs-string and decimal-vs-numeric, but not
   decimal-vs-quoted-string). Captured in `df/coercion.slt`. A narrow edge; whether
   to replicate the shim on the read path is a product decision, not a blocker.
+- **Keyless tables (corpus-only)** — the product requires a PRIMARY KEY, but the
+  external corpus assumes keyless tables. The require-PK rule is a server-side
+  toggle (`schema_rules::enforce`) that is **off** on the harness's raw GlueSQL
+  connection, so keyless `CREATE`/`INSERT` already land (GlueSQL keys rows
+  internally, exposing only the user columns). Only the read needed a shim: a
+  harness `CorpusSchemaProvider` resolves keyed tables through the real provider
+  and reads keyless tables back from GlueSQL into an in-memory DataFusion table
+  for the query. **No surrogate, nothing hidden, zero product change.** Proven by
+  `df/keyless.slt` (bag semantics, aggregates, window functions, joins over
+  keyless tables). This unblocks running the broad external corpus through `df`.
 
 ### Still deferred (flagged)
 
 - **Secondary-index pushdown** — non-PK indexed predicates currently take the
   merge path (correct, not point-fast). Perf follow-up.
-- **Broad read-dialect re-baseline** — the gated `df/` corpus is curated; running
-  the full external corpus through `--engine df` for a headline coverage number
-  (and triaging the PK-regime rejects, since the external corpus assumes PK-less
-  tables) is follow-on.
+- **Broad read-dialect re-baseline** — the gated `df/` corpus is curated; keyless
+  tables are now supported, so running the full external corpus through
+  `--engine df` for a headline coverage number (and triaging the remaining
+  non-keyless rejects — DuckDB functions, exotic types, recursion, as the GlueSQL
+  baseline showed) is follow-on.
 - **PG-wire** (`datafusion-postgres`) — out of scope.
 - **HA-302 cross-node redirect** — a non-writer still 503s on a fresher-than-
   sealed read (no writer-URL resolution yet).

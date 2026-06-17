@@ -10,15 +10,22 @@
 
 use std::sync::Arc;
 
+use std::any::Any;
+
 use arrow_array::{
-    Array, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
+    Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
     Int8Array, LargeStringArray, RecordBatch, StringArray, UInt16Array, UInt32Array, UInt64Array,
     UInt8Array,
 };
+use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use async_trait::async_trait;
 use bluedb_lakehouse::{object_store_file_io, LakehouseEngine};
-use bluedb_query::query_via_catalog;
+use bluedb_query::BluedbSchemaProvider;
 use bluedb_sql::{CdcConfig, Database, SlateDbStorage};
+use datafusion::catalog::{SchemaProvider, TableProvider};
+use datafusion::datasource::MemTable;
+use datafusion::error::{DataFusionError, Result as DfResult};
+use datafusion::prelude::SessionContext;
 use gluesql_core::prelude::{Glue, Payload, Value};
 use slatedb::object_store::ObjectStore;
 use slatedb::config::Settings;
@@ -326,8 +333,11 @@ impl AsyncDB for DataFusionTester {
         }
         if is_read(sql) {
             // The read front door: DataFusion over the bluedb schema provider —
-            // the same entry point the server's `POST /sql` uses for SELECTs.
-            let batches = query_via_catalog(self.eng.clone(), sql, &[])
+            // the same path the server's `POST /sql` uses for SELECTs. Keyless
+            // corpus tables (which the product rejects at its DDL surface) are
+            // materialized as in-memory tables here so the read can still be
+            // planned — harness only; see `CorpusSchemaProvider`.
+            let batches = query_via_corpus(self.eng.clone(), self.db.clone(), sql)
                 .await
                 .map_err(|e| DfError(e.to_string()))?;
             return Ok(render_batches(&batches));
@@ -411,4 +421,202 @@ fn render_cell(col: &dyn Array, i: usize) -> String {
         Dt::LargeUtf8 => val!(LargeStringArray).to_string(),
         other => format!("<{other:?}>"),
     }
+}
+
+// ───────────────────── keyless-table support (corpus only) ───────────────────
+//
+// The product requires a PRIMARY KEY on every table (`schema_rules::enforce` on
+// the server's DDL surface), and both the read provider and the Iceberg schema
+// key on it. The harness's raw GlueSQL connection has that enforcement OFF, so
+// the external SQL corpus's keyless `CREATE`/`INSERT`s land fine — GlueSQL keeps
+// the row identity internal, exposing only the user's columns. The only gap is
+// the read: the front-door provider can't resolve a keyless table. So a keyless
+// table is read back from GlueSQL and materialized as an in-memory DataFusion
+// table for that query. No surrogate, nothing hidden, no product code changed.
+
+/// Resolves table names for the corpus read path: keyed (single-column or
+/// composite-PK) tables go through the real front-door [`BluedbSchemaProvider`];
+/// keyless tables fall back to an in-memory snapshot read from GlueSQL.
+struct CorpusSchemaProvider {
+    inner: BluedbSchemaProvider,
+    db: Database,
+}
+
+impl CorpusSchemaProvider {
+    fn new(engine: Arc<LakehouseEngine>, db: Database) -> Self {
+        Self {
+            inner: BluedbSchemaProvider::new(engine),
+            db,
+        }
+    }
+}
+
+impl std::fmt::Debug for CorpusSchemaProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CorpusSchemaProvider").finish()
+    }
+}
+
+#[async_trait]
+impl SchemaProvider for CorpusSchemaProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn table_names(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn table_exist(&self, _name: &str) -> bool {
+        true
+    }
+
+    async fn table(&self, name: &str) -> DfResult<Option<Arc<dyn TableProvider>>> {
+        // Keyed tables (single-column or composite PK) → the real front-door
+        // provider, so those reads exercise production code unchanged.
+        if let Some(p) = self.inner.table(name).await? {
+            return Ok(Some(p));
+        }
+        // Keyless table (corpus only): read its current rows from GlueSQL and wrap
+        // them in a MemTable. A genuinely missing table yields no Select → None.
+        let mut glue = Glue::new(self.db.connection_serialized());
+        let Ok(payloads) = glue.execute(&format!("SELECT * FROM {name}")).await else {
+            return Ok(None);
+        };
+        let Some(Payload::Select { labels, rows }) = payloads.into_iter().last() else {
+            return Ok(None);
+        };
+        let batch =
+            batch_from_rows(&labels, &rows).map_err(|e| DataFusionError::External(e.into()))?;
+        let schema = batch.schema();
+        let mem = MemTable::try_new(schema, vec![vec![batch]])?;
+        Ok(Some(Arc::new(mem) as Arc<dyn TableProvider>))
+    }
+}
+
+/// Run a read `sql` through DataFusion with tables resolved by
+/// [`CorpusSchemaProvider`] (keyed via the real provider, keyless via an in-memory
+/// snapshot). Mirrors `bluedb_query::query_via_catalog` minus parameter binding
+/// (sqllogictest corpora use literals, not bind parameters).
+async fn query_via_corpus(
+    engine: Arc<LakehouseEngine>,
+    db: Database,
+    sql: &str,
+) -> anyhow::Result<Vec<RecordBatch>> {
+    let ctx = SessionContext::new();
+    ctx.catalog("datafusion")
+        .ok_or_else(|| anyhow::anyhow!("default catalog 'datafusion' missing"))?
+        .register_schema("public", Arc::new(CorpusSchemaProvider::new(engine, db)))?;
+    let df = ctx.sql(sql).await?;
+    Ok(df.collect().await?)
+}
+
+/// A column's Arrow kind, inferred from the first non-null value. Variant-based
+/// (not string-based) so a `TEXT` column of numeric-looking strings stays text.
+#[derive(Clone, Copy)]
+enum ColKind {
+    Bool,
+    Int,
+    Float,
+    Text,
+}
+
+fn col_kind(v: &Value) -> ColKind {
+    match v {
+        Value::Bool(_) => ColKind::Bool,
+        Value::Str(_) => ColKind::Text,
+        _ if as_i64(v).is_some() => ColKind::Int,
+        _ if as_f64(v).is_some() => ColKind::Float,
+        _ => ColKind::Text,
+    }
+}
+
+fn as_i64(v: &Value) -> Option<i64> {
+    match v {
+        Value::I8(n) => Some(*n as i64),
+        Value::I16(n) => Some(*n as i64),
+        Value::I32(n) => Some(*n as i64),
+        Value::I64(n) => Some(*n),
+        Value::I128(n) => i64::try_from(*n).ok(),
+        Value::U8(n) => Some(*n as i64),
+        Value::U16(n) => Some(*n as i64),
+        Value::U32(n) => Some(*n as i64),
+        Value::U64(n) => i64::try_from(*n).ok(),
+        Value::U128(n) => i64::try_from(*n).ok(),
+        _ => None,
+    }
+}
+
+fn as_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::F64(x) => Some(*x),
+        _ => None,
+    }
+}
+
+/// Build a typed Arrow [`RecordBatch`] from GlueSQL `SELECT *` output. Each
+/// column's type is inferred from its first non-null value; an all-null column
+/// defaults to text.
+fn batch_from_rows(labels: &[String], rows: &[Vec<Value>]) -> anyhow::Result<RecordBatch> {
+    use arrow_array::builder::{BooleanBuilder, Float64Builder, Int64Builder, StringBuilder};
+
+    let mut fields = Vec::with_capacity(labels.len());
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(labels.len());
+
+    for (c, name) in labels.iter().enumerate() {
+        let kind = rows
+            .iter()
+            .find_map(|r| match r.get(c) {
+                Some(Value::Null) | None => None,
+                Some(v) => Some(col_kind(v)),
+            })
+            .unwrap_or(ColKind::Text);
+
+        let (dt, arr): (DataType, ArrayRef) = match kind {
+            ColKind::Bool => {
+                let mut b = BooleanBuilder::new();
+                for r in rows {
+                    match r.get(c) {
+                        Some(Value::Bool(x)) => b.append_value(*x),
+                        _ => b.append_null(),
+                    }
+                }
+                (DataType::Boolean, Arc::new(b.finish()))
+            }
+            ColKind::Int => {
+                let mut b = Int64Builder::new();
+                for r in rows {
+                    match r.get(c).and_then(as_i64) {
+                        Some(n) => b.append_value(n),
+                        None => b.append_null(),
+                    }
+                }
+                (DataType::Int64, Arc::new(b.finish()))
+            }
+            ColKind::Float => {
+                let mut b = Float64Builder::new();
+                for r in rows {
+                    match r.get(c).and_then(as_f64) {
+                        Some(x) => b.append_value(x),
+                        None => b.append_null(),
+                    }
+                }
+                (DataType::Float64, Arc::new(b.finish()))
+            }
+            ColKind::Text => {
+                let mut b = StringBuilder::new();
+                for r in rows {
+                    match r.get(c) {
+                        Some(Value::Null) | None => b.append_null(),
+                        Some(v) => b.append_value(value_to_string(v)),
+                    }
+                }
+                (DataType::Utf8, Arc::new(b.finish()))
+            }
+        };
+        fields.push(Field::new(name.to_string(), dt, true));
+        arrays.push(arr);
+    }
+
+    Ok(RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), arrays)?)
 }

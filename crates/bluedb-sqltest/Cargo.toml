@@ -13,6 +13,7 @@ bluedb-sql       = { workspace = true }
 bluedb-query     = { path = "../bluedb-query" }
 bluedb-lakehouse = { path = "../bluedb-lakehouse" }
 gluesql-core     = "=0.19.0"
+datafusion       = "52"
 arrow-array      = "57"
 arrow-schema     = "57"
 slatedb          = { workspace = true }

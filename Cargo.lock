@@ -954,6 +954,7 @@ dependencies = [
  "bluedb-lakehouse",
  "bluedb-query",
  "bluedb-sql",
+ "datafusion",
  "gluesql-core",
  "slatedb",
  "sqllogictest",
