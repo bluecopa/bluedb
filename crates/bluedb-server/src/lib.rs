@@ -932,14 +932,16 @@ fn extract_single_table_name(sql: &str) -> Option<String> {
 /// Convert a slice of Arrow [`RecordBatch`]es into a JSON array of row-objects,
 /// matching the shape of the existing read endpoints (`[{"col": val, ...}, ...]`).
 ///
-/// Arrow scalar types map to JSON as follows:
+/// Canonical JSON rendering per logical type (must match `sql_value_to_json`):
 /// - Null → `null`
 /// - Boolean → JSON bool
 /// - Integer (i8/i16/i32/i64/u8/u16/u32/u64) → JSON number
-/// - Float (f32/f64) → JSON number (NaN/Inf → null)
+/// - Float (f32/f64) → JSON number (NaN/Inf → `null`)
 /// - Utf8 / LargeUtf8 → JSON string
-/// - Date32 → JSON number (days-since-epoch, matches what bluedb inserts)
-/// - Decimal128 → JSON string (preserves precision across the HTTP boundary)
+/// - Decimal128 → JSON string preserving scale (e.g. `"10.50"`)
+/// - Date32 → ISO-8601 date string `"YYYY-MM-DD"`
+/// - Timestamp(Microsecond, _) → `"YYYY-MM-DDTHH:MM:SS[.ffffff]"`
+/// - Time64(Microsecond) → `"HH:MM:SS[.ffffff]"`
 /// - Everything else → JSON string via `format!("{:?}", ...)`
 fn record_batches_to_json(batches: &[RecordBatch]) -> Value {
     use arrow_array::Array;
@@ -948,7 +950,9 @@ fn record_batches_to_json(batches: &[RecordBatch]) -> Value {
         Int8Type, Int16Type, Int32Type, Int64Type,
         UInt8Type, UInt16Type, UInt32Type, UInt64Type,
         Float32Type, Float64Type, Date32Type, Decimal128Type,
+        TimestampMicrosecondType, Time64MicrosecondType,
     };
+    use arrow_schema::{DataType, TimeUnit};
 
     let mut rows: Vec<Value> = Vec::new();
     for batch in batches {
@@ -961,66 +965,65 @@ fn record_batches_to_json(batches: &[RecordBatch]) -> Value {
                 let val: Value = if col.is_null(row_idx) {
                     Value::Null
                 } else {
-                    let dt = field.data_type();
-                    // Match on the data type name to avoid importing arrow_schema.
-                    let dt_str = format!("{dt:?}");
-                    if dt_str.starts_with("Boolean") {
-                        if let Some(a) = col.as_any().downcast_ref::<arrow_array::BooleanArray>() {
-                            Value::Bool(a.value(row_idx))
-                        } else { Value::Null }
-                    } else if dt_str.starts_with("Int8") {
-                        json!(col.as_primitive::<Int8Type>().value(row_idx))
-                    } else if dt_str.starts_with("Int16") {
-                        json!(col.as_primitive::<Int16Type>().value(row_idx))
-                    } else if dt_str.starts_with("Int32") {
-                        json!(col.as_primitive::<Int32Type>().value(row_idx))
-                    } else if dt_str.starts_with("Int64") {
-                        json!(col.as_primitive::<Int64Type>().value(row_idx))
-                    } else if dt_str.starts_with("UInt8") {
-                        json!(col.as_primitive::<UInt8Type>().value(row_idx))
-                    } else if dt_str.starts_with("UInt16") {
-                        json!(col.as_primitive::<UInt16Type>().value(row_idx))
-                    } else if dt_str.starts_with("UInt32") {
-                        json!(col.as_primitive::<UInt32Type>().value(row_idx))
-                    } else if dt_str.starts_with("UInt64") {
-                        json!(col.as_primitive::<UInt64Type>().value(row_idx))
-                    } else if dt_str.starts_with("Float32") {
-                        let v = col.as_primitive::<Float32Type>().value(row_idx);
-                        serde_json::Number::from_f64(v as f64).map(Value::Number).unwrap_or(Value::Null)
-                    } else if dt_str.starts_with("Float64") {
-                        let v = col.as_primitive::<Float64Type>().value(row_idx);
-                        serde_json::Number::from_f64(v).map(Value::Number).unwrap_or(Value::Null)
-                    } else if dt_str.starts_with("Utf8") || dt_str.starts_with("LargeUtf8") {
-                        if let Some(a) = col.as_any().downcast_ref::<arrow_array::StringArray>() {
-                            Value::String(a.value(row_idx).to_string())
-                        } else if let Some(a) = col.as_any().downcast_ref::<arrow_array::LargeStringArray>() {
-                            Value::String(a.value(row_idx).to_string())
-                        } else { Value::Null }
-                    } else if dt_str.starts_with("Date32") {
-                        let days = col.as_primitive::<Date32Type>().value(row_idx);
-                        json!(days)
-                    } else if dt_str.starts_with("Decimal128") {
-                        // Extract scale from the type string "Decimal128(prec, scale)".
-                        let scale: u32 = dt_str
-                            .trim_start_matches("Decimal128(")
-                            .trim_end_matches(')')
-                            .split(',')
-                            .nth(1)
-                            .and_then(|s| s.trim().parse::<u32>().ok())
-                            .unwrap_or(0);
-                        let raw = col.as_primitive::<Decimal128Type>().value(row_idx);
-                        let s = if scale == 0 {
-                            format!("{raw}")
-                        } else {
-                            let divisor = 10i128.pow(scale);
-                            let whole = raw / divisor;
-                            let frac = (raw % divisor).unsigned_abs();
-                            format!("{whole}.{frac:0>width$}", width = scale as usize)
-                        };
-                        Value::String(s)
-                    } else {
-                        // Fallback: display the array element as debug string.
-                        Value::String(format!("{:?}", col.slice(row_idx, 1)))
+                    match field.data_type() {
+                        DataType::Boolean => {
+                            if let Some(a) = col.as_any().downcast_ref::<arrow_array::BooleanArray>() {
+                                Value::Bool(a.value(row_idx))
+                            } else { Value::Null }
+                        }
+                        DataType::Int8 => json!(col.as_primitive::<Int8Type>().value(row_idx)),
+                        DataType::Int16 => json!(col.as_primitive::<Int16Type>().value(row_idx)),
+                        DataType::Int32 => json!(col.as_primitive::<Int32Type>().value(row_idx)),
+                        DataType::Int64 => json!(col.as_primitive::<Int64Type>().value(row_idx)),
+                        DataType::UInt8 => json!(col.as_primitive::<UInt8Type>().value(row_idx)),
+                        DataType::UInt16 => json!(col.as_primitive::<UInt16Type>().value(row_idx)),
+                        DataType::UInt32 => json!(col.as_primitive::<UInt32Type>().value(row_idx)),
+                        DataType::UInt64 => json!(col.as_primitive::<UInt64Type>().value(row_idx)),
+                        DataType::Float32 => {
+                            let v = col.as_primitive::<Float32Type>().value(row_idx);
+                            serde_json::Number::from_f64(v as f64).map(Value::Number).unwrap_or(Value::Null)
+                        }
+                        DataType::Float64 => {
+                            let v = col.as_primitive::<Float64Type>().value(row_idx);
+                            serde_json::Number::from_f64(v).map(Value::Number).unwrap_or(Value::Null)
+                        }
+                        DataType::Utf8 => {
+                            if let Some(a) = col.as_any().downcast_ref::<arrow_array::StringArray>() {
+                                Value::String(a.value(row_idx).to_string())
+                            } else { Value::Null }
+                        }
+                        DataType::LargeUtf8 => {
+                            if let Some(a) = col.as_any().downcast_ref::<arrow_array::LargeStringArray>() {
+                                Value::String(a.value(row_idx).to_string())
+                            } else { Value::Null }
+                        }
+                        DataType::Decimal128(_precision, scale) => {
+                            let scale = *scale as u32;
+                            let raw = col.as_primitive::<Decimal128Type>().value(row_idx);
+                            Value::String(decimal128_to_string(raw, scale))
+                        }
+                        DataType::Date32 => {
+                            let days = col.as_primitive::<Date32Type>().value(row_idx);
+                            match chrono::NaiveDate::from_epoch_days(days) {
+                                Some(d) => Value::String(d.format("%Y-%m-%d").to_string()),
+                                None => Value::Null,
+                            }
+                        }
+                        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+                            let micros = col.as_primitive::<TimestampMicrosecondType>().value(row_idx);
+                            match chrono::DateTime::from_timestamp_micros(micros) {
+                                Some(dt) => Value::String(format_naive_datetime(&dt.naive_utc())),
+                                None => Value::Null,
+                            }
+                        }
+                        DataType::Time64(TimeUnit::Microsecond) => {
+                            let micros = col.as_primitive::<Time64MicrosecondType>().value(row_idx);
+                            Value::String(format_naive_time_micros(micros))
+                        }
+                        _dt => {
+                            // Fallback: display the array element as debug string.
+                            Value::String(format!("{:?}", col.slice(row_idx, 1)))
+                        }
                     }
                 };
                 obj.insert(field.name().clone(), val);
@@ -1029,6 +1032,59 @@ fn record_batches_to_json(batches: &[RecordBatch]) -> Value {
         }
     }
     Value::Array(rows)
+}
+
+/// Format a `Decimal128` raw mantissa + scale as a normalized decimal string.
+///
+/// Trailing fractional zeros are stripped so that the analytical path (always
+/// scale 18 from Iceberg) and the SQL/OLTP path (scale from gluesql) produce
+/// the same string for the same logical value, e.g. both give `"12.34"` not
+/// `"12.340000000000000000"`.  An integer result has no decimal point.
+fn decimal128_to_string(raw: i128, scale: u32) -> String {
+    if scale == 0 {
+        return format!("{raw}");
+    }
+    let neg = raw < 0;
+    let abs_raw = raw.unsigned_abs();
+    let divisor = 10u128.pow(scale);
+    let whole = abs_raw / divisor;
+    let frac = abs_raw % divisor;
+    let sign = if neg { "-" } else { "" };
+    // Pad fractional part to `scale` digits, then strip trailing zeros.
+    let frac_str = format!("{frac:0>width$}", width = scale as usize);
+    let frac_trimmed = frac_str.trim_end_matches('0');
+    if frac_trimmed.is_empty() {
+        format!("{sign}{whole}")
+    } else {
+        format!("{sign}{whole}.{frac_trimmed}")
+    }
+}
+
+/// Format a `NaiveDateTime` as `"YYYY-MM-DDTHH:MM:SS"` or
+/// `"YYYY-MM-DDTHH:MM:SS.ffffff"` when there are sub-second microseconds.
+fn format_naive_datetime(dt: &chrono::NaiveDateTime) -> String {
+    let micros = dt.and_utc().timestamp_subsec_micros();
+    if micros == 0 {
+        dt.format("%Y-%m-%dT%H:%M:%S").to_string()
+    } else {
+        dt.format("%Y-%m-%dT%H:%M:%S%.6f").to_string()
+    }
+}
+
+/// Format microseconds-since-midnight as `"HH:MM:SS"` or `"HH:MM:SS.ffffff"`.
+fn format_naive_time_micros(total_micros: i64) -> String {
+    let total_micros = total_micros.unsigned_abs();
+    let h = total_micros / 3_600_000_000;
+    let rem = total_micros % 3_600_000_000;
+    let m = rem / 60_000_000;
+    let rem = rem % 60_000_000;
+    let s = rem / 1_000_000;
+    let micros = rem % 1_000_000;
+    if micros == 0 {
+        format!("{h:02}:{m:02}:{s:02}")
+    } else {
+        format!("{h:02}:{m:02}:{s:02}.{micros:06}")
+    }
 }
 
 async fn health() -> Json<Value> {
@@ -1444,6 +1500,24 @@ fn sql_value_to_json(value: &SqlValue) -> Value {
         SqlValue::U128(n) => Value::String(n.to_string()),
         SqlValue::I128(n) => Value::String(n.to_string()),
         SqlValue::Str(s) => Value::String(s.clone()),
+        // Temporal/Decimal types — canonical rendering matches record_batches_to_json.
+        // Decimal → normalized string (trailing fractional zeros stripped) so the
+        // OLTP path matches the analytical path which always has Iceberg scale 18.
+        SqlValue::Decimal(d) => Value::String(d.normalize().to_string()),
+        // Date → ISO-8601 "YYYY-MM-DD".
+        SqlValue::Date(d) => Value::String(d.format("%Y-%m-%d").to_string()),
+        // Timestamp → "YYYY-MM-DDTHH:MM:SS[.ffffff]".
+        SqlValue::Timestamp(dt) => Value::String(format_naive_datetime(dt)),
+        // Time → "HH:MM:SS[.ffffff]".
+        SqlValue::Time(t) => {
+            use chrono::Timelike as _;
+            let micros_frac = t.nanosecond() / 1_000;
+            if micros_frac == 0 {
+                Value::String(t.format("%H:%M:%S").to_string())
+            } else {
+                Value::String(t.format("%H:%M:%S%.6f").to_string())
+            }
+        }
         other => Value::String(format!("{other:?}")),
     }
 }

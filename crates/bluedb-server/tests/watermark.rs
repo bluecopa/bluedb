@@ -420,3 +420,129 @@ async fn analytical_path_honors_min_watermark() {
         "503 from analytical path must include X-Bluedb-Watermark"
     );
 }
+
+// ----- serializer cross-path consistency tests -----
+//
+// A table with DECIMAL, DATE, TIMESTAMP, TIME columns must render IDENTICALLY
+// whether the row is served by the SlateDB/OLTP path (GET /tables) or by the
+// analytical Iceberg path (a guardrail-rejected filter routed to DataFusion).
+//
+// `score INTEGER` is intentionally NOT indexed so `WHERE score > 0` is
+// guardrail-rejected and routed to the analytical path.
+
+/// Helper: set up a typed-column table, insert one row, seal to Iceberg.
+/// Returns the sealed watermark seq.
+async fn setup_typed_table(state: &AppState, app: &axum::Router) -> i64 {
+    let r = call_full(app, "POST", "/sql", None, None,
+        Some(json!({"sql": "PRAGMA lakehouse_mirror = on"}))).await;
+    assert!(r.status.is_success(), "pragma: {} {:?}", r.status, r.body);
+
+    let r = call_full(app, "POST", "/admin/sql", None, None,
+        Some(json!({"sql":
+            "CREATE TABLE typed_row (\
+                id INTEGER PRIMARY KEY, \
+                score INTEGER, \
+                amount DECIMAL, \
+                day DATE, \
+                ts TIMESTAMP, \
+                slot TIME\
+            )"
+        }))).await;
+    assert!(r.status.is_success(), "create typed_row: {} {:?}", r.status, r.body);
+
+    // Insert one row with known values.
+    let r = call_full(app, "POST", "/sql", None, None,
+        Some(json!({"sql":
+            "INSERT INTO typed_row VALUES (\
+                1, \
+                42, \
+                12.34, \
+                DATE '2024-03-15', \
+                TIMESTAMP '2024-03-15 12:34:56', \
+                TIME '14:30:05'\
+            )"
+        }))).await;
+    assert!(r.status.is_success(), "insert typed_row: {} {:?}", r.status, r.body);
+
+    state.seal_now().await.expect("seal typed_row");
+
+    let r = call_full(app, "GET", "/tables/typed_row", None, None, None).await;
+    assert!(r.status.is_success());
+    parse_watermark_header(&r.headers).map(|(_, seq)| seq).unwrap_or(0)
+}
+
+#[tokio::test]
+async fn decimal_date_timestamp_time_render_identically_on_both_paths() {
+    let state = make_state().await;
+    let app = build_app(state.clone());
+
+    setup_typed_table(&state, &app).await;
+
+    // --- SlateDB/OLTP path: GET /tables/typed_row (no filter → PK scan) ---
+    let r_oltp = call_full(&app, "GET", "/tables/typed_row", None, None, None).await;
+    assert!(
+        r_oltp.status.is_success(),
+        "OLTP path must succeed: {} {:?}", r_oltp.status, r_oltp.body
+    );
+    let oltp_rows = r_oltp.body.as_array().expect("OLTP response is an array");
+    assert_eq!(oltp_rows.len(), 1, "expected 1 row from OLTP path");
+    let oltp = &oltp_rows[0];
+
+    // --- Analytical path: guardrail-rejected WHERE score > 0 → DataFusion ---
+    let r_analytical = call_full(
+        &app, "POST", "/sql", None, None,
+        Some(json!({"sql": "SELECT * FROM typed_row WHERE score > 0 ORDER BY id"})),
+    ).await;
+    assert!(
+        r_analytical.status.is_success(),
+        "analytical path must succeed: {} {:?}", r_analytical.status, r_analytical.body
+    );
+    let analytical_rows = r_analytical.body.as_array().expect("analytical response is an array");
+    assert_eq!(analytical_rows.len(), 1, "expected 1 row from analytical path");
+    let analytical = &analytical_rows[0];
+
+    // Assert canonical rendering for each typed column.
+    // DECIMAL 12.34 → normalized string "12.34" (trailing zeros stripped).
+    assert_eq!(
+        oltp["amount"], analytical["amount"],
+        "DECIMAL: OLTP={} analytical={}", oltp["amount"], analytical["amount"]
+    );
+    assert_eq!(
+        oltp["amount"],
+        Value::String("12.34".to_string()),
+        "DECIMAL canonical form should be \"12.34\", got {}", oltp["amount"]
+    );
+
+    // DATE '2024-03-15' → ISO-8601 "2024-03-15".
+    assert_eq!(
+        oltp["day"], analytical["day"],
+        "DATE: OLTP={} analytical={}", oltp["day"], analytical["day"]
+    );
+    assert_eq!(
+        oltp["day"],
+        Value::String("2024-03-15".to_string()),
+        "DATE canonical form should be \"2024-03-15\", got {}", oltp["day"]
+    );
+
+    // TIMESTAMP '2024-03-15 12:34:56' → "2024-03-15T12:34:56".
+    assert_eq!(
+        oltp["ts"], analytical["ts"],
+        "TIMESTAMP: OLTP={} analytical={}", oltp["ts"], analytical["ts"]
+    );
+    assert_eq!(
+        oltp["ts"],
+        Value::String("2024-03-15T12:34:56".to_string()),
+        "TIMESTAMP canonical form should be \"2024-03-15T12:34:56\", got {}", oltp["ts"]
+    );
+
+    // TIME '14:30:05' → "14:30:05".
+    assert_eq!(
+        oltp["slot"], analytical["slot"],
+        "TIME: OLTP={} analytical={}", oltp["slot"], analytical["slot"]
+    );
+    assert_eq!(
+        oltp["slot"],
+        Value::String("14:30:05".to_string()),
+        "TIME canonical form should be \"14:30:05\", got {}", oltp["slot"]
+    );
+}
