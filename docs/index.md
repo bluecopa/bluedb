@@ -42,10 +42,11 @@ flowchart TD
 
 - **`bluedb-storage`** — the substrate: SlateDB on object storage, with
   tenant-namespaced, order-preserving keys.
-- **[`bluedb-sql`](sql/README.md)** — a SQL engine (GlueSQL + a compatibility
-  layer) over the substrate: schema'd tables with a `PRIMARY KEY`, online schema
-  evolution, secondary indexes, transactions, views — and a plan-time
-  [query guardrail](sql/query-guardrail.md) that keeps every read index-served.
+- **[`bluedb-sql`](sql/README.md)** — a SQL engine over the substrate: schema'd
+  tables with a `PRIMARY KEY`, online schema evolution, secondary indexes,
+  transactions, views, and a full `SELECT` surface (joins, aggregates, window
+  functions, arbitrary filters and sorts) — with the primary key and
+  [indexes](sql/query-guardrail.md) accelerating point/range lookups.
 - **[`bluedb-fts`](sql/full-text-search.md)** — **SQL-integrated** BM25 full-text
   search (tantivy) over object storage: declare a full-text index and query it
   through SQL (Postgres `@@`/`ts_rank`), read-your-writes, no separate search

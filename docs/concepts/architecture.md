@@ -62,8 +62,8 @@ pointer** (Oracle `ROWID`, Postgres `ctid`):
 
 - A primary-key point lookup is a direct key fetch; a PK **range / prefix /
   `ORDER BY pk`** is a contiguous byte range — no secondary structure, no sort.
-  This is the access path the [query guardrail](../sql/query-guardrail.md) relies
-  on to keep every read bounded.
+  This is the fast [point/range access path](../sql/query-guardrail.md); other
+  reads are served by an analytical scan.
 - Secondary indexes map `indexed-value → primary key` (a *logical* pointer, not a
   physical address), so they ride the same clustered store.
 
@@ -131,9 +131,10 @@ database). Writes are accepted only by the **active writer**; a replica returns
 - **Index-organized storage.** Every table is clustered by its primary key (no
   heap, no `ROWID`) — PK reads are contiguous range scans, and that same ordering
   seals to Parquet with no re-sort. See [Storage model](#storage-model-index-organized-tables).
-- **Bounded reads.** A plan-time [query guardrail](../sql/query-guardrail.md)
-  keeps every read served by the primary key or an index; whole-table analytics
-  goes to the warehouse via the Iceberg mirror, off the OLTP hot path.
+- **Two read tiers, one SQL surface.** Point and range lookups by primary key or
+  index are served from the row store; analytical reads (joins, aggregates,
+  window functions, arbitrary filters/sorts) are served columnar from the
+  [Iceberg mirror](../lakehouse/iceberg-mirror.md), off the OLTP hot path.
 - **Portable.** The substrate targets any S3-compatible store, GCS, or Azure
   Blob — all three verified end-to-end with a real SlateDB round-trip (S3/Azure
   via emulators, GCS against real GCS). See

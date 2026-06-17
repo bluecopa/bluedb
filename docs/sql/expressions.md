@@ -95,7 +95,6 @@ SELECT * FROM users WHERE deleted_at IS NULL;
 `EXISTS`, scalar subqueries, and `IN (SELECT …)` are all valid in expressions —
 see [Query syntax › Subqueries](query-syntax.md#subqueries).
 
-!!! warning
-    **window functions are not supported.** `SUM(x) OVER (…)`,
-    `ROW_NUMBER() OVER (…)`, `RANK()`, etc. are **rejected** with a clear error
-    (the engine has no windowing; rejecting prevents silently wrong results).
+!!! note
+    **Window functions are supported** — `SUM(x) OVER (…)`, `ROW_NUMBER() OVER
+    (…)`, `RANK()`, `LAG`/`LEAD`, and friends.

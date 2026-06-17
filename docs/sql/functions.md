@@ -6,11 +6,11 @@ These are the built-in functions bluedb's engine provides. Exact argument
 signatures follow [GlueSQL](https://gluesql.org); the groupings below cover the
 common ones.
 
-!!! warning
-    bluedb does **not** support **window functions** (`… OVER (…)`)
-    or **user-defined functions** (`CREATE FUNCTION`). Many PostgreSQL/DuckDB-only
-    builtins (`arg_min`, `list_*`, `regexp_*`, `any_value`, …) are also absent.
-    See [Limitations](limitations.md).
+!!! note
+    **Window functions** (`… OVER (…)` — `ROW_NUMBER`, `RANK`, running `SUM`, …)
+    are supported. **User-defined functions** (`CREATE FUNCTION`) are not, and
+    some PostgreSQL/DuckDB-specific builtins (`arg_min`, `list_*`, `any_value`, …)
+    are absent. See [Limitations](limitations.md).
 
 ## Aggregate functions
 

@@ -20,8 +20,7 @@ CREATE TABLE users (
     schemaless tables — a column-less `CREATE TABLE`, or one without a primary
     key, is rejected. The primary key is the clustered row key (so it must be
     unique and is the default scan order) and the identity column for the
-    warehouse Iceberg mirror, and it guarantees every table has at least one
-    index-served access path for the [query guardrail](query-guardrail.md).
+    warehouse Iceberg mirror.
 
 Options:
 
@@ -50,7 +49,7 @@ CREATE TABLE memberships (
 
 The component columns are forced `NOT NULL`. Point, **leading-prefix**, range,
 and **row-value keyset** lookups all use the key — the same shapes a Postgres
-multicolumn index serves, so they pass the [query guardrail](query-guardrail.md):
+multicolumn index serves, as fast key-served access paths:
 
 ```sql
 SELECT role FROM memberships WHERE org_id = 1 AND user_id = 7;   -- point
@@ -152,10 +151,10 @@ DROP INDEX users_email ON users;
 ```
 
 !!! note
-    Indexes aren't just an optimization here — they're what makes a query
-    *runnable*. The [query guardrail](query-guardrail.md) rejects a filter or
-    `ORDER BY` on a non-indexed column (it would be a full scan / in-memory
-    sort), and the rejection tells you the exact `CREATE INDEX` to add.
+    An index is a **performance** feature: it turns an equality or range filter
+    (or an `ORDER BY`) on that column into a fast index-served lookup. Queries on
+    non-indexed columns still run — they're served as analytical scans (see
+    [Reads and indexes](query-guardrail.md)).
 
 !!! warning
     Indexes are **single-column** only. Composite (multi-column)

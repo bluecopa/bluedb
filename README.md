@@ -25,7 +25,7 @@ Start with the [Quickstart](docs/quickstart.md) and the
 
 | Capability | Docs |
 |---|---|
-| **SQL** — typed tables with a required `PRIMARY KEY`, online `ALTER` (no row rewrite), transactions, secondary indexes, and a plan-time scan/sort guardrail that keeps every read index-served | [SQL reference](docs/sql/README.md) · [Query guardrail](docs/sql/query-guardrail.md) |
+| **SQL** — typed tables with a required `PRIMARY KEY`, online `ALTER` (no row rewrite), transactions, secondary indexes, and a full `SELECT` surface (joins, aggregates, window functions, arbitrary filters/sorts) | [SQL reference](docs/sql/README.md) · [Reads and indexes](docs/sql/query-guardrail.md) |
 | **Full-text search** — SQL-integrated BM25 (Postgres `@@`/`ts_rank`), read-your-writes, no separate search cluster | [Full-text search](docs/sql/full-text-search.md) |
 | **Ledger** — TigerBeetle-style double-entry (typed accounts/transfers, two-phase, balances queryable over SQL) | [Ledger](docs/api/ledger.md) |
 | **Lakehouse mirror** — continuous **Apache Iceberg** mirror in the same bucket (full CRUD, seconds-fresh, exactly-once) + a read-only Iceberg REST catalog, so BigQuery/Databricks/Snowflake/DuckDB join bluedb data with no ETL | [Iceberg mirror](docs/lakehouse/iceberg-mirror.md) |
@@ -40,7 +40,7 @@ Start with the [Quickstart](docs/quickstart.md) and the
 | Crate | Role |
 |---|---|
 | `bluedb-storage` | object-store seam (SlateDB + chunked blobs) |
-| `bluedb-sql` | SQL engine (GlueSQL over SlateDB): PK'd tables, online ALTER, transactions, indexes, scan guardrail, CDC log |
+| `bluedb-sql` | SQL engine over SlateDB: PK'd tables, online ALTER, transactions, indexes, analytical reads, CDC log |
 | `bluedb-fts` | BM25 full-text search (vendored Quickwit read path over object storage) |
 | `bluedb-ledger` | TigerBeetle-style double-entry ledger |
 | `bluedb-lakehouse` | Apache Iceberg CDC mirror + Iceberg REST catalog |
@@ -54,7 +54,7 @@ Start with the [Quickstart](docs/quickstart.md) and the
 
 M1–M4 core complete (FTS, SQL, engine + HTTP service, single-writer HA), plus the
 HTTP/write-path hardening, SQL-integrated FTS, the double-entry ledger, the
-schema regime (required PK + online ALTER + scan guardrail), the Iceberg
+schema regime (required PK + online ALTER), the Iceberg
 lakehouse mirror (all four v1 spike items shipped: multi-tenancy, composite PKs,
 schema-evolution reconciliation, incremental compaction), and the evidence
 substrate (verifiable Merkle chains + native graph store with snapshot-isolated

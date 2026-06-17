@@ -115,3 +115,53 @@ Net: the two load-bearing risks (arbitrary SQL served fresh from a transparent u
 - **Dialect divergence** — reads on the DataFusion dialect, writes/DDL on GlueSQL; conformance re-baseline is a follow-on.
 - **`SELECT *` composite leak** — see §5.5.
 - **PK-less tables** are rejected; depends on / reinforces the "require PK" schema direction.
+
+---
+
+## 8. Cutover status (built 2026-06-17)
+
+The full flip is **built and merged into the spike branch**, full workspace green
+(server 126 + all integration suites, query, lakehouse, the 205-test storage
+conformance, ledger, evidence, fts, ha, cache). Commits: `query_via_catalog` +
+non-mirrored branch (`2ca39b4`) → `/sql` cutover (`c71c4bc`) → composite
+surrogate-hide (`634ecd5`).
+
+What shipped beyond §2: `POST /sql` SELECTs route to DataFusion via
+`BluedbSchemaProvider` (no GlueSQL fallback); writes/DDL/`GET /tables` unchanged;
+FTS re-targeted through `rewrite_for` → DataFusion; the freshness gate preserved.
+Correctness hardening surfaced by the battery: PK fast-path gated on the PK's
+Arrow type (Int64/Utf8 only — decimal/u128/composite fall to the merge); the
+merge gated on **mirror-enablement** (a non-mirrored table is served from the row
+store via `current_record_batch`, since a bare writer handle can leave a spurious
+empty snapshot); `build_arrow_column` extended to u64/u128/i128 → `decimal(p,0)`.
+
+### Read-dialect changes (re-baselined)
+
+Behaviors that changed on the **read** path, each accepted (DataFusion is more
+capable / more standard); writes are unchanged:
+
+- **Un-indexed filters / sorts / `LIKE` / joins / window functions / cartesian
+  products are now served** (were rejected by the scan/sort guardrail or absent).
+  The guardrail no longer gates `/sql` reads (it still applies on `GET /tables`).
+  Test updated: `fts.rs::trigram_like_over_http_read_your_writes` (un-indexed
+  `LIKE` now 200 + matching row, was 400).
+- **Result order without `ORDER BY`**, **`NULL` ordering**, and **empty-match
+  no-`GROUP BY` aggregates** now follow standard-SQL / analytical-engine
+  semantics rather than the previous storage-order / no-row behaviors.
+- User docs re-baselined: `docs/sql/{README,limitations,statements,
+  query-guardrail,functions,expressions,query-syntax}.md`, `docs/index.md`,
+  `docs/concepts/architecture.md`, `README.md`.
+
+### Still deferred (flagged)
+
+- **Secondary-index pushdown** — non-PK indexed predicates currently take the
+  merge path (correct, not point-fast). Perf follow-up.
+- **Full DataFusion-dialect conformance corpus** — the existing storage
+  conformance suite (205) runs through the unchanged write/GlueSQL path; a
+  dedicated read-dialect sqllogictest corpus against DataFusion is a separate
+  harness, not built. The server + query suites are the current read-path proof.
+- **PG-wire** (`datafusion-postgres`) — out of scope.
+- **HA-302 cross-node redirect** — a non-writer still 503s on a fresher-than-
+  sealed read (no writer-URL resolution yet).
+- **`result_large_err`** — pre-existing workspace-wide clippy lint (`AppError`
+  size); not addressed (would need boxing `AppError`).

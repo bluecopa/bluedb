@@ -40,11 +40,11 @@ Equi-joins (`a.x = b.y`) run as **hash joins**: the planner pushes the equality
 from `WHERE` into the join automatically, so a comma join with a key is as fast
 as an explicit `JOIN … ON`.
 
-!!! warning
-    A multi-table query **without** a join key (a `CROSS JOIN`, or a
-    comma join with no `WHERE` equality) is **rejected** at plan time, because it
-    would materialize the full cartesian product. Give every join a key, or use a
-    subquery.
+!!! note
+    A multi-table query without a join key (a `CROSS JOIN`, or a comma join with
+    no `WHERE` equality) produces the full cartesian product — fine for small
+    inputs, expensive for large ones. Give every join a key when you mean an
+    equi-join.
 
 ## `WHERE`
 
