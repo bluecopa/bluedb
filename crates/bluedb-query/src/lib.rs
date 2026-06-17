@@ -28,12 +28,101 @@ use arrow_array::RecordBatch;
 use bluedb_lakehouse::LakehouseEngine;
 use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
+use datafusion::scalar::ScalarValue;
 use iceberg_datafusion::IcebergStaticTableProvider;
 
 mod catalog;
 mod provider;
 pub use catalog::BluedbSchemaProvider;
 pub use provider::{BluedbTableProvider, ProviderStats};
+
+/// Run a read `sql` through the DataFusion front door: register the tenant's
+/// tables via [`BluedbSchemaProvider`] and execute, binding positional params.
+///
+/// This is the server's `POST /sql` SELECT entry point. The schema provider
+/// resolves every referenced table (joins / CTEs / subqueries) to a streaming
+/// read-your-writes union (or a PK point read). `params` are JSON values bound
+/// positionally; `?` placeholders are rewritten to DataFusion's `$N` form first.
+///
+/// # Errors
+///
+/// - `sql` is malformed, references unknown tables/columns, or uses a feature the
+///   engine can't plan.
+/// - A referenced table has no single-column primary key.
+/// - DataFusion / Iceberg I/O fails.
+pub async fn query_via_catalog(
+    engine: Arc<LakehouseEngine>,
+    sql: &str,
+    params: &[serde_json::Value],
+) -> anyhow::Result<Vec<RecordBatch>> {
+    let ctx = SessionContext::new();
+    ctx.catalog("datafusion")
+        .ok_or_else(|| anyhow!("default catalog 'datafusion' missing"))?
+        .register_schema("public", Arc::new(BluedbSchemaProvider::new(engine)))
+        .with_context(|| "registering bluedb schema provider")?;
+
+    let sql = rewrite_placeholders(sql);
+    let df = ctx
+        .sql(&sql)
+        .await
+        .with_context(|| format!("planning SQL: {sql}"))?;
+    let df = if params.is_empty() {
+        df
+    } else {
+        let scalars: Vec<ScalarValue> = params.iter().map(json_to_scalar).collect();
+        df.with_param_values(scalars)
+            .with_context(|| "binding query parameters")?
+    };
+    let batches = df
+        .collect()
+        .await
+        .with_context(|| format!("executing SQL: {sql}"))?;
+    Ok(batches)
+}
+
+/// Rewrite `?` positional placeholders to DataFusion's `$1, $2, …`, skipping
+/// quoted string literals. (bluedb's REST/SQL surface uses `?`; DataFusion uses
+/// `$N`.) Note: does not special-case `''` escapes inside string literals.
+fn rewrite_placeholders(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len() + 8);
+    let mut n = 0usize;
+    let (mut in_single, mut in_double) = (false, false);
+    for c in sql.chars() {
+        match c {
+            '\'' if !in_double => {
+                in_single = !in_single;
+                out.push(c);
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                out.push(c);
+            }
+            '?' if !in_single && !in_double => {
+                n += 1;
+                out.push('$');
+                out.push_str(&n.to_string());
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Convert a JSON parameter to a DataFusion [`ScalarValue`] for positional binding.
+fn json_to_scalar(v: &serde_json::Value) -> ScalarValue {
+    use serde_json::Value as J;
+    match v {
+        J::Null => ScalarValue::Null,
+        J::Bool(b) => ScalarValue::Boolean(Some(*b)),
+        J::Number(n) => n
+            .as_i64()
+            .map(|i| ScalarValue::Int64(Some(i)))
+            .unwrap_or_else(|| ScalarValue::Float64(n.as_f64())),
+        J::String(s) => ScalarValue::Utf8(Some(s.clone())),
+        // Arrays/objects: bind as their JSON text (rarely parameterized).
+        other => ScalarValue::Utf8(Some(other.to_string())),
+    }
+}
 
 /// Run `sql` against the current sealed Iceberg snapshot of `table` using
 /// DataFusion, and return the resulting [`RecordBatch`]es.

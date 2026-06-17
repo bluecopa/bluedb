@@ -16,6 +16,7 @@ tokio = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 gluesql-core = "=0.19.0"
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

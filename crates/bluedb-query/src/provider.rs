@@ -108,52 +108,65 @@ impl BluedbTableProvider {
         let merge_err = |ctx: &str, e: String| DataFusionError::Execution(format!("{ctx}: {e}"));
         let inner = SessionContext::new();
 
-        // Tail: upserts + the touched-key set (both small, in-memory).
-        let (upserts, touched) = self
-            .engine
-            .unsealed_delta(&self.table)
-            .await
-            .map_err(|e| merge_err("unsealed delta", e.to_string()))?;
-        inner.register_table(
-            "__dup",
-            Arc::new(MemTable::try_new(upserts.schema(), vec![vec![upserts]])?),
-        )?;
-        inner.register_table(
-            "__dk",
-            Arc::new(MemTable::try_new(touched.schema(), vec![vec![touched]])?),
-        )?;
-
-        // Bulk: the sealed Iceberg snapshot streams from Parquet (no whole-table
-        // materialization). Absent until the first seal.
-        let has_iceberg = match self
+        let merged = match self
             .engine
             .current_iceberg_table(&self.table)
             .await
             .map_err(|e| merge_err("load iceberg", e.to_string()))?
         {
+            // A sealed snapshot exists → stream the columnar Iceberg bulk and
+            // merge the unsealed CDC tail (read-your-writes). Only the tail is in
+            // memory; the bulk streams from Parquet.
             Some(t) => {
                 let p = IcebergStaticTableProvider::try_new_from_table(t)
                     .await
                     .map_err(|e| merge_err("iceberg provider", e.to_string()))?;
                 inner.register_table("__ice", Arc::new(p))?;
-                true
+                let (upserts, touched) = self
+                    .engine
+                    .unsealed_delta(&self.table)
+                    .await
+                    .map_err(|e| merge_err("unsealed delta", e.to_string()))?;
+                inner.register_table(
+                    "__dup",
+                    Arc::new(MemTable::try_new(upserts.schema(), vec![vec![upserts]])?),
+                )?;
+                inner.register_table(
+                    "__dk",
+                    Arc::new(MemTable::try_new(touched.schema(), vec![vec![touched]])?),
+                )?;
+                let pk = &self.pk_name;
+                // Iceberg rows whose PK the tail did NOT touch, UNION ALL the tail's
+                // surviving upserts. `NOT IN` is key-type-agnostic (int / utf8 / the
+                // composite-PK BYTEA surrogate alike).
+                let ice = inner
+                    .sql(&format!(
+                        "SELECT * FROM __ice WHERE \"{pk}\" NOT IN (SELECT \"{pk}\" FROM __dk)"
+                    ))
+                    .await?;
+                ice.union(inner.table("__dup").await?)?
             }
-            None => false,
-        };
-
-        let pk = &self.pk_name;
-        // Iceberg rows whose PK is NOT touched by the tail, UNION ALL the tail's
-        // surviving upserts. `NOT IN` is key-type-agnostic (int / utf8 / the
-        // composite-PK BYTEA surrogate alike).
-        let merged = if has_iceberg {
-            let ice = inner
-                .sql(&format!(
-                    "SELECT * FROM __ice WHERE \"{pk}\" NOT IN (SELECT \"{pk}\" FROM __dk)"
-                ))
-                .await?;
-            ice.union(inner.table("__dup").await?)?
-        } else {
-            inner.table("__dup").await?
+            // No snapshot yet — a never-sealed table, OR one not mirrored to the
+            // lakehouse at all. Serve every current row straight from the row store
+            // (the source of truth): always correct, just not columnar.
+            None => {
+                let batch = self
+                    .engine
+                    .current_record_batch(&self.table)
+                    .await
+                    .map_err(|e| merge_err("current rows", e.to_string()))?
+                    .ok_or_else(|| {
+                        DataFusionError::Execution(format!(
+                            "table '{}' does not exist",
+                            self.table
+                        ))
+                    })?;
+                inner.register_table(
+                    "__all",
+                    Arc::new(MemTable::try_new(batch.schema(), vec![vec![batch]])?),
+                )?;
+                inner.table("__all").await?
+            }
         };
 
         // Apply DataFusion's projection (indices into our schema) and limit.
