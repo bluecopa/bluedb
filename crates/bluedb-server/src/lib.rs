@@ -929,138 +929,6 @@ fn parse_min_watermark(headers: &axum::http::HeaderMap) -> Option<i64> {
 
 // --- analytical read path helpers ------------------------------------------
 
-/// True if `err` is a guardrail-reject error from the scan/sort guardrail
-/// (`bluedb_sql::guardrail`).
-///
-/// # Why a sentinel string, not a Rust type?
-///
-/// The guardrail runs inside gluesql's `Planner::plan()` implementation
-/// (inside `bluedb-sql`'s `SlateDbStorage`).  That trait method **must** return
-/// `gluesql_core::error::Error`; there is no way to surface a bluedb-defined
-/// Rust variant above the gluesql boundary.  Every storage/plan error,
-/// including guardrail rejects, arrives here as
-/// `EngineError::Sql(Error::StorageMsg(String))`.  Detection via a **single
-/// stable sentinel prefix** — `bluedb_sql::GUARDRAIL_REJECT_PREFIX` — is the
-/// only non-fragile discriminant available: the guardrail prefixes every reject
-/// message with this constant, so detection survives any rephrasing of the
-/// human-readable portion.
-fn is_guardrail_reject(err: &EngineError) -> bool {
-    match err {
-        EngineError::Sql(e) => e
-            .to_string()
-            .contains(bluedb_sql::GUARDRAIL_REJECT_PREFIX),
-        _ => false,
-    }
-}
-
-/// Extract the single-table name from a SQL SELECT statement.
-///
-/// Uses sqlparser (via gluesql) to parse. Returns `Some(table_name)` for a
-/// single-table SELECT with no joins; `None` for anything else (multi-table,
-/// non-SELECT, parse failure). We deliberately do NOT use a bare string search
-/// because the guardrail already parsed the statement — this is just extracting
-/// the table name safely.
-fn extract_single_table_name(sql: &str) -> Option<String> {
-    use gluesql_core::sqlparser::ast::{
-        SetExpr, Statement, TableFactor, TableWithJoins,
-    };
-    let parsed = gluesql_core::parse_sql::parse(sql).ok()?;
-    if parsed.len() != 1 {
-        return None;
-    }
-    let query = match &parsed[0] {
-        Statement::Query(q) => q,
-        _ => return None,
-    };
-    let select = match query.body.as_ref() {
-        SetExpr::Select(s) => s,
-        _ => return None,
-    };
-    if select.from.len() != 1 {
-        return None;
-    }
-    let twj: &TableWithJoins = &select.from[0];
-    if !twj.joins.is_empty() {
-        return None;
-    }
-    match &twj.relation {
-        TableFactor::Table { name, .. } => {
-            name.0.last().map(|ident| ident.value.clone())
-        }
-        _ => None,
-    }
-}
-
-/// HTAP P4 freshness decision: handle a guardrail-routed analytical SELECT whose
-/// requested `X-Bluedb-Min-Watermark` (`min`) outruns the sealed Iceberg
-/// watermark (`sealed`). The sealed snapshot can't satisfy the read, so:
-///
-/// 1. **This node IS the active writer** — it holds the fresh, *unsealed* rows.
-///    Serve them via the writer-local read ([`bluedb_query::query_sql_fresh`] over
-///    [`LakehouseEngine::current_record_batch`](bluedb_lakehouse::LakehouseEngine::current_record_batch)).
-///    No redirect; the writer is the source of truth, so the
-///    `bluedb_read_wait_seal_n` tolerance is satisfied trivially.
-/// 2. **This node is NOT the writer** — the fresh rows live on the active writer,
-///    so the client must be **302-redirected** there. The redirect target is the
-///    active writer's URL, which **bluedb cannot resolve today** (the HA lease
-///    stores only a node-id fencing token — no advertised address, and there is no
-///    node registry; see the function body + the P4 report). Until that lands we
-///    **fail fast with 503** (never hang), carrying the sealed watermark so the
-///    client can retry/seal-and-poll. This is also the writer-unavailable outcome.
-///
-/// The `bluedb_read_wait_seal_n` PRAGMA (seal-cycle tolerance) is read here; it
-/// governs the wait-before-redirect budget a follower would honor once a writer
-/// URL is resolvable. On the writer it short-circuits to an immediate fresh serve.
-#[allow(clippy::too_many_arguments)]
-async fn serve_fresh_analytical(
-    state: &AppState,
-    manager: &Arc<LakehouseManager>,
-    engine: &bluedb_lakehouse::LakehouseEngine,
-    tenant: &str,
-    table: &str,
-    sql: &str,
-    min: i64,
-    sealed: i64,
-) -> Result<(axum::http::HeaderMap, Json<Value>), AppError> {
-    // Tolerance in seal cycles (default 1). Read for both branches; the writer
-    // branch serves immediately, the follower branch would wait up to this many
-    // seal cadences before redirecting (deferred — no writer URL, see below).
-    let _wait_seal_n = manager.read_wait_seal_n(tenant).await;
-
-    if state.is_writer() {
-        // We are the active writer: serve the FRESH current table (incl. unsealed
-        // writes) directly. No wait, no redirect — this satisfies read-your-writes.
-        let batches = bluedb_query::query_sql_fresh(engine, table, sql)
-            .await
-            .map_err(|e| AppError::bad_request(format!("fresh analytical query: {e}")))?;
-        // The fresh read reflects the writer's current state, so the response is
-        // at least as fresh as `min`; stamp the live write watermark.
-        let fresh_wm = state.write_watermark(tenant).await;
-        let wm_hdrs = watermark_headers_always(tenant, fresh_wm.max(min));
-        return Ok((wm_hdrs, Json(record_batches_to_json(&batches))));
-    }
-
-    // We are NOT the active writer. The fresh rows live on the writer, so the
-    // correct answer is a 302 to the writer's URL. bluedb cannot resolve that URL
-    // today: the HA lease (bluedb-ha) records only the holder's node-id + a
-    // fencing epoch — there is no advertised network address and no node registry
-    // mapping node-id → URL, and a node does not even track its own external URL
-    // (it only binds `BLUEDB_ADDR`). Rather than fake a Location, fail fast with
-    // 503 (never hang) and surface the sealed watermark for retry/poll.
-    let wm_hdrs = watermark_headers_always(tenant, sealed);
-    Err(AppError::plain(
-        StatusCode::SERVICE_UNAVAILABLE,
-        format!(
-            "read-your-writes freshness not satisfiable on this node: requested \
-             min-watermark {min} > sealed watermark {sealed}, and this node is not \
-             the active writer. A 302 redirect to the writer is required but the \
-             writer's address is not resolvable (no advertised address / node \
-             registry in the HA lease); retry against the writer or after the next seal"
-        ),
-    )
-    .with_headers(wm_hdrs))
-}
-
 /// Convert a slice of Arrow [`RecordBatch`]es into a JSON array of row-objects,
 /// matching the shape of the existing read endpoints (`[{"col": val, ...}, ...]`).
 ///
@@ -1270,60 +1138,86 @@ async fn exec_sql(
             None => return Err(AppError::internal("lakehouse manager not bound")),
         }
     }
+    // Reads are served by the analytical engine (the DataFusion front door);
+    // writes and DDL stay on the transactional engine.
+    if is_read_query(&req.sql) {
+        return exec_sql_read(&state, &headers, &tenant, &req).await;
+    }
+
     let params = req.params.iter().map(json_to_param).collect::<Result<Vec<_>, _>>()?;
     let mut glue = Glue::new(state.connection_serialized(&tenant).await?);
-    // Route through the FTS engine: it rewrites `@@`/`ts_rank` against the live
-    // segment when a fulltext index is declared, else runs the SQL unchanged.
-    let result = state.fts().await.execute_fts(&mut glue, &req.sql, &params).await;
+    // Writes flow through the FTS engine so its commit observer indexes them;
+    // a non-`@@` statement runs unchanged.
+    let payloads = state.fts().await.execute_fts(&mut glue, &req.sql, &params).await?;
+    let wm = state.write_watermark(&tenant).await;
+    Ok((watermark_headers(&tenant, wm), Json(payloads_to_json(payloads))))
+}
 
-    match result {
-        Ok(payloads) => {
-            let wm = state.write_watermark(&tenant).await;
-            Ok((watermark_headers(&tenant, wm), Json(payloads_to_json(payloads))))
-        }
-        Err(ref err) if is_guardrail_reject(err) => {
-            // Guardrail-reject: route to the analytical path (DataFusion over Iceberg).
-            // Only single-table SELECTs are routed; multi-table → return the original error.
-            let Some(table) = extract_single_table_name(&req.sql) else {
-                return Err(AppError::bad_request(format!(
-                    "{err} (multi-table or non-SELECT queries cannot be routed to the analytical path)"
-                )));
-            };
-
-            // The per-tenant lakehouse engine is required for any analytical read.
-            let manager = state.lakehouse().await.ok_or_else(|| {
-                AppError::internal("analytical path unavailable: lakehouse manager not bound")
-            })?;
-            let engine = manager
-                .engine_for(&tenant)
-                .await
-                .map_err(|e| AppError::internal(format!("get lakehouse engine: {e}")))?;
-
-            // Freshness gate (HTAP P4): the sealed Iceberg snapshot may lag the
-            // last acknowledged write. When the client demands a watermark the
-            // seal hasn't reached yet (`min > sealed`), decide per the
-            // `bluedb_read_wait_seal_n` tolerance instead of an unconditional 503.
-            let sealed = state.sealed_watermark(&tenant).await;
-            if let Some(min) = parse_min_watermark(&headers) {
-                if min > sealed {
-                    return serve_fresh_analytical(
-                        &state, &manager, &engine, &tenant, &table, &req.sql, min, sealed,
-                    )
-                    .await;
-                }
-            }
-
-            // Fast/fresh-enough path: the seal already covers the requested
-            // watermark (or none was requested) — serve the sealed Iceberg snapshot.
-            let batches = bluedb_query::query_sql(&engine, &table, &req.sql)
-                .await
-                .map_err(|e| AppError::bad_request(format!("analytical query: {e}")))?;
-
-            let wm_hdrs = watermark_headers(&tenant, sealed);
-            Ok((wm_hdrs, Json(record_batches_to_json(&batches))))
-        }
-        Err(err) => Err(AppError::from(err)),
+/// True if `sql` is a single read query (`SELECT` / `VALUES` / CTE) — routed to
+/// the analytical engine. Writes and DDL return false (the transactional engine
+/// serves them). A parse failure is treated as not-a-read, so the transactional
+/// engine surfaces the error.
+fn is_read_query(sql: &str) -> bool {
+    use gluesql_core::sqlparser::ast::Statement;
+    match gluesql_core::parse_sql::parse(sql) {
+        Ok(stmts) if stmts.len() == 1 => matches!(stmts[0], Statement::Query(_)),
+        _ => false,
     }
+}
+
+/// Serve a `POST /sql` read through the DataFusion front door: the per-tenant
+/// analytical engine, with every referenced table resolved via the bluedb schema
+/// provider (joins / windows / aggregates / multi-table / CTEs). FTS predicates
+/// are rewritten to plain SQL first; the freshness gate 503s on a non-writer node
+/// that cannot satisfy a fresher-than-sealed read.
+async fn exec_sql_read(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    tenant: &str,
+    req: &SqlRequest,
+) -> Result<(axum::http::HeaderMap, Json<Value>), AppError> {
+    let manager = state.lakehouse().await.ok_or_else(|| {
+        AppError::internal("analytical path unavailable: lakehouse manager not bound")
+    })?;
+    let engine = manager
+        .engine_for(tenant)
+        .await
+        .map_err(|e| AppError::internal(format!("get lakehouse engine: {e}")))?;
+
+    // Rewrite FTS (`@@` / `ts_rank` / trigram-`LIKE`) to plain SQL the analytical
+    // engine runs; non-FTS SQL passes through unchanged.
+    let rewritten = state.fts().await.rewrite_for(&req.sql).await?;
+    let sql = rewritten.unwrap_or_else(|| req.sql.clone());
+
+    // Freshness gate: a non-writer node holds no fresh unsealed tail, so it cannot
+    // satisfy a read demanding a watermark beyond the sealed snapshot.
+    let sealed = state.sealed_watermark(tenant).await;
+    if let Some(min) = parse_min_watermark(headers) {
+        if min > sealed && !state.is_writer() {
+            return Err(AppError::plain(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "read-your-writes freshness not satisfiable on this node: requested \
+                     min-watermark {min} > sealed watermark {sealed}, and this node is not \
+                     the active writer; retry against the writer or after the next seal"
+                ),
+            )
+            .with_headers(watermark_headers_always(tenant, sealed)));
+        }
+    }
+
+    let batches = bluedb_query::query_via_catalog(engine, &sql, &req.params)
+        .await
+        .map_err(|e| AppError::bad_request(format!("query: {e}")))?;
+
+    // On the writer the union reflects unsealed writes (read-your-writes);
+    // elsewhere it is at least the sealed snapshot.
+    let wm = if state.is_writer() {
+        state.write_watermark(tenant).await
+    } else {
+        sealed
+    };
+    Ok((watermark_headers(tenant, wm), Json(record_batches_to_json(&batches))))
 }
 
 /// `POST /admin/sql` — arbitrary SQL (DDL/txns/multi). Off by default; audited.
@@ -1811,53 +1705,6 @@ impl IntoResponse for AppError {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Unit tests for is_guardrail_reject
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod guardrail_detect_tests {
-    use super::*;
-    use bluedb_engine::EngineError;
-    use bluedb_sql::GUARDRAIL_REJECT_PREFIX;
-    use gluesql_core::error::Error as GlueError;
-
-    fn sql_err(msg: &str) -> EngineError {
-        EngineError::Sql(GlueError::StorageMsg(msg.to_string()))
-    }
-
-    /// An error carrying the sentinel prefix → must be detected.
-    #[test]
-    fn detects_scan_reject_with_sentinel_prefix() {
-        let msg = format!("{GUARDRAIL_REJECT_PREFIX} query on `t` filters only non-indexed column(s) `x` — ...");
-        assert!(is_guardrail_reject(&sql_err(&msg)));
-    }
-
-    /// ORDER BY reject also carries the prefix.
-    #[test]
-    fn detects_sort_reject_with_sentinel_prefix() {
-        let msg = format!("{GUARDRAIL_REJECT_PREFIX} ORDER BY `x` on `t` is an in-memory sort — ...");
-        assert!(is_guardrail_reject(&sql_err(&msg)));
-    }
-
-    /// A plain storage error that does NOT carry the prefix → must NOT be detected.
-    #[test]
-    fn does_not_detect_unrelated_storage_error() {
-        let err = sql_err("table `t` not found");
-        assert!(!is_guardrail_reject(&err));
-    }
-
-    /// The sentinel prefix alone (without surrounding prose) is sufficient.
-    #[test]
-    fn sentinel_prefix_alone_is_sufficient() {
-        let msg = format!("{GUARDRAIL_REJECT_PREFIX} whatever");
-        assert!(is_guardrail_reject(&sql_err(&msg)));
-    }
-
-    /// Non-Sql engine errors are never guardrail rejects.
-    #[test]
-    fn non_sql_error_is_not_guardrail_reject() {
-        let err = EngineError::Other(anyhow::anyhow!("oops"));
-        assert!(!is_guardrail_reject(&err));
-    }
-}
+// Read SELECTs route to the analytical engine (DataFusion); the scan/sort
+// guardrail no longer gates the `/sql` read path (it still applies on the
+// `GET /tables` REST fast path).

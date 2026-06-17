@@ -1046,6 +1046,7 @@ fn build_arrow_column(arrow_dt: &ArrowDataType, cells: &[&Value]) -> Result<Arra
         // to the target scale before extracting the i128 mantissa.
         ArrowDataType::Decimal128(precision, scale) => {
             let target_scale = *scale as u32;
+            let pow = 10i128.pow(target_scale);
             let raw: Vec<Option<i128>> = cells
                 .iter()
                 .map(|v| match v {
@@ -1054,6 +1055,12 @@ fn build_arrow_column(arrow_dt: &ArrowDataType, cells: &[&Value]) -> Result<Arra
                         d.rescale(target_scale);
                         Some(d.mantissa())
                     }
+                    // Integer columns that exceed Long map to decimal(p,0): u64,
+                    // i128/u128 (e.g. the ledger's u128 amounts). Their mantissa is
+                    // the integer scaled to the target scale (0 in practice).
+                    Value::U64(n) => Some((*n as i128) * pow),
+                    Value::U128(n) => Some((*n as i128) * pow),
+                    Value::I128(n) => Some((*n) * pow),
                     _ => None,
                 })
                 .collect();

@@ -749,6 +749,14 @@ impl LakehouseEngine {
         Ok(Some(merged))
     }
 
+    /// Whether `table` is enabled for the lakehouse CDC mirror. The analytical
+    /// merge (Iceberg ∪ unsealed tail) is only *complete* for mirrored tables; a
+    /// table whose writes bypass the CDC mirror (e.g. it's not enabled) has its
+    /// rows only in the row store, so it must be read from there directly.
+    pub fn is_table_mirrored(&self, table: &str) -> bool {
+        self.cdc.is_enabled(&self.tenant, table)
+    }
+
     /// The unsealed CDC tail of `table` as Arrow, for the streaming analytical
     /// merge: `(upserts, touched_keys)` — the upsert rows (full table schema) and
     /// a batch whose primary-key column carries every key touched since the last
@@ -824,7 +832,7 @@ impl LakehouseEngine {
             Some(r) => vec![(key, r)],
             None => Vec::new(),
         };
-        Ok(writer.rows_to_record_batch(&rows)?)
+        writer.rows_to_record_batch(&rows)
     }
 
     /// Fetch a table's gluesql schema through a read connection.

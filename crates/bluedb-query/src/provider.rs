@@ -21,7 +21,7 @@ use std::any::Any;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use bluedb_lakehouse::LakehouseEngine;
 use datafusion::catalog::{Session, TableProvider};
@@ -61,6 +61,7 @@ pub struct BluedbTableProvider {
     table: String,
     schema: SchemaRef,
     pk_name: String,
+    pk_type: DataType,
     stats: Arc<ProviderStats>,
 }
 
@@ -83,11 +84,17 @@ impl BluedbTableProvider {
             .await?
             .ok_or_else(|| anyhow::anyhow!("table '{table}' does not exist"))?;
         let pk_name = engine.pk_column_name(table).await?;
+        let pk_type = schema
+            .field_with_name(&pk_name)
+            .map_err(|e| anyhow::anyhow!("pk column '{pk_name}' not in schema: {e}"))?
+            .data_type()
+            .clone();
         Ok(Self {
             engine,
             table: table.to_string(),
             schema,
             pk_name,
+            pk_type,
             stats: Arc::new(ProviderStats::default()),
         })
     }
@@ -108,12 +115,20 @@ impl BluedbTableProvider {
         let merge_err = |ctx: &str, e: String| DataFusionError::Execution(format!("{ctx}: {e}"));
         let inner = SessionContext::new();
 
-        let merged = match self
-            .engine
-            .current_iceberg_table(&self.table)
-            .await
-            .map_err(|e| merge_err("load iceberg", e.to_string()))?
-        {
+        // The Iceberg ∪ tail merge is only *complete* for mirrored tables; a
+        // non-mirrored table's rows live solely in the row store. A bare
+        // `LakehouseWriter` handle can leave a spurious empty snapshot, so gate on
+        // mirror-enablement, not snapshot existence.
+        let iceberg = if self.engine.is_table_mirrored(&self.table) {
+            self.engine
+                .current_iceberg_table(&self.table)
+                .await
+                .map_err(|e| merge_err("load iceberg", e.to_string()))?
+        } else {
+            None
+        };
+
+        let merged = match iceberg {
             // A sealed snapshot exists → stream the columnar Iceberg bulk and
             // merge the unsealed CDC tail (read-your-writes). Only the tail is in
             // memory; the bulk streams from Parquet.
@@ -212,7 +227,7 @@ impl TableProvider for BluedbTableProvider {
         Ok(filters
             .iter()
             .map(|f| {
-                if pk_eq_key(f, &self.pk_name).is_some() {
+                if pk_eq_key(f, &self.pk_name, &self.pk_type).is_some() {
                     TableProviderFilterPushDown::Exact
                 } else {
                     TableProviderFilterPushDown::Unsupported
@@ -228,7 +243,10 @@ impl TableProvider for BluedbTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        if let Some(key) = filters.iter().find_map(|f| pk_eq_key(f, &self.pk_name)) {
+        if let Some(key) = filters
+            .iter()
+            .find_map(|f| pk_eq_key(f, &self.pk_name, &self.pk_type))
+        {
             // OLTP fast path: point-read the row store, skip Iceberg.
             self.stats.fast_path.fetch_add(1, Ordering::Relaxed);
             let batch = self
@@ -245,9 +263,15 @@ impl TableProvider for BluedbTableProvider {
     }
 }
 
-/// If `filter` is `pk = <literal>` (either argument order) on column `pk_name`
-/// with a literal we can encode, return the row-store [`Key`]; else `None`.
-fn pk_eq_key(filter: &Expr, pk_name: &str) -> Option<Key> {
+/// If `filter` is `pk = <literal>` (either argument order) on column `pk_name`,
+/// and the PK column's Arrow type is one we can encode to a row-store [`Key`]
+/// that matches the stored key exactly, return that `Key`; else `None`.
+///
+/// Only `Int64` and `Utf8`/`LargeUtf8` PKs fast-path. Other PK types (decimal /
+/// u128 / date / the composite BYTEA surrogate) fall through to the merge path —
+/// correct, just not a single-row point read. (Encoding a `= 1` literal as
+/// `Key::I64(1)` for, say, a `u128` PK would build a key that never matches.)
+fn pk_eq_key(filter: &Expr, pk_name: &str, pk_type: &DataType) -> Option<Key> {
     let Expr::BinaryExpr(be) = filter else {
         return None;
     };
@@ -262,16 +286,10 @@ fn pk_eq_key(filter: &Expr, pk_name: &str) -> Option<Key> {
     if col.name.as_str() != pk_name {
         return None;
     }
-    scalar_to_key(lit)
-}
-
-/// Convert a DataFusion literal to a gluesql primary [`Key`] (the common
-/// single-column PK types; composite-PK point reads fall to the merge path).
-fn scalar_to_key(v: &ScalarValue) -> Option<Key> {
-    match v {
-        ScalarValue::Int64(Some(n)) => Some(Key::I64(*n)),
-        ScalarValue::Int32(Some(n)) => Some(Key::I32(*n)),
-        ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => Some(Key::Str(s.clone())),
+    match (pk_type, lit) {
+        (DataType::Int64, ScalarValue::Int64(Some(n))) => Some(Key::I64(*n)),
+        (DataType::Utf8, ScalarValue::Utf8(Some(s))) => Some(Key::Str(s.clone())),
+        (DataType::LargeUtf8, ScalarValue::LargeUtf8(Some(s))) => Some(Key::Str(s.clone())),
         _ => None,
     }
 }
