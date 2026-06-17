@@ -903,19 +903,25 @@ fn parse_min_watermark(headers: &axum::http::HeaderMap) -> Option<i64> {
 // --- analytical read path helpers ------------------------------------------
 
 /// True if `err` is a guardrail-reject error from the scan/sort guardrail
-/// (`bluedb_sql::guardrail`). The guardrail emits `Error::StorageMsg` with a
-/// message starting `"rejected: "` which surfaces as `EngineError::Sql` whose
-/// `Display` rendering includes `"rejected: query on"` (non-indexed filter) or
-/// `"rejected: ORDER BY"` / `"rejected: in-memory sort on"` (non-indexed sort).
-/// GlueSQL wraps these as `"sql: storage: rejected: ..."`.
+/// (`bluedb_sql::guardrail`).
+///
+/// # Why a sentinel string, not a Rust type?
+///
+/// The guardrail runs inside gluesql's `Planner::plan()` implementation
+/// (inside `bluedb-sql`'s `SlateDbStorage`).  That trait method **must** return
+/// `gluesql_core::error::Error`; there is no way to surface a bluedb-defined
+/// Rust variant above the gluesql boundary.  Every storage/plan error,
+/// including guardrail rejects, arrives here as
+/// `EngineError::Sql(Error::StorageMsg(String))`.  Detection via a **single
+/// stable sentinel prefix** — `bluedb_sql::GUARDRAIL_REJECT_PREFIX` — is the
+/// only non-fragile discriminant available: the guardrail prefixes every reject
+/// message with this constant, so detection survives any rephrasing of the
+/// human-readable portion.
 fn is_guardrail_reject(err: &EngineError) -> bool {
     match err {
-        EngineError::Sql(e) => {
-            let msg = e.to_string();
-            msg.contains("rejected: query on")
-                || msg.contains("rejected: ORDER BY")
-                || msg.contains("rejected: in-memory sort on")
-        }
+        EngineError::Sql(e) => e
+            .to_string()
+            .contains(bluedb_sql::GUARDRAIL_REJECT_PREFIX),
         _ => false,
     }
 }
@@ -1775,5 +1781,56 @@ impl IntoResponse for AppError {
             None => (self.status, Json(body)).into_response(),
             Some(extra) => (self.status, extra, Json(body)).into_response(),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests for is_guardrail_reject
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod guardrail_detect_tests {
+    use super::*;
+    use bluedb_engine::EngineError;
+    use bluedb_sql::GUARDRAIL_REJECT_PREFIX;
+    use gluesql_core::error::Error as GlueError;
+
+    fn sql_err(msg: &str) -> EngineError {
+        EngineError::Sql(GlueError::StorageMsg(msg.to_string()))
+    }
+
+    /// An error carrying the sentinel prefix → must be detected.
+    #[test]
+    fn detects_scan_reject_with_sentinel_prefix() {
+        let msg = format!("{GUARDRAIL_REJECT_PREFIX} query on `t` filters only non-indexed column(s) `x` — ...");
+        assert!(is_guardrail_reject(&sql_err(&msg)));
+    }
+
+    /// ORDER BY reject also carries the prefix.
+    #[test]
+    fn detects_sort_reject_with_sentinel_prefix() {
+        let msg = format!("{GUARDRAIL_REJECT_PREFIX} ORDER BY `x` on `t` is an in-memory sort — ...");
+        assert!(is_guardrail_reject(&sql_err(&msg)));
+    }
+
+    /// A plain storage error that does NOT carry the prefix → must NOT be detected.
+    #[test]
+    fn does_not_detect_unrelated_storage_error() {
+        let err = sql_err("table `t` not found");
+        assert!(!is_guardrail_reject(&err));
+    }
+
+    /// The sentinel prefix alone (without surrounding prose) is sufficient.
+    #[test]
+    fn sentinel_prefix_alone_is_sufficient() {
+        let msg = format!("{GUARDRAIL_REJECT_PREFIX} whatever");
+        assert!(is_guardrail_reject(&sql_err(&msg)));
+    }
+
+    /// Non-Sql engine errors are never guardrail rejects.
+    #[test]
+    fn non_sql_error_is_not_guardrail_reject() {
+        let err = EngineError::Other(anyhow::anyhow!("oops"));
+        assert!(!is_guardrail_reject(&err));
     }
 }
