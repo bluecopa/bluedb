@@ -30,6 +30,9 @@ use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
 use iceberg_datafusion::IcebergStaticTableProvider;
 
+mod provider;
+pub use provider::{BluedbTableProvider, ProviderStats};
+
 /// Run `sql` against the current sealed Iceberg snapshot of `table` using
 /// DataFusion, and return the resulting [`RecordBatch`]es.
 ///

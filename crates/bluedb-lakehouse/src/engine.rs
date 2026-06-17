@@ -749,6 +749,50 @@ impl LakehouseEngine {
         Ok(Some(merged))
     }
 
+    /// The Arrow schema of `table` (the schema shared by the seal path and the
+    /// Iceberg read-back), or `None` if the table does not exist. Errors if the
+    /// table has no single-column primary key.
+    pub async fn arrow_schema_for(&self, table: &str) -> Result<Option<arrow_schema::SchemaRef>> {
+        let Some(schema) = self.try_fetch_schema(table).await? else {
+            return Ok(None);
+        };
+        single_pk_index(&schema)?; // reject PK-less / composite up front
+        let writer = self.writer_for(table, &schema, &[]).await?;
+        Ok(Some(writer.arrow_schema()?))
+    }
+
+    /// The name of the single primary-key column — the front-door's pushdown /
+    /// merge key. Errors if the table has no single-column primary key.
+    pub async fn pk_column_name(&self, table: &str) -> Result<String> {
+        let schema = self.fetch_schema(table).await?;
+        let idx = single_pk_index(&schema)?;
+        let columns = schema
+            .column_defs
+            .as_ref()
+            .expect("single_pk_index requires column_defs");
+        Ok(columns[idx].name.clone())
+    }
+
+    /// Point-read `table` by primary [`Key`](gluesql_core::data::Key) straight
+    /// from the row store (SlateDB, the OLTP source of truth) and convert the row
+    /// to Arrow — the front-door's **PK fast path**, which never touches Iceberg.
+    /// Returns an empty (schema-only) batch when the key is absent.
+    pub async fn record_batch_for_pk(
+        &self,
+        table: &str,
+        key: gluesql_core::data::Key,
+    ) -> Result<arrow_array::RecordBatch> {
+        let schema = self.fetch_schema(table).await?;
+        let conn = self.db.connection_for_tenant(&self.tenant);
+        let row = conn.fetch_data(table, &key).await.map_err(glue_err)?;
+        let writer = self.writer_for(table, &schema, &[]).await?;
+        let rows: Vec<(gluesql_core::data::Key, DataRow)> = match row {
+            Some(r) => vec![(key, r)],
+            None => Vec::new(),
+        };
+        Ok(writer.rows_to_record_batch(&rows)?)
+    }
+
     /// Fetch a table's gluesql schema through a read connection.
     pub async fn fetch_schema(&self, table: &str) -> Result<gluesql_core::data::Schema> {
         self.try_fetch_schema(table)
