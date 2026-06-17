@@ -187,24 +187,31 @@ same `is_read_query` split as `POST /sql`.
 
 ### Broad corpus run (DuckDB, 863 files / 7,494 records)
 
-`fetch_corpus.sh` + `conformance --engine df crates/bluedb-sqltest/slt/corpus/duckdb`:
+`fetch_corpus.sh` + `conformance --engine df crates/bluedb-sqltest/slt/corpus/duckdb`.
 
-| | DataFusion (read front door) | GlueSQL (baseline) |
+The **aggregate** accept-rate is a poor read-dialect metric: it scores `statement`
+records (CREATE/INSERT/DDL) alongside queries, and those go through gluesql in
+*both* backends. The corpus's `CREATE`s use length-parameterized / exotic type
+decls (`VARCHAR(n)`, `HUGEINT`, `BIT`, `STRUCT`, `CREATE TYPE`) that gluesql's
+translate rejects in both; add DuckDB-only statements (`EXPLAIN`, `DESCRIBE`,
+`SUMMARIZE`, `PIVOT`) and negative `statement error` tests, and the write side
+dominates. So `conformance` reports a **read-path-only** figure: score `query`
+records, exclude **cascades** (queries downstream of a failed setup statement —
+a write-path gap, not a read one). That isolates the read dialect:
+
+| read path only (non-cascade queries) | DataFusion | GlueSQL |
 |---|---|---|
-| engine-accepted | 28.8% (PASS 1,681 / wrong 480) | 33.8% (PASS 1,983 / wrong 550) |
-| unsupported (feature gaps) | 1,229 | 2,339 |
-| cascade (failed-setup downstream) | 25.4% | 12.8% |
+| read-accepted | **34.5%** (1,244) | 27.1% (1,110) |
+| PASS (correct of accepted) | **787 (63.3%)** | 581 (52.3%) |
+| unsupported rejections | **584** | 1,832 |
 
-The two are close on raw acceptance because **both are gated by the same gluesql
-write-path ceiling** — the corpus's `CREATE`s use length-parameterized / exotic
-type decls (`VARCHAR(n)`, `HUGEINT`, `BIT`, `STRUCT`, `CREATE TYPE`) that gluesql's
-translate rejects in *both* backends, plus DuckDB-only statements (`EXPLAIN`,
-`DESCRIBE`, `SUMMARIZE`, `PIVOT`) and negative `statement error` tests. None of
-those are the read dialect. The read-dialect signal is the **`unsupported` drop,
-2,339 → 1,229 (≈−47%)**: DataFusion serves the windows, CTEs, and set operations
-GlueSQL rejects outright. Of what each *accepts*, correctness is comparable
-(≈78%). Remaining ceiling is gluesql's write-path types + DuckDB-specific
-features, i.e. follow-on engine work, not the front door.
+Isolated to the read path, DataFusion is **ahead** — more queries accepted, higher
+correctness, ~3× fewer `unsupported` (it serves windows / CTEs / set operations
+GlueSQL refuses). The remaining read rejections are DuckDB-specific query syntax
+and functions (`PIVOT`, `LIST`/`STRUCT` literals, the DuckDB function library),
+not standard-SQL gaps — the DuckDB corpus is a DuckDB-idiom yardstick, so this is
+a floor. (Aggregate, for reference: DataFusion 28.8% accept / 1,681 PASS vs
+GlueSQL 33.8% / 1,983, both capped by the shared write-path ceiling.)
 
 ### Still deferred (flagged)
 
