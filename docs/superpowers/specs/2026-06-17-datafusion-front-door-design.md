@@ -185,15 +185,31 @@ same `is_read_query` split as `POST /sql`.
   `df/keyless.slt` (bag semantics, aggregates, window functions, joins over
   keyless tables). This unblocks running the broad external corpus through `df`.
 
+### Broad corpus run (DuckDB, 863 files / 7,494 records)
+
+`fetch_corpus.sh` + `conformance --engine df crates/bluedb-sqltest/slt/corpus/duckdb`:
+
+| | DataFusion (read front door) | GlueSQL (baseline) |
+|---|---|---|
+| engine-accepted | 28.8% (PASS 1,681 / wrong 480) | 33.8% (PASS 1,983 / wrong 550) |
+| unsupported (feature gaps) | 1,229 | 2,339 |
+| cascade (failed-setup downstream) | 25.4% | 12.8% |
+
+The two are close on raw acceptance because **both are gated by the same gluesql
+write-path ceiling** — the corpus's `CREATE`s use length-parameterized / exotic
+type decls (`VARCHAR(n)`, `HUGEINT`, `BIT`, `STRUCT`, `CREATE TYPE`) that gluesql's
+translate rejects in *both* backends, plus DuckDB-only statements (`EXPLAIN`,
+`DESCRIBE`, `SUMMARIZE`, `PIVOT`) and negative `statement error` tests. None of
+those are the read dialect. The read-dialect signal is the **`unsupported` drop,
+2,339 → 1,229 (≈−47%)**: DataFusion serves the windows, CTEs, and set operations
+GlueSQL rejects outright. Of what each *accepts*, correctness is comparable
+(≈78%). Remaining ceiling is gluesql's write-path types + DuckDB-specific
+features, i.e. follow-on engine work, not the front door.
+
 ### Still deferred (flagged)
 
 - **Secondary-index pushdown** — non-PK indexed predicates currently take the
   merge path (correct, not point-fast). Perf follow-up.
-- **Broad read-dialect re-baseline** — the gated `df/` corpus is curated; keyless
-  tables are now supported, so running the full external corpus through
-  `--engine df` for a headline coverage number (and triaging the remaining
-  non-keyless rejects — DuckDB functions, exotic types, recursion, as the GlueSQL
-  baseline showed) is follow-on.
 - **PG-wire** (`datafusion-postgres`) — out of scope.
 - **HA-302 cross-node redirect** — a non-writer still 503s on a fresher-than-
   sealed read (no writer-URL resolution yet).
