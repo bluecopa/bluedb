@@ -133,6 +133,9 @@ struct Report {
     /// they are excluded here to isolate the read dialect.
     qt: Tally,
     backlog: BTreeMap<String, usize>,
+    /// Rejection reasons for QUERY records only (unsupported + other) — the
+    /// read-path "why not 100%" breakdown, with write-path/DDL records excluded.
+    qbacklog: BTreeMap<String, usize>,
     wrong_examples: Vec<String>,
     other_examples: Vec<String>,
     wrong_hashed: usize,
@@ -198,6 +201,7 @@ async fn main() -> anyhow::Result<()> {
             let mut qt = Tally::default();
             let mut parse_errors = 0usize;
             let mut backlog: BTreeMap<String, usize> = BTreeMap::new();
+            let mut qbacklog: BTreeMap<String, usize> = BTreeMap::new();
             let mut wrong_examples: Vec<String> = Vec::new();
             let mut other_examples: Vec<String> = Vec::new();
             let mut wrong_hashed = 0usize;
@@ -274,10 +278,11 @@ async fn main() -> anyhow::Result<()> {
                                 }
                                 Cat::Unsupported => {
                                     t.unsupported += 1;
+                                    *backlog.entry(feature_key(&msg)).or_default() += 1;
                                     if is_query {
                                         qt.unsupported += 1;
+                                        *qbacklog.entry(feature_key(&msg)).or_default() += 1;
                                     }
-                                    *backlog.entry(feature_key(&msg)).or_default() += 1;
                                 }
                                 Cat::Cascade => {
                                     t.cascade += 1;
@@ -289,6 +294,7 @@ async fn main() -> anyhow::Result<()> {
                                     t.other += 1;
                                     if is_query {
                                         qt.other += 1;
+                                        *qbacklog.entry(feature_key(&msg)).or_default() += 1;
                                     }
                                     if other_examples.len() < 8 {
                                         other_examples.push(format!(
@@ -308,6 +314,7 @@ async fn main() -> anyhow::Result<()> {
                 t,
                 qt,
                 backlog,
+                qbacklog,
                 wrong_examples,
                 other_examples,
                 wrong_hashed,
@@ -320,6 +327,7 @@ async fn main() -> anyhow::Result<()> {
         t,
         qt,
         backlog,
+        qbacklog,
         wrong_examples,
         other_examples,
         wrong_hashed,
@@ -380,10 +388,22 @@ async fn main() -> anyhow::Result<()> {
     );
     println!("=======================================================");
 
+    if !qbacklog.is_empty() {
+        let mut ranked: Vec<(&String, &usize)> = qbacklog.iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        println!("\nREAD-PATH REJECTIONS (query records only — why reads aren't 100%):");
+        for (key, count) in ranked.iter().take(30) {
+            println!("  {count:>5}  {key}");
+        }
+        if ranked.len() > 30 {
+            println!("  ... and {} more distinct read-path rejections", ranked.len() - 30);
+        }
+    }
+
     if !backlog.is_empty() {
         let mut ranked: Vec<(&String, &usize)> = backlog.iter().collect();
         ranked.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
-        println!("\nTOP REJECTED FEATURES (the backlog — implement these to raise coverage):");
+        println!("\nTOP REJECTED FEATURES (all records — the backlog — implement these to raise coverage):");
         for (key, count) in ranked.iter().take(25) {
             println!("  {count:>5}  {key}");
         }
