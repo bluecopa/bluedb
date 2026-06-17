@@ -29,6 +29,14 @@ const MARGIN: Duration = Duration::from_secs(5);
 
 /// Build a promoted, CDC-enabled app state (lakehouse mirror on by default).
 async fn make_state() -> AppState {
+    let state = make_unpromoted_state();
+    state.promote().await.expect("promote");
+    state
+}
+
+/// Build an app state that has NOT been promoted (no writer `Db` bound). Used to
+/// exercise the writer-unavailable fail-fast path.
+fn make_unpromoted_state() -> AppState {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let writer = Arc::new(WriterController::new(
         "test-node",
@@ -37,9 +45,7 @@ async fn make_state() -> AppState {
         TTL,
         MARGIN,
     ));
-    let state = AppState::new(store, "bluedb", writer).with_admin_sql_enabled(true);
-    state.promote().await.expect("promote");
-    state
+    AppState::new(store, "bluedb", writer).with_admin_sql_enabled(true)
 }
 
 /// Full response (status + headers + body).
@@ -377,10 +383,11 @@ async fn guardrail_rejected_select_routed_to_analytical_path_returns_correct_row
     assert_eq!(names, vec!["alpha", "gamma"], "rows should be alpha then gamma (score DESC): {names:?}");
 }
 
-// ----- test: analytical path honors X-Bluedb-Min-Watermark -----
+// ----- test: analytical path honors X-Bluedb-Min-Watermark (P4) -----
 //
-// The freshness gate on the analytical path: when min > sealed, the handler
-// must return 503. When min <= sealed it serves normally.
+// HTAP P4 changed the `min > sealed` outcome on the ACTIVE WRITER from a hard
+// 503 to a writer-local FRESH serve (the writer holds rows ≥ any acknowledged
+// write). `min <= sealed` still serves from the sealed Iceberg snapshot.
 
 #[tokio::test]
 async fn analytical_path_honors_min_watermark() {
@@ -389,7 +396,7 @@ async fn analytical_path_honors_min_watermark() {
 
     let sealed = setup_analytical_table(&state, &app).await;
 
-    // (a) min <= sealed: must succeed.
+    // (a) min <= sealed: served from the sealed Iceberg snapshot.
     let r_ok = call_full(
         &app, "POST", "/sql", None, Some("0"),
         Some(json!({"sql": "SELECT id, name FROM products WHERE score > 50 ORDER BY score DESC"})),
@@ -403,21 +410,149 @@ async fn analytical_path_honors_min_watermark() {
     let wm = r_ok.headers.get("x-bluedb-watermark");
     assert!(wm.is_some(), "analytical response must include X-Bluedb-Watermark");
 
-    // (b) min > sealed: must return 503 with X-Bluedb-Watermark.
+    // (b) min > sealed on the active writer: P4 serves FRESH (not 503).
     let future_seq = sealed + 1_000_000;
-    let r_503 = call_full(
+    let r_fresh = call_full(
         &app, "POST", "/sql", None, Some(&future_seq.to_string()),
         Some(json!({"sql": "SELECT id, name FROM products WHERE score > 50 ORDER BY score DESC"})),
     ).await;
-    assert_eq!(
-        r_503.status,
-        StatusCode::SERVICE_UNAVAILABLE,
-        "analytical path with min > sealed must 503: {} {:?}",
-        r_503.status, r_503.body
-    );
     assert!(
-        r_503.headers.get("x-bluedb-watermark").is_some(),
-        "503 from analytical path must include X-Bluedb-Watermark"
+        r_fresh.status.is_success(),
+        "P4: analytical path with min > sealed must serve FRESH on the active writer, not 503: {} {:?}",
+        r_fresh.status, r_fresh.body
+    );
+    // Same rows as the sealed path: alpha (90), gamma (75) by score DESC.
+    let names: Vec<&str> = r_fresh.body.as_array().expect("rows array")
+        .iter().map(|row| row["name"].as_str().unwrap_or("?")).collect();
+    assert_eq!(names, vec!["alpha", "gamma"], "fresh rows must match: {names:?}");
+    assert!(
+        r_fresh.headers.get("x-bluedb-watermark").is_some(),
+        "fresh serve must include X-Bluedb-Watermark"
+    );
+}
+
+// ----- P4 test: writer serves an UNSEALED freshly-written row (min > sealed) ---
+//
+// The core P4 win: a row written but NOT yet sealed into Iceberg is still
+// served by the analytical path on the active writer, gated by the freshness
+// header. The table is never sealed (sealed watermark stays 0), so the OLD
+// behavior would have 503'd; P4 reads it fresh from the live store.
+
+#[tokio::test]
+async fn writer_serves_unsealed_fresh_row_on_analytical_path() {
+    let state = make_state().await;
+    let app = build_app(state.clone());
+
+    let r = call_full(&app, "POST", "/sql", None, None,
+        Some(json!({"sql": "PRAGMA lakehouse_mirror = on"}))).await;
+    assert!(r.status.is_success());
+
+    let r = call_full(&app, "POST", "/admin/sql", None, None,
+        Some(json!({"sql": "CREATE TABLE fresh_items (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)"}))).await;
+    assert!(r.status.is_success(), "create: {} {:?}", r.status, r.body);
+
+    // Write rows; capture the write watermark. Do NOT seal — sealed stays 0.
+    let mut write_seq = 0i64;
+    for (id, name, score) in [(1, "alpha", 90), (2, "beta", 40), (3, "gamma", 75)] {
+        let r = call_full(&app, "POST", "/sql", None, None,
+            Some(json!({"sql": format!("INSERT INTO fresh_items VALUES ({id}, '{name}', {score})")}))).await;
+        assert!(r.status.is_success(), "insert {id}: {} {:?}", r.status, r.body);
+        if let Some((_, seq)) = parse_watermark_header(&r.headers) {
+            write_seq = seq;
+        }
+    }
+    assert!(write_seq > 0, "writes should have produced a CDC watermark");
+
+    // Demand a min-watermark at the last write (strictly greater than the sealed
+    // watermark, which is still 0). The guardrail-rejected filter on `score`
+    // routes to the analytical path; P4 must serve the UNSEALED rows fresh.
+    let r = call_full(
+        &app, "POST", "/sql", None, Some(&write_seq.to_string()),
+        Some(json!({"sql": "SELECT id, name FROM fresh_items WHERE score > 50 ORDER BY score DESC"})),
+    ).await;
+    assert!(
+        r.status.is_success(),
+        "P4: writer must serve unsealed fresh rows for min={write_seq} > sealed=0: {} {:?}",
+        r.status, r.body
+    );
+    let names: Vec<&str> = r.body.as_array().expect("rows array")
+        .iter().map(|row| row["name"].as_str().unwrap_or("?")).collect();
+    assert_eq!(names, vec!["alpha", "gamma"], "expected alpha, gamma (score DESC): {names:?}");
+}
+
+// ----- P4 test: PRAGMA bluedb_read_wait_seal_n is accepted and stored ---------
+
+#[tokio::test]
+async fn read_wait_seal_n_pragma_is_accepted_and_affects_decision() {
+    let state = make_state().await;
+    let app = build_app(state.clone());
+
+    let r = call_full(&app, "POST", "/sql", None, None,
+        Some(json!({"sql": "PRAGMA lakehouse_mirror = on"}))).await;
+    assert!(r.status.is_success());
+
+    // The PRAGMA is intercepted (gluesql would reject it) and acked by name.
+    let r = call_full(&app, "POST", "/sql", None, None,
+        Some(json!({"sql": "PRAGMA bluedb_read_wait_seal_n = 3"}))).await;
+    assert!(r.status.is_success(), "pragma accepted: {} {:?}", r.status, r.body);
+    assert_eq!(
+        r.body["pragma"].as_str(), Some("bluedb_read_wait_seal_n"),
+        "ack must name the pragma: {:?}", r.body
+    );
+
+    // `0` (reset to default) is also accepted and acked by name. (The stored
+    // value itself is engine-internal; its effect is covered below.)
+    let r = call_full(&app, "POST", "/sql", None, None,
+        Some(json!({"sql": "SET bluedb_read_wait_seal_n = 0"}))).await;
+    assert!(r.status.is_success(), "pragma reset: {} {:?}", r.status, r.body);
+    assert_eq!(r.body["pragma"].as_str(), Some("bluedb_read_wait_seal_n"));
+
+    // With the pragma set to a non-default value, a min > sealed analytical read
+    // still serves fresh on the writer (the pragma tunes the follower-redirect
+    // budget, not the writer's own fresh-serve).
+    let r = call_full(&app, "POST", "/sql", None, None,
+        Some(json!({"sql": "PRAGMA bluedb_read_wait_seal_n = 5"}))).await;
+    assert!(r.status.is_success());
+    let _ = call_full(&app, "POST", "/admin/sql", None, None,
+        Some(json!({"sql": "CREATE TABLE wpragma (id INTEGER PRIMARY KEY, score INTEGER)"}))).await;
+    let _ = call_full(&app, "POST", "/sql", None, None,
+        Some(json!({"sql": "INSERT INTO wpragma VALUES (1, 99)"}))).await;
+    let r = call_full(
+        &app, "POST", "/sql", None, Some("1000000"),
+        Some(json!({"sql": "SELECT id FROM wpragma WHERE score > 0"})),
+    ).await;
+    assert!(
+        r.status.is_success(),
+        "writer serves fresh even with pragma set: {} {:?}", r.status, r.body
+    );
+}
+
+// ----- P4 test: writer unavailable → fail-fast 503 (never hang) ---------------
+//
+// A node with no writer `Db` bound (never promoted) must 503 immediately on
+// `/sql` rather than block. This is the writer-unavailable outcome.
+
+#[tokio::test]
+async fn unpromoted_node_fails_fast_503_on_sql() {
+    let state = make_unpromoted_state();
+    let app = build_app(state.clone());
+
+    // No promote() — the node is passive. A guardrail-routable analytical query
+    // with a freshness demand must 503 fast (require_active gate), not hang.
+    let r = tokio::time::timeout(
+        Duration::from_secs(5),
+        call_full(
+            &app, "POST", "/sql", None, Some("1000000"),
+            Some(json!({"sql": "SELECT id, name FROM whatever WHERE score > 50 ORDER BY score DESC"})),
+        ),
+    )
+    .await
+    .expect("request must not hang — fail fast");
+    assert_eq!(
+        r.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "unpromoted node must 503 (writer unavailable): {} {:?}",
+        r.status, r.body
     );
 }
 

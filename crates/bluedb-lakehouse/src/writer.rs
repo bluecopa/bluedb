@@ -267,7 +267,12 @@ impl LakehouseWriter {
 
     /// Convert gluesql rows to an Arrow [`RecordBatch`] matching the table's
     /// Arrow schema (field-ids carried via [`schema_to_arrow_schema`]).
-    fn rows_to_record_batch(&self, rows: &[(Key, DataRow)]) -> Result<RecordBatch> {
+    ///
+    /// Public so the fresh writer-local analytical read (`bluedb-query`) can
+    /// reuse the exact gluesql-`Value`→Arrow conversion the seal path uses,
+    /// guaranteeing identical typing/rendering across the OLTP and analytical
+    /// tiers. (`LakehouseEngine::current_record_batch` is the caller.)
+    pub fn rows_to_record_batch(&self, rows: &[(Key, DataRow)]) -> Result<RecordBatch> {
         let arrow_schema = Arc::new(schema_to_arrow_schema(&self.schema)?);
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(arrow_schema.fields().len());
         for (col_idx, field) in arrow_schema.fields().iter().enumerate() {

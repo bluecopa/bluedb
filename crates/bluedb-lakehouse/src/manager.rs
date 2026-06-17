@@ -232,6 +232,28 @@ impl LakehouseManager {
         }
     }
 
+    /// The analytical read-your-writes freshness tolerance for `tenant`, in seal
+    /// cycles (set via `PRAGMA bluedb_read_wait_seal_n`). Defaults to 1 when the
+    /// tenant's engine isn't loaded or the pragma was never set.
+    pub async fn read_wait_seal_n(&self, tenant: &str) -> u64 {
+        match self.engines.read().await.get(tenant) {
+            Some(engine) => engine.read_wait_seal_n(),
+            None => 1,
+        }
+    }
+
+    /// Build a fresh Arrow [`RecordBatch`](arrow_array::RecordBatch) of `table`'s
+    /// current rows for `tenant` straight from the live store (writer-local fresh
+    /// analytical read; HTAP P4). `None` if the tenant or table doesn't exist.
+    /// See [`LakehouseEngine::current_record_batch`].
+    pub async fn current_record_batch(
+        &self,
+        tenant: &str,
+        table: &str,
+    ) -> Result<Option<arrow_array::RecordBatch>> {
+        self.engine_for(tenant).await?.current_record_batch(table).await
+    }
+
     /// Stop the background loops (called on demote; the next promote reopens).
     pub fn shutdown(&self) {
         for h in self.handles.lock().unwrap().drain(..) {

@@ -22,6 +22,12 @@ pub enum LhPragma {
     Table(String, bool),
     /// Set the incremental-compaction bin-pack target file size, in bytes.
     TargetFileBytes(u64),
+    /// Set the read-your-writes freshness tolerance for the analytical path, in
+    /// *seal cycles* (`PRAGMA bluedb_read_wait_seal_n = N`). Governs how a
+    /// `X-Bluedb-Min-Watermark` request that outruns the sealed Iceberg
+    /// watermark is handled: serve fresh from the writer / wait / redirect / 503.
+    /// `0` reverts to the engine default (1).
+    ReadWaitSealN(u64),
 }
 
 /// Parse a `PRAGMA`/`SET lakehouse_mirror[...]` statement, or `None` if `sql`
@@ -31,6 +37,13 @@ pub fn parse_lakehouse_pragma(sql: &str) -> Option<LhPragma> {
     let body = lower.strip_suffix(';').unwrap_or(&lower).trim();
     if !(body.starts_with("pragma ") || body.starts_with("set ")) {
         return None;
+    }
+    // Read-wait freshness tolerance form: bluedb_read_wait_seal_n = <integer>.
+    // Checked before the mirror containment guard (which early-returns None).
+    if let Some(rest) = body.split("bluedb_read_wait_seal_n").nth(1) {
+        let value = rest.trim_start_matches([' ', '=']).trim();
+        let value = value.split_whitespace().next().unwrap_or(value);
+        return value.parse::<u64>().ok().map(LhPragma::ReadWaitSealN);
     }
     // Target-file-size form: lakehouse_target_file_bytes = <integer>. Checked
     // before the mirror containment guard (which early-returns None).
@@ -109,6 +122,22 @@ mod tests {
         );
         assert_eq!(
             parse_lakehouse_pragma("PRAGMA lakehouse_target_file_bytes = nope"),
+            None
+        );
+    }
+
+    #[test]
+    fn parses_read_wait_seal_n() {
+        assert_eq!(
+            parse_lakehouse_pragma("PRAGMA bluedb_read_wait_seal_n = 3"),
+            Some(LhPragma::ReadWaitSealN(3))
+        );
+        assert_eq!(
+            parse_lakehouse_pragma("SET bluedb_read_wait_seal_n = 0;"),
+            Some(LhPragma::ReadWaitSealN(0))
+        );
+        assert_eq!(
+            parse_lakehouse_pragma("PRAGMA bluedb_read_wait_seal_n = nope"),
             None
         );
     }

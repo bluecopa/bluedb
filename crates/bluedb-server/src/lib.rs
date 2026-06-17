@@ -59,7 +59,7 @@ pub use signer::verify_es256_der;
 
 use bluedb_lakehouse::{object_store_file_io, LakehouseConfig, LakehouseManager};
 use bluedb_rest::{parse_filters, DeleteRequest, InsertRequest, UpdateRequest};
-use bluedb_sql::{parse_lakehouse_pragma, CdcConfig, Database, SlateDbStorage, DEFAULT_TENANT};
+use bluedb_sql::{parse_lakehouse_pragma, CdcConfig, Database, LhPragma, SlateDbStorage, DEFAULT_TENANT};
 use gluesql_core::prelude::{Glue, Payload, Value as SqlValue};
 use slatedb::object_store::ObjectStore;
 use slatedb::{Db, DbReader, Settings};
@@ -716,7 +716,7 @@ impl AppState {
     /// [`Inner::writer_bound`]). The `Acquire` load pairs with the `Release` store
     /// in [`AppState::promote`]/[`AppState::attach_reader`].
     pub(crate) fn require_active(&self) -> Result<(), AppError> {
-        if self.inner.writer.is_active() && self.inner.writer_bound.load(Ordering::Acquire) {
+        if self.is_writer() {
             Ok(())
         } else {
             Err(AppError::plain(
@@ -724,6 +724,13 @@ impl AppState {
                 format!("node '{}' is passive (not the active writer)", self.inner.writer.node_id()),
             ))
         }
+    }
+
+    /// Whether this node is the active writer (lease held **and** writer `Db`
+    /// bound — same condition as [`Self::require_active`], as a bool). Used by the
+    /// HTAP analytical freshness gate to decide writer-local-serve vs. redirect.
+    pub(crate) fn is_writer(&self) -> bool {
+        self.inner.writer.is_active() && self.inner.writer_bound.load(Ordering::Acquire)
     }
 }
 
@@ -929,6 +936,76 @@ fn extract_single_table_name(sql: &str) -> Option<String> {
     }
 }
 
+/// HTAP P4 freshness decision: handle a guardrail-routed analytical SELECT whose
+/// requested `X-Bluedb-Min-Watermark` (`min`) outruns the sealed Iceberg
+/// watermark (`sealed`). The sealed snapshot can't satisfy the read, so:
+///
+/// 1. **This node IS the active writer** — it holds the fresh, *unsealed* rows.
+///    Serve them via the writer-local read ([`bluedb_query::query_sql_fresh`] over
+///    [`LakehouseEngine::current_record_batch`](bluedb_lakehouse::LakehouseEngine::current_record_batch)).
+///    No redirect; the writer is the source of truth, so the
+///    `bluedb_read_wait_seal_n` tolerance is satisfied trivially.
+/// 2. **This node is NOT the writer** — the fresh rows live on the active writer,
+///    so the client must be **302-redirected** there. The redirect target is the
+///    active writer's URL, which **bluedb cannot resolve today** (the HA lease
+///    stores only a node-id fencing token — no advertised address, and there is no
+///    node registry; see the function body + the P4 report). Until that lands we
+///    **fail fast with 503** (never hang), carrying the sealed watermark so the
+///    client can retry/seal-and-poll. This is also the writer-unavailable outcome.
+///
+/// The `bluedb_read_wait_seal_n` PRAGMA (seal-cycle tolerance) is read here; it
+/// governs the wait-before-redirect budget a follower would honor once a writer
+/// URL is resolvable. On the writer it short-circuits to an immediate fresh serve.
+#[allow(clippy::too_many_arguments)]
+async fn serve_fresh_analytical(
+    state: &AppState,
+    manager: &Arc<LakehouseManager>,
+    engine: &bluedb_lakehouse::LakehouseEngine,
+    tenant: &str,
+    table: &str,
+    sql: &str,
+    min: i64,
+    sealed: i64,
+) -> Result<(axum::http::HeaderMap, Json<Value>), AppError> {
+    // Tolerance in seal cycles (default 1). Read for both branches; the writer
+    // branch serves immediately, the follower branch would wait up to this many
+    // seal cadences before redirecting (deferred — no writer URL, see below).
+    let _wait_seal_n = manager.read_wait_seal_n(tenant).await;
+
+    if state.is_writer() {
+        // We are the active writer: serve the FRESH current table (incl. unsealed
+        // writes) directly. No wait, no redirect — this satisfies read-your-writes.
+        let batches = bluedb_query::query_sql_fresh(engine, table, sql)
+            .await
+            .map_err(|e| AppError::bad_request(format!("fresh analytical query: {e}")))?;
+        // The fresh read reflects the writer's current state, so the response is
+        // at least as fresh as `min`; stamp the live write watermark.
+        let fresh_wm = state.write_watermark(tenant).await;
+        let wm_hdrs = watermark_headers_always(tenant, fresh_wm.max(min));
+        return Ok((wm_hdrs, Json(record_batches_to_json(&batches))));
+    }
+
+    // We are NOT the active writer. The fresh rows live on the writer, so the
+    // correct answer is a 302 to the writer's URL. bluedb cannot resolve that URL
+    // today: the HA lease (bluedb-ha) records only the holder's node-id + a
+    // fencing epoch — there is no advertised network address and no node registry
+    // mapping node-id → URL, and a node does not even track its own external URL
+    // (it only binds `BLUEDB_ADDR`). Rather than fake a Location, fail fast with
+    // 503 (never hang) and surface the sealed watermark for retry/poll.
+    let wm_hdrs = watermark_headers_always(tenant, sealed);
+    Err(AppError::plain(
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!(
+            "read-your-writes freshness not satisfiable on this node: requested \
+             min-watermark {min} > sealed watermark {sealed}, and this node is not \
+             the active writer. A 302 redirect to the writer is required but the \
+             writer's address is not resolvable (no advertised address / node \
+             registry in the HA lease); retry against the writer or after the next seal"
+        ),
+    )
+    .with_headers(wm_hdrs))
+}
+
 /// Convert a slice of Arrow [`RecordBatch`]es into a JSON array of row-objects,
 /// matching the shape of the existing read endpoints (`[{"col": val, ...}, ...]`).
 ///
@@ -1102,9 +1179,13 @@ async fn health() -> Json<Value> {
 /// tenant's sealed Iceberg snapshot. Only single-table SELECTs are routed;
 /// multi-table SELECTs return the original guardrail-reject (noted in the error).
 ///
-/// **Freshness gate on the analytical path:** `X-Bluedb-Min-Watermark` is
-/// checked against the sealed Iceberg watermark. If `min > sealed`, the handler
-/// returns `503` with the current sealed watermark in `X-Bluedb-Watermark`.
+/// **Freshness gate on the analytical path (HTAP P4):** `X-Bluedb-Min-Watermark`
+/// is checked against the sealed Iceberg watermark. If `min > sealed`, the
+/// sealed snapshot can't satisfy the read, so [`serve_fresh_analytical`] decides:
+/// the active writer serves the **fresh, unsealed** rows via the writer-local
+/// read; a non-writer node would 302-redirect to the writer (deferred — no
+/// resolvable writer URL today) and meanwhile fails fast with `503` (never
+/// hangs). The `bluedb_read_wait_seal_n` PRAGMA tunes the tolerance.
 async fn exec_sql(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -1113,16 +1194,23 @@ async fn exec_sql(
     state.authorize(&headers, authz::Scope::DataQuery)?;
     let tenant = state.tenant(&headers)?;
     state.require_active()?;
-    // Intercept `PRAGMA lakehouse_mirror[...]` before gluesql (which would reject
-    // it): apply the opt-out/opt-in to this tenant's mirror engine and ack.
+    // Intercept bluedb PRAGMAs before gluesql (which would reject them): apply to
+    // this tenant's mirror engine and ack. Covers `lakehouse_mirror[...]`,
+    // `lakehouse_target_file_bytes`, and the HTAP `bluedb_read_wait_seal_n`
+    // freshness tolerance — all parsed by `parse_lakehouse_pragma`.
     if let Some(pragma) = parse_lakehouse_pragma(&req.sql) {
+        let name = match &pragma {
+            LhPragma::GlobalDefault(_) | LhPragma::Table(_, _) => "lakehouse_mirror",
+            LhPragma::TargetFileBytes(_) => "lakehouse_target_file_bytes",
+            LhPragma::ReadWaitSealN(_) => "bluedb_read_wait_seal_n",
+        };
         match state.lakehouse().await {
             Some(manager) => {
                 manager
                     .apply_pragma(&tenant, pragma)
                     .await
                     .map_err(|e| AppError::internal(format!("lakehouse pragma: {e}")))?;
-                return Ok((axum::http::HeaderMap::new(), Json(json!({ "ok": true, "pragma": "lakehouse_mirror" }))));
+                return Ok((axum::http::HeaderMap::new(), Json(json!({ "ok": true, "pragma": name }))));
             }
             None => return Err(AppError::internal("lakehouse manager not bound")),
         }
@@ -1147,23 +1235,7 @@ async fn exec_sql(
                 )));
             };
 
-            // Freshness gate: analytical reads serve sealed Iceberg data, so check
-            // X-Bluedb-Min-Watermark here (not on the SlateDB OLTP path).
-            let sealed = state.sealed_watermark(&tenant).await;
-            if let Some(min) = parse_min_watermark(&headers) {
-                if min > sealed {
-                    let wm_hdrs = watermark_headers_always(&tenant, sealed);
-                    return Err(AppError::plain(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        format!(
-                            "read-your-writes freshness not yet satisfied: \
-                             requested min-watermark {min}, sealed watermark {sealed}"
-                        ),
-                    ).with_headers(wm_hdrs));
-                }
-            }
-
-            // Get the per-tenant lakehouse engine.
+            // The per-tenant lakehouse engine is required for any analytical read.
             let manager = state.lakehouse().await.ok_or_else(|| {
                 AppError::internal("analytical path unavailable: lakehouse manager not bound")
             })?;
@@ -1172,6 +1244,22 @@ async fn exec_sql(
                 .await
                 .map_err(|e| AppError::internal(format!("get lakehouse engine: {e}")))?;
 
+            // Freshness gate (HTAP P4): the sealed Iceberg snapshot may lag the
+            // last acknowledged write. When the client demands a watermark the
+            // seal hasn't reached yet (`min > sealed`), decide per the
+            // `bluedb_read_wait_seal_n` tolerance instead of an unconditional 503.
+            let sealed = state.sealed_watermark(&tenant).await;
+            if let Some(min) = parse_min_watermark(&headers) {
+                if min > sealed {
+                    return serve_fresh_analytical(
+                        &state, &manager, &engine, &tenant, &table, &req.sql, min, sealed,
+                    )
+                    .await;
+                }
+            }
+
+            // Fast/fresh-enough path: the seal already covers the requested
+            // watermark (or none was requested) — serve the sealed Iceberg snapshot.
             let batches = bluedb_query::query_sql(&engine, &table, &req.sql)
                 .await
                 .map_err(|e| AppError::bad_request(format!("analytical query: {e}")))?;

@@ -61,6 +61,10 @@ struct Registry {
     /// `PRAGMA lakehouse_target_file_bytes`). `None` ⇒ use the engine default.
     #[serde(default)]
     target_file_bytes: Option<u64>,
+    /// Read-your-writes freshness tolerance for the analytical path, in seal
+    /// cycles (set via `PRAGMA bluedb_read_wait_seal_n`). `None` ⇒ default (1).
+    #[serde(default)]
+    read_wait_seal_n: Option<u64>,
 }
 
 /// Default incremental-compaction bin-pack target when no PRAGMA is set:
@@ -226,6 +230,7 @@ impl LakehouseEngine {
             LhPragma::Table(table, true) => self.enable_table(&table).await,
             LhPragma::Table(table, false) => self.disable_table(&table).await,
             LhPragma::TargetFileBytes(bytes) => self.set_target_file_bytes(bytes).await,
+            LhPragma::ReadWaitSealN(n) => self.set_read_wait_seal_n(n).await,
         }
     }
 
@@ -244,6 +249,20 @@ impl LakehouseEngine {
             .unwrap()
             .target_file_bytes
             .unwrap_or_else(default_target_bytes)
+    }
+
+    /// Set the analytical read-your-writes freshness tolerance, in seal cycles
+    /// (persisted to the registry, restored on promote/failover). `0` clears it
+    /// (revert to the default of 1).
+    pub async fn set_read_wait_seal_n(&self, n: u64) -> Result<()> {
+        self.state.write().unwrap().read_wait_seal_n = (n > 0).then_some(n);
+        self.persist_registry().await
+    }
+
+    /// The configured analytical freshness tolerance in seal cycles, or `1`
+    /// (the default) when unset.
+    pub fn read_wait_seal_n(&self) -> u64 {
+        self.state.read().unwrap().read_wait_seal_n.unwrap_or(1)
     }
 
     /// Is `table` currently mirrored (effective `default_on XOR override`)?
@@ -610,6 +629,43 @@ impl LakehouseEngine {
         }
         let writer = self.writer_for(table, &schema, &[]).await?;
         Ok(Some(writer.to_table()?))
+    }
+
+    /// Build an Arrow [`RecordBatch`](arrow_array::RecordBatch) of the table's
+    /// **current** rows read straight from the live store — including writes not
+    /// yet sealed into Iceberg. Returns `None` if the table doesn't exist.
+    ///
+    /// This is the writer-local **fresh** analytical read source (HTAP P4): the
+    /// active writer always holds rows at least as fresh as any acknowledged
+    /// write, so a freshness-gated analytical query can be answered here instead
+    /// of waiting for the next seal. It reuses the seal path's exact
+    /// gluesql-`Value`→Arrow conversion ([`LakehouseWriter::rows_to_record_batch`]
+    /// over the schema [`writer_for`](Self::writer_for) derives), so a column
+    /// renders identically whether served fresh from the writer or from a sealed
+    /// Iceberg snapshot.
+    ///
+    /// First cut: serves the **whole** current table (correctness over
+    /// efficiency). The Iceberg ∪ unsealed-delta union is out of scope.
+    pub async fn current_record_batch(
+        &self,
+        table: &str,
+    ) -> Result<Option<arrow_array::RecordBatch>> {
+        let Some(schema) = self.try_fetch_schema(table).await? else {
+            return Ok(None);
+        };
+        let rows = self.scan_all_rows(table).await?;
+        let sample_rows: Vec<&[gluesql_core::data::Value]> = rows
+            .iter()
+            .filter_map(|(_, row)| match row {
+                DataRow::Vec(vals) => Some(vals.as_slice()),
+                DataRow::Map(_) => None,
+            })
+            .collect();
+        // writer_for derives the Iceberg/Arrow schema from the gluesql schema +
+        // sample rows (decimal precision/scale etc.); we only use it to convert
+        // rows — nothing is written to object storage.
+        let writer = self.writer_for(table, &schema, &sample_rows).await?;
+        Ok(Some(writer.rows_to_record_batch(&rows)?))
     }
 
     /// Fetch a table's gluesql schema through a read connection.
