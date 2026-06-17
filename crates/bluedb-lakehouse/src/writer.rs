@@ -241,6 +241,14 @@ impl LakehouseWriter {
             .build()?)
     }
 
+    /// The Arrow schema of this table (Iceberg field-ids carried via
+    /// [`schema_to_arrow_schema`]), shared by the seal path's row conversion
+    /// ([`Self::rows_to_record_batch`]) and the Iceberg read-back so merged
+    /// batches from both sides align for concatenation.
+    pub fn arrow_schema(&self) -> Result<arrow_schema::SchemaRef> {
+        Ok(Arc::new(schema_to_arrow_schema(&self.schema)?))
+    }
+
     // --- internals ----------------------------------------------------------
 
     fn metadata_dir(&self) -> String {

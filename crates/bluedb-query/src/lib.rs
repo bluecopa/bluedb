@@ -122,3 +122,62 @@ pub async fn query_sql_fresh(
 
     Ok(batches)
 }
+
+/// Run `sql` against the exact read-your-writes **union** of `table`'s sealed
+/// Iceberg snapshot and its unsealed CDC tail — the analytical read of the
+/// DataFusion front-door design — via DataFusion.
+///
+/// Unlike [`query_sql`] (sealed Iceberg only) and [`query_sql_fresh`] (whole
+/// current table materialized), this reads the columnar bulk from Iceberg and
+/// merges only the *unsealed delta* on the primary key, so results are both
+/// fresh (read-your-writes) and cheap (the row store is touched only for the
+/// tail). See [`LakehouseEngine::merged_record_batch`].
+///
+/// # Errors
+///
+/// - `table` does not exist, or has no single-column primary key.
+/// - `sql` is malformed, or DataFusion / Iceberg I/O fails.
+pub async fn query_sql_unified(
+    engine: &LakehouseEngine,
+    table: &str,
+    sql: &str,
+) -> anyhow::Result<Vec<RecordBatch>> {
+    query_sql_unified_multi(engine, &[table], sql).await
+}
+
+/// Like [`query_sql_unified`] but registers **several** tables, so `sql` may JOIN
+/// across them. Each table is read as its own read-your-writes union; DataFusion
+/// then plans the join / window / aggregate over the merged providers — the
+/// mechanism by which multi-table and window-function support "fall out" of the
+/// front-door flip (GlueSQL handles neither correctly).
+///
+/// First cut: each merged table is registered as an in-memory provider (the
+/// spike's stand-in for the pushdown-capable `TableProvider`). The PK fast-path
+/// (predicate pushdown straight to the row store) is the next spike step.
+pub async fn query_sql_unified_multi(
+    engine: &LakehouseEngine,
+    tables: &[&str],
+    sql: &str,
+) -> anyhow::Result<Vec<RecordBatch>> {
+    let ctx = SessionContext::new();
+    for &table in tables {
+        let batch = engine
+            .merged_record_batch(table)
+            .await
+            .with_context(|| format!("building unified read of '{table}'"))?
+            .ok_or_else(|| anyhow!("table '{table}' does not exist"))?;
+        let schema = batch.schema();
+        let provider = MemTable::try_new(schema, vec![vec![batch]])
+            .with_context(|| format!("building merged provider for '{table}'"))?;
+        ctx.register_table(table, Arc::new(provider))
+            .with_context(|| format!("registering '{table}' in DataFusion session"))?;
+    }
+    let batches = ctx
+        .sql(sql)
+        .await
+        .with_context(|| format!("planning SQL (unified): {sql}"))?
+        .collect()
+        .await
+        .with_context(|| format!("executing SQL (unified): {sql}"))?;
+    Ok(batches)
+}

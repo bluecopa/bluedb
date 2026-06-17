@@ -9,7 +9,7 @@
 //! alongside the tables so a freshly promoted node reopens with the same
 //! mirror set. The event-driven seal loop and compaction land in later tasks.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -668,6 +668,87 @@ impl LakehouseEngine {
         Ok(Some(writer.rows_to_record_batch(&rows)?))
     }
 
+    /// Build an Arrow [`RecordBatch`] of `table`'s **current** rows as the exact
+    /// read-your-writes union of its sealed Iceberg snapshot and its unsealed
+    /// CDC tail — the analytical read source for the DataFusion front-door.
+    ///
+    /// Bulk rows (CDC seq ≤ the snapshot's sealed watermark) are read columnar
+    /// from Iceberg (merge-on-read deletes already applied by the reader); the
+    /// small tail (seq > watermark) is replayed from the CDC log, collapsed
+    /// last-writer-wins, and merged on the primary key: every key touched in the
+    /// tail is dropped from the Iceberg side (anti-join), then surviving tail
+    /// upserts are appended. A tail delete drops the key from both sides.
+    ///
+    /// This is the efficient replacement for [`Self::current_record_batch`]'s
+    /// whole-table materialization — it reads only the unsealed delta from the
+    /// row store, not every row. Returns `None` if `table` does not exist; errors
+    /// if it has no single-column primary key (the merge keys on it), matching
+    /// the seal path's requirement.
+    ///
+    /// First cut: returns a single concatenated batch (the tail is bounded by the
+    /// seal cadence). A streaming, pushdown-capable `TableProvider` is the
+    /// productionization.
+    pub async fn merged_record_batch(
+        &self,
+        table: &str,
+    ) -> Result<Option<arrow_array::RecordBatch>> {
+        use futures::StreamExt;
+
+        let Some(schema) = self.try_fetch_schema(table).await? else {
+            return Ok(None);
+        };
+        // Merge key: the single PK column position. Errors on no-PK / composite
+        // (PK-less tables cannot be merged on read — front-door design decision).
+        let pk_idx = single_pk_index(&schema)?;
+
+        // The writer yields both the shared Arrow schema and the sealed watermark.
+        let writer = self.writer_for(table, &schema, &[]).await?;
+        let arrow_schema = writer.arrow_schema()?;
+        let sealed_seq = writer.current_watermark().unwrap_or(0);
+
+        // --- unsealed delta: CDC entries with seq > sealed_seq ----------------
+        let entries = self
+            .db
+            .scan_cdc(&self.tenant, sealed_seq)
+            .await
+            .map_err(LakehouseError::Sql)?;
+        let mut collapsed = collapse_lww(entries);
+        let changes = collapsed.remove(table).unwrap_or_default();
+        let touched: BTreeSet<gluesql_core::data::Key> = changes.keys().cloned().collect();
+        let upserts: Vec<(gluesql_core::data::Key, DataRow)> = changes
+            .into_iter()
+            .filter_map(|(k, row)| row.map(|r| (k, r)))
+            .collect();
+
+        let mut parts: Vec<arrow_array::RecordBatch> = Vec::new();
+
+        // --- bulk side: sealed Iceberg rows minus any tail-touched key --------
+        if self.table_metadata_location(table).await?.is_some() {
+            let ice = writer.to_table()?;
+            let mut stream = ice.scan().build()?.to_arrow().await?;
+            while let Some(batch) = stream.next().await {
+                let batch = batch?;
+                let kept = if touched.is_empty() {
+                    batch
+                } else {
+                    antijoin_batch(&batch, pk_idx, &touched)?
+                };
+                if kept.num_rows() > 0 {
+                    parts.push(kept);
+                }
+            }
+        }
+
+        // --- tail side: surviving upserts -------------------------------------
+        if !upserts.is_empty() {
+            parts.push(writer.rows_to_record_batch(&upserts)?);
+        }
+
+        let merged = arrow_select::concat::concat_batches(&arrow_schema, &parts)
+            .map_err(|e| LakehouseError::Iceberg(format!("merge concat: {e}")))?;
+        Ok(Some(merged))
+    }
+
     /// Fetch a table's gluesql schema through a read connection.
     pub async fn fetch_schema(&self, table: &str) -> Result<gluesql_core::data::Schema> {
         self.try_fetch_schema(table)
@@ -700,4 +781,76 @@ impl LakehouseEngine {
 /// Map a gluesql execution error into a [`LakehouseError`].
 fn glue_err(e: gluesql_core::error::Error) -> LakehouseError {
     LakehouseError::Sql(bluedb_sql::SqlError::Serde(e.to_string()))
+}
+
+/// The position of the single primary-key column — the key the analytical merge
+/// joins on. Errors if the table has no primary key or a composite one (the v1
+/// merge supports single-column keys only), matching [`table_to_iceberg`].
+fn single_pk_index(schema: &gluesql_core::data::Schema) -> Result<usize> {
+    let columns = schema.column_defs.as_ref().ok_or_else(|| {
+        LakehouseError::Schema(format!(
+            "table '{}' is schemaless; the analytical merge requires a primary key",
+            schema.table_name
+        ))
+    })?;
+    let pks: Vec<usize> = columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.unique.as_ref().is_some_and(|u| u.is_primary))
+        .map(|(i, _)| i)
+        .collect();
+    match pks.as_slice() {
+        [only] => Ok(*only),
+        [] => Err(LakehouseError::Schema(format!(
+            "table '{}' has no primary key; the analytical merge requires one",
+            schema.table_name
+        ))),
+        _ => Err(LakehouseError::Schema(format!(
+            "table '{}' has a composite primary key; the v1 analytical merge \
+             supports single-column keys only",
+            schema.table_name
+        ))),
+    }
+}
+
+/// Drop every Iceberg row whose primary key was touched in the unsealed CDC
+/// tail, so the tail's last-writer-wins value (appended separately) shadows the
+/// sealed copy. The retained mask is `pk ∉ touched`.
+fn antijoin_batch(
+    batch: &arrow_array::RecordBatch,
+    pk_idx: usize,
+    touched: &BTreeSet<gluesql_core::data::Key>,
+) -> Result<arrow_array::RecordBatch> {
+    use arrow_array::{Array, BooleanArray, Int32Array, Int64Array, StringArray};
+    use gluesql_core::data::Key;
+
+    let pk = batch.column(pk_idx);
+    let keep: BooleanArray = match pk.data_type() {
+        arrow_schema::DataType::Int64 => {
+            let a = pk.as_any().downcast_ref::<Int64Array>().unwrap();
+            (0..a.len())
+                .map(|i| Some(!touched.contains(&Key::I64(a.value(i)))))
+                .collect()
+        }
+        arrow_schema::DataType::Int32 => {
+            let a = pk.as_any().downcast_ref::<Int32Array>().unwrap();
+            (0..a.len())
+                .map(|i| Some(!touched.contains(&Key::I32(a.value(i)))))
+                .collect()
+        }
+        arrow_schema::DataType::Utf8 => {
+            let a = pk.as_any().downcast_ref::<StringArray>().unwrap();
+            (0..a.len())
+                .map(|i| Some(!touched.contains(&Key::Str(a.value(i).to_string()))))
+                .collect()
+        }
+        other => {
+            return Err(LakehouseError::Iceberg(format!(
+                "analytical merge: unsupported primary-key Arrow type {other:?} \
+                 (spike supports Int32/Int64/Utf8)"
+            )))
+        }
+    };
+    arrow_select::filter::filter_record_batch(batch, &keep)
+        .map_err(|e| LakehouseError::Iceberg(format!("merge anti-join filter: {e}")))
 }
