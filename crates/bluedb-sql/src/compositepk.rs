@@ -32,6 +32,7 @@ use sqlparser::parser::Parser;
 
 use crate::error::SqlError;
 use crate::pkcodec::encode_composite_key;
+use crate::rewrite::normalize_data_type;
 use crate::storage::SlateDbStorage;
 
 /// The hidden surrogate primary-key column. Reserved: user columns may not use
@@ -84,15 +85,34 @@ pub async fn prepare(
         .join("; "))
 }
 
-/// Rewrite `stmt` in place for composite-PK support. Returns whether it changed.
+/// Rewrite `stmt` in place for composite-PK support and data-type normalisation.
+/// Returns whether it changed.
+///
+/// For `CREATE TABLE` statements this always normalises column data types (e.g.
+/// `DECIMAL(12,2)` → bare `DECIMAL`, `VARCHAR(n)` → `TEXT`, …) so gluesql's
+/// translate step never sees a type it would reject with `UnsupportedDataType`.
+/// Precision/scale declared in `DECIMAL(p,s)` / `NUMERIC(p,s)` are coerced to
+/// gluesql's internal Decimal(38,18); enforcement of the declared p,s is out of
+/// scope for this shim.
 async fn apply(
     storage: &mut SlateDbStorage,
     stmt: &mut Statement,
     params: &[Value],
 ) -> Result<bool, SqlError> {
     if let Statement::CreateTable(create) = stmt {
+        // Normalise column types for ALL CREATE TABLE statements: DECIMAL(p,s) →
+        // bare DECIMAL, VARCHAR(n) → TEXT, INT(n) → INTEGER, etc.  This is the
+        // single execution chokepoint; doing it here means the normalisation
+        // applies to every path (REST API, /admin/sql, direct Glue::execute via
+        // prepare_composite_pk).
+        let mut type_changed = false;
+        for col in &mut create.columns {
+            if normalize_data_type(&mut col.data_type) {
+                type_changed = true;
+            }
+        }
         let Some(catalog) = strip_composite_pk(create)? else {
-            return Ok(false);
+            return Ok(type_changed);
         };
         let table = object_table_name(&create.name);
         storage.write_pk_catalog(&table, &catalog).await?;
