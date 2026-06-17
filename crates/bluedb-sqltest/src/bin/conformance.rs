@@ -126,7 +126,12 @@ struct Tally {
 /// One corpus run's full result, so the per-engine run loop (a macro, since the
 /// two backends are distinct concrete types) can hand a single value back.
 struct Report {
+    /// All scored records (statements + queries) — the overall coverage figure.
     t: Tally,
+    /// Query records only — the read-path figure. Statements still run (they set
+    /// up the data a query reads), but their pass/fail is a write-path signal, so
+    /// they are excluded here to isolate the read dialect.
+    qt: Tally,
     backlog: BTreeMap<String, usize>,
     wrong_examples: Vec<String>,
     other_examples: Vec<String>,
@@ -190,6 +195,7 @@ async fn main() -> anyhow::Result<()> {
     macro_rules! run_all {
         ($make:expr) => {{
             let mut t = Tally::default();
+            let mut qt = Tally::default();
             let mut parse_errors = 0usize;
             let mut backlog: BTreeMap<String, usize> = BTreeMap::new();
             let mut wrong_examples: Vec<String> = Vec::new();
@@ -217,22 +223,29 @@ async fn main() -> anyhow::Result<()> {
                     // Only statements and queries are scored; everything else
                     // (control, conditions, comments, hash-threshold, ...) is still
                     // applied so the runner state stays correct.
-                    let scored_sql = match &record {
-                        Record::Statement { sql, .. } | Record::Query { sql, .. } => {
-                            Some(sql.clone())
-                        }
-                        _ => None,
+                    let (scored_sql, is_query) = match &record {
+                        Record::Query { sql, .. } => (Some(sql.clone()), true),
+                        Record::Statement { sql, .. } => (Some(sql.clone()), false),
+                        _ => (None, false),
                     };
                     let outcome = runner.run_async(record).await;
                     let Some(sql) = scored_sql else { continue };
 
                     match outcome {
-                        Ok(_) => t.pass += 1,
+                        Ok(_) => {
+                            t.pass += 1;
+                            if is_query {
+                                qt.pass += 1;
+                            }
+                        }
                         Err(e) => {
                             let msg = e.to_string();
                             match classify(&msg) {
                                 Cat::WrongResult => {
                                     t.wrong += 1;
+                                    if is_query {
+                                        qt.wrong += 1;
+                                    }
                                     // Hashed results (corpus uses hash-threshold 8)
                                     // need byte-exact value formatting to match;
                                     // literal-block mismatches are more likely just
@@ -261,11 +274,22 @@ async fn main() -> anyhow::Result<()> {
                                 }
                                 Cat::Unsupported => {
                                     t.unsupported += 1;
+                                    if is_query {
+                                        qt.unsupported += 1;
+                                    }
                                     *backlog.entry(feature_key(&msg)).or_default() += 1;
                                 }
-                                Cat::Cascade => t.cascade += 1,
+                                Cat::Cascade => {
+                                    t.cascade += 1;
+                                    if is_query {
+                                        qt.cascade += 1;
+                                    }
+                                }
                                 Cat::Other => {
                                     t.other += 1;
+                                    if is_query {
+                                        qt.other += 1;
+                                    }
                                     if other_examples.len() < 8 {
                                         other_examples.push(format!(
                                             "{}  ::  {}",
@@ -282,6 +306,7 @@ async fn main() -> anyhow::Result<()> {
 
             Report {
                 t,
+                qt,
                 backlog,
                 wrong_examples,
                 other_examples,
@@ -293,6 +318,7 @@ async fn main() -> anyhow::Result<()> {
 
     let Report {
         t,
+        qt,
         backlog,
         wrong_examples,
         other_examples,
@@ -321,6 +347,37 @@ async fn main() -> anyhow::Result<()> {
     println!("  of accepted (output comparison — lower bound, rendering still minimal):");
     println!("      PASS         {:>6}", t.pass);
     println!("      WRONG-RESULT {:>6}  ({wrong_hashed} hashed / {} literal)", t.wrong, t.wrong - wrong_hashed);
+    println!("=======================================================");
+
+    // The read-path-only figure: score QUERY records, exclude cascades (queries
+    // blocked by a failed CREATE/INSERT — a write-path gap, not a read-dialect
+    // one). This isolates how much of the read dialect the engine actually serves.
+    let q_scored = qt.pass + qt.unsupported + qt.wrong + qt.cascade + qt.other;
+    let q_base = q_scored - qt.cascade; // non-cascade queries = the real denominator
+    let q_accept = qt.pass + qt.wrong;
+    println!("\n  READ PATH ONLY (query records; cascades excluded — downstream of a");
+    println!("  failed setup statement, i.e. a write-path gap, not the read dialect):");
+    println!(
+        "    queries: {q_scored}   non-cascade: {q_base}   (cascade-blocked: {})",
+        qt.cascade
+    );
+    println!(
+        "    READ-ACCEPTED  {q_accept:>6}  ({:.1}% of non-cascade)",
+        pct(q_accept, q_base)
+    );
+    println!(
+        "        PASS         {:>6}  ({:.1}% correct of accepted)",
+        qt.pass,
+        pct(qt.pass, q_accept)
+    );
+    println!("        WRONG-RESULT {:>6}", qt.wrong);
+    println!(
+        "    READ-REJECTED  {:>6}  ({:.1}%)   unsupported {} / other {}",
+        qt.unsupported + qt.other,
+        pct(qt.unsupported + qt.other, q_base),
+        qt.unsupported,
+        qt.other
+    );
     println!("=======================================================");
 
     if !backlog.is_empty() {
