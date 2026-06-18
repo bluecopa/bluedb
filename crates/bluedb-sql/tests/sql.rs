@@ -73,6 +73,47 @@ async fn create_insert_select_where() {
     assert_eq!(rows, vec![vec![Value::Str("bob".to_owned())]]);
 }
 
+/// Ask #3: a bound integer param must land in a DECIMAL column the way an inline
+/// literal already does. Without the `coerce_writes` planner pass this is the
+/// reported failure: `incompatible data type, data type: Decimal, value: I64(1)`.
+#[tokio::test]
+async fn bound_int_param_widens_into_decimal_column() {
+    let mut glue = new_glue().await;
+    exec_one(
+        &mut glue,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, amount DECIMAL);",
+    )
+    .await;
+
+    // INSERT with both columns bound as I64 params (the data plane's form).
+    let payloads = glue
+        .execute_with_params(
+            "INSERT INTO t (id, amount) VALUES ($1, $2);",
+            gluesql_core::params!(1_i64, 20_i64),
+        )
+        .await
+        .expect("parameterised insert into a DECIMAL column should succeed");
+    assert!(matches!(payloads[0], Payload::Insert(1)), "got {:?}", payloads[0]);
+
+    // It is stored as a real DECIMAL (the cast widened I64 → Decimal).
+    let rows = select_rows(exec_one(&mut glue, "SELECT amount FROM t WHERE id = 1;").await);
+    assert!(
+        matches!(rows[0][0], Value::Decimal(_)),
+        "expected a Decimal, got {:?}",
+        rows[0][0]
+    );
+
+    // UPDATE with a bound int param into the same DECIMAL column also widens.
+    let updated = glue
+        .execute_with_params(
+            "UPDATE t SET amount = $1 WHERE id = $2;",
+            gluesql_core::params!(33_i64, 1_i64),
+        )
+        .await
+        .expect("parameterised update of a DECIMAL column should succeed");
+    assert!(matches!(updated[0], Payload::Update(1)), "got {:?}", updated[0]);
+}
+
 #[tokio::test]
 async fn ordered_scan_returns_sorted_rows() {
     let mut glue = new_glue().await;

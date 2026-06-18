@@ -1638,6 +1638,20 @@ impl Planner for SlateDbStorage {
         let statement = crate::pushdown::pushdown_equijoins(&schema_map, statement);
         crate::pushdown::reject_cross_products(&statement)?;
         let statement = crate::coerce::coerce_comparisons(&schema_map, statement);
+        // Widen bound-param write values (an `I64`/`F64` param into a DECIMAL/FLOAT
+        // column) the way an inline literal already coerces — a CAST insertion, so
+        // the data plane's parameterised INSERT/UPDATE matches inline SQL.
+        // `fetch_schema_map` omits an UPDATE's target table (it covers Query/Insert
+        // only), so top it up here — otherwise the pass has no column types to
+        // widen against.
+        if let gluesql_core::ast::Statement::Update { table_name, .. } = &statement {
+            if !schema_map.contains_key(table_name) {
+                if let Some(schema) = Store::fetch_schema(self, table_name).await? {
+                    schema_map.insert(table_name.clone(), schema);
+                }
+            }
+        }
+        let statement = crate::coerce::coerce_writes(&schema_map, statement);
         // On a guarded (user-facing) connection, bound every read: an unfiltered
         // SELECT is capped to a PK-ordered prefix, and a non-indexed WHERE/ORDER BY
         // is rejected. Internal/admin connections (`strict == false`) are exempt.
