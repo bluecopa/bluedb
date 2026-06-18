@@ -49,6 +49,24 @@ pub fn register_extensions(ctx: &mut SessionContext) -> datafusion::error::Resul
     Ok(())
 }
 
+/// Build a fresh DataFusion [`SessionContext`] with bluedb's analytical
+/// extensions: the default features (built-in functions / optimizers), a
+/// [`json_udfs::JsonTypePlanner`] mapping `JSON`/`JSONB` SQL types to `Utf8`
+/// (text-backed JSON — set at build time, the only place a `TypePlanner` can be
+/// installed), and the scalar-function extensions ([`register_extensions`]). The
+/// caller registers its own schema provider. Used by [`query_via_catalog`] and
+/// the conformance harness so both plan identically.
+pub fn analytical_context() -> datafusion::error::Result<SessionContext> {
+    use datafusion::execution::SessionStateBuilder;
+    let state = SessionStateBuilder::new()
+        .with_default_features()
+        .with_type_planner(Arc::new(json_udfs::JsonTypePlanner))
+        .build();
+    let mut ctx = SessionContext::new_with_state(state);
+    register_extensions(&mut ctx)?;
+    Ok(ctx)
+}
+
 /// Run a read `sql` through the DataFusion front door: register the tenant's
 /// tables via [`BluedbSchemaProvider`] and execute, binding positional params.
 ///
@@ -68,8 +86,7 @@ pub async fn query_via_catalog(
     sql: &str,
     params: &[serde_json::Value],
 ) -> anyhow::Result<Vec<RecordBatch>> {
-    let mut ctx = SessionContext::new();
-    register_extensions(&mut ctx).with_context(|| "registering bluedb scalar functions")?;
+    let ctx = analytical_context().with_context(|| "building analytical context")?;
     ctx.catalog("datafusion")
         .ok_or_else(|| anyhow!("default catalog 'datafusion' missing"))?
         .register_schema("public", Arc::new(BluedbSchemaProvider::new(engine)))

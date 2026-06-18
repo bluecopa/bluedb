@@ -25,7 +25,6 @@ use bluedb_sql::{CdcConfig, Database, SlateDbStorage};
 use datafusion::catalog::{SchemaProvider, TableProvider};
 use datafusion::datasource::MemTable;
 use datafusion::error::{DataFusionError, Result as DfResult};
-use datafusion::prelude::SessionContext;
 use gluesql_core::prelude::{Glue, Payload, Value};
 use slatedb::object_store::ObjectStore;
 use slatedb::config::Settings;
@@ -535,10 +534,10 @@ async fn query_via_corpus(
     db: Database,
     sql: &str,
 ) -> anyhow::Result<Vec<RecordBatch>> {
-    let mut ctx = SessionContext::new();
-    // Same scalar-function extensions (JSON accessors + Postgres formatting fns)
-    // the production front door registers, so the corpus exercises them too.
-    bluedb_query::register_extensions(&mut ctx)?;
+    // Identical context to the production front door: scalar-function extensions
+    // (JSON accessors + Postgres formatting fns) plus the JSON/JSONB→Utf8 type
+    // planner, so the corpus exercises exactly what production plans.
+    let ctx = bluedb_query::analytical_context()?;
     ctx.catalog("datafusion")
         .ok_or_else(|| anyhow::anyhow!("default catalog 'datafusion' missing"))?
         .register_schema("public", Arc::new(CorpusSchemaProvider::new(engine, db)))?;

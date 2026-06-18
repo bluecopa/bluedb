@@ -21,7 +21,7 @@ use std::sync::Arc;
 use datafusion::arrow::array::{Array, ArrayRef, Int64Array, StringArray, StringBuilder};
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::{DFSchema, Result as DfResult};
-use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawBinaryExpr};
+use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawBinaryExpr, TypePlanner};
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
@@ -170,6 +170,24 @@ impl ExprPlanner for JsonExprPlanner {
     }
 }
 
+/// Maps the SQL `JSON` / `JSONB` types to Arrow `Utf8`, so `CAST(x AS JSONB)` and
+/// a JSONB column type plan instead of erroring with "Unsupported SQL type JSONB".
+/// Consistent with bluedb's text-backed JSON (`normalize_data_type` does the same
+/// `JSON`/`JSONB` → `TEXT` on the GlueSQL side). Registered via the SessionState
+/// builder's `with_type_planner` (type planning is build-time, not a UDF).
+#[derive(Debug)]
+pub(crate) struct JsonTypePlanner;
+
+impl TypePlanner for JsonTypePlanner {
+    fn plan_type(
+        &self,
+        sql_type: &datafusion::sql::sqlparser::ast::DataType,
+    ) -> DfResult<Option<DataType>> {
+        use datafusion::sql::sqlparser::ast::DataType as SqlDt;
+        Ok(matches!(sql_type, SqlDt::JSON | SqlDt::JSONB).then_some(DataType::Utf8))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,5 +274,32 @@ mod tests {
         let batches = df.collect().await.expect("run json_get_str");
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 2);
+    }
+
+    #[tokio::test]
+    async fn json_type_planner_accepts_cast_as_jsonb() {
+        use datafusion::arrow::array::AsArray;
+        // The full analytical context carries the JSON/JSONB→Utf8 TypePlanner.
+        let ctx = crate::analytical_context().unwrap();
+
+        // CAST(... AS JSONB) plans (→ Utf8) instead of "Unsupported SQL type JSONB".
+        let b = ctx
+            .sql(r#"SELECT CAST('{"a":1}' AS JSONB) AS j"#)
+            .await
+            .expect("plan CAST AS JSONB")
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(b[0].column(0).as_string::<i32>().value(0), r#"{"a":1}"#);
+
+        // And it composes with the accessor: (cast result) ->> 'a' → "1".
+        let b2 = ctx
+            .sql(r#"SELECT CAST('{"a":1}' AS JSONB) ->> 'a' AS v"#)
+            .await
+            .expect("plan JSONB cast + ->>")
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(b2[0].column(0).as_string::<i32>().value(0), "1");
     }
 }
