@@ -196,7 +196,10 @@ impl JsonPathQuery {
         Self {
             name,
             out,
-            signature: Signature::any(2, Volatility::Immutable),
+            // Postgres has 2-, 3-, and 4-arg forms: (target, path[, vars[, silent]]).
+            // We use target+path; `vars`/`silent` are accepted and ignored (a path
+            // that needs `vars` isn't in our supported subset, so it yields NULL).
+            signature: Signature::variadic_any(Volatility::Immutable),
         }
     }
 }
@@ -215,7 +218,14 @@ impl ScalarUDFImpl for JsonPathQuery {
         Ok(DataType::Utf8)
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DfResult<ColumnarValue> {
+        if args.args.len() < 2 {
+            return datafusion::common::exec_err!(
+                "{} requires (target, path[, vars[, silent]])",
+                self.name
+            );
+        }
         let arrays = ColumnarValue::values_to_arrays(&args.args)?;
+        // Only target (0) + path (1) are used; vars/silent (2,3) are ignored.
         let json = cast(&arrays[0], &DataType::Utf8)?;
         let path = cast(&arrays[1], &DataType::Utf8)?;
         let json = json.as_any().downcast_ref::<StringArray>().unwrap();
