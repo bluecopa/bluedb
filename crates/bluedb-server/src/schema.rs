@@ -17,7 +17,9 @@
 
 use axum::extract::{Path, State};
 use axum::Json;
+use gluesql_core::ast::Expr;
 use gluesql_core::prelude::Glue;
+use gluesql_core::store::Store;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -53,11 +55,23 @@ fn default_nullable() -> bool {
     true
 }
 
+/// An index declared inline in a `CreateTableRequest` (one atomic schema apply).
+#[derive(Deserialize)]
+pub(crate) struct InlineIndex {
+    pub name: String,
+    pub columns: Vec<String>,
+}
+
 /// Body for `POST /schema/tables`.
 #[derive(Deserialize)]
 pub(crate) struct CreateTableRequest {
     pub name: String,
     pub columns: Vec<ColumnDef>,
+    /// Indexes to create on the new table, in one schema apply (ask #6) — so a
+    /// client can declare filterable columns up front instead of a follow-up
+    /// `POST …/indexes` per index.
+    #[serde(default)]
+    pub indexes: Vec<InlineIndex>,
 }
 
 /// Body for `POST /schema/tables/{table}/indexes`.
@@ -108,6 +122,10 @@ fn validate_type(ty: &str) -> Result<&'static str, AppError> {
         "TIME" => Ok("TIME"),
         "TIMESTAMP" => Ok("TIMESTAMP"),
         "UUID" => Ok("UUID"),
+        // JSON/JSONB are text-backed (normalize_data_type maps them to TEXT) but
+        // tracked so reads re-inflate; accept them in the structured create path.
+        "JSON" => Ok("JSON"),
+        "JSONB" => Ok("JSONB"),
         other => Err(AppError::bad_request(format!("unsupported column type '{other}'"))),
     }
 }
@@ -166,7 +184,110 @@ pub(crate) async fn create_table(
 
     let sql = format!("CREATE TABLE {table} ({});", col_defs.join(", "));
     run_ddl(&state, &tenant, sql).await?;
-    Ok(Json(json!({ "created": true, "table": table })))
+
+    // Inline indexes: validate then create each on the just-created table.
+    let mut created_indexes = Vec::with_capacity(req.indexes.len());
+    for index in &req.indexes {
+        let index_name = ident(&index.name)?.to_string();
+        if index.columns.is_empty() {
+            return Err(AppError::bad_request(format!(
+                "index '{index_name}' must name at least one column"
+            )));
+        }
+        let cols: Vec<&str> = index
+            .columns
+            .iter()
+            .map(|c| ident(c))
+            .collect::<Result<Vec<_>, _>>()?;
+        let sql = format!("CREATE INDEX {index_name} ON {table} ({});", cols.join(", "));
+        run_ddl(&state, &tenant, sql).await?;
+        created_indexes.push(index_name);
+    }
+
+    Ok(Json(json!({
+        "created": true,
+        "table": table,
+        "created_indexes": created_indexes,
+    })))
+}
+
+/// The column an index expression refers to, for a simple single-column index.
+fn index_column(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Identifier(name) => Some(name.clone()),
+        _ => None,
+    }
+}
+
+/// `GET /schema/tables/{table}` — JSON describe (ask #6): the columns (with type,
+/// primary-key, indexed, nullable) and indexes, so an adapter reads the schema
+/// structurally instead of parsing a debug repr. The hidden composite-PK
+/// surrogate is omitted, the user PK columns are marked, and a JSON/JSONB column
+/// reports type `JSON` (it is stored as `TEXT` but tracked in the JSON catalog).
+pub(crate) async fn describe_table(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(table): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    state.authorize(&headers, Scope::DataRead)?;
+    let tenant = state.tenant(&headers)?;
+    let table = ident(&table)?.to_string();
+
+    let storage = state.connection(&tenant).await?;
+    let pk_cols = storage
+        .primary_key_columns(&table)
+        .await
+        .map_err(|e| AppError::internal(format!("pk columns: {e}")))?;
+    let json_cols = storage
+        .json_columns(&table)
+        .await
+        .map_err(|e| AppError::internal(format!("json columns: {e}")))?
+        .unwrap_or_default();
+    let schema = Store::fetch_schema(&storage, &table)
+        .await
+        .map_err(|e| AppError::internal(format!("fetch schema: {e}")))?
+        .ok_or_else(|| {
+            AppError::not_found(format!("table '{table}' not found")).with_code("NOT_FOUND")
+        })?;
+
+    // Index list + the set of indexed columns (PK columns are index-served too).
+    let mut indexed: std::collections::HashSet<String> = pk_cols.iter().cloned().collect();
+    let mut index_list = Vec::with_capacity(schema.indexes.len());
+    for idx in &schema.indexes {
+        let column = index_column(&idx.expr);
+        if let Some(c) = &column {
+            indexed.insert(c.clone());
+        }
+        index_list.push(json!({ "name": idx.name, "column": column }));
+    }
+
+    let pk_set: std::collections::HashSet<&String> = pk_cols.iter().collect();
+    let columns: Vec<Value> = schema
+        .column_defs
+        .into_iter()
+        .flatten()
+        .filter(|c| c.name != bluedb_sql::PK_COL) // hide the composite-PK surrogate
+        .map(|c| {
+            let ty = if json_cols.contains(&c.name) {
+                "JSON".to_string()
+            } else {
+                c.data_type.to_string()
+            };
+            json!({
+                "name": c.name,
+                "type": ty,
+                "primary_key": pk_set.contains(&c.name),
+                "indexed": indexed.contains(&c.name),
+                "nullable": c.nullable,
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "table": table,
+        "columns": columns,
+        "indexes": index_list,
+    })))
 }
 
 /// `DELETE /schema/tables/{table}` — drop a table.

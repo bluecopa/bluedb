@@ -177,9 +177,9 @@ async fn drop_table_removes_table() {
     let (status, body) = call(&app, "DELETE", "/schema/tables/docs", None).await;
     assert_eq!(status, StatusCode::OK, "drop table should succeed; body: {body}");
 
-    // Afterwards, a SELECT on the gone table is a 400 (table not found).
+    // Afterwards, a SELECT on the gone table is a 404 (table not found).
     let (status, _) = call(&app, "GET", "/tables/docs", None).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "select on dropped table should fail");
+    assert_eq!(status, StatusCode::NOT_FOUND, "select on dropped table should 404");
 }
 
 /// 5a. Validation: malicious table name is rejected with 400, nothing executed.
@@ -219,7 +219,7 @@ async fn validation_rejects_malicious_column_type() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "malicious type should be rejected; body: {body}");
     assert!(body.get("error").is_some(), "should have error field; body: {body}");
 
-    // Confirm the table was NOT created (a subsequent SELECT errors with 400, not 200).
+    // Confirm the table was NOT created (a subsequent SELECT is 404, not 200).
     let (status, _) = call(&app, "GET", "/tables/safe_table", None).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "table must not have been created");
+    assert_eq!(status, StatusCode::NOT_FOUND, "table must not have been created");
 }

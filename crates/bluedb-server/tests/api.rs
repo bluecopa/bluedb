@@ -314,6 +314,50 @@ async fn unknown_table_select_is_a_404() {
 }
 
 #[tokio::test]
+async fn schema_describe_and_inline_indexes() {
+    let app = app().await;
+    // Create a table WITH an index declared inline (one schema apply), incl. JSON.
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/schema/tables",
+        Some(json!({
+            "name": "people",
+            "columns": [
+                {"name": "id", "type": "INTEGER", "primaryKey": true},
+                {"name": "email", "type": "TEXT"},
+                {"name": "meta", "type": "JSON"}
+            ],
+            "indexes": [{"name": "people_email", "columns": ["email"]}]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["created_indexes"], json!(["people_email"]));
+
+    // Describe it: structured columns + indexes.
+    let (status, body) = call(&app, "GET", "/schema/tables/people", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let cols = body["columns"].as_array().expect("columns array");
+    let col = |n: &str| cols.iter().find(|c| c["name"] == n).cloned().unwrap_or(Value::Null);
+    assert_eq!(col("id")["primary_key"], json!(true), "{body}");
+    assert_eq!(col("id")["indexed"], json!(true), "pk is index-served: {body}");
+    assert_eq!(col("email")["primary_key"], json!(false));
+    assert_eq!(col("email")["indexed"], json!(true), "inline index: {body}");
+    assert_eq!(col("meta")["type"], json!("JSON"), "JSON column type reported: {body}");
+    assert_eq!(
+        body["indexes"],
+        json!([{"name": "people_email", "column": "email"}]),
+        "{body}"
+    );
+
+    // Describe a missing table → 404 with a code.
+    let (status, body) = call(&app, "GET", "/schema/tables/ghost", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["code"], json!("NOT_FOUND"), "{body}");
+}
+
+#[tokio::test]
 async fn errors_carry_structured_codes() {
     let app = app().await;
     let (status, _) = sql_admin(&app, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)").await;

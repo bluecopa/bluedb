@@ -812,7 +812,10 @@ pub fn build_app(state: AppState) -> Router {
         .route("/admin/demote", post(admin_demote))
         .route("/admin/sql", post(admin_sql))
         .route("/schema/tables", post(schema::create_table))
-        .route("/schema/tables/{table}", delete(schema::drop_table))
+        .route(
+            "/schema/tables/{table}",
+            get(schema::describe_table).delete(schema::drop_table),
+        )
         .route("/schema/tables/{table}/indexes", post(schema::create_index))
         .route("/schema/tables/{table}/indexes/{name}", delete(schema::drop_index))
         .route(
@@ -2029,7 +2032,7 @@ impl AppError {
     }
 
     /// Attach a stable machine-readable code (see [`Self::code`]).
-    fn with_code(mut self, code: &'static str) -> Self {
+    pub(crate) fn with_code(mut self, code: &'static str) -> Self {
         self.code = Some(code);
         self
     }
