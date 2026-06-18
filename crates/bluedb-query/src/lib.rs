@@ -32,6 +32,7 @@ use datafusion::scalar::ScalarValue;
 use iceberg_datafusion::IcebergStaticTableProvider;
 
 mod catalog;
+mod json_udfs;
 mod provider;
 pub use catalog::BluedbSchemaProvider;
 pub use provider::{BluedbTableProvider, ProviderStats};
@@ -55,7 +56,9 @@ pub async fn query_via_catalog(
     sql: &str,
     params: &[serde_json::Value],
 ) -> anyhow::Result<Vec<RecordBatch>> {
-    let ctx = SessionContext::new();
+    let mut ctx = SessionContext::new();
+    // JSON accessors (`->`, `->>`, json_get, json_get_str) over JSON-as-Utf8 cols.
+    json_udfs::register(&mut ctx).with_context(|| "registering JSON functions")?;
     ctx.catalog("datafusion")
         .ok_or_else(|| anyhow!("default catalog 'datafusion' missing"))?
         .register_schema("public", Arc::new(BluedbSchemaProvider::new(engine)))

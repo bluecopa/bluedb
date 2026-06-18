@@ -681,3 +681,51 @@ async fn decimal_date_timestamp_time_render_identically_on_both_paths() {
         "TIME canonical form should be \"14:30:05\", got {}", oltp["slot"]
     );
 }
+
+/// JSON accessors (`->>` / `->`) over a JSON-as-TEXT column run on the analytical
+/// (DataFusion) path — projecting and filtering on a JSON subfield. Proves the
+/// hand-rolled json_get_str/json_get UDFs and the `->`/`->>` operator rewrite are
+/// wired into query_via_catalog, and that a JSON column mirrors as a plain string.
+#[tokio::test]
+async fn json_accessors_work_on_the_analytical_path() {
+    let state = make_state().await;
+    let app = build_app(state.clone());
+
+    let r = call_full(&app, "POST", "/sql", None, None,
+        Some(json!({"sql": "PRAGMA lakehouse_mirror = on"}))).await;
+    assert!(r.status.is_success(), "pragma: {} {:?}", r.status, r.body);
+
+    let r = call_full(&app, "POST", "/admin/sql", None, None,
+        Some(json!({"sql": "CREATE TABLE docs (id INTEGER PRIMARY KEY, data JSON)"}))).await;
+    assert!(r.status.is_success(), "create: {} {:?}", r.status, r.body);
+
+    // Insert JSON documents (the JSON column stores canonical text).
+    let mut write_seq = 0i64;
+    for (id, body) in [
+        (1, r#"{"status":"active","n":90}"#),
+        (2, r#"{"status":"idle","n":40}"#),
+    ] {
+        let r = call_full(&app, "POST", "/sql", None, None,
+            Some(json!({"sql": format!("INSERT INTO docs VALUES ({id}, '{body}')")}))).await;
+        assert!(r.status.is_success(), "insert {id}: {} {:?}", r.status, r.body);
+        if let Some((_, seq)) = parse_watermark_header(&r.headers) {
+            write_seq = seq;
+        }
+    }
+
+    // Project + filter on a JSON subfield via `->>` (text accessor). `/sql` always
+    // runs on the analytical path; min-watermark forces a fresh (unsealed) read.
+    let r = call_full(
+        &app, "POST", "/sql", None, Some(&write_seq.to_string()),
+        Some(json!({
+            "sql": "SELECT id, data->>'status' AS status, data->>'n' AS n \
+                    FROM docs WHERE (data->>'status') = 'active'"
+        })),
+    ).await;
+    assert!(r.status.is_success(), "json query: {} {:?}", r.status, r.body);
+    let rows = r.body.as_array().expect("rows array");
+    assert_eq!(rows.len(), 1, "only the active row: {:?}", r.body);
+    assert_eq!(rows[0]["id"], json!(1));
+    assert_eq!(rows[0]["status"], json!("active"));
+    assert_eq!(rows[0]["n"], json!("90"), "->> renders the number as text");
+}
