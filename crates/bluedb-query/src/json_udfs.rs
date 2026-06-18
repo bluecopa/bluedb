@@ -184,7 +184,12 @@ impl TypePlanner for JsonTypePlanner {
         sql_type: &datafusion::sql::sqlparser::ast::DataType,
     ) -> DfResult<Option<DataType>> {
         use datafusion::sql::sqlparser::ast::DataType as SqlDt;
-        Ok(matches!(sql_type, SqlDt::JSON | SqlDt::JSONB).then_some(DataType::Utf8))
+        // JSON / JSONB, and the `jsonpath` custom type (a path literal is just the
+        // text we hand to jsonb_path_query) → Utf8.
+        let is_text_json = matches!(sql_type, SqlDt::JSON | SqlDt::JSONB)
+            || matches!(sql_type, SqlDt::Custom(name, _)
+                if name.to_string().eq_ignore_ascii_case("jsonpath"));
+        Ok(is_text_json.then_some(DataType::Utf8))
     }
 }
 
