@@ -873,7 +873,9 @@ fn json_to_param(v: &Value) -> Result<bluedb_rest::Param, AppError> {
             }
         }
         Value::String(s) => Param::Str(s.clone()),
-        other => return Err(AppError::bad_request(format!("param must be a JSON scalar, got {other}"))),
+        // Object/array params bind as canonical JSON text — for a JSON column or a
+        // JSON function argument on the query path.
+        Value::Object(_) | Value::Array(_) => Param::Str(v.to_string()),
     })
 }
 
@@ -1259,8 +1261,19 @@ async fn select(
 
     let sealed = state.sealed_watermark(&tenant).await;
     let mut glue = Glue::new(state.connection(&tenant).await?);
+    // JSON/JSONB columns are stored as TEXT; the catalog tells us which to
+    // re-inflate to real JSON on the way out.
+    let json_cols = glue
+        .storage
+        .json_columns(&table)
+        .await
+        .map_err(|e| AppError::internal(format!("read json catalog: {e}")))?
+        .unwrap_or_default();
     let payloads = rest_sql::execute_query_str(&mut glue, &table, query.as_deref().unwrap_or("")).await?;
-    Ok((watermark_headers(&tenant, sealed), Json(payloads_to_json(payloads))))
+    Ok((
+        watermark_headers(&tenant, sealed),
+        Json(select_to_json(payloads, &json_cols)),
+    ))
 }
 
 /// `POST /tables/{table}` — INSERT (JSON object → autocommit; array → one txn batch).
@@ -1454,18 +1467,78 @@ fn build_insert(table: String, body: Value) -> Result<(InsertRequest, bool), App
     Ok((InsertRequest { table, columns, rows }, is_batch))
 }
 
-/// Render a JSON scalar into the DSL string form `bluedb-rest` expects. (Like
+/// Render a JSON value into the DSL string form `bluedb-rest` expects. (Like
 /// PostgREST, values are stringly-typed on the wire: the engine later types them
 /// into typed `$N` parameters — numeric text → Int/Float, `true`/`false` → Bool,
 /// `null` → Null, everything else → Str.)
+///
+/// A JSON object/array serializes to its **canonical compact JSON text** so it
+/// can be stored in a `JSON`/`JSONB` (→ `TEXT`) column; validation is implicit
+/// (the body already parsed as JSON). A bare JSON scalar keeps its natural type.
 fn json_scalar_to_dsl(value: &Value) -> Result<String, AppError> {
     match value {
         Value::String(s) => Ok(s.clone()),
         Value::Number(n) => Ok(n.to_string()),
         Value::Bool(b) => Ok(b.to_string()),
         Value::Null => Ok("null".to_string()),
-        other => Err(AppError::bad_request(format!("expected a scalar value, got {other}"))),
+        Value::Object(_) | Value::Array(_) => Ok(value.to_string()),
     }
+}
+
+/// Serialize `/tables` SELECT payloads, re-inflating JSON columns: a column
+/// declared `JSON`/`JSONB` is stored as `TEXT`, and its text is parsed back to a
+/// real JSON value on read so the grid sees an object/array, not an escaped
+/// string. Non-JSON columns are unchanged; a JSON column holding non-JSON text
+/// (e.g. written via raw SQL) is emitted as the string rather than failing.
+fn select_to_json(payloads: Vec<Payload>, json_cols: &[String]) -> Value {
+    let one = |payload: Payload| match payload {
+        Payload::Select { labels, rows } => Value::Array(
+            rows.into_iter()
+                .map(|row| {
+                    let obj: Map<String, Value> = labels
+                        .iter()
+                        .cloned()
+                        .zip(row.iter().map(sql_value_to_json))
+                        .map(|(label, v)| {
+                            let v = reinflate_json(&label, v, json_cols);
+                            (label, v)
+                        })
+                        .collect();
+                    Value::Object(obj)
+                })
+                .collect(),
+        ),
+        Payload::SelectMap(maps) => Value::Array(
+            maps.into_iter()
+                .map(|m| {
+                    let obj: Map<String, Value> = m
+                        .iter()
+                        .map(|(k, v)| (k.clone(), reinflate_json(k, sql_value_to_json(v), json_cols)))
+                        .collect();
+                    Value::Object(obj)
+                })
+                .collect(),
+        ),
+        other => payload_to_json(other),
+    };
+    if payloads.len() == 1 {
+        one(payloads.into_iter().next().unwrap())
+    } else {
+        Value::Array(payloads.into_iter().map(one).collect())
+    }
+}
+
+/// Parse a JSON column's stored text back to a real JSON value. Leaves non-JSON
+/// columns, non-string cells, and unparseable text untouched.
+fn reinflate_json(label: &str, v: Value, json_cols: &[String]) -> Value {
+    if json_cols.iter().any(|c| c == label) {
+        if let Value::String(s) = &v {
+            if let Ok(parsed) = serde_json::from_str::<Value>(s) {
+                return parsed;
+            }
+        }
+    }
+    v
 }
 
 /// One payload → JSON; many (multi-statement `/sql`) → a JSON array.

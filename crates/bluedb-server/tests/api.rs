@@ -166,6 +166,27 @@ async fn bad_identifier_is_a_400() {
 }
 
 #[tokio::test]
+async fn json_column_round_trips_as_real_json() {
+    let app = app().await;
+    let (status, _) =
+        sql_admin(&app, "CREATE TABLE docs (id INTEGER PRIMARY KEY, data JSON);").await;
+    assert_eq!(status, StatusCode::OK);
+
+    // POST a row whose JSON column holds a real object (today this 400'd as
+    // "expected a scalar value").
+    let row = json!({ "id": 1, "data": { "k": "v", "n": 3, "tags": [1, 2] } });
+    let (status, body) = call(&app, "POST", "/tables/docs", Some(row.clone())).await;
+    assert_eq!(status, StatusCode::OK, "insert failed: {body}");
+
+    // GET it back: `data` is a real JSON object, not an escaped string.
+    let (status, body) = call(&app, "GET", "/tables/docs?id=eq.1", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!([row]));
+    // Specifically, it must be an object — not the string "{\"k\":\"v\",...}".
+    assert!(body[0]["data"].is_object(), "data should be a JSON object: {body}");
+}
+
+#[tokio::test]
 async fn unknown_table_select_is_a_400() {
     let app = app().await;
     // Selecting a table that doesn't exist is a SQL error → 400 (client error).
