@@ -17,10 +17,17 @@
 | `TIMESTAMP` | Date + time |
 | `INTERVAL` | Duration |
 | `UUID` | 128-bit UUID |
+| `JSON` / `JSONB` | JSON document — see [JSON](json.md) |
 
 !!! note
     `LIST`, `MAP`, and `POINT` values are also supported (for the list/map/geo
     functions); they are niche and not covered in depth here.
+
+!!! note "JSON"
+    `JSON` and `JSONB` are interchangeable: both are stored as text and round-trip
+    as real JSON over the data plane. Field access (`->`, `->>`), containment
+    (`@>`, `<@`), and `jsonb_path_query` are documented on the
+    [JSON](json.md) page.
 
 ## Accepted aliases (normalized)
 

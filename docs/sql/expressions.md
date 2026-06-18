@@ -11,6 +11,7 @@
 | Logical | `AND` `OR` `NOT` |
 | Null test | `IS NULL` `IS NOT NULL` |
 | String | `||` (concatenation) |
+| JSON | `->` `->>` (field access) · `@>` `<@` (containment) — see [JSON](json.md) |
 
 ```sql
 SELECT price * quantity AS total FROM line_items;

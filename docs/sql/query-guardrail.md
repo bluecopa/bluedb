@@ -42,7 +42,14 @@ SELECT o.id, c.name FROM orders o JOIN customers c ON o.customer_id = c.id
     WHERE c.region = 'EU' ORDER BY o.total DESC;
 SELECT id, ROW_NUMBER() OVER (ORDER BY created_at) AS rn FROM events;
 SELECT * FROM users WHERE name LIKE '%ada%' ORDER BY name;
+SELECT * FROM events WHERE (attrs ->> 'status') = 'active';   -- JSON, see below
 ```
+
+A [JSON](json.md) operator (`->`, `->>`, `@>`, `jsonb_path_query`, …) is served
+on this analytical path too. On the [`/tables`](../api/rest.md#get-tablestable-select)
+data plane, a read whose filter or sort needs the analytical path — an arbitrary
+non-indexed column, or a JSON path (`attrs->>status=eq.active`) — is **routed to
+it automatically**; you never get a "needs an index" error for a read.
 
 ## Substring search
 

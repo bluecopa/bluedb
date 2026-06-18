@@ -2,9 +2,8 @@
 
 [← SQL index](README.md)
 
-These are the built-in functions bluedb's engine provides. Exact argument
-signatures follow [GlueSQL](https://gluesql.org); the groupings below cover the
-common ones.
+These are the built-in functions bluedb provides. The groupings below cover the
+common ones; signatures are PostgreSQL-style.
 
 !!! note
     **Window functions** (`… OVER (…)` — `ROW_NUMBER`, `RANK`, running `SUM`, …)
@@ -87,6 +86,29 @@ GROUP BY EXTRACT(YEAR FROM created_at);
 | `IFNULL(a, b)` | `b` if `a` is null |
 | `NULLIF(a, b)` | `NULL` if `a = b`, else `a` |
 | `GREATEST(a, b, …)` | Largest argument |
+
+## Formatting
+
+PostgreSQL-style text/number formatting.
+
+| Function | Description |
+|----------|-------------|
+| `to_char(numeric, fmt)` | Format a number to text — `9`/`0` digits, `.`/`D` decimals, `,`/`G` thousands grouping (e.g. `'FM9,999.00'`) |
+| `to_char(date/timestamp, fmt)` | Format a temporal value to text (the same `to_char`, dispatched on argument type) |
+| `to_number(text, fmt)` | Parse a formatted number string to a float; the mask is advisory (US-style `.`/`,`), group separators and currency are stripped |
+| `format(fmt, …)` | Substitute `%s` / `%I` / `%L` with successive arguments (as text); `%%` is a literal `%` |
+
+```sql
+SELECT to_char(1234.5, 'FM9,999.00');     -- '1,234.50'
+SELECT to_number('$1,234.50', '9G999D99'); -- 1234.5
+SELECT format('%s/%s', area_code, number) AS phone FROM phones;
+```
+
+## JSON
+
+Field access (`->`, `->>`), containment (`@>`, `<@`), and `jsonb_path_query` /
+`jsonb_path_query_first` / `jsonb_path_query_array` are documented on the
+[JSON](json.md) page.
 
 ## Other
 

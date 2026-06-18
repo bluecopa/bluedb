@@ -6,3 +6,4 @@ Cargo.lock.orig
 .idea/
 .vscode/
 /site
+/.venv-docs

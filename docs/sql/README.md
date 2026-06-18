@@ -26,6 +26,8 @@ write one SQL surface, and bluedb routes each query to the right path.
   accelerate point and range lookups.
 - **Transactions** with snapshot isolation (`BEGIN` / `COMMIT` / `ROLLBACK`).
 - **Secondary indexes**, **views**, **non-recursive CTEs**, **set operations**.
+- **JSON** — a `JSON` / `JSONB` column type with PostgreSQL operators (`->`,
+  `->>`, `@>`, `<@`) and the `jsonb_path_query` family.
 - Closest in feel to **PostgreSQL**; this guide calls out every place the
   behavior diverges from PostgreSQL or DuckDB.
 
@@ -39,6 +41,7 @@ write one SQL surface, and bluedb routes each query to the right path.
 | [Data types](data-types.md) | Native types and accepted aliases (`VARCHAR(n)`, `DOUBLE`, …) |
 | [Expressions](expressions.md) | Operators, comparisons & coercion, `CAST`/`TRY_CAST`, `CASE`, `IN`, `BETWEEN` |
 | [Functions](functions.md) | Scalar (math/string/date/…) and aggregate functions |
+| [JSON](json.md) | The `JSON`/`JSONB` type, `->`/`->>`/`@>`/`<@`, `jsonb_path_query` |
 | [Transactions](transactions.md) | `BEGIN`/`COMMIT`/`ROLLBACK`, isolation, concurrency |
 | [Metadata](metadata.md) | Introspection tables: `GLUE_OBJECTS`, `GLUE_TABLES`, … |
 | [Limitations & differences](limitations.md) | What's **not** supported and where semantics differ |

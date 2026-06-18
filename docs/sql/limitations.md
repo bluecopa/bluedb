@@ -22,6 +22,7 @@ window functions, subqueries, CTEs, set operations, and arbitrary `WHERE` /
 | **User-defined functions** | `CREATE FUNCTION` and custom aggregates. |
 | **Exotic types** | `BIT`, `STRUCT`, enums (`CREATE TYPE`). See [Data types](data-types.md). |
 | **Large multi-row `INSERT … VALUES (…),(…),…`** | Parser limit. Use single-row inserts or one `BEGIN … COMMIT` batch. |
+| **JSON key-existence `?` / `?|` / `?&`** | The dialect reserves `?` for parameters, so these can't parse. Use `@>` or `(col ->> 'k') IS NOT NULL`. See [JSON](json.md). |
 
 The function library is its own set — broad coverage of the common string /
 numeric / date-time / aggregate functions, but not every PostgreSQL- or
@@ -43,6 +44,13 @@ DuckDB-specific builtin. See [Functions](functions.md).
 - **Single-row insert throughput.** Each autocommit `INSERT` is one durable
   object-storage write; batch large loads in a transaction. See
   [Transactions](transactions.md).
+
+- **`jsonb_path_query` is scalar over a navigation subset.** It returns the
+  **first** match (PostgreSQL returns one row per match — use
+  `jsonb_path_query_array` for all of them), supports only navigation paths
+  (`$`, `.key`, `[n]`, `.*`, `[*]`), and **errors** (rather than returning `NULL`)
+  on a path it can't evaluate — filters, methods, ranges, or variables. See
+  [JSON](json.md).
 
 ## How this is verified
 

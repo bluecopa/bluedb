@@ -6,6 +6,12 @@ local disks to provision and no storage cluster to operate. Schemas are explicit
 and evolve **online**: ADD/DROP/RENAME column and RENAME TABLE are O(1) metadata
 ops, never a row rewrite.
 
+It is **HTAP on one copy of your data**: transactional point, range, and indexed
+reads are served fresh from the LSM store, while analytical queries — joins,
+aggregates, window functions, and [JSON](sql/json.md) — run over a continuously,
+seconds-fresh [Apache Iceberg mirror](lakehouse/iceberg-mirror.md), through one
+SQL surface. No ETL, no second system to keep in sync.
+
 It is **CP** (consistent under partition), built on a **single serial writer
 plus asynchronous read replicas**, with automatic failover and a real
 [Jepsen](guarantees/jepsen.md) test suite backing the consistency claims.
@@ -44,9 +50,10 @@ flowchart TD
   tenant-namespaced, order-preserving keys.
 - **[`bluedb-sql`](sql/README.md)** — a SQL engine over the substrate: schema'd
   tables with a `PRIMARY KEY`, online schema evolution, secondary indexes,
-  transactions, views, and a full `SELECT` surface (joins, aggregates, window
-  functions, arbitrary filters and sorts) — with the primary key and
-  [indexes](sql/query-guardrail.md) accelerating point/range lookups.
+  transactions, views, [JSON columns and operators](sql/json.md), and a full
+  `SELECT` surface (joins, aggregates, window functions, arbitrary filters and
+  sorts) — with the primary key and [indexes](sql/query-guardrail.md)
+  accelerating point/range lookups.
 - **[`bluedb-fts`](sql/full-text-search.md)** — **SQL-integrated** BM25 full-text
   search (tantivy) over object storage: declare a full-text index and query it
   through SQL (Postgres `@@`/`ts_rank`), read-your-writes, no separate search
