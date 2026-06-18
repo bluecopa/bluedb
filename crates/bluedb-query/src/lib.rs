@@ -33,6 +33,7 @@ use iceberg_datafusion::IcebergStaticTableProvider;
 
 mod catalog;
 mod format_udfs;
+mod json_ops;
 mod json_udfs;
 mod provider;
 pub use catalog::BluedbSchemaProvider;
@@ -45,6 +46,7 @@ pub use provider::{BluedbTableProvider, ProviderStats};
 /// can build an identical context.
 pub fn register_extensions(ctx: &mut SessionContext) -> datafusion::error::Result<()> {
     json_udfs::register(ctx)?;
+    json_ops::register(ctx)?;
     format_udfs::register(ctx)?;
     Ok(())
 }
