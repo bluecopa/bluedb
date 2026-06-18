@@ -114,6 +114,45 @@ async fn bound_int_param_widens_into_decimal_column() {
     assert!(matches!(updated[0], Payload::Update(1)), "got {:?}", updated[0]);
 }
 
+/// A `JSON`/`JSONB` column normalises to `TEXT` for GlueSQL, and the JSON-ness is
+/// captured in a durable per-table catalog (the chokepoint `prepare_composite_pk`
+/// runs the normalisation + capture). The catalog is what lets the read path
+/// re-inflate the stored text to real JSON.
+#[tokio::test]
+async fn json_columns_normalize_to_text_and_are_catalogued() {
+    let mut glue = new_glue().await;
+
+    // The data plane / SQL surface runs every statement through this chokepoint.
+    let ddl = "CREATE TABLE t (id INTEGER PRIMARY KEY, data JSON, meta JSONB, name TEXT);";
+    let rewritten = bluedb_sql::prepare_composite_pk(&mut glue.storage, ddl, &[])
+        .await
+        .expect("prepare CREATE TABLE with JSON columns");
+    // JSON/JSONB were rewritten to TEXT so GlueSQL accepts the DDL.
+    let upper = rewritten.to_uppercase();
+    assert!(upper.contains("TEXT"), "expected TEXT, got: {rewritten}");
+    assert!(!upper.contains("JSON"), "JSON should be gone, got: {rewritten}");
+    glue.execute(&rewritten).await.expect("execute normalised DDL");
+
+    // The JSON columns are remembered (in declaration order); non-JSON columns are not.
+    let json_cols = glue
+        .storage
+        .json_columns("t")
+        .await
+        .expect("read json catalog");
+    assert_eq!(
+        json_cols,
+        Some(vec!["data".to_string(), "meta".to_string()])
+    );
+
+    // A table with no JSON column has no catalog entry.
+    let ddl2 = "CREATE TABLE plain (id INTEGER PRIMARY KEY, name TEXT);";
+    let rw2 = bluedb_sql::prepare_composite_pk(&mut glue.storage, ddl2, &[])
+        .await
+        .unwrap();
+    glue.execute(&rw2).await.unwrap();
+    assert_eq!(glue.storage.json_columns("plain").await.unwrap(), None);
+}
+
 #[tokio::test]
 async fn ordered_scan_returns_sorted_rows() {
     let mut glue = new_glue().await;

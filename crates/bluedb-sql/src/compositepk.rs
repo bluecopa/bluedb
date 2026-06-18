@@ -31,6 +31,7 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::error::SqlError;
+use crate::jsoncat::JsonCatalog;
 use crate::pkcodec::encode_composite_key;
 use crate::rewrite::normalize_data_type;
 use crate::storage::SlateDbStorage;
@@ -100,21 +101,29 @@ async fn apply(
     params: &[Value],
 ) -> Result<bool, SqlError> {
     if let Statement::CreateTable(create) = stmt {
+        let table = object_table_name(&create.name);
+        // Capture which columns are JSON/JSONB *before* normalisation rewrites
+        // them to TEXT (erasing the JSON-ness), so the read path can re-inflate.
+        let json_cols = crate::jsoncat::json_columns(create);
         // Normalise column types for ALL CREATE TABLE statements: DECIMAL(p,s) →
-        // bare DECIMAL, VARCHAR(n) → TEXT, INT(n) → INTEGER, etc.  This is the
-        // single execution chokepoint; doing it here means the normalisation
-        // applies to every path (REST API, /admin/sql, direct Glue::execute via
-        // prepare_composite_pk).
+        // bare DECIMAL, VARCHAR(n) → TEXT, INT(n) → INTEGER, JSON → TEXT, etc.
+        // This is the single execution chokepoint; doing it here means the
+        // normalisation applies to every path (REST API, /admin/sql, direct
+        // Glue::execute via prepare_composite_pk).
         let mut type_changed = false;
         for col in &mut create.columns {
             if normalize_data_type(&mut col.data_type) {
                 type_changed = true;
             }
         }
+        if !json_cols.is_empty() {
+            storage
+                .write_json_catalog(&table, &JsonCatalog { columns: json_cols })
+                .await?;
+        }
         let Some(catalog) = strip_composite_pk(create)? else {
             return Ok(type_changed);
         };
-        let table = object_table_name(&create.name);
         storage.write_pk_catalog(&table, &catalog).await?;
         return Ok(true);
     }

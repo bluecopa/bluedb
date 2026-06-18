@@ -665,6 +665,37 @@ impl SlateDbStorage {
         self.write_key(key, encode(catalog)?).await
     }
 
+    /// Read a table's JSON-column catalog (the columns declared `JSON`/`JSONB`,
+    /// stored as `TEXT`). `None` for tables with no JSON column.
+    pub(crate) async fn read_json_catalog(
+        &self,
+        table_name: &str,
+    ) -> Result<Option<crate::jsoncat::JsonCatalog>, SqlError> {
+        let key = self.keyspace.jsoncat_key(table_name);
+        match self.read_key(&key).await? {
+            Some(bytes) => Ok(Some(decode(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// The JSON/JSONB column names of `table` (stored as `TEXT`), or `None` for a
+    /// table with no JSON column. Public so the server's `/tables` row serializer
+    /// can re-inflate those columns' text to real JSON. Mirrors [`Self::pk_columns`].
+    pub async fn json_columns(&self, table_name: &str) -> Result<Option<Vec<String>>, SqlError> {
+        Ok(self.read_json_catalog(table_name).await?.map(|c| c.columns))
+    }
+
+    /// Persist a table's JSON-column catalog (written at CREATE TABLE, before the
+    /// rewritten DDL runs). A durable, immediate write (no open txn).
+    pub(crate) async fn write_json_catalog(
+        &mut self,
+        table_name: &str,
+        catalog: &crate::jsoncat::JsonCatalog,
+    ) -> Result<(), SqlError> {
+        let key = self.keyspace.jsoncat_key(table_name);
+        self.write_key(key, encode(catalog)?).await
+    }
+
     /// Resolve a table's stable id (assigned at CREATE). Data and index keys are
     /// keyed by this id — not the table name — so it must exist for any table
     /// that has rows. Reading it is how name→id resolution happens on every data
