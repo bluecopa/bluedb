@@ -64,6 +64,20 @@ impl RestQuery {
     }
 }
 
+impl RestQuery {
+    /// Render `SELECT COUNT(*) FROM table [WHERE …];` with the same bound filters,
+    /// ignoring projection/order/limit/offset — the total for `Prefer:
+    /// count=exact` (PostgREST `Content-Range`). A JSON-path filter renders the
+    /// same `json_get_str(...)` form as the data query, so the count must run on
+    /// the engine that has those functions.
+    pub fn to_count_sql_with_params(&self) -> Result<(String, Vec<Param>), RestError> {
+        let table = validate_ident(&self.table)?;
+        let mut params = Vec::new();
+        let where_clause = render_where_params(&self.filters, &mut params)?;
+        Ok((format!("SELECT COUNT(*) FROM {table}{where_clause};"), params))
+    }
+}
+
 impl InsertRequest {
     /// Render one **single-row** `INSERT` statement per row (no terminating `;`),
     /// with placeholders numbered **globally** across all rows so the statements
@@ -340,6 +354,36 @@ mod params_render {
             offset: None,
         };
         assert!(q.to_sql_with_params().is_err());
+    }
+
+    #[test]
+    fn count_sql_keeps_filters_drops_order_limit() {
+        let q = RestQuery {
+            table: "t".into(),
+            select: vec!["id".into()],
+            filters: vec![Filter::new("age", Operator::Gt, "20")],
+            order: vec![OrderKey { column: "age".into(), direction: Direction::Desc }],
+            limit: Some(10),
+            offset: Some(5),
+        };
+        let (sql, params) = q.to_count_sql_with_params().unwrap();
+        assert_eq!(sql, "SELECT COUNT(*) FROM t WHERE age > $1;");
+        assert_eq!(params, vec![Param::Int(20)]);
+    }
+
+    #[test]
+    fn count_sql_no_filters() {
+        let q = RestQuery {
+            table: "t".into(),
+            select: vec![],
+            filters: vec![],
+            order: vec![],
+            limit: None,
+            offset: None,
+        };
+        let (sql, params) = q.to_count_sql_with_params().unwrap();
+        assert_eq!(sql, "SELECT COUNT(*) FROM t;");
+        assert!(params.is_empty());
     }
 
     #[test]

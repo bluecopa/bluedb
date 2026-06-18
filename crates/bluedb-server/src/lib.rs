@@ -1299,7 +1299,7 @@ async fn select(
     headers: axum::http::HeaderMap,
     Path(table): Path<String>,
     RawQuery(query): RawQuery,
-) -> Result<impl IntoResponse, AppError> {
+) -> Result<(axum::http::HeaderMap, Json<Value>), AppError> {
     state.authorize(&headers, authz::Scope::DataRead)?;
     let tenant = state.tenant(&headers)?;
 
@@ -1322,25 +1322,37 @@ async fn select(
         .map_err(|e| AppError::internal(format!("read json catalog: {e}")))?
         .unwrap_or_default();
 
+    let want_count = wants_count(&headers);
     // A JSON-path query (`data->>k`) can only be served by the analytical engine
-    // (GlueSQL has no JSON functions) — route it there directly.
-    if rq.has_json_path() {
-        return route_select_to_analytical(&state, &headers, &tenant, &rq, &json_cols, sealed).await;
-    }
-    // Otherwise take the GlueSQL fast path. A guardrail reject (a filter / ORDER BY
-    // on a non-indexed column) means GlueSQL can't bound the read; re-route it to
-    // the analytical engine, which scans/sorts the Iceberg mirror. This is doc
-    // ask #4: the grid filters/sorts arbitrary columns without a standing index.
-    match rest_sql::execute_query(&mut glue, &rq).await {
-        Ok(payloads) => Ok((
-            watermark_headers(&tenant, sealed),
-            Json(select_to_json(payloads, &json_cols)),
-        )),
-        Err(e) if is_guardrail_reject(&e) => {
-            route_select_to_analytical(&state, &headers, &tenant, &rq, &json_cols, sealed).await
+    // (GlueSQL has no JSON functions); otherwise take the GlueSQL fast path and
+    // re-route a guardrail reject (a filter / ORDER BY on a non-indexed column) to
+    // the analytical engine, which scans/sorts the Iceberg mirror — doc ask #4
+    // (grids filter/sort arbitrary columns without a standing index).
+    let (mut resp_headers, body) = if rq.has_json_path() {
+        route_select_to_analytical(&state, &headers, &tenant, &rq, &json_cols, sealed).await?
+    } else {
+        match rest_sql::execute_query(&mut glue, &rq).await {
+            Ok(payloads) => (
+                watermark_headers(&tenant, sealed),
+                Json(select_to_json(payloads, &json_cols)),
+            ),
+            Err(e) if is_guardrail_reject(&e) => {
+                route_select_to_analytical(&state, &headers, &tenant, &rq, &json_cols, sealed).await?
+            }
+            Err(e) => return Err(e.into()),
         }
-        Err(e) => Err(e.into()),
+    };
+
+    // `Prefer: count=exact` → attach the PostgREST `Content-Range` total.
+    if want_count {
+        let total = count_rows(&state, &tenant, &rq).await?;
+        let returned = body.0.as_array().map(|a| a.len()).unwrap_or(0);
+        let offset = rq.offset.unwrap_or(0) as usize;
+        if let Ok(v) = axum::http::HeaderValue::from_str(&content_range(offset, returned, total)) {
+            resp_headers.insert("content-range", v);
+        }
     }
+    Ok((resp_headers, body))
 }
 
 /// Serve a `/tables` read the GlueSQL fast path can't (an arbitrary-column filter
@@ -1739,12 +1751,70 @@ fn reinflate_rows(value: Value, json_cols: &[String]) -> Value {
 /// return=representation`, PostgREST). `Prefer` may carry several
 /// comma-separated preferences.
 fn wants_representation(headers: &axum::http::HeaderMap) -> bool {
+    prefers(headers, "return=representation")
+}
+
+/// True if the request asked for an exact total (`Prefer: count=exact`).
+fn wants_count(headers: &axum::http::HeaderMap) -> bool {
+    prefers(headers, "count=exact")
+}
+
+/// True if any `Prefer` header carries the given comma-separated preference.
+fn prefers(headers: &axum::http::HeaderMap, pref: &str) -> bool {
     headers
         .get_all("prefer")
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(','))
-        .any(|p| p.trim().eq_ignore_ascii_case("return=representation"))
+        .any(|p| p.trim().eq_ignore_ascii_case(pref))
+}
+
+/// The PostgREST `Content-Range` value for a page: `offset-end/total`, or
+/// `*/total` when the page is empty.
+fn content_range(offset: usize, returned: usize, total: i64) -> String {
+    if returned == 0 {
+        format!("*/{total}")
+    } else {
+        format!("{}-{}/{}", offset, offset + returned - 1, total)
+    }
+}
+
+/// The exact row count for `rq`'s filters (`Prefer: count=exact`). A JSON-path
+/// filter must run on the analytical engine (GlueSQL has no JSON functions);
+/// everything else counts on an unguarded SlateDB connection — the client opted
+/// into the scan, and the count reflects fresh OLTP state.
+async fn count_rows(state: &AppState, tenant: &str, rq: &bluedb_rest::RestQuery) -> Result<i64, AppError> {
+    let (sql, params) = rq.to_count_sql_with_params().map_err(EngineError::from)?;
+    if rq.has_json_path() {
+        let manager = state.lakehouse().await.ok_or_else(|| {
+            AppError::internal("analytical path unavailable: lakehouse manager not bound")
+        })?;
+        let engine = manager
+            .engine_for(tenant)
+            .await
+            .map_err(|e| AppError::internal(format!("get lakehouse engine: {e}")))?;
+        let json_params: Vec<Value> = params.iter().map(param_to_json).collect();
+        let batches = bluedb_query::query_via_catalog(engine, &sql, &json_params)
+            .await
+            .map_err(|e| AppError::bad_request(format!("count: {e}")))?;
+        Ok(scalar_count(&record_batches_to_json(&batches)))
+    } else {
+        let mut glue = Glue::new(state.connection_unguarded(tenant).await?);
+        let payloads = rest_sql::execute_sql(&mut glue, &sql, &params, false).await?;
+        Ok(scalar_count(&payloads_to_json(payloads)))
+    }
+}
+
+/// Extract the integer from a `SELECT COUNT(*)` result rendered as JSON (a one-row,
+/// one-column array of objects). `0` if the shape is unexpected.
+fn scalar_count(value: &Value) -> i64 {
+    value
+        .as_array()
+        .and_then(|rows| rows.first())
+        .and_then(|row| row.as_object())
+        .and_then(|obj| obj.values().next())
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
 }
 
 /// Read the rows matching `filters` from `table` on an **unguarded** connection

@@ -77,6 +77,38 @@ async fn sql_admin(app: &Router, statement: &str) -> (StatusCode, Value) {
     call(app, "POST", "/admin/sql", Some(json!({ "sql": statement }))).await
 }
 
+/// A GET that returns status + response headers + body, with an optional
+/// `Prefer` header. (Bodyless — used by the `count=exact` / Content-Range tests.)
+async fn call_full(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    prefer: Option<&str>,
+) -> (StatusCode, axum::http::HeaderMap, Value) {
+    let mut builder = Request::builder().method(method).uri(uri);
+    if let Some(p) = prefer {
+        builder = builder.header("prefer", p);
+    }
+    let response = app.clone().oneshot(builder.body(Body::empty()).unwrap()).await.unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap()
+    };
+    (status, headers, body)
+}
+
+/// The `Content-Range` response header value, if present.
+fn content_range(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get("content-range")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
 /// Like [`call`] but sets `Prefer: return=representation`.
 async fn call_prefer(
     app: &Router,
@@ -311,6 +343,32 @@ async fn unknown_table_select_is_a_404() {
     let (status, body) = call(&app, "GET", "/tables/ghost", None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["code"], json!("NOT_FOUND"), "{body}");
+}
+
+#[tokio::test]
+async fn count_exact_sets_content_range() {
+    let app = app().await;
+    sql_admin(&app, "CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT)").await;
+    for id in 1..=5 {
+        let (s, _) = call(&app, "POST", "/tables/t", Some(json!({"id": id, "label": "x"}))).await;
+        assert_eq!(s, StatusCode::OK);
+    }
+
+    // A page of 2 with count=exact → Content-Range: 0-1/5.
+    let (status, headers, body) =
+        call_full(&app, "GET", "/tables/t?order=id.asc&limit=2", Some("count=exact")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body.as_array().unwrap().len(), 2);
+    assert_eq!(content_range(&headers), Some("0-1/5".to_string()), "body: {body}");
+
+    // Second page, offset 2 → 2-3/5.
+    let (_, headers, _) =
+        call_full(&app, "GET", "/tables/t?order=id.asc&limit=2&offset=2", Some("count=exact")).await;
+    assert_eq!(content_range(&headers), Some("2-3/5".to_string()));
+
+    // Without the header, no Content-Range.
+    let (_, headers, _) = call_full(&app, "GET", "/tables/t?order=id.asc&limit=2", None).await;
+    assert_eq!(content_range(&headers), None);
 }
 
 #[tokio::test]
