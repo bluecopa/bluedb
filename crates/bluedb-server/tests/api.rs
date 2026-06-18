@@ -77,6 +77,35 @@ async fn sql_admin(app: &Router, statement: &str) -> (StatusCode, Value) {
     call(app, "POST", "/admin/sql", Some(json!({ "sql": statement }))).await
 }
 
+/// Like [`call`] but sets `Prefer: return=representation`.
+async fn call_prefer(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    json_body: Option<Value>,
+) -> (StatusCode, Value) {
+    let builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("prefer", "return=representation");
+    let request = match json_body {
+        Some(v) => builder
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&v).unwrap()))
+            .unwrap(),
+        None => builder.body(Body::empty()).unwrap(),
+    };
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap()
+    };
+    (status, body)
+}
+
 /// Send a parameterized statement to `POST /sql` (non-DDL only).
 #[allow(dead_code)]
 async fn sql_dml(app: &Router, statement: &str, params: serde_json::Value) -> (StatusCode, Value) {
@@ -241,6 +270,38 @@ async fn arbitrary_and_json_filters_on_tables_route_to_analytical_engine() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body.as_array().expect("rows").len(), 1);
     assert_eq!(body[0]["label"], json!("beta"));
+}
+
+#[tokio::test]
+async fn prefer_representation_returns_affected_rows() {
+    let app = app().await;
+    let (status, _) = sql_admin(&app, "CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT)").await;
+    assert_eq!(status, StatusCode::OK);
+
+    // INSERT + representation → the inserted row(s), not a count.
+    let (status, body) =
+        call_prefer(&app, "POST", "/tables/t", Some(json!({"id": 1, "label": "alpha"}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, json!([{"id": 1, "label": "alpha"}]), "insert repr: {body}");
+
+    // PATCH + representation → the updated row.
+    let (status, body) =
+        call_prefer(&app, "PATCH", "/tables/t?id=eq.1", Some(json!({"label": "beta"}))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!([{"id": 1, "label": "beta"}]), "update repr: {body}");
+
+    // DELETE + representation → the removed row (its pre-delete state).
+    let (status, body) = call_prefer(&app, "DELETE", "/tables/t?id=eq.1", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!([{"id": 1, "label": "beta"}]), "delete repr: {body}");
+
+    // The row is really gone.
+    let (_, body) = call(&app, "GET", "/tables/t?id=eq.1", None).await;
+    assert_eq!(body, json!([]), "row should be deleted: {body}");
+
+    // Without the header, the count shape is unchanged.
+    let (_, body) = call(&app, "POST", "/tables/t", Some(json!({"id": 2, "label": "g"}))).await;
+    assert_eq!(body, json!({"inserted": 1}), "no-prefer insert still returns a count: {body}");
 }
 
 #[tokio::test]

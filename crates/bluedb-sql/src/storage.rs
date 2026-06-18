@@ -685,6 +685,29 @@ impl SlateDbStorage {
         Ok(self.read_json_catalog(table_name).await?.map(|c| c.columns))
     }
 
+    /// The primary-key column names of `table`: the user PK columns of a composite
+    /// key, else the single primary-key column, else empty (no PK / unknown table).
+    /// Public so the server can identify the rows a mutation affected (the
+    /// `Prefer: return=representation` read-back).
+    pub async fn primary_key_columns(&self, table_name: &str) -> Result<Vec<String>, SqlError> {
+        if let Some(cols) = self.pk_columns(table_name).await? {
+            return Ok(cols); // composite-PK user columns
+        }
+        let Some(schema) = Store::fetch_schema(self, table_name)
+            .await
+            .map_err(|e| SqlError::KeyEncode(e.to_string()))?
+        else {
+            return Ok(Vec::new());
+        };
+        Ok(schema
+            .column_defs
+            .into_iter()
+            .flatten()
+            .filter(|c| c.unique.as_ref().is_some_and(|u| u.is_primary))
+            .map(|c| c.name)
+            .collect())
+    }
+
     /// Persist a table's JSON-column catalog (written at CREATE TABLE, before the
     /// rewritten DDL runs). A durable, immediate write (no open txn).
     pub(crate) async fn write_json_catalog(

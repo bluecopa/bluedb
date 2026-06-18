@@ -726,6 +726,21 @@ impl AppState {
         }
     }
 
+    /// An **unguarded** connection for internal read-backs — specifically the
+    /// `Prefer: return=representation` path, which re-reads the exact rows a
+    /// mutation just affected. The scan/sort guardrail deliberately does not apply:
+    /// the read is bounded by the mutation's own filter (or the inserted keys), not
+    /// a client-supplied scan, and reads the fresh SlateDB state (not the Iceberg
+    /// mirror). Reads committed state on the active node's database.
+    async fn connection_unguarded(&self, tenant: &str) -> Result<SlateDbStorage, AppError> {
+        match self.inner.db.read().await.as_ref() {
+            Some(db) => Ok(db.connection_for_tenant(tenant)),
+            None => Err(AppError::service_unavailable(
+                "node has no database yet (no writer has been promoted)",
+            )),
+        }
+    }
+
     /// Build a [`Ledger`] over the currently-bound database, or `503` if the
     /// node has no database yet. The `Database` is cheap to clone (`Arc`-based)
     /// and [`Ledger::new`] captures owned handles, so the returned ledger
@@ -1393,25 +1408,43 @@ async fn insert(
     state.authorize(&headers, authz::Scope::DataWrite)?;
     let tenant = state.tenant(&headers)?;
     state.require_active()?;
+    let want_repr = wants_representation(&headers);
     let (req, is_batch) = build_insert(table, body)?;
-    if is_batch {
-        // Multi-row: atomic BEGIN..COMMIT on the serialized (lease-holding) connection.
+
+    // Execute the insert on its usual connection (batch = atomic BEGIN..COMMIT on
+    // the serialized lease-holder; single = group-commit fast path).
+    let inserted: usize = if is_batch {
         let mut glue = Glue::new(state.connection_serialized(&tenant).await?);
         let payloads = rest_sql::execute_insert_batch(&mut glue, &req).await?;
-        // Fold all per-row Insert(n) payloads from the transaction into one count.
-        let total: usize = payloads
+        payloads
             .iter()
             .filter_map(|p| if let Payload::Insert(n) = p { Some(*n) } else { None })
-            .sum();
-        let wm = state.write_watermark(&tenant).await;
-        Ok((watermark_headers(&tenant, wm), Json(json!({ "inserted": total }))))
+            .sum()
     } else {
-        // Single row: autocommit on the group-commit connection (concurrent fast path).
         let mut glue = Glue::new(state.connection(&tenant).await?);
         let payloads = rest_sql::execute_insert(&mut glue, &req).await?;
-        let wm = state.write_watermark(&tenant).await;
-        Ok((watermark_headers(&tenant, wm), Json(payloads_to_json(payloads))))
+        payloads
+            .iter()
+            .filter_map(|p| if let Payload::Insert(n) = p { Some(*n) } else { None })
+            .sum()
+    };
+    let wm = state.write_watermark(&tenant).await;
+
+    // `Prefer: return=representation` → read the inserted rows back by primary key.
+    if want_repr {
+        let pk_cols = state
+            .connection_unguarded(&tenant)
+            .await?
+            .primary_key_columns(&req.table)
+            .await
+            .map_err(|e| AppError::internal(format!("pk columns: {e}")))?;
+        if let Some(filters) = insert_pk_filters(&pk_cols, &req) {
+            let rows = read_affected_json(&state, &tenant, &req.table, filters).await?;
+            return Ok((watermark_headers(&tenant, wm), Json(rows)));
+        }
+        // Can't identify the rows by PK (e.g. multi-row composite) → fall back to count.
     }
+    Ok((watermark_headers(&tenant, wm), Json(json!({ "inserted": inserted }))))
 }
 
 /// `PATCH /tables/{table}?<filters>` — UPDATE (JSON assignments body).
@@ -1427,6 +1460,7 @@ async fn update(
     state.authorize(&headers, authz::Scope::DataWrite)?;
     let tenant = state.tenant(&headers)?;
     state.require_active()?;
+    let want_repr = wants_representation(&headers);
     let filters = parse_filters(query.as_deref().unwrap_or("")).map_err(EngineError::from)?;
     let assignments = assignments
         .into_iter()
@@ -1437,6 +1471,14 @@ async fn update(
     let mut glue = Glue::new(state.connection_serialized(&tenant).await?);
     let payloads = rest_sql::execute_update(&mut glue, &req).await?;
     let wm = state.write_watermark(&tenant).await;
+    // `Prefer: return=representation` → read the updated rows back by the same
+    // filter. (Caveat: if the filter targets a column the UPDATE changed, the
+    // re-select reflects post-update matches — full RETURNING fidelity needs
+    // engine support GlueSQL lacks.)
+    if want_repr {
+        let rows = read_affected_json(&state, &tenant, &req.table, req.filters.clone()).await?;
+        return Ok((watermark_headers(&tenant, wm), Json(rows)));
+    }
     Ok((watermark_headers(&tenant, wm), Json(payloads_to_json(payloads))))
 }
 
@@ -1452,13 +1494,25 @@ async fn delete_rows(
     state.authorize(&headers, authz::Scope::DataWrite)?;
     let tenant = state.tenant(&headers)?;
     state.require_active()?;
+    let want_repr = wants_representation(&headers);
     let filters = parse_filters(query.as_deref().unwrap_or("")).map_err(EngineError::from)?;
+    // `Prefer: return=representation` → capture the matching rows BEFORE the
+    // delete (they're gone afterwards). This is what feeds the DELETE→Pusher
+    // notification with the removed rows in one round trip.
+    let repr = if want_repr {
+        Some(read_affected_json(&state, &tenant, &table, filters.clone()).await?)
+    } else {
+        None
+    };
     let req = DeleteRequest { table, filters };
     // DELETE reads the rows it removes; serialize for the same reason as UPDATE.
     let mut glue = Glue::new(state.connection_serialized(&tenant).await?);
     let payloads = rest_sql::execute_delete(&mut glue, &req).await?;
     let wm = state.write_watermark(&tenant).await;
-    Ok((watermark_headers(&tenant, wm), Json(payloads_to_json(payloads))))
+    match repr {
+        Some(rows) => Ok((watermark_headers(&tenant, wm), Json(rows))),
+        None => Ok((watermark_headers(&tenant, wm), Json(payloads_to_json(payloads)))),
+    }
 }
 
 // --- admin / high-availability control --------------------------------------
@@ -1676,6 +1730,86 @@ fn reinflate_rows(value: Value, json_cols: &[String]) -> Value {
             })
             .collect(),
     )
+}
+
+/// True if the request asked for the affected rows back (`Prefer:
+/// return=representation`, PostgREST). `Prefer` may carry several
+/// comma-separated preferences.
+fn wants_representation(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get_all("prefer")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|p| p.trim().eq_ignore_ascii_case("return=representation"))
+}
+
+/// Read the rows matching `filters` from `table` on an **unguarded** connection
+/// (the `Prefer: return=representation` read-back), serialized as `/tables` JSON
+/// with JSON columns re-inflated. The read is bounded by the mutation's own
+/// filter, so the scan guardrail is intentionally bypassed, and it reads fresh
+/// SlateDB state (not the Iceberg mirror).
+async fn read_affected_json(
+    state: &AppState,
+    tenant: &str,
+    table: &str,
+    filters: Vec<bluedb_rest::Filter>,
+) -> Result<Value, AppError> {
+    let storage = state.connection_unguarded(tenant).await?;
+    let json_cols = storage
+        .json_columns(table)
+        .await
+        .map_err(|e| AppError::internal(format!("read json catalog: {e}")))?
+        .unwrap_or_default();
+    let mut glue = Glue::new(storage);
+    let q = bluedb_rest::RestQuery {
+        table: table.to_string(),
+        select: Vec::new(),
+        filters,
+        order: Vec::new(),
+        limit: None,
+        offset: None,
+    };
+    let payloads = rest_sql::execute_query(&mut glue, &q).await?;
+    Ok(select_to_json(payloads, &json_cols))
+}
+
+/// The PostgREST filters identifying the rows an INSERT just added, from the
+/// table's PK columns + the inserted values. `None` when the rows can't be
+/// identified by PK — a PK column absent from the insert, or a multi-row insert
+/// into a composite-PK table (the per-row AND-of-components OR'd across rows isn't
+/// expressible as AND-only PostgREST filters). The caller falls back to the count.
+fn insert_pk_filters(pk_cols: &[String], req: &InsertRequest) -> Option<Vec<bluedb_rest::Filter>> {
+    use bluedb_rest::{Filter, Operator};
+    if pk_cols.is_empty() {
+        return None;
+    }
+    // Each PK column's position in the insert's column list (all must be present).
+    let idx: Vec<usize> = pk_cols
+        .iter()
+        .map(|pk| req.columns.iter().position(|c| c == pk))
+        .collect::<Option<_>>()?;
+    match req.rows.len() {
+        0 => None,
+        // Single row: AND each PK component (works for single- and composite-PK).
+        1 => Some(
+            pk_cols
+                .iter()
+                .zip(&idx)
+                .map(|(pk, &i)| Filter::new(pk.clone(), Operator::Eq, req.rows[0][i].clone()))
+                .collect(),
+        ),
+        // Multi-row, single-column PK: one IN filter over all the key values.
+        _ if pk_cols.len() == 1 => {
+            let values: Vec<String> = req.rows.iter().map(|r| r[idx[0]].clone()).collect();
+            Some(vec![Filter::new(
+                pk_cols[0].clone(),
+                Operator::In,
+                format!("({})", values.join(",")),
+            )])
+        }
+        _ => None,
+    }
 }
 
 /// One payload → JSON; many (multi-statement `/sql`) → a JSON array.
