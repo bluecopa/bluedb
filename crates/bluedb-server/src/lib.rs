@@ -1555,11 +1555,52 @@ fn sql_value_to_json(value: &SqlValue) -> Value {
                 Value::String(t.format("%H:%M:%S%.6f").to_string())
             }
         }
+        // Uuid (stored as u128) → canonical hyphenated 8-4-4-4-12 lowercase hex,
+        // matching gluesql's own `Uuid::from_u128(..).hyphenated()` rendering so the
+        // OLTP wire form agrees with the analytical path.
+        SqlValue::Uuid(n) => {
+            let hex = format!("{n:032x}");
+            Value::String(format!(
+                "{}-{}-{}-{}-{}",
+                &hex[0..8],
+                &hex[8..12],
+                &hex[12..16],
+                &hex[16..20],
+                &hex[20..32]
+            ))
+        }
+        // Bytea → standard base64 (the same encoding the evidence API uses on the wire).
+        SqlValue::Bytea(b) => {
+            use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+            Value::String(B64.encode(b))
+        }
         other => Value::String(format!("{other:?}")),
     }
 }
 
 // --- tests ------------------------------------------------------------------
+
+#[cfg(test)]
+mod value_serialization {
+    use super::sql_value_to_json;
+    use gluesql_core::prelude::Value as SqlValue;
+    use serde_json::Value;
+
+    #[test]
+    fn renders_uuid_as_canonical_hyphenated_string() {
+        let u = SqlValue::Uuid(0x550e8400_e29b_41d4_a716_446655440000u128);
+        assert_eq!(
+            sql_value_to_json(&u),
+            Value::String("550e8400-e29b-41d4-a716-446655440000".into())
+        );
+    }
+
+    #[test]
+    fn renders_bytea_as_base64() {
+        let b = SqlValue::Bytea(vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(sql_value_to_json(&b), Value::String("3q2+7w==".into()));
+    }
+}
 
 #[cfg(test)]
 mod flush_interval_cfg {
