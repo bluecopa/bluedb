@@ -128,6 +128,11 @@ const TAG_TABLEID_SEQ: u8 = 0x07;
 /// names that map to the hidden `__bluedb_pk` surrogate). Absent for
 /// single-column-PK tables. Looked up by exact key per table, never prefix-scanned.
 const TAG_PKCAT: u8 = 0x08;
+/// Tag byte for a table's **JSON-column catalog** (the columns declared
+/// `JSON`/`JSONB`, stored as `TEXT` for GlueSQL). Lets the read path re-inflate
+/// their text to real JSON. Absent for tables with no JSON column. Looked up by
+/// exact key per table, never prefix-scanned.
+const TAG_JSONCAT: u8 = 0x09;
 
 /// Tag floor for namespaces owned by layers *above* bluedb-sql (e.g.
 /// `bluedb-ledger`). bluedb-sql's own tags (`TAG_SCHEMA`/`TAG_DATA`/`TAG_INDEX`)
@@ -248,6 +253,14 @@ impl Keyspace {
     pub fn pkcat_key(&self, table_name: &str) -> Vec<u8> {
         let name = table_name.as_bytes();
         let mut key = self.tagged(TAG_PKCAT, name.len());
+        key.extend_from_slice(name);
+        key
+    }
+
+    /// Encode the storage key for a table's JSON-column catalog.
+    pub fn jsoncat_key(&self, table_name: &str) -> Vec<u8> {
+        let name = table_name.as_bytes();
+        let mut key = self.tagged(TAG_JSONCAT, name.len());
         key.extend_from_slice(name);
         key
     }

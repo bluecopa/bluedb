@@ -27,6 +27,7 @@ allow = [
     "BSL-1.0",
     "Zlib",
     "zlib-acknowledgement",
+    "bzip2-1.0.6", # libbz2-rs-sys (via datafusion-datasource → async-compression → bzip2); permissive BSD-style bzip2/libbzip2 license
     "CC0-1.0",
     "CDLA-Permissive-2.0",
     "Unicode-3.0",

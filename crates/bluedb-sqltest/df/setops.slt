@@ -1,0 +1,47 @@
+# Set operations — GlueSQL rewrites these to joins/subqueries; the DataFusion
+# front door runs them natively (UNION / UNION ALL / INTERSECT / EXCEPT).
+
+statement ok
+CREATE TABLE p (id INTEGER PRIMARY KEY, v INTEGER)
+
+statement ok
+CREATE TABLE q (id INTEGER PRIMARY KEY, v INTEGER)
+
+statement ok
+INSERT INTO p VALUES (1,10),(2,20),(3,30)
+
+statement ok
+INSERT INTO q VALUES (2,20),(3,30),(4,40)
+
+# UNION (distinct).
+query I
+SELECT v FROM p UNION SELECT v FROM q ORDER BY v
+----
+10
+20
+30
+40
+
+# UNION ALL (keeps duplicates).
+query I
+SELECT v FROM p UNION ALL SELECT v FROM q ORDER BY v
+----
+10
+20
+20
+30
+30
+40
+
+# INTERSECT.
+query I
+SELECT v FROM p INTERSECT SELECT v FROM q ORDER BY v
+----
+20
+30
+
+# EXCEPT.
+query I
+SELECT v FROM p EXCEPT SELECT v FROM q ORDER BY v
+----
+10

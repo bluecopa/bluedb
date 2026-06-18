@@ -9,11 +9,15 @@ bluedb-sql = { workspace = true }
 gluesql-core = "=0.19.0"
 arrow-array = "57"
 arrow-schema = "57"
+# Read-path merge (RYW union): anti-join filter + batch concat over Arrow.
+arrow-select = "57"
 iceberg = "0.9.1"
 parquet = "57"
 tokio = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
+chrono = "0.4"
+rust_decimal = "1"
 # metadata.json (TableMetadata) (de)serialization for our self-hosted catalog,
 # and the durable mirror registry.
 serde = { workspace = true }
@@ -33,3 +37,8 @@ typetag = "0.2"
 tempfile = { workspace = true }
 # Engine tests drive a real Database over an in-memory SlateDB.
 slatedb = { workspace = true }
+# The seal-latency harness (`tests/seal_latency_gcs.rs`) builds a real GCS
+# `ObjectStore` — needs object_store's `gcp` feature (the lib dep above doesn't
+# enable it). Pinned to the workspace-resolved 0.12.5 so the `Arc<dyn ObjectStore>`
+# unifies with both `object_store_file_io` and slatedb's `Db::open`.
+object_store = { version = "=0.12.5", features = ["gcp"] }

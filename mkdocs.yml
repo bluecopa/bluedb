@@ -62,6 +62,7 @@ nav:
       - Data types: sql/data-types.md
       - Expressions: sql/expressions.md
       - Functions: sql/functions.md
+      - JSON: sql/json.md
       - Transactions: sql/transactions.md
       - Metadata: sql/metadata.md
       - Limitations & differences: sql/limitations.md

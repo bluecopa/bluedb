@@ -114,6 +114,47 @@ Common modifiers:
 | `order=col.asc` / `col.desc` | Ordering |
 | `limit=N` / `offset=N` | Pagination |
 
+A point or range filter on the primary key or a secondary-indexed column is
+served from the transactional store (fresh, read-your-writes). A filter or sort
+on any other column — or a JSON path (below) — is **routed to the analytical
+engine** automatically; you never add an index just to make a read run. See
+[Reads and indexes](../sql/query-guardrail.md).
+
+### JSON-path filters on `/tables`
+
+A [JSON](../sql/json.md) column can be filtered and projected by path with the
+PostgREST `col->>key` syntax (extract as text) or `col->key` (extract as JSON):
+
+```bash
+# SELECT * FROM events WHERE (attrs ->> 'status') = 'active'
+curl -s 'localhost:8081/tables/events?attrs->>status=eq.active'
+
+# project a nested field
+curl -s 'localhost:8081/tables/events?select=id,attrs->>status&order=id.asc'
+```
+
+A JSON-path read is served by the analytical engine. Containment (`@>`) and
+`jsonb_path_query` are available over [`POST /sql`](#post-sql-run-one-parameterized-statement).
+
+### Pagination total — `Prefer: count=exact`
+
+Send `Prefer: count=exact` to get the total row count (ignoring `limit`/`offset`)
+in a PostgREST `Content-Range` response header, so a grid can show "page 1 of N":
+
+```bash
+curl -si 'localhost:8081/tables/users?limit=25' -H 'Prefer: count=exact'
+# Content-Range: 0-24/137
+```
+
+The format is `first-last/total` (`*/0` when no rows match). The count runs on
+the same engine that served the data.
+
+### Value encoding
+
+`UUID` values are returned as their canonical hyphenated string; `BYTEA` as
+**base64**. `JSON` / `JSONB` columns are returned as real JSON (objects/arrays),
+not as a quoted string.
+
 ## `POST /tables/{table}` — insert
 
 A JSON object, or an array of objects for a batch:
@@ -147,6 +188,30 @@ curl -s -X DELETE 'localhost:8081/tables/users?age=lt.18'
     A `PATCH`/`DELETE` with no filter affects every row. Always include a
     query-string filter unless you mean it.
 
+### Returning the affected rows — `Prefer: return=representation`
+
+By default a write returns a count: `{"inserted": 1}`, `{"updated": 3}`,
+`{"deleted": 2}`. Send `Prefer: return=representation` to get the **affected rows
+themselves** back instead — the same JSON shape a `GET` returns (JSON columns
+re-inflated):
+
+```bash
+curl -s -X POST 'localhost:8081/tables/users' \
+  -H 'content-type: application/json' -H 'Prefer: return=representation' \
+  -d '{"id": 1, "name": "ada", "age": 36}'
+# [{"id":1,"name":"ada","age":36}]
+```
+
+- `POST` reads the inserted rows back by primary key.
+- `PATCH` returns the rows after the update (re-selected by the same filter).
+- `DELETE` captures the matching rows **before** removing them — so you get the
+  deleted rows in the response.
+
+!!! note
+    For an `INSERT` whose rows can't be identified by primary key after the fact
+    (a multi-row insert into a table with a composite key), the response falls
+    back to the count form.
+
 ## Schema DDL endpoints
 
 DDL is expressed as **typed JSON**, never raw SQL: every identifier is checked
@@ -157,6 +222,7 @@ the `schema:admin` scope and the active writer.
 | Method | Path | Purpose |
 |--------|------|---------|
 | `POST` | `/schema/tables` | Create a table from a typed column spec |
+| `GET` | `/schema/tables/{table}` | Describe a table — columns + indexes (`data:read`) |
 | `DELETE` | `/schema/tables/{table}` | Drop a table |
 | `POST` | `/schema/tables/{table}/indexes` | Create a secondary index |
 | `DELETE` | `/schema/tables/{table}/indexes/{name}` | Drop an index |
@@ -173,7 +239,11 @@ curl -s -X POST localhost:8081/schema/tables -H 'content-type: application/json'
           {"name": "id",     "type": "INTEGER", "primaryKey": true},
           {"name": "title",  "type": "TEXT",    "nullable": false},
           {"name": "body",   "type": "TEXT"},
-          {"name": "status", "type": "TEXT"}
+          {"name": "status", "type": "TEXT"},
+          {"name": "attrs",  "type": "JSON"}
+        ],
+        "indexes": [
+          {"name": "docs_status", "columns": ["status"]}
         ]
       }'
 ```
@@ -181,7 +251,38 @@ curl -s -X POST localhost:8081/schema/tables -H 'content-type: application/json'
 Each column takes `name`, `type`, and optionally `primaryKey` (camelCase),
 `nullable` (defaults to `true`), and `unique`. Allowed types: `TEXT`,
 `INTEGER`/`INT`, `BOOLEAN`/`BOOL`, `FLOAT`, `DECIMAL`, `DATE`, `TIME`,
-`TIMESTAMP`, `UUID`.
+`TIMESTAMP`, `UUID`, `JSON`/`JSONB` (see [JSON](../sql/json.md)).
+
+The optional `indexes` array declares secondary indexes in the **same schema
+apply** — each entry is `{"name": …, "columns": […]}`, equivalent to a follow-up
+`POST …/indexes` but atomic with the create.
+
+### Describe a table
+
+`GET /schema/tables/{table}` returns the table's columns and indexes as
+structured JSON (the composite-primary-key surrogate column is hidden):
+
+```bash
+curl -s localhost:8081/schema/tables/docs
+```
+
+```json
+{
+  "table": "docs",
+  "columns": [
+    {"name": "id",     "type": "INT",  "primary_key": true,  "indexed": true,  "nullable": false},
+    {"name": "title",  "type": "TEXT", "primary_key": false, "indexed": false, "nullable": false},
+    {"name": "status", "type": "TEXT", "primary_key": false, "indexed": true,  "nullable": true},
+    {"name": "attrs",  "type": "JSON", "primary_key": false, "indexed": false, "nullable": true}
+  ],
+  "indexes": [
+    {"name": "docs_status", "column": "status"}
+  ]
+}
+```
+
+`indexed` is `true` for a primary-key column or one backed by a secondary index —
+i.e. the columns a point/range filter is served from without an analytical scan.
 
 ### Create / drop an index
 
@@ -215,6 +316,59 @@ curl -s -X POST localhost:8081/schema/tables/docs/trigram-indexes \
 ```
 
 Once declared, query both through [`/sql`](../sql/full-text-search.md).
+
+## Read-your-writes & freshness
+
+Every **mutating** response carries the CDC sequence the write reached:
+
+```
+X-Bluedb-Watermark: acme:42
+```
+
+(`<tenant>:<seq>`.) A read response carries the same header for the watermark it
+reflects. To require a read to reflect at least a given write — e.g. read your
+own write through the analytical engine — echo it back on the read:
+
+```
+X-Bluedb-Min-Watermark: acme:42
+```
+
+If the node can't satisfy that freshness (its sealed analytical snapshot is
+behind the requested sequence and it is not the active writer), it returns
+**`503`** rather than serve stale data — retry against the writer or after the
+next seal. How much staleness a read tolerates before that gate trips is set per
+tenant, in **seal cycles**, with a PRAGMA over [`/sql`](#post-sql-run-one-parameterized-statement)
+(default `1`):
+
+```bash
+curl -s localhost:8081/sql -H 'content-type: application/json' \
+  -d '{"sql": "PRAGMA bluedb_read_wait_seal_n = 2"}'
+```
+
+The active writer serves reads from its own live state, so a read routed to it
+reflects every write it has acknowledged. See
+[Consistency model](../guarantees/consistency.md#read-consistency).
+
+## Errors
+
+Error responses are JSON with a human `error` message and, when the failure is
+classified, a stable machine-readable `code` — branch on the `code`, not the
+prose:
+
+```json
+{ "error": "table 'usrs' not found", "code": "NOT_FOUND" }
+```
+
+| `code` | HTTP | Meaning |
+|--------|------|---------|
+| `NOT_FOUND` | 404 | No such table |
+| `UNIQUE_VIOLATION` | 409 | Duplicate primary key / unique value |
+| `PARSE_ERROR` | 400 | SQL did not parse / translate |
+| `TYPE_MISMATCH` | 400 | A value didn't match the column type |
+| `NO_INDEX` | 400 | A query the guardrail won't serve without an index |
+
+A write sent to a passive (non-writer) node returns `503` — re-resolve the active
+writer (see [Administration](../operations/admin.md)).
 
 ## Ledger
 

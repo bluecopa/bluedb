@@ -69,6 +69,7 @@ mod connection;
 mod cte;
 mod error;
 mod guardrail;
+mod jsoncat;
 mod keyspace;
 mod lakehouse;
 mod nullorder;
@@ -83,8 +84,10 @@ mod setops;
 mod storage;
 
 pub use cdc::{collapse_lww, CdcConfig, CdcEntry, CollapsedChanges};
+pub use guardrail::GUARDRAIL_REJECT_PREFIX;
 pub use compositepk::{prepare as prepare_composite_pk, PkCatalog, PK_COL};
 pub use connection::Database;
+pub use jsoncat::JsonCatalog;
 pub use cte::{inline_ctes, inline_views, parse_create_view, parse_drop_view};
 pub use error::SqlError;
 pub use keyspace::{prefix_upper_bound, Keyspace, DEFAULT_TENANT, TAG_CDC, TAG_EXTERNAL_BASE};

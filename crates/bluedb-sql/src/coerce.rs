@@ -34,8 +34,8 @@
 use std::collections::{HashMap, HashSet};
 
 use gluesql_core::ast::{
-    BinaryOperator, DataType, Expr, Function, JoinConstraint, JoinOperator, Literal, Query, Select,
-    SelectItem, SetExpr, Statement, TableFactor, TableWithJoins,
+    Assignment, BinaryOperator, DataType, Expr, Function, JoinConstraint, JoinOperator, Literal,
+    Query, Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, Values,
 };
 use gluesql_core::data::{Schema, Value};
 
@@ -73,6 +73,120 @@ pub fn coerce_comparisons(schema_map: &SchemaMap, statement: Statement) -> State
             }
         }
         other => other,
+    }
+}
+
+/// Widen bound-param write values to their target column type — a `Planner::plan`
+/// pass run alongside [`coerce_comparisons`].
+///
+/// A parameterised write binds its values as concrete `Expr::Value(..)` nodes
+/// (`translate_with_params` runs before `plan()`), so a JSON `1` reaches the
+/// INSERT/UPDATE type-check as a fixed `Value::I64(1)` and is rejected against a
+/// `DECIMAL` column — even though the inline literal `1` would be coerced. This
+/// restores the literal's behaviour for params: when a value bound to a
+/// `DECIMAL`/`FLOAT` column is a *different* numeric kind, wrap it in
+/// `CAST(.. AS <col type>)` and let GlueSQL's own CAST executor widen it. No
+/// fork, no param mutation; text/NULL/narrowing values are left untouched, so it
+/// can never turn a working write into a wrong result.
+pub fn coerce_writes(schema_map: &SchemaMap, statement: Statement) -> Statement {
+    match statement {
+        Statement::Insert {
+            table_name,
+            columns,
+            mut source,
+        } => {
+            let targets = insert_value_targets(schema_map, &table_name, &columns);
+            if let SetExpr::Values(Values(rows)) = &mut source.body {
+                for row in rows.iter_mut() {
+                    for (i, cell) in row.iter_mut().enumerate() {
+                        if let Some(Some(target)) = targets.get(i) {
+                            widen_in_place(cell, target);
+                        }
+                    }
+                }
+            }
+            Statement::Insert {
+                table_name,
+                columns,
+                source,
+            }
+        }
+        Statement::Update {
+            table_name,
+            assignments,
+            selection,
+        } => {
+            let types = table_column_types(schema_map, &table_name);
+            let assignments = assignments
+                .into_iter()
+                .map(|Assignment { id, mut value }| {
+                    if let Some(target) = types.get(&id) {
+                        widen_in_place(&mut value, target);
+                    }
+                    Assignment { id, value }
+                })
+                .collect();
+            Statement::Update {
+                table_name,
+                assignments,
+                selection,
+            }
+        }
+        other => other,
+    }
+}
+
+/// The target column type for each INSERT value position. With an explicit
+/// column list, position `i` maps to that column's type; without one, to the
+/// `i`-th schema column (declaration order). An unknown table/column yields
+/// `None`, so the value is left untouched.
+fn insert_value_targets(
+    schema_map: &SchemaMap,
+    table: &str,
+    columns: &[String],
+) -> Vec<Option<DataType>> {
+    let Some(defs) = schema_map.get(table).and_then(|s| s.column_defs.as_ref()) else {
+        return Vec::new();
+    };
+    if columns.is_empty() {
+        defs.iter().map(|c| Some(c.data_type.clone())).collect()
+    } else {
+        let by_name: HashMap<&str, &DataType> =
+            defs.iter().map(|c| (c.name.as_str(), &c.data_type)).collect();
+        columns
+            .iter()
+            .map(|name| by_name.get(name.as_str()).map(|d| (*d).clone()))
+            .collect()
+    }
+}
+
+/// Every column of `table` as `name → type` (empty if the table is unknown).
+fn table_column_types(schema_map: &SchemaMap, table: &str) -> HashMap<String, DataType> {
+    schema_map
+        .get(table)
+        .and_then(|s| s.column_defs.as_ref())
+        .map(|defs| {
+            defs.iter()
+                .map(|c| (c.name.clone(), c.data_type.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// If `cell` is a concrete numeric `Value` of a kind that must widen to land in a
+/// `DECIMAL`/`FLOAT` `target`, wrap it in `CAST(cell AS target)`. A value already
+/// of the target kind, a non-numeric value, and a non-`DECIMAL`/`FLOAT` target
+/// are all left untouched.
+fn widen_in_place(cell: &mut Expr, target: &DataType) {
+    let Expr::Value(v) = &*cell else { return };
+    let needs = match target {
+        DataType::Decimal => !matches!(v, Value::Decimal(_)) && value_numeric_target(v).is_some(),
+        DataType::Float => !matches!(v, Value::F64(_)) && value_numeric_target(v).is_some(),
+        _ => false,
+    };
+    if needs {
+        let taken = std::mem::replace(cell, Expr::Value(Value::Null));
+        *cell = cast(taken, target.clone());
     }
 }
 
@@ -599,5 +713,121 @@ mod tests {
         let m = map(vec![schema("t", &[("id", DataType::Int), ("name", DataType::Text)])]);
         let out = where_after(&m, "SELECT * FROM t WHERE id = '5' AND name = 'x'");
         assert!(out.contains("CAST"), "expected nested comparison coerced, got: {out}");
+    }
+
+    // --- coerce_writes (parameterised INSERT/UPDATE value widening) -----------
+
+    fn insert_row(table: &str, columns: &[&str], row: Vec<Expr>) -> Statement {
+        Statement::Insert {
+            table_name: table.to_owned(),
+            columns: columns.iter().map(|s| (*s).to_owned()).collect(),
+            source: Query {
+                body: SetExpr::Values(Values(vec![row])),
+                order_by: vec![],
+                limit: None,
+                offset: None,
+            },
+        }
+    }
+
+    fn insert_cells(stmt: Statement) -> Vec<Expr> {
+        match stmt {
+            Statement::Insert { source, .. } => match source.body {
+                SetExpr::Values(Values(mut rows)) => rows.remove(0),
+                _ => panic!("expected VALUES body"),
+            },
+            _ => panic!("expected INSERT"),
+        }
+    }
+
+    fn is_cast_to(expr: &Expr, dt: &DataType) -> bool {
+        matches!(expr, Expr::Function(f)
+            if matches!(&**f, Function::Cast { data_type, .. } if data_type == dt))
+    }
+
+    #[test]
+    fn widens_int_param_into_decimal_column_on_insert() {
+        let m = map(vec![schema(
+            "t",
+            &[("id", DataType::Int), ("amount", DataType::Decimal)],
+        )]);
+        let stmt = insert_row(
+            "t",
+            &["id", "amount"],
+            vec![Expr::Value(Value::I64(1)), Expr::Value(Value::I64(20))],
+        );
+        let cells = insert_cells(coerce_writes(&m, stmt));
+        // id (Int target) untouched; amount (Decimal target) wrapped in CAST.
+        assert!(
+            matches!(cells[0], Expr::Value(Value::I64(1))),
+            "id changed: {:?}",
+            cells[0]
+        );
+        assert!(
+            is_cast_to(&cells[1], &DataType::Decimal),
+            "amount not cast: {:?}",
+            cells[1]
+        );
+    }
+
+    #[test]
+    fn widens_int_param_into_float_column_on_insert() {
+        let m = map(vec![schema("t", &[("x", DataType::Float)])]);
+        let cells = insert_cells(coerce_writes(
+            &m,
+            insert_row("t", &["x"], vec![Expr::Value(Value::I64(3))]),
+        ));
+        assert!(is_cast_to(&cells[0], &DataType::Float), "x not cast: {:?}", cells[0]);
+    }
+
+    #[test]
+    fn leaves_matching_and_textual_write_values_untouched() {
+        let m = map(vec![schema(
+            "t",
+            &[
+                ("b", DataType::Float),
+                ("c", DataType::Text),
+                ("d", DataType::Int),
+            ],
+        )]);
+        let cells = insert_cells(coerce_writes(
+            &m,
+            insert_row(
+                "t",
+                &["b", "c", "d"],
+                vec![
+                    Expr::Value(Value::F64(1.5)),         // already F64 into Float → no cast
+                    Expr::Value(Value::Str("hi".into())), // text into Text → no cast
+                    Expr::Value(Value::I64(7)),           // int into Int → no cast
+                ],
+            ),
+        ));
+        assert!(!is_cast_to(&cells[0], &DataType::Float), "b wrongly cast: {:?}", cells[0]);
+        assert!(matches!(cells[1], Expr::Value(Value::Str(_))), "c changed: {:?}", cells[1]);
+        assert!(matches!(cells[2], Expr::Value(Value::I64(7))), "d changed: {:?}", cells[2]);
+    }
+
+    #[test]
+    fn widens_update_assignment_into_decimal_column() {
+        let m = map(vec![schema(
+            "t",
+            &[("id", DataType::Int), ("amount", DataType::Decimal)],
+        )]);
+        let stmt = Statement::Update {
+            table_name: "t".into(),
+            assignments: vec![Assignment {
+                id: "amount".into(),
+                value: Expr::Value(Value::I64(20)),
+            }],
+            selection: None,
+        };
+        let Statement::Update { assignments, .. } = coerce_writes(&m, stmt) else {
+            panic!("expected UPDATE")
+        };
+        assert!(
+            is_cast_to(&assignments[0].value, &DataType::Decimal),
+            "update value not cast: {:?}",
+            assignments[0].value
+        );
     }
 }

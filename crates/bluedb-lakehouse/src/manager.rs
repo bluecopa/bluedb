@@ -219,6 +219,41 @@ impl LakehouseManager {
             .find(|e| e.namespace() == ns)
     }
 
+    /// The sealed Iceberg watermark for `tenant`: the max CDC sequence durably
+    /// committed to Iceberg for that tenant, or 0 if the tenant has no sealed
+    /// snapshots yet (e.g. CDC is off or the first seal hasn't fired).
+    ///
+    /// Used by HTAP read-path freshness checks: a client's `X-Bluedb-Min-Watermark`
+    /// header is compared against this before serving analytical reads.
+    pub async fn sealed_watermark(&self, tenant: &str) -> i64 {
+        match self.engines.read().await.get(tenant) {
+            Some(engine) => engine.sealed_watermark().await,
+            None => 0,
+        }
+    }
+
+    /// The analytical read-your-writes freshness tolerance for `tenant`, in seal
+    /// cycles (set via `PRAGMA bluedb_read_wait_seal_n`). Defaults to 1 when the
+    /// tenant's engine isn't loaded or the pragma was never set.
+    pub async fn read_wait_seal_n(&self, tenant: &str) -> u64 {
+        match self.engines.read().await.get(tenant) {
+            Some(engine) => engine.read_wait_seal_n(),
+            None => 1,
+        }
+    }
+
+    /// Build a fresh Arrow [`RecordBatch`](arrow_array::RecordBatch) of `table`'s
+    /// current rows for `tenant` straight from the live store (writer-local fresh
+    /// analytical read; HTAP P4). `None` if the tenant or table doesn't exist.
+    /// See [`LakehouseEngine::current_record_batch`].
+    pub async fn current_record_batch(
+        &self,
+        tenant: &str,
+        table: &str,
+    ) -> Result<Option<arrow_array::RecordBatch>> {
+        self.engine_for(tenant).await?.current_record_batch(table).await
+    }
+
     /// Stop the background loops (called on demote; the next promote reopens).
     pub fn shutdown(&self) {
         for h in self.handles.lock().unwrap().drain(..) {

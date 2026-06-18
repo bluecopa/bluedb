@@ -309,7 +309,13 @@ fn rewrite_create_table(create: &mut CreateTable, changed: &mut bool) {
 ///
 /// Compares by the rendered base word to avoid enumerating sqlparser's ~30
 /// numeric/string variants. Returns whether it changed the type.
-fn normalize_data_type(data_type: &mut DataType) -> bool {
+///
+/// `pub(crate)` so the composite-PK execution chokepoint (`compositepk::prepare`)
+/// can apply the same normalisation on every `CREATE TABLE`, not just the ones
+/// that happen to have a composite primary key.  Precision / scale declared in
+/// `DECIMAL(p,s)` / `NUMERIC(p,s)` are silently coerced to gluesql's internal
+/// Decimal(38,18); enforcement of the declared p,s is out of scope for this shim.
+pub(crate) fn normalize_data_type(data_type: &mut DataType) -> bool {
     let rendered = data_type.to_string().to_ascii_uppercase();
     let base = rendered.split(['(', ' ']).next().unwrap_or("");
     let has_param = rendered.contains('(');
@@ -318,6 +324,10 @@ fn normalize_data_type(data_type: &mut DataType) -> bool {
         "VARCHAR" | "CHAR" | "CHARACTER" | "NVARCHAR" | "NCHAR" | "CLOB" | "STRING" => {
             Some(DataType::Text)
         }
+        // JSON/JSONB are text-backed in bluedb: stored as TEXT (GlueSQL has no JSON
+        // type), with JSON-ness tracked out-of-band (JsonCatalog) so the read path
+        // can re-inflate, and JSON functions handled on the DataFusion query path.
+        "JSON" | "JSONB" => Some(DataType::Text),
         "DECIMAL" | "NUMERIC" | "DEC" | "BIGDECIMAL" | "BIGNUMERIC" | "BIGNUM" => {
             Some(DataType::Decimal(ExactNumberInfo::None))
         }
@@ -392,6 +402,15 @@ mod tests {
         let out = rewrite_multitable("CREATE TABLE t (a INTEGER, x VARCHAR(30))");
         assert!(out.to_uppercase().contains("TEXT"), "got: {out}");
         assert!(!out.to_uppercase().contains("VARCHAR"), "got: {out}");
+    }
+
+    #[test]
+    fn json_and_jsonb_become_text() {
+        for ddl in ["CREATE TABLE t (data JSON)", "CREATE TABLE t (data JSONB)"] {
+            let out = rewrite_multitable(ddl).to_uppercase();
+            assert!(out.contains("TEXT"), "{ddl} -> {out}");
+            assert!(!out.contains("JSON"), "{ddl} -> {out}");
+        }
     }
 
     #[test]

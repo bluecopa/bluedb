@@ -14,9 +14,12 @@
 
 #![cfg(feature = "postgres")]
 
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use bluedb_ha::{LeaseProvider, PostgresLeaseProvider};
+use bluedb_ha::{
+    LeaseProvider, NodeRegistry, PostgresLeaseProvider, PostgresNodeRegistry, TestClock,
+};
 
 const TTL: Duration = Duration::from_millis(10_000);
 
@@ -123,4 +126,83 @@ async fn concurrent_acquire_grants_exactly_one() {
         1,
         "exactly one of two concurrent acquirers wins the fresh lease"
     );
+}
+
+// --- node registry ----------------------------------------------------------
+//
+// Gated the same two ways (the `postgres` feature + a reachable `BLUEDB_TEST_PG_URL`).
+// Each test uses a unique `node_id` so concurrent runs against the shared
+// `bluedb_nodes` table don't interfere, and an injected `TestClock` so TTL
+// liveness is deterministic without sleeping.
+
+/// Connect a registry (TTL 10s) on an injected clock, or `None` if PG is unset.
+async fn registry(clock: TestClock) -> Option<PostgresNodeRegistry> {
+    let url = pg_url()?;
+    Some(
+        PostgresNodeRegistry::connect_with_clock(&url, TTL, Arc::new(clock))
+            .await
+            .expect("connect postgres node registry"),
+    )
+}
+
+macro_rules! registry_or_skip {
+    ($clock:expr) => {
+        match registry($clock).await {
+            Some(r) => r,
+            None => {
+                eprintln!("skipping: BLUEDB_TEST_PG_URL not set");
+                return;
+            }
+        }
+    };
+}
+
+#[tokio::test]
+async fn registry_heartbeat_live_and_url_for() {
+    let clock = TestClock::new(0);
+    let reg = registry_or_skip!(clock.clone());
+    let id = unique_resource("node");
+
+    assert_eq!(reg.url_for(&id).await.unwrap(), None);
+    reg.heartbeat(&id, "http://a:8080").await.unwrap();
+
+    // Live + resolvable within TTL.
+    assert_eq!(reg.url_for(&id).await.unwrap(), Some("http://a:8080".to_string()));
+    assert!(reg.live_nodes().await.unwrap().iter().any(|(n, u)| n == &id && u == "http://a:8080"));
+}
+
+#[tokio::test]
+async fn registry_entry_ages_out_past_ttl() {
+    let clock = TestClock::new(0);
+    let reg = registry_or_skip!(clock.clone());
+    let id = unique_resource("node");
+    reg.heartbeat(&id, "http://a:8080").await.unwrap(); // last_heartbeat = 0
+
+    clock.set(9_999);
+    assert_eq!(reg.url_for(&id).await.unwrap(), Some("http://a:8080".to_string()));
+
+    clock.set(10_001);
+    assert_eq!(reg.url_for(&id).await.unwrap(), None, "aged out past TTL");
+    assert!(!reg.live_nodes().await.unwrap().iter().any(|(n, _)| n == &id));
+}
+
+#[tokio::test]
+async fn registry_re_heartbeat_refreshes_and_updates_url() {
+    let clock = TestClock::new(0);
+    let reg = registry_or_skip!(clock.clone());
+    let id = unique_resource("node");
+    reg.heartbeat(&id, "http://a:8080").await.unwrap(); // t=0
+
+    clock.set(9_000);
+    reg.heartbeat(&id, "http://a-v2:8080").await.unwrap(); // refresh + new url, expires 19_000
+
+    clock.set(18_000);
+    assert_eq!(
+        reg.url_for(&id).await.unwrap(),
+        Some("http://a-v2:8080".to_string()),
+        "upsert refreshed the window and updated the url"
+    );
+
+    clock.set(19_001);
+    assert_eq!(reg.url_for(&id).await.unwrap(), None);
 }

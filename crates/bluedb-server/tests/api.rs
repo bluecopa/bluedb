@@ -77,6 +77,67 @@ async fn sql_admin(app: &Router, statement: &str) -> (StatusCode, Value) {
     call(app, "POST", "/admin/sql", Some(json!({ "sql": statement }))).await
 }
 
+/// A GET that returns status + response headers + body, with an optional
+/// `Prefer` header. (Bodyless — used by the `count=exact` / Content-Range tests.)
+async fn call_full(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    prefer: Option<&str>,
+) -> (StatusCode, axum::http::HeaderMap, Value) {
+    let mut builder = Request::builder().method(method).uri(uri);
+    if let Some(p) = prefer {
+        builder = builder.header("prefer", p);
+    }
+    let response = app.clone().oneshot(builder.body(Body::empty()).unwrap()).await.unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap()
+    };
+    (status, headers, body)
+}
+
+/// The `Content-Range` response header value, if present.
+fn content_range(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get("content-range")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
+/// Like [`call`] but sets `Prefer: return=representation`.
+async fn call_prefer(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    json_body: Option<Value>,
+) -> (StatusCode, Value) {
+    let builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("prefer", "return=representation");
+    let request = match json_body {
+        Some(v) => builder
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&v).unwrap()))
+            .unwrap(),
+        None => builder.body(Body::empty()).unwrap(),
+    };
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap()
+    };
+    (status, body)
+}
+
 /// Send a parameterized statement to `POST /sql` (non-DDL only).
 #[allow(dead_code)]
 async fn sql_dml(app: &Router, statement: &str, params: serde_json::Value) -> (StatusCode, Value) {
@@ -166,11 +227,206 @@ async fn bad_identifier_is_a_400() {
 }
 
 #[tokio::test]
-async fn unknown_table_select_is_a_400() {
+async fn json_column_round_trips_as_real_json() {
     let app = app().await;
-    // Selecting a table that doesn't exist is a SQL error → 400 (client error).
-    let (status, _) = call(&app, "GET", "/tables/ghost", None).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) =
+        sql_admin(&app, "CREATE TABLE docs (id INTEGER PRIMARY KEY, data JSON);").await;
+    assert_eq!(status, StatusCode::OK);
+
+    // POST a row whose JSON column holds a real object (today this 400'd as
+    // "expected a scalar value").
+    let row = json!({ "id": 1, "data": { "k": "v", "n": 3, "tags": [1, 2] } });
+    let (status, body) = call(&app, "POST", "/tables/docs", Some(row.clone())).await;
+    assert_eq!(status, StatusCode::OK, "insert failed: {body}");
+
+    // GET it back: `data` is a real JSON object, not an escaped string.
+    let (status, body) = call(&app, "GET", "/tables/docs?id=eq.1", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!([row]));
+    // Specifically, it must be an object — not the string "{\"k\":\"v\",...}".
+    assert!(body[0]["data"].is_object(), "data should be a JSON object: {body}");
+}
+
+#[tokio::test]
+async fn arbitrary_and_json_filters_on_tables_route_to_analytical_engine() {
+    let app = app().await;
+
+    // Enable the Iceberg mirror so the analytical engine has the tenant's data.
+    let (status, _) = call(&app, "POST", "/sql",
+        Some(json!({"sql": "PRAGMA lakehouse_mirror = on"}))).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = sql_admin(
+        &app,
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT, data JSON)",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Insert rows; `label` is NOT indexed, `data` is JSON.
+    for (id, label, status_field) in [(1, "alpha", "active"), (2, "beta", "idle"), (3, "alpha", "active")] {
+        let (s, body) = call(
+            &app,
+            "POST",
+            "/tables/items",
+            Some(json!({"id": id, "label": label, "data": {"status": status_field}})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "insert {id}: {body}");
+    }
+
+    // A filter on the NON-indexed `label` 400s on the GlueSQL fast path (guardrail).
+    // It must now route to the analytical engine and return rows (doc ask #4).
+    let (status, body) = call(&app, "GET", "/tables/items?label=eq.alpha&order=id.asc", None).await;
+    assert_eq!(status, StatusCode::OK, "label filter should route, got: {body}");
+    let ids: Vec<i64> = body
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|r| r["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids, vec![1, 3], "both alpha rows: {body}");
+
+    // A JSON-path filter also routes; `data` comes back as a real object. `>` is
+    // percent-encoded as a conformant HTTP client would send it (`%3E%3E`).
+    let (status, body) =
+        call(&app, "GET", "/tables/items?data-%3E%3Estatus=eq.active&order=id.asc", None).await;
+    assert_eq!(status, StatusCode::OK, "json-path filter should route, got: {body}");
+    let rows = body.as_array().expect("rows");
+    assert_eq!(rows.len(), 2, "two active rows: {body}");
+    assert!(rows[0]["data"].is_object(), "data re-inflated to an object: {body}");
+    assert_eq!(rows[0]["data"]["status"], json!("active"));
+
+    // A PK point read still takes the GlueSQL fast path and works unchanged.
+    let (status, body) = call(&app, "GET", "/tables/items?id=eq.2", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_array().expect("rows").len(), 1);
+    assert_eq!(body[0]["label"], json!("beta"));
+}
+
+#[tokio::test]
+async fn prefer_representation_returns_affected_rows() {
+    let app = app().await;
+    let (status, _) = sql_admin(&app, "CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT)").await;
+    assert_eq!(status, StatusCode::OK);
+
+    // INSERT + representation → the inserted row(s), not a count.
+    let (status, body) =
+        call_prefer(&app, "POST", "/tables/t", Some(json!({"id": 1, "label": "alpha"}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, json!([{"id": 1, "label": "alpha"}]), "insert repr: {body}");
+
+    // PATCH + representation → the updated row.
+    let (status, body) =
+        call_prefer(&app, "PATCH", "/tables/t?id=eq.1", Some(json!({"label": "beta"}))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!([{"id": 1, "label": "beta"}]), "update repr: {body}");
+
+    // DELETE + representation → the removed row (its pre-delete state).
+    let (status, body) = call_prefer(&app, "DELETE", "/tables/t?id=eq.1", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!([{"id": 1, "label": "beta"}]), "delete repr: {body}");
+
+    // The row is really gone.
+    let (_, body) = call(&app, "GET", "/tables/t?id=eq.1", None).await;
+    assert_eq!(body, json!([]), "row should be deleted: {body}");
+
+    // Without the header, the count shape is unchanged.
+    let (_, body) = call(&app, "POST", "/tables/t", Some(json!({"id": 2, "label": "g"}))).await;
+    assert_eq!(body, json!({"inserted": 1}), "no-prefer insert still returns a count: {body}");
+}
+
+#[tokio::test]
+async fn unknown_table_select_is_a_404() {
+    let app = app().await;
+    // Selecting a table that doesn't exist → 404 NOT_FOUND (ask #7 taxonomy).
+    let (status, body) = call(&app, "GET", "/tables/ghost", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["code"], json!("NOT_FOUND"), "{body}");
+}
+
+#[tokio::test]
+async fn count_exact_sets_content_range() {
+    let app = app().await;
+    sql_admin(&app, "CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT)").await;
+    for id in 1..=5 {
+        let (s, _) = call(&app, "POST", "/tables/t", Some(json!({"id": id, "label": "x"}))).await;
+        assert_eq!(s, StatusCode::OK);
+    }
+
+    // A page of 2 with count=exact → Content-Range: 0-1/5.
+    let (status, headers, body) =
+        call_full(&app, "GET", "/tables/t?order=id.asc&limit=2", Some("count=exact")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body.as_array().unwrap().len(), 2);
+    assert_eq!(content_range(&headers), Some("0-1/5".to_string()), "body: {body}");
+
+    // Second page, offset 2 → 2-3/5.
+    let (_, headers, _) =
+        call_full(&app, "GET", "/tables/t?order=id.asc&limit=2&offset=2", Some("count=exact")).await;
+    assert_eq!(content_range(&headers), Some("2-3/5".to_string()));
+
+    // Without the header, no Content-Range.
+    let (_, headers, _) = call_full(&app, "GET", "/tables/t?order=id.asc&limit=2", None).await;
+    assert_eq!(content_range(&headers), None);
+}
+
+#[tokio::test]
+async fn schema_describe_and_inline_indexes() {
+    let app = app().await;
+    // Create a table WITH an index declared inline (one schema apply), incl. JSON.
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/schema/tables",
+        Some(json!({
+            "name": "people",
+            "columns": [
+                {"name": "id", "type": "INTEGER", "primaryKey": true},
+                {"name": "email", "type": "TEXT"},
+                {"name": "meta", "type": "JSON"}
+            ],
+            "indexes": [{"name": "people_email", "columns": ["email"]}]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["created_indexes"], json!(["people_email"]));
+
+    // Describe it: structured columns + indexes.
+    let (status, body) = call(&app, "GET", "/schema/tables/people", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let cols = body["columns"].as_array().expect("columns array");
+    let col = |n: &str| cols.iter().find(|c| c["name"] == n).cloned().unwrap_or(Value::Null);
+    assert_eq!(col("id")["primary_key"], json!(true), "{body}");
+    assert_eq!(col("id")["indexed"], json!(true), "pk is index-served: {body}");
+    assert_eq!(col("email")["primary_key"], json!(false));
+    assert_eq!(col("email")["indexed"], json!(true), "inline index: {body}");
+    assert_eq!(col("meta")["type"], json!("JSON"), "JSON column type reported: {body}");
+    assert_eq!(
+        body["indexes"],
+        json!([{"name": "people_email", "column": "email"}]),
+        "{body}"
+    );
+
+    // Describe a missing table → 404 with a code.
+    let (status, body) = call(&app, "GET", "/schema/tables/ghost", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["code"], json!("NOT_FOUND"), "{body}");
+}
+
+#[tokio::test]
+async fn errors_carry_structured_codes() {
+    let app = app().await;
+    let (status, _) = sql_admin(&app, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)").await;
+    assert_eq!(status, StatusCode::OK);
+
+    // A duplicate primary key → 409 with a stable code, not a parsed-prose 400.
+    let (s, _) = call(&app, "POST", "/tables/t", Some(json!({"id": 1, "v": "a"}))).await;
+    assert_eq!(s, StatusCode::OK);
+    let (status, body) = call(&app, "POST", "/tables/t", Some(json!({"id": 1, "v": "b"}))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "dup pk: {body}");
+    assert_eq!(body["code"], json!("UNIQUE_VIOLATION"), "{body}");
 }
 
 #[tokio::test]

@@ -1,0 +1,53 @@
+# Keyless tables (no PRIMARY KEY). The product requires a PK, but the SQL corpus
+# assumes keyless tables, so the harness materializes a keyless table's current
+# rows as an in-memory DataFusion table for the read (writes use GlueSQL's
+# internal row key; nothing is added to the user's columns). Proves the DataFusion
+# read dialect works without a user key — including bag (duplicate-row) semantics,
+# aggregates, window functions, and joins across keyless tables.
+
+statement ok
+CREATE TABLE k (a INTEGER, b INTEGER)
+
+statement ok
+INSERT INTO k VALUES (1, 10), (2, 20), (2, 20), (3, 30)
+
+# Bag semantics: the duplicate (2, 20) row is preserved (no key to collapse on).
+query I
+SELECT COUNT(*) FROM k
+----
+4
+
+query I
+SELECT COUNT(*) FROM k WHERE a = 2
+----
+2
+
+# Aggregate over a keyless table.
+query II
+SELECT a, SUM(b) FROM k GROUP BY a ORDER BY a
+----
+1 10
+2 40
+3 30
+
+# Window function over a keyless table (GlueSQL can't; DataFusion does).
+query II
+SELECT a, ROW_NUMBER() OVER (ORDER BY a, b) FROM k ORDER BY a, b
+----
+1 1
+2 2
+2 3
+3 4
+
+statement ok
+CREATE TABLE m (a INTEGER, label TEXT)
+
+statement ok
+INSERT INTO m VALUES (1, 'x'), (3, 'z')
+
+# Join across two keyless tables.
+query IT
+SELECT k.a, m.label FROM k JOIN m ON k.a = m.a ORDER BY k.a
+----
+1 x
+3 z

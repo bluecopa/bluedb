@@ -1,0 +1,25 @@
+[package]
+name = "bluedb-cache"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+rust-version = "1.80"
+description = "Foyer-backed CachingObjectStore for the bluedb HTAP read tier."
+
+[dependencies]
+# foyer is ALREADY in the workspace via SlateDB (0.22.3). Pinning to the
+# exact version keeps Cargo on ONE copy. SlateDB enables foyer's `serde`
+# feature workspace-wide, so the blanket `Code` impl for String + Vec<u8>
+# is activated through feature-unification — no need to re-declare it here,
+# but declaring `serde` is harmless and makes the dep self-contained.
+foyer = { version = "=0.22.3", features = ["serde"] }
+# object_store pinned to the workspace-resolved 0.12.5 so Arc<dyn ObjectStore>
+# unifies with the lakehouse FileIO bridge and bluedb-query.
+object_store = { version = "=0.12.5" }
+bytes   = { workspace = true }
+tokio   = { workspace = true }
+async-trait = { workspace = true }
+futures = "0.3"
+
+[dev-dependencies]
+tokio = { workspace = true }

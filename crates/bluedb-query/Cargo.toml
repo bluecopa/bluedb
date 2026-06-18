@@ -1,0 +1,25 @@
+[package]
+name = "bluedb-query"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+rust-version = "1.92"
+
+[dependencies]
+bluedb-lakehouse = { path = "../bluedb-lakehouse" }
+datafusion = "52"
+iceberg = "0.9.1"
+iceberg-datafusion = "0.9.1"
+arrow-array = "57"
+arrow-schema = "57"
+tokio = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+gluesql-core = "=0.19.0"
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+slatedb = { workspace = true }
+bluedb-sql = { workspace = true }
+bluedb-cache = { path = "../bluedb-cache" }

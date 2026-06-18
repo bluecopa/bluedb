@@ -73,6 +73,86 @@ async fn create_insert_select_where() {
     assert_eq!(rows, vec![vec![Value::Str("bob".to_owned())]]);
 }
 
+/// Ask #3: a bound integer param must land in a DECIMAL column the way an inline
+/// literal already does. Without the `coerce_writes` planner pass this is the
+/// reported failure: `incompatible data type, data type: Decimal, value: I64(1)`.
+#[tokio::test]
+async fn bound_int_param_widens_into_decimal_column() {
+    let mut glue = new_glue().await;
+    exec_one(
+        &mut glue,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, amount DECIMAL);",
+    )
+    .await;
+
+    // INSERT with both columns bound as I64 params (the data plane's form).
+    let payloads = glue
+        .execute_with_params(
+            "INSERT INTO t (id, amount) VALUES ($1, $2);",
+            gluesql_core::params!(1_i64, 20_i64),
+        )
+        .await
+        .expect("parameterised insert into a DECIMAL column should succeed");
+    assert!(matches!(payloads[0], Payload::Insert(1)), "got {:?}", payloads[0]);
+
+    // It is stored as a real DECIMAL (the cast widened I64 → Decimal).
+    let rows = select_rows(exec_one(&mut glue, "SELECT amount FROM t WHERE id = 1;").await);
+    assert!(
+        matches!(rows[0][0], Value::Decimal(_)),
+        "expected a Decimal, got {:?}",
+        rows[0][0]
+    );
+
+    // UPDATE with a bound int param into the same DECIMAL column also widens.
+    let updated = glue
+        .execute_with_params(
+            "UPDATE t SET amount = $1 WHERE id = $2;",
+            gluesql_core::params!(33_i64, 1_i64),
+        )
+        .await
+        .expect("parameterised update of a DECIMAL column should succeed");
+    assert!(matches!(updated[0], Payload::Update(1)), "got {:?}", updated[0]);
+}
+
+/// A `JSON`/`JSONB` column normalises to `TEXT` for GlueSQL, and the JSON-ness is
+/// captured in a durable per-table catalog (the chokepoint `prepare_composite_pk`
+/// runs the normalisation + capture). The catalog is what lets the read path
+/// re-inflate the stored text to real JSON.
+#[tokio::test]
+async fn json_columns_normalize_to_text_and_are_catalogued() {
+    let mut glue = new_glue().await;
+
+    // The data plane / SQL surface runs every statement through this chokepoint.
+    let ddl = "CREATE TABLE t (id INTEGER PRIMARY KEY, data JSON, meta JSONB, name TEXT);";
+    let rewritten = bluedb_sql::prepare_composite_pk(&mut glue.storage, ddl, &[])
+        .await
+        .expect("prepare CREATE TABLE with JSON columns");
+    // JSON/JSONB were rewritten to TEXT so GlueSQL accepts the DDL.
+    let upper = rewritten.to_uppercase();
+    assert!(upper.contains("TEXT"), "expected TEXT, got: {rewritten}");
+    assert!(!upper.contains("JSON"), "JSON should be gone, got: {rewritten}");
+    glue.execute(&rewritten).await.expect("execute normalised DDL");
+
+    // The JSON columns are remembered (in declaration order); non-JSON columns are not.
+    let json_cols = glue
+        .storage
+        .json_columns("t")
+        .await
+        .expect("read json catalog");
+    assert_eq!(
+        json_cols,
+        Some(vec!["data".to_string(), "meta".to_string()])
+    );
+
+    // A table with no JSON column has no catalog entry.
+    let ddl2 = "CREATE TABLE plain (id INTEGER PRIMARY KEY, name TEXT);";
+    let rw2 = bluedb_sql::prepare_composite_pk(&mut glue.storage, ddl2, &[])
+        .await
+        .unwrap();
+    glue.execute(&rw2).await.unwrap();
+    assert_eq!(glue.storage.json_columns("plain").await.unwrap(), None);
+}
+
 #[tokio::test]
 async fn ordered_scan_returns_sorted_rows() {
     let mut glue = new_glue().await;

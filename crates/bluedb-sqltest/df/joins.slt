@@ -1,0 +1,59 @@
+# Joins — INNER works on GlueSQL, but LEFT/RIGHT/FULL OUTER and CROSS are gaps the
+# DataFusion front door closes. NULL-extended rows from outer joins included.
+
+statement ok
+CREATE TABLE l (id INTEGER PRIMARY KEY, x INTEGER)
+
+statement ok
+CREATE TABLE r (id INTEGER PRIMARY KEY, y INTEGER)
+
+statement ok
+INSERT INTO l VALUES (1,10),(2,20),(3,30)
+
+statement ok
+INSERT INTO r VALUES (2,200),(3,300),(4,400)
+
+# INNER join.
+query III
+SELECT l.id, l.x, r.y FROM l JOIN r ON l.id = r.id ORDER BY l.id
+----
+2 20 200
+3 30 300
+
+# LEFT join — unmatched l.id=1 yields NULL on the right.
+query III
+SELECT l.id, l.x, r.y FROM l LEFT JOIN r ON l.id = r.id ORDER BY l.id
+----
+1 10 NULL
+2 20 200
+3 30 300
+
+# RIGHT join — unmatched r.id=4 yields NULL on the left.
+query II
+SELECT r.id, l.x FROM l RIGHT JOIN r ON l.id = r.id ORDER BY r.id
+----
+2 20
+3 30
+4 NULL
+
+# FULL OUTER join — both sides NULL-extended.
+query II
+SELECT l.id, r.id FROM l FULL OUTER JOIN r ON l.id = r.id ORDER BY l.id NULLS LAST, r.id
+----
+1 NULL
+2 2
+3 3
+NULL 4
+
+# CROSS join cardinality.
+query I
+SELECT COUNT(*) FROM l CROSS JOIN r
+----
+9
+
+# Self join.
+query II
+SELECT a.id, b.id FROM l a JOIN l b ON b.id = a.id + 1 ORDER BY a.id
+----
+1 2
+2 3

@@ -6,30 +6,28 @@ where the behavior matches PostgreSQL/DuckDB, and where it differs.
 
 ## What powers it
 
-bluedb's SQL is an embedded engine ([GlueSQL]) extended by a bluedb
-**compatibility layer** — a set of query rewrites and planner passes that widen
-what you can write (parameterized types, `JOIN … USING`, `TRY_CAST`,
-`NULLS FIRST/LAST`, set operations, CTEs, views, …) and tighten correctness
-(predicate pushdown to hash joins, secondary-index selection, numeric/text
-comparison coercion). Everything runs directly on the same object-storage
-substrate as the rest of bluedb — no separate database server.
-
-[GlueSQL]: https://gluesql.org
+bluedb speaks SQL directly over its object-storage substrate — no separate
+database server. Point and range access by primary key or secondary index is
+served from the transactional store; analytical reads — joins, `GROUP BY` /
+aggregates, window functions, subqueries, CTEs, set operations, and arbitrary
+filters and sorts — are served by a columnar engine over the same data. You
+write one SQL surface, and bluedb routes each query to the right path.
 
 ## Dialect at a glance
 
-- Core **SQL-92**: `CREATE TABLE` / `INSERT` / `UPDATE` / `DELETE` / `SELECT`
-  with `WHERE`, `GROUP BY` / `HAVING`, `ORDER BY`, `LIMIT` / `OFFSET`,
-  `DISTINCT`, joins, subqueries, aggregates.
+- Core **SQL-92** plus analytics: `SELECT` with `WHERE`, `GROUP BY` / `HAVING`,
+  `ORDER BY`, `LIMIT` / `OFFSET`, `DISTINCT`, joins, subqueries, aggregates, and
+  **window functions**; `CREATE TABLE` / `INSERT` / `UPDATE` / `DELETE`.
 - **Schema'd tables** — every table has a typed column list and a `PRIMARY KEY`;
   schema evolution (ADD/DROP/RENAME column, RENAME TABLE) is **online** (O(1)
   metadata, no row rewrite). There are no schemaless tables.
-- **Bounded reads** — a plan-time [query guardrail](query-guardrail.md) keeps
-  every read served by the primary key or an index (an unfiltered `SELECT` is
-  capped to the first 100 rows in PK order; a non-indexed filter/sort is
-  rejected with the exact `CREATE INDEX` to run).
+- **Full read surface** — `SELECT` runs any filter, sort, join, aggregate, or
+  window function; the primary key and [secondary indexes](query-guardrail.md)
+  accelerate point and range lookups.
 - **Transactions** with snapshot isolation (`BEGIN` / `COMMIT` / `ROLLBACK`).
 - **Secondary indexes**, **views**, **non-recursive CTEs**, **set operations**.
+- **JSON** — a `JSON` / `JSONB` column type with PostgreSQL operators (`->`,
+  `->>`, `@>`, `<@`) and the `jsonb_path_query` family.
 - Closest in feel to **PostgreSQL**; this guide calls out every place the
   behavior diverges from PostgreSQL or DuckDB.
 
@@ -38,11 +36,12 @@ substrate as the rest of bluedb — no separate database server.
 | Page | Covers |
 |------|--------|
 | [Statements](statements.md) | `CREATE`/`DROP`/`ALTER TABLE`·`INDEX`·`VIEW`, `INSERT`/`UPDATE`/`DELETE`, `SET` |
-| [Query guardrail](query-guardrail.md) | Why reads must be index-served, the bare-scan cap, and the index a rejected query asks for |
+| [Reads and indexes](query-guardrail.md) | How `SELECT` is served, and how the primary key and secondary indexes accelerate point/range lookups |
 | [Query syntax](query-syntax.md) | `SELECT`, `FROM`/joins, `WHERE`, `GROUP BY`, `ORDER BY`, set ops, CTEs, subqueries |
 | [Data types](data-types.md) | Native types and accepted aliases (`VARCHAR(n)`, `DOUBLE`, …) |
 | [Expressions](expressions.md) | Operators, comparisons & coercion, `CAST`/`TRY_CAST`, `CASE`, `IN`, `BETWEEN` |
 | [Functions](functions.md) | Scalar (math/string/date/…) and aggregate functions |
+| [JSON](json.md) | The `JSON`/`JSONB` type, `->`/`->>`/`@>`/`<@`, `jsonb_path_query` |
 | [Transactions](transactions.md) | `BEGIN`/`COMMIT`/`ROLLBACK`, isolation, concurrency |
 | [Metadata](metadata.md) | Introspection tables: `GLUE_OBJECTS`, `GLUE_TABLES`, … |
 | [Limitations & differences](limitations.md) | What's **not** supported and where semantics differ |

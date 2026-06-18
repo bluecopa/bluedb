@@ -1,0 +1,48 @@
+# Type coercion across the text/number boundary in the DataFusion read front
+# door. Pins where it coerces and where it does NOT — a deliberate record of a
+# read-dialect difference from bluedb's GlueSQL path, whose coerce shim matched a
+# DECIMAL column against a quoted numeric string. Asserted via COUNT(*) so the
+# divergence is captured without depending on decimal value rendering.
+
+statement ok
+CREATE TABLE t (id INTEGER PRIMARY KEY, price DECIMAL, code TEXT)
+
+statement ok
+INSERT INTO t VALUES (5, 9.99, 'x')
+
+# Integer column vs a quoted number — coerced, matches.
+query I
+SELECT COUNT(*) FROM t WHERE id = '5'
+----
+1
+
+# Integer column vs a quoted number, ordering — coerced, matches.
+query I
+SELECT COUNT(*) FROM t WHERE id < '6'
+----
+1
+
+# Quoted number vs a number literal — coerced, true for the row.
+query I
+SELECT COUNT(*) FROM t WHERE '5' = 5
+----
+1
+
+# Text column vs a number literal — no spurious match.
+query I
+SELECT COUNT(*) FROM t WHERE code = 5
+----
+0
+
+# Decimal column vs a quoted number — the DataFusion front door does NOT coerce a
+# string literal to decimal, so this does not match (bluedb's GlueSQL path did).
+query I
+SELECT COUNT(*) FROM t WHERE price = '9.99'
+----
+0
+
+# Decimal column vs a numeric literal — matches (no string is involved).
+query I
+SELECT COUNT(*) FROM t WHERE price = 9.99
+----
+1

@@ -1,0 +1,46 @@
+# Subqueries — scalar, IN, correlated EXISTS, derived table, correlated scalar —
+# through the DataFusion front door.
+
+statement ok
+CREATE TABLE u (id INTEGER PRIMARY KEY, dept TEXT, sal INTEGER)
+
+statement ok
+INSERT INTO u VALUES (1,'eng',100),(2,'eng',200),(3,'sales',150),(4,'sales',150)
+
+# Scalar subquery in a predicate.
+query I
+SELECT id FROM u WHERE sal = (SELECT MAX(sal) FROM u) ORDER BY id
+----
+2
+
+# IN (subquery).
+query I
+SELECT id FROM u WHERE dept IN (SELECT dept FROM u WHERE sal >= 200) ORDER BY id
+----
+1
+2
+
+# Correlated EXISTS — every dept has a sibling row.
+query I
+SELECT id FROM u u1 WHERE EXISTS (SELECT 1 FROM u u2 WHERE u2.dept = u1.dept AND u2.id <> u1.id) ORDER BY id
+----
+1
+2
+3
+4
+
+# Derived table (subquery in FROM).
+query TI
+SELECT dept, total FROM (SELECT dept, SUM(sal) AS total FROM u GROUP BY dept) d ORDER BY dept
+----
+eng 300
+sales 300
+
+# Correlated scalar subquery in the projection.
+query II
+SELECT id, (SELECT COUNT(*) FROM u u2 WHERE u2.dept = u1.dept) AS n FROM u u1 ORDER BY id
+----
+1 2
+2 2
+3 2
+4 2

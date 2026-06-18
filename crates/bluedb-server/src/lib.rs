@@ -44,8 +44,9 @@ pub mod objstore;
 mod schema;
 
 use bluedb_engine::{rest_sql, EngineError, FtsEngine};
-use bluedb_ha::{HaError, Status, WriterController};
+use bluedb_ha::{HaError, NodeRegistry, Status, WriterController};
 use bluedb_ledger::Ledger;
+use arrow_array::RecordBatch;
 
 mod ledger_api;
 mod evidence_api;
@@ -58,7 +59,7 @@ pub use signer::verify_es256_der;
 
 use bluedb_lakehouse::{object_store_file_io, LakehouseConfig, LakehouseManager};
 use bluedb_rest::{parse_filters, DeleteRequest, InsertRequest, UpdateRequest};
-use bluedb_sql::{parse_lakehouse_pragma, CdcConfig, Database, SlateDbStorage, DEFAULT_TENANT};
+use bluedb_sql::{parse_lakehouse_pragma, CdcConfig, Database, LhPragma, SlateDbStorage, DEFAULT_TENANT};
 use gluesql_core::prelude::{Glue, Payload, Value as SqlValue};
 use slatedb::object_store::ObjectStore;
 use slatedb::{Db, DbReader, Settings};
@@ -200,6 +201,12 @@ pub struct AppState {
 struct Inner {
     /// Object store + SlateDB path the writer/reader open against.
     object_store: Arc<dyn ObjectStore>,
+    /// Object store handed to the lakehouse/Iceberg mirror.  Normally the same
+    /// `Arc` as `object_store`, but on nodes whose `BLUEDB_ANALYTICAL_CACHE_BYTES`
+    /// is non-zero it is a `CachingObjectStore` wrapping a clone of the raw store
+    /// (so SlateDB — which has its own internal foyer block cache — is never
+    /// double-cached, while Iceberg files benefit from the DRAM read cache).
+    lakehouse_object_store: Arc<dyn ObjectStore>,
     db_path: String,
     /// Single-writer lease controller (HA election + self-fencing).
     writer: Arc<WriterController>,
@@ -257,6 +264,13 @@ struct Inner {
     /// (or injected directly in tests via [`AppState::with_signer`]). The private
     /// key never lives here in production — the `Vault` backend holds only a token.
     signer: Option<Arc<signer::EvidenceSigner>>,
+    /// Node registry: cross-node discovery of live coordinators and their
+    /// externally-reachable URLs, keyed by `node_id`. `None` until set at startup
+    /// via [`AppState::with_node_registry`] (`main` picks the backend). Foundation
+    /// for the later cross-node redirect (resolving the writer's URL via
+    /// `url_for(lease.holder)`) and affinity routing — neither built yet. Kept as
+    /// the deployment-selected backend (in-memory / Postgres / Kubernetes).
+    node_registry: Option<Arc<dyn NodeRegistry>>,
 }
 
 impl AppState {
@@ -271,6 +285,9 @@ impl AppState {
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
+                // lakehouse_object_store defaults to the raw store; callers that
+                // want the analytical read cache call `with_analytical_cache`.
+                lakehouse_object_store: object_store.clone(),
                 object_store,
                 db_path: db_path.into(),
                 writer,
@@ -284,8 +301,39 @@ impl AppState {
                 lakehouse_base: String::new(),
                 lakehouse: RwLock::new(None),
                 signer: None,
+                node_registry: None,
             }),
         }
+    }
+
+    /// Install the node registry (cross-node discovery). Must be called at
+    /// startup, before the `Arc<Inner>` is shared; `main` picks the backend
+    /// (in-memory / Postgres / Kubernetes). No-op once the state is shared. When
+    /// unset, discovery is unavailable (single-node / tests).
+    pub fn with_node_registry(mut self, registry: Arc<dyn NodeRegistry>) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.node_registry = Some(registry);
+        }
+        self
+    }
+
+    /// The node registry, if one was installed. Discovery of live coordinators
+    /// and their URLs (`live_nodes` / `url_for`). The later cross-node redirect
+    /// will resolve the writer's URL via `url_for(self.writer().node_id())` once
+    /// the lease holder is known; that consumer is not built yet.
+    pub fn node_registry(&self) -> Option<&Arc<dyn NodeRegistry>> {
+        self.inner.node_registry.as_ref()
+    }
+
+    /// Override the object store handed to the lakehouse/Iceberg mirror with a
+    /// pre-built (e.g. `CachingObjectStore`-wrapped) store.  Must be called at
+    /// startup, before `Arc<Inner>` is shared (`main` does this).  Silently
+    /// ignored after the state is shared.
+    pub fn with_analytical_cache(mut self, store: Arc<dyn ObjectStore>) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.lakehouse_object_store = store;
+        }
+        self
     }
 
     /// Set the fully-qualified storage base URI the lakehouse mirror publishes
@@ -387,9 +435,9 @@ impl AppState {
         if authz.allows(token, required) {
             Ok(())
         } else if token.is_none() {
-            Err(AppError { status: StatusCode::UNAUTHORIZED, message: "missing or malformed bearer token".into() })
+            Err(AppError::plain(StatusCode::UNAUTHORIZED, "missing or malformed bearer token"))
         } else {
-            Err(AppError { status: StatusCode::FORBIDDEN, message: "insufficient scope".into() })
+            Err(AppError::plain(StatusCode::FORBIDDEN, "insufficient scope"))
         }
     }
 
@@ -401,10 +449,10 @@ impl AppState {
         if authz.allows_tenant(bearer_token(headers), tenant) {
             Ok(())
         } else {
-            Err(AppError {
-                status: StatusCode::FORBIDDEN,
-                message: format!("token not authorized for tenant '{tenant}'"),
-            })
+            Err(AppError::plain(
+                StatusCode::FORBIDDEN,
+                format!("token not authorized for tenant '{tenant}'"),
+            ))
         }
     }
 
@@ -495,7 +543,9 @@ impl AppState {
         } else {
             format!("{base}/{}", lakehouse_root())
         };
-        let file_io = object_store_file_io(self.inner.object_store.clone(), base);
+        // Use the lakehouse-specific store (may be a CachingObjectStore wrapper
+        // when BLUEDB_ANALYTICAL_CACHE_BYTES is set); SlateDB keeps the raw store.
+        let file_io = object_store_file_io(self.inner.lakehouse_object_store.clone(), base);
         // Stop a prior manager (re-promote) before opening a fresh one.
         if let Some(old) = self.inner.lakehouse.write().await.take() {
             old.shutdown();
@@ -609,10 +659,9 @@ impl AppState {
                 .strict()
                 .with_cdc(self.inner.cdc.clone())
                 .with_commit_observer(fts)),
-            None => Err(AppError {
-                status: StatusCode::SERVICE_UNAVAILABLE,
-                message: "node has no database yet (no writer has been promoted)".to_string(),
-            }),
+            None => Err(AppError::service_unavailable(
+                "node has no database yet (no writer has been promoted)",
+            )),
         }
     }
 
@@ -635,6 +684,28 @@ impl AppState {
         Ok(())
     }
 
+    /// Return the last CDC sequence assigned to `tenant` on this writer (the
+    /// in-memory counter after the most recent CDC commit). Returns 0 when no
+    /// CDC write has yet been stamped for this tenant. Used to populate
+    /// `X-Bluedb-Watermark` on write responses.
+    pub(crate) async fn write_watermark(&self, tenant: &str) -> i64 {
+        match self.inner.db.read().await.as_ref() {
+            Some(db) => db.last_cdc_seq(tenant).await,
+            None => 0,
+        }
+    }
+
+    /// The sealed Iceberg watermark for `tenant`: the max CDC sequence durably
+    /// committed to Iceberg for this tenant. Returns 0 when nothing has been
+    /// sealed yet. Used to populate `X-Bluedb-Watermark` on read responses and
+    /// to check `X-Bluedb-Min-Watermark` freshness constraints.
+    pub(crate) async fn sealed_watermark(&self, tenant: &str) -> i64 {
+        match self.inner.lakehouse.read().await.as_ref() {
+            Some(manager) => manager.sealed_watermark(tenant).await,
+            None => 0,
+        }
+    }
+
     /// Like [`Self::connection`] but the connection also serializes autocommit
     /// writes (see [`bluedb_sql::SlateDbStorage::serialize_writes`]). Used by the
     /// routes that can run a single-statement read-modify-write (`/sql`,
@@ -649,10 +720,24 @@ impl AppState {
                 .strict()
                 .with_cdc(self.inner.cdc.clone())
                 .with_commit_observer(fts)),
-            None => Err(AppError {
-                status: StatusCode::SERVICE_UNAVAILABLE,
-                message: "node has no database yet (no writer has been promoted)".to_string(),
-            }),
+            None => Err(AppError::service_unavailable(
+                "node has no database yet (no writer has been promoted)",
+            )),
+        }
+    }
+
+    /// An **unguarded** connection for internal read-backs — specifically the
+    /// `Prefer: return=representation` path, which re-reads the exact rows a
+    /// mutation just affected. The scan/sort guardrail deliberately does not apply:
+    /// the read is bounded by the mutation's own filter (or the inserted keys), not
+    /// a client-supplied scan, and reads the fresh SlateDB state (not the Iceberg
+    /// mirror). Reads committed state on the active node's database.
+    async fn connection_unguarded(&self, tenant: &str) -> Result<SlateDbStorage, AppError> {
+        match self.inner.db.read().await.as_ref() {
+            Some(db) => Ok(db.connection_for_tenant(tenant)),
+            None => Err(AppError::service_unavailable(
+                "node has no database yet (no writer has been promoted)",
+            )),
         }
     }
 
@@ -663,10 +748,9 @@ impl AppState {
     async fn ledger(&self) -> Result<Ledger, AppError> {
         match self.inner.db.read().await.as_ref() {
             Some(db) => Ok(Ledger::new(db)),
-            None => Err(AppError {
-                status: StatusCode::SERVICE_UNAVAILABLE,
-                message: "node has no database yet (no writer has been promoted)".to_string(),
-            }),
+            None => Err(AppError::service_unavailable(
+                "node has no database yet (no writer has been promoted)",
+            )),
         }
     }
 
@@ -696,17 +780,21 @@ impl AppState {
     /// [`Inner::writer_bound`]). The `Acquire` load pairs with the `Release` store
     /// in [`AppState::promote`]/[`AppState::attach_reader`].
     pub(crate) fn require_active(&self) -> Result<(), AppError> {
-        if self.inner.writer.is_active() && self.inner.writer_bound.load(Ordering::Acquire) {
+        if self.is_writer() {
             Ok(())
         } else {
-            Err(AppError {
-                status: StatusCode::SERVICE_UNAVAILABLE,
-                message: format!(
-                    "node '{}' is passive (not the active writer)",
-                    self.inner.writer.node_id()
-                ),
-            })
+            Err(AppError::plain(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("node '{}' is passive (not the active writer)", self.inner.writer.node_id()),
+            ))
         }
+    }
+
+    /// Whether this node is the active writer (lease held **and** writer `Db`
+    /// bound — same condition as [`Self::require_active`], as a bool). Used by the
+    /// HTAP analytical freshness gate to decide writer-local-serve vs. redirect.
+    pub(crate) fn is_writer(&self) -> bool {
+        self.inner.writer.is_active() && self.inner.writer_bound.load(Ordering::Acquire)
     }
 }
 
@@ -724,7 +812,10 @@ pub fn build_app(state: AppState) -> Router {
         .route("/admin/demote", post(admin_demote))
         .route("/admin/sql", post(admin_sql))
         .route("/schema/tables", post(schema::create_table))
-        .route("/schema/tables/{table}", delete(schema::drop_table))
+        .route(
+            "/schema/tables/{table}",
+            get(schema::describe_table).delete(schema::drop_table),
+        )
         .route("/schema/tables/{table}/indexes", post(schema::create_index))
         .route("/schema/tables/{table}/indexes/{name}", delete(schema::drop_index))
         .route(
@@ -800,8 +891,36 @@ fn json_to_param(v: &Value) -> Result<bluedb_rest::Param, AppError> {
             }
         }
         Value::String(s) => Param::Str(s.clone()),
-        other => return Err(AppError::bad_request(format!("param must be a JSON scalar, got {other}"))),
+        // Object/array params bind as canonical JSON text — for a JSON column or a
+        // JSON function argument on the query path.
+        Value::Object(_) | Value::Array(_) => Param::Str(v.to_string()),
     })
+}
+
+/// Inverse of [`json_to_param`]: a bound REST [`bluedb_rest::Param`] back to a JSON
+/// value, so a `/tables` query's params can be handed to the analytical front door
+/// ([`bluedb_query::query_via_catalog`], which binds JSON values positionally).
+fn param_to_json(p: &bluedb_rest::Param) -> Value {
+    use bluedb_rest::Param;
+    match p {
+        Param::Null => Value::Null,
+        Param::Bool(b) => Value::Bool(*b),
+        Param::Int(i) => json!(*i),
+        Param::Float(f) => json!(*f),
+        Param::Str(s) => Value::String(s.clone()),
+    }
+}
+
+/// True if `err` is the plan-time scan/sort guardrail rejection (a `/tables` read
+/// whose filter / ORDER BY touches a non-indexed column on the GlueSQL fast path).
+/// Such a read is re-routed to the analytical engine, which can scan/sort the
+/// Iceberg mirror. Detected by the stable sentinel prefix the guardrail emits.
+fn is_guardrail_reject(err: &EngineError) -> bool {
+    matches!(
+        err,
+        EngineError::Sql(gluesql_core::error::Error::StorageMsg(msg))
+            if msg.starts_with(bluedb_sql::GUARDRAIL_REJECT_PREFIX)
+    )
 }
 
 // --- handlers ---------------------------------------------------------------
@@ -814,39 +933,337 @@ fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
         .and_then(|v| v.strip_prefix("Bearer "))
 }
 
+/// Build an `X-Bluedb-Watermark: <tenant>:<seq>` header map.
+///
+/// Skips the header when `seq == 0` on normal (success) responses — a zero
+/// watermark means no CDC writes happened yet (CDC is off, or this was a
+/// DDL-only request) and omitting it avoids a misleading `<tenant>:0`.
+///
+/// For error responses (e.g. the freshness 503) use [`watermark_headers_always`]
+/// which emits the header even for 0 so the client learns the current sealed seq.
+fn watermark_headers(tenant: &str, seq: i64) -> axum::http::HeaderMap {
+    if seq > 0 {
+        watermark_headers_always(tenant, seq)
+    } else {
+        axum::http::HeaderMap::new()
+    }
+}
+
+/// Like [`watermark_headers`] but always emits the header, including `seq == 0`.
+/// Used on error responses where 0 is a meaningful "nothing sealed yet" signal.
+fn watermark_headers_always(tenant: &str, seq: i64) -> axum::http::HeaderMap {
+    let mut map = axum::http::HeaderMap::new();
+    let value = format!("{tenant}:{seq}");
+    if let Ok(v) = axum::http::HeaderValue::from_str(&value) {
+        map.insert("x-bluedb-watermark", v);
+    }
+    map
+}
+
+/// Parse the `X-Bluedb-Min-Watermark` request header.
+///
+/// Accepts both `<seq>` (bare integer, applies to the request's tenant) and
+/// `<tenant>:<seq>` (ignores the tenant portion — the server always uses the
+/// request's `X-Bluedb-Tenant` for scope). Returns `None` when the header is
+/// absent or unparseable (no freshness gate applied).
+fn parse_min_watermark(headers: &axum::http::HeaderMap) -> Option<i64> {
+    let raw = headers.get("x-bluedb-min-watermark")?.to_str().ok()?;
+    // Accept "<seq>" or "<tenant>:<seq>".
+    let seq_str = raw.find(':').map_or(raw, |i| &raw[i + 1..]);
+    seq_str.trim().parse::<i64>().ok()
+}
+
+// --- analytical read path helpers ------------------------------------------
+
+/// Convert a slice of Arrow [`RecordBatch`]es into a JSON array of row-objects,
+/// matching the shape of the existing read endpoints (`[{"col": val, ...}, ...]`).
+///
+/// Canonical JSON rendering per logical type (must match `sql_value_to_json`):
+/// - Null → `null`
+/// - Boolean → JSON bool
+/// - Integer (i8/i16/i32/i64/u8/u16/u32/u64) → JSON number
+/// - Float (f32/f64) → JSON number (NaN/Inf → `null`)
+/// - Utf8 / LargeUtf8 → JSON string
+/// - Decimal128 → JSON string preserving scale (e.g. `"10.50"`)
+/// - Date32 → ISO-8601 date string `"YYYY-MM-DD"`
+/// - Timestamp(Microsecond, _) → `"YYYY-MM-DDTHH:MM:SS[.ffffff]"`
+/// - Time64(Microsecond) → `"HH:MM:SS[.ffffff]"`
+/// - Everything else → JSON string via `format!("{:?}", ...)`
+fn record_batches_to_json(batches: &[RecordBatch]) -> Value {
+    use arrow_array::Array;
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::{
+        Int8Type, Int16Type, Int32Type, Int64Type,
+        UInt8Type, UInt16Type, UInt32Type, UInt64Type,
+        Float32Type, Float64Type, Date32Type, Decimal128Type,
+        TimestampMicrosecondType, Time64MicrosecondType,
+    };
+    use arrow_schema::{DataType, TimeUnit};
+
+    let mut rows: Vec<Value> = Vec::new();
+    for batch in batches {
+        let schema = batch.schema();
+        let n = batch.num_rows();
+        for row_idx in 0..n {
+            let mut obj = Map::new();
+            for (col_idx, field) in schema.fields().iter().enumerate() {
+                let col = batch.column(col_idx);
+                let val: Value = if col.is_null(row_idx) {
+                    Value::Null
+                } else {
+                    match field.data_type() {
+                        DataType::Boolean => {
+                            if let Some(a) = col.as_any().downcast_ref::<arrow_array::BooleanArray>() {
+                                Value::Bool(a.value(row_idx))
+                            } else { Value::Null }
+                        }
+                        DataType::Int8 => json!(col.as_primitive::<Int8Type>().value(row_idx)),
+                        DataType::Int16 => json!(col.as_primitive::<Int16Type>().value(row_idx)),
+                        DataType::Int32 => json!(col.as_primitive::<Int32Type>().value(row_idx)),
+                        DataType::Int64 => json!(col.as_primitive::<Int64Type>().value(row_idx)),
+                        DataType::UInt8 => json!(col.as_primitive::<UInt8Type>().value(row_idx)),
+                        DataType::UInt16 => json!(col.as_primitive::<UInt16Type>().value(row_idx)),
+                        DataType::UInt32 => json!(col.as_primitive::<UInt32Type>().value(row_idx)),
+                        DataType::UInt64 => json!(col.as_primitive::<UInt64Type>().value(row_idx)),
+                        DataType::Float32 => {
+                            let v = col.as_primitive::<Float32Type>().value(row_idx);
+                            serde_json::Number::from_f64(v as f64).map(Value::Number).unwrap_or(Value::Null)
+                        }
+                        DataType::Float64 => {
+                            let v = col.as_primitive::<Float64Type>().value(row_idx);
+                            serde_json::Number::from_f64(v).map(Value::Number).unwrap_or(Value::Null)
+                        }
+                        DataType::Utf8 => {
+                            if let Some(a) = col.as_any().downcast_ref::<arrow_array::StringArray>() {
+                                Value::String(a.value(row_idx).to_string())
+                            } else { Value::Null }
+                        }
+                        DataType::LargeUtf8 => {
+                            if let Some(a) = col.as_any().downcast_ref::<arrow_array::LargeStringArray>() {
+                                Value::String(a.value(row_idx).to_string())
+                            } else { Value::Null }
+                        }
+                        DataType::Decimal128(_precision, scale) => {
+                            let scale = *scale as u32;
+                            let raw = col.as_primitive::<Decimal128Type>().value(row_idx);
+                            Value::String(decimal128_to_string(raw, scale))
+                        }
+                        DataType::Date32 => {
+                            let days = col.as_primitive::<Date32Type>().value(row_idx);
+                            match chrono::NaiveDate::from_epoch_days(days) {
+                                Some(d) => Value::String(d.format("%Y-%m-%d").to_string()),
+                                None => Value::Null,
+                            }
+                        }
+                        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+                            let micros = col.as_primitive::<TimestampMicrosecondType>().value(row_idx);
+                            match chrono::DateTime::from_timestamp_micros(micros) {
+                                Some(dt) => Value::String(format_naive_datetime(&dt.naive_utc())),
+                                None => Value::Null,
+                            }
+                        }
+                        DataType::Time64(TimeUnit::Microsecond) => {
+                            let micros = col.as_primitive::<Time64MicrosecondType>().value(row_idx);
+                            Value::String(format_naive_time_micros(micros))
+                        }
+                        _dt => {
+                            // Fallback: display the array element as debug string.
+                            Value::String(format!("{:?}", col.slice(row_idx, 1)))
+                        }
+                    }
+                };
+                obj.insert(field.name().clone(), val);
+            }
+            rows.push(Value::Object(obj));
+        }
+    }
+    Value::Array(rows)
+}
+
+/// Format a `Decimal128` raw mantissa + scale as a normalized decimal string.
+///
+/// Trailing fractional zeros are stripped so that the analytical path (always
+/// scale 18 from Iceberg) and the SQL/OLTP path (scale from gluesql) produce
+/// the same string for the same logical value, e.g. both give `"12.34"` not
+/// `"12.340000000000000000"`.  An integer result has no decimal point.
+fn decimal128_to_string(raw: i128, scale: u32) -> String {
+    if scale == 0 {
+        return format!("{raw}");
+    }
+    let neg = raw < 0;
+    let abs_raw = raw.unsigned_abs();
+    let divisor = 10u128.pow(scale);
+    let whole = abs_raw / divisor;
+    let frac = abs_raw % divisor;
+    let sign = if neg { "-" } else { "" };
+    // Pad fractional part to `scale` digits, then strip trailing zeros.
+    let frac_str = format!("{frac:0>width$}", width = scale as usize);
+    let frac_trimmed = frac_str.trim_end_matches('0');
+    if frac_trimmed.is_empty() {
+        format!("{sign}{whole}")
+    } else {
+        format!("{sign}{whole}.{frac_trimmed}")
+    }
+}
+
+/// Format a `NaiveDateTime` as `"YYYY-MM-DDTHH:MM:SS"` or
+/// `"YYYY-MM-DDTHH:MM:SS.ffffff"` when there are sub-second microseconds.
+fn format_naive_datetime(dt: &chrono::NaiveDateTime) -> String {
+    let micros = dt.and_utc().timestamp_subsec_micros();
+    if micros == 0 {
+        dt.format("%Y-%m-%dT%H:%M:%S").to_string()
+    } else {
+        dt.format("%Y-%m-%dT%H:%M:%S%.6f").to_string()
+    }
+}
+
+/// Format microseconds-since-midnight as `"HH:MM:SS"` or `"HH:MM:SS.ffffff"`.
+fn format_naive_time_micros(total_micros: i64) -> String {
+    let total_micros = total_micros.unsigned_abs();
+    let h = total_micros / 3_600_000_000;
+    let rem = total_micros % 3_600_000_000;
+    let m = rem / 60_000_000;
+    let rem = rem % 60_000_000;
+    let s = rem / 1_000_000;
+    let micros = rem % 1_000_000;
+    if micros == 0 {
+        format!("{h:02}:{m:02}:{s:02}")
+    } else {
+        format!("{h:02}:{m:02}:{s:02}.{micros:06}")
+    }
+}
+
 async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
 }
 
 /// `POST /sql` — one parameterized non-DDL statement (SELECT/INSERT/UPDATE/DELETE).
+///
+/// Mutating statements (INSERT/UPDATE/DELETE) return `X-Bluedb-Watermark: <tenant>:<seq>`
+/// so the client knows which CDC sequence this write reached.
+///
+/// **Analytical fallback (P2.2):** when a SELECT is rejected by the scan/sort
+/// guardrail (non-indexed filter or in-memory sort), the handler automatically
+/// routes it to the analytical path — `bluedb_query::query_sql` over the
+/// tenant's sealed Iceberg snapshot. Only single-table SELECTs are routed;
+/// multi-table SELECTs return the original guardrail-reject (noted in the error).
+///
+/// **Freshness gate on the analytical path (HTAP P4):** `X-Bluedb-Min-Watermark`
+/// is checked against the sealed Iceberg watermark. If `min > sealed`, the
+/// sealed snapshot can't satisfy the read, so [`serve_fresh_analytical`] decides:
+/// the active writer serves the **fresh, unsealed** rows via the writer-local
+/// read; a non-writer node would 302-redirect to the writer (deferred — no
+/// resolvable writer URL today) and meanwhile fails fast with `503` (never
+/// hangs). The `bluedb_read_wait_seal_n` PRAGMA tunes the tolerance.
 async fn exec_sql(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Json(req): Json<SqlRequest>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<impl IntoResponse, AppError> {
     state.authorize(&headers, authz::Scope::DataQuery)?;
     let tenant = state.tenant(&headers)?;
     state.require_active()?;
-    // Intercept `PRAGMA lakehouse_mirror[...]` before gluesql (which would reject
-    // it): apply the opt-out/opt-in to this tenant's mirror engine and ack.
+    // Intercept bluedb PRAGMAs before gluesql (which would reject them): apply to
+    // this tenant's mirror engine and ack. Covers `lakehouse_mirror[...]`,
+    // `lakehouse_target_file_bytes`, and the HTAP `bluedb_read_wait_seal_n`
+    // freshness tolerance — all parsed by `parse_lakehouse_pragma`.
     if let Some(pragma) = parse_lakehouse_pragma(&req.sql) {
+        let name = match &pragma {
+            LhPragma::GlobalDefault(_) | LhPragma::Table(_, _) => "lakehouse_mirror",
+            LhPragma::TargetFileBytes(_) => "lakehouse_target_file_bytes",
+            LhPragma::ReadWaitSealN(_) => "bluedb_read_wait_seal_n",
+        };
         match state.lakehouse().await {
             Some(manager) => {
                 manager
                     .apply_pragma(&tenant, pragma)
                     .await
                     .map_err(|e| AppError::internal(format!("lakehouse pragma: {e}")))?;
-                return Ok(Json(json!({ "ok": true, "pragma": "lakehouse_mirror" })));
+                return Ok((axum::http::HeaderMap::new(), Json(json!({ "ok": true, "pragma": name }))));
             }
             None => return Err(AppError::internal("lakehouse manager not bound")),
         }
     }
+    // Reads are served by the analytical engine (the DataFusion front door);
+    // writes and DDL stay on the transactional engine.
+    if is_read_query(&req.sql) {
+        return exec_sql_read(&state, &headers, &tenant, &req).await;
+    }
+
     let params = req.params.iter().map(json_to_param).collect::<Result<Vec<_>, _>>()?;
     let mut glue = Glue::new(state.connection_serialized(&tenant).await?);
-    // Route through the FTS engine: it rewrites `@@`/`ts_rank` against the live
-    // segment when a fulltext index is declared, else runs the SQL unchanged.
+    // Writes flow through the FTS engine so its commit observer indexes them;
+    // a non-`@@` statement runs unchanged.
     let payloads = state.fts().await.execute_fts(&mut glue, &req.sql, &params).await?;
-    Ok(Json(payloads_to_json(payloads)))
+    let wm = state.write_watermark(&tenant).await;
+    Ok((watermark_headers(&tenant, wm), Json(payloads_to_json(payloads))))
+}
+
+/// True if `sql` is a single read query (`SELECT` / `VALUES` / CTE) — routed to
+/// the analytical engine. Writes and DDL return false (the transactional engine
+/// serves them). A parse failure is treated as not-a-read, so the transactional
+/// engine surfaces the error.
+fn is_read_query(sql: &str) -> bool {
+    use gluesql_core::sqlparser::ast::Statement;
+    match gluesql_core::parse_sql::parse(sql) {
+        Ok(stmts) if stmts.len() == 1 => matches!(stmts[0], Statement::Query(_)),
+        _ => false,
+    }
+}
+
+/// Serve a `POST /sql` read through the DataFusion front door: the per-tenant
+/// analytical engine, with every referenced table resolved via the bluedb schema
+/// provider (joins / windows / aggregates / multi-table / CTEs). FTS predicates
+/// are rewritten to plain SQL first; the freshness gate 503s on a non-writer node
+/// that cannot satisfy a fresher-than-sealed read.
+async fn exec_sql_read(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    tenant: &str,
+    req: &SqlRequest,
+) -> Result<(axum::http::HeaderMap, Json<Value>), AppError> {
+    let manager = state.lakehouse().await.ok_or_else(|| {
+        AppError::internal("analytical path unavailable: lakehouse manager not bound")
+    })?;
+    let engine = manager
+        .engine_for(tenant)
+        .await
+        .map_err(|e| AppError::internal(format!("get lakehouse engine: {e}")))?;
+
+    // Rewrite FTS (`@@` / `ts_rank` / trigram-`LIKE`) to plain SQL the analytical
+    // engine runs; non-FTS SQL passes through unchanged.
+    let rewritten = state.fts().await.rewrite_for(&req.sql).await?;
+    let sql = rewritten.unwrap_or_else(|| req.sql.clone());
+
+    // Freshness gate: a non-writer node holds no fresh unsealed tail, so it cannot
+    // satisfy a read demanding a watermark beyond the sealed snapshot.
+    let sealed = state.sealed_watermark(tenant).await;
+    if let Some(min) = parse_min_watermark(headers) {
+        if min > sealed && !state.is_writer() {
+            return Err(AppError::plain(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "read-your-writes freshness not satisfiable on this node: requested \
+                     min-watermark {min} > sealed watermark {sealed}, and this node is not \
+                     the active writer; retry against the writer or after the next seal"
+                ),
+            )
+            .with_headers(watermark_headers_always(tenant, sealed)));
+        }
+    }
+
+    let batches = bluedb_query::query_via_catalog(engine, &sql, &req.params)
+        .await
+        .map_err(|e| AppError::bad_request(format!("query: {e}")))?;
+
+    // On the writer the union reflects unsealed writes (read-your-writes);
+    // elsewhere it is at least the sealed snapshot.
+    let wm = if state.is_writer() {
+        state.write_watermark(tenant).await
+    } else {
+        sealed
+    };
+    Ok((watermark_headers(tenant, wm), Json(record_batches_to_json(&batches))))
 }
 
 /// `POST /admin/sql` — arbitrary SQL (DDL/txns/multi). Off by default; audited.
@@ -857,10 +1274,7 @@ async fn admin_sql(
 ) -> Result<Json<Value>, AppError> {
     state.authorize(&headers, authz::Scope::Superuser)?;
     if !state.inner.admin_sql_enabled.load(Ordering::Relaxed) {
-        return Err(AppError {
-            status: StatusCode::NOT_FOUND,
-            message: "admin SQL endpoint is disabled".to_string(),
-        });
+        return Err(AppError::not_found("admin SQL endpoint is disabled"));
     }
     let tenant = state.tenant(&headers)?;
     state.require_active()?;
@@ -872,59 +1286,196 @@ async fn admin_sql(
 }
 
 /// `GET /tables/{table}?<filters>` — PostgREST SELECT (served by writer or replica).
+///
+/// Echoes the current Iceberg-sealed watermark in `X-Bluedb-Watermark` on every
+/// response so clients can track mirror freshness. The freshness gate
+/// (`X-Bluedb-Min-Watermark`) is intentionally **not** applied here: this path
+/// reads from SlateDB, which is always at least as fresh as the Iceberg seal,
+/// so a min-watermark constraint on the seal would incorrectly 503 queries that
+/// the OLTP store can actually satisfy. The freshness gate belongs on the
+/// analytical path (`POST /sql` guardrail-routed queries that read from Iceberg).
 async fn select(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Path(table): Path<String>,
     RawQuery(query): RawQuery,
-) -> Result<Json<Value>, AppError> {
+) -> Result<(axum::http::HeaderMap, Json<Value>), AppError> {
     state.authorize(&headers, authz::Scope::DataRead)?;
     let tenant = state.tenant(&headers)?;
+
+    let sealed = state.sealed_watermark(&tenant).await;
+    // Percent-decode the query string: a JSON-path key (`data->>status`) arrives
+    // `%3E%3E`-encoded from any conformant client, and `parse_query` expects
+    // already-decoded text. Separators (`&`/`=`) are literal in the URL, so they
+    // survive; only `%XX` escapes within keys/values are decoded.
+    let decoded_qs = percent_encoding::percent_decode_str(query.as_deref().unwrap_or(""))
+        .decode_utf8_lossy();
+    let rq = bluedb_rest::parse_query(&table, &decoded_qs).map_err(EngineError::from)?;
+
     let mut glue = Glue::new(state.connection(&tenant).await?);
-    let payloads = rest_sql::execute_query_str(&mut glue, &table, query.as_deref().unwrap_or("")).await?;
-    Ok(Json(payloads_to_json(payloads)))
+    // JSON/JSONB columns are stored as TEXT; the catalog tells us which to
+    // re-inflate to real JSON on the way out.
+    let json_cols = glue
+        .storage
+        .json_columns(&table)
+        .await
+        .map_err(|e| AppError::internal(format!("read json catalog: {e}")))?
+        .unwrap_or_default();
+
+    let want_count = wants_count(&headers);
+    // A JSON-path query (`data->>k`) can only be served by the analytical engine
+    // (GlueSQL has no JSON functions); otherwise take the GlueSQL fast path and
+    // re-route a guardrail reject (a filter / ORDER BY on a non-indexed column) to
+    // the analytical engine, which scans/sorts the Iceberg mirror — doc ask #4
+    // (grids filter/sort arbitrary columns without a standing index).
+    let (mut resp_headers, body) = if rq.has_json_path() {
+        route_select_to_analytical(&state, &headers, &tenant, &rq, &json_cols, sealed).await?
+    } else {
+        match rest_sql::execute_query(&mut glue, &rq).await {
+            Ok(payloads) => (
+                watermark_headers(&tenant, sealed),
+                Json(select_to_json(payloads, &json_cols)),
+            ),
+            Err(e) if is_guardrail_reject(&e) => {
+                route_select_to_analytical(&state, &headers, &tenant, &rq, &json_cols, sealed).await?
+            }
+            Err(e) => return Err(e.into()),
+        }
+    };
+
+    // `Prefer: count=exact` → attach the PostgREST `Content-Range` total.
+    if want_count {
+        let total = count_rows(&state, &tenant, &rq).await?;
+        let returned = body.0.as_array().map(|a| a.len()).unwrap_or(0);
+        let offset = rq.offset.unwrap_or(0) as usize;
+        if let Ok(v) = axum::http::HeaderValue::from_str(&content_range(offset, returned, total)) {
+            resp_headers.insert("content-range", v);
+        }
+    }
+    Ok((resp_headers, body))
+}
+
+/// Serve a `/tables` read the GlueSQL fast path can't (an arbitrary-column filter
+/// / sort, or a JSON-path predicate) through the analytical front door, exactly
+/// like `POST /sql`: render the PostgREST request to SQL, run it on DataFusion
+/// over the tenant's Iceberg mirror (+ writer-local unsealed tail), and re-inflate
+/// JSON columns so the response matches the fast path. Reads only — writes stay on
+/// GlueSQL. The freshness gate applies (routed reads hit the sealed snapshot).
+async fn route_select_to_analytical(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    tenant: &str,
+    rq: &bluedb_rest::RestQuery,
+    json_cols: &[String],
+    sealed: i64,
+) -> Result<(axum::http::HeaderMap, Json<Value>), AppError> {
+    let (sql, params) = rq.to_sql_with_params().map_err(EngineError::from)?;
+    let json_params: Vec<Value> = params.iter().map(param_to_json).collect();
+
+    // Freshness gate: a non-writer node can't satisfy a read demanding a watermark
+    // beyond its sealed snapshot (same rule as `exec_sql_read`).
+    if let Some(min) = parse_min_watermark(headers) {
+        if min > sealed && !state.is_writer() {
+            return Err(AppError::plain(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "read-your-writes freshness not satisfiable on this node: requested \
+                     min-watermark {min} > sealed watermark {sealed}, and this node is not \
+                     the active writer; retry against the writer or after the next seal"
+                ),
+            )
+            .with_headers(watermark_headers_always(tenant, sealed)));
+        }
+    }
+
+    let manager = state.lakehouse().await.ok_or_else(|| {
+        AppError::internal("analytical path unavailable: lakehouse manager not bound")
+    })?;
+    let engine = manager
+        .engine_for(tenant)
+        .await
+        .map_err(|e| AppError::internal(format!("get lakehouse engine: {e}")))?;
+    let batches = bluedb_query::query_via_catalog(engine, &sql, &json_params)
+        .await
+        .map_err(|e| AppError::bad_request(format!("query: {e}")))?;
+
+    let wm = if state.is_writer() {
+        state.write_watermark(tenant).await
+    } else {
+        sealed
+    };
+    Ok((
+        watermark_headers(tenant, wm),
+        Json(reinflate_rows(record_batches_to_json(&batches), json_cols)),
+    ))
 }
 
 /// `POST /tables/{table}` — INSERT (JSON object → autocommit; array → one txn batch).
+///
+/// Returns `X-Bluedb-Watermark: <tenant>:<seq>` so the caller can pass it back
+/// as `X-Bluedb-Min-Watermark` on a subsequent read to enforce read-your-writes.
 async fn insert(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Path(table): Path<String>,
     Json(body): Json<Value>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<impl IntoResponse, AppError> {
     state.authorize(&headers, authz::Scope::DataWrite)?;
     let tenant = state.tenant(&headers)?;
     state.require_active()?;
+    let want_repr = wants_representation(&headers);
     let (req, is_batch) = build_insert(table, body)?;
-    if is_batch {
-        // Multi-row: atomic BEGIN..COMMIT on the serialized (lease-holding) connection.
+
+    // Execute the insert on its usual connection (batch = atomic BEGIN..COMMIT on
+    // the serialized lease-holder; single = group-commit fast path).
+    let inserted: usize = if is_batch {
         let mut glue = Glue::new(state.connection_serialized(&tenant).await?);
         let payloads = rest_sql::execute_insert_batch(&mut glue, &req).await?;
-        // Fold all per-row Insert(n) payloads from the transaction into one count.
-        let total: usize = payloads
+        payloads
             .iter()
             .filter_map(|p| if let Payload::Insert(n) = p { Some(*n) } else { None })
-            .sum();
-        Ok(Json(json!({ "inserted": total })))
+            .sum()
     } else {
-        // Single row: autocommit on the group-commit connection (concurrent fast path).
         let mut glue = Glue::new(state.connection(&tenant).await?);
         let payloads = rest_sql::execute_insert(&mut glue, &req).await?;
-        Ok(Json(payloads_to_json(payloads)))
+        payloads
+            .iter()
+            .filter_map(|p| if let Payload::Insert(n) = p { Some(*n) } else { None })
+            .sum()
+    };
+    let wm = state.write_watermark(&tenant).await;
+
+    // `Prefer: return=representation` → read the inserted rows back by primary key.
+    if want_repr {
+        let pk_cols = state
+            .connection_unguarded(&tenant)
+            .await?
+            .primary_key_columns(&req.table)
+            .await
+            .map_err(|e| AppError::internal(format!("pk columns: {e}")))?;
+        if let Some(filters) = insert_pk_filters(&pk_cols, &req) {
+            let rows = read_affected_json(&state, &tenant, &req.table, filters).await?;
+            return Ok((watermark_headers(&tenant, wm), Json(rows)));
+        }
+        // Can't identify the rows by PK (e.g. multi-row composite) → fall back to count.
     }
+    Ok((watermark_headers(&tenant, wm), Json(json!({ "inserted": inserted }))))
 }
 
 /// `PATCH /tables/{table}?<filters>` — UPDATE (JSON assignments body).
+///
+/// Returns `X-Bluedb-Watermark` for read-your-writes freshness tracking.
 async fn update(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Path(table): Path<String>,
     RawQuery(query): RawQuery,
     Json(assignments): Json<Map<String, Value>>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<impl IntoResponse, AppError> {
     state.authorize(&headers, authz::Scope::DataWrite)?;
     let tenant = state.tenant(&headers)?;
     state.require_active()?;
+    let want_repr = wants_representation(&headers);
     let filters = parse_filters(query.as_deref().unwrap_or("")).map_err(EngineError::from)?;
     let assignments = assignments
         .into_iter()
@@ -934,25 +1485,49 @@ async fn update(
     // UPDATE is a read-modify-write; serialize so concurrent ones can't lose.
     let mut glue = Glue::new(state.connection_serialized(&tenant).await?);
     let payloads = rest_sql::execute_update(&mut glue, &req).await?;
-    Ok(Json(payloads_to_json(payloads)))
+    let wm = state.write_watermark(&tenant).await;
+    // `Prefer: return=representation` → read the updated rows back by the same
+    // filter. (Caveat: if the filter targets a column the UPDATE changed, the
+    // re-select reflects post-update matches — full RETURNING fidelity needs
+    // engine support GlueSQL lacks.)
+    if want_repr {
+        let rows = read_affected_json(&state, &tenant, &req.table, req.filters.clone()).await?;
+        return Ok((watermark_headers(&tenant, wm), Json(rows)));
+    }
+    Ok((watermark_headers(&tenant, wm), Json(payloads_to_json(payloads))))
 }
 
 /// `DELETE /tables/{table}?<filters>` — DELETE.
+///
+/// Returns `X-Bluedb-Watermark` for read-your-writes freshness tracking.
 async fn delete_rows(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Path(table): Path<String>,
     RawQuery(query): RawQuery,
-) -> Result<Json<Value>, AppError> {
+) -> Result<impl IntoResponse, AppError> {
     state.authorize(&headers, authz::Scope::DataWrite)?;
     let tenant = state.tenant(&headers)?;
     state.require_active()?;
+    let want_repr = wants_representation(&headers);
     let filters = parse_filters(query.as_deref().unwrap_or("")).map_err(EngineError::from)?;
+    // `Prefer: return=representation` → capture the matching rows BEFORE the
+    // delete (they're gone afterwards). This is what feeds the DELETE→Pusher
+    // notification with the removed rows in one round trip.
+    let repr = if want_repr {
+        Some(read_affected_json(&state, &tenant, &table, filters.clone()).await?)
+    } else {
+        None
+    };
     let req = DeleteRequest { table, filters };
     // DELETE reads the rows it removes; serialize for the same reason as UPDATE.
     let mut glue = Glue::new(state.connection_serialized(&tenant).await?);
     let payloads = rest_sql::execute_delete(&mut glue, &req).await?;
-    Ok(Json(payloads_to_json(payloads)))
+    let wm = state.write_watermark(&tenant).await;
+    match repr {
+        Some(rows) => Ok((watermark_headers(&tenant, wm), Json(rows))),
+        None => Ok((watermark_headers(&tenant, wm), Json(payloads_to_json(payloads)))),
+    }
 }
 
 // --- admin / high-availability control --------------------------------------
@@ -1065,17 +1640,248 @@ fn build_insert(table: String, body: Value) -> Result<(InsertRequest, bool), App
     Ok((InsertRequest { table, columns, rows }, is_batch))
 }
 
-/// Render a JSON scalar into the DSL string form `bluedb-rest` expects. (Like
+/// Render a JSON value into the DSL string form `bluedb-rest` expects. (Like
 /// PostgREST, values are stringly-typed on the wire: the engine later types them
 /// into typed `$N` parameters — numeric text → Int/Float, `true`/`false` → Bool,
 /// `null` → Null, everything else → Str.)
+///
+/// A JSON object/array serializes to its **canonical compact JSON text** so it
+/// can be stored in a `JSON`/`JSONB` (→ `TEXT`) column; validation is implicit
+/// (the body already parsed as JSON). A bare JSON scalar keeps its natural type.
 fn json_scalar_to_dsl(value: &Value) -> Result<String, AppError> {
     match value {
         Value::String(s) => Ok(s.clone()),
         Value::Number(n) => Ok(n.to_string()),
         Value::Bool(b) => Ok(b.to_string()),
         Value::Null => Ok("null".to_string()),
-        other => Err(AppError::bad_request(format!("expected a scalar value, got {other}"))),
+        Value::Object(_) | Value::Array(_) => Ok(value.to_string()),
+    }
+}
+
+/// Serialize `/tables` SELECT payloads, re-inflating JSON columns: a column
+/// declared `JSON`/`JSONB` is stored as `TEXT`, and its text is parsed back to a
+/// real JSON value on read so the grid sees an object/array, not an escaped
+/// string. Non-JSON columns are unchanged; a JSON column holding non-JSON text
+/// (e.g. written via raw SQL) is emitted as the string rather than failing.
+fn select_to_json(payloads: Vec<Payload>, json_cols: &[String]) -> Value {
+    let one = |payload: Payload| match payload {
+        Payload::Select { labels, rows } => Value::Array(
+            rows.into_iter()
+                .map(|row| {
+                    let obj: Map<String, Value> = labels
+                        .iter()
+                        .cloned()
+                        .zip(row.iter().map(sql_value_to_json))
+                        .map(|(label, v)| {
+                            let v = reinflate_json(&label, v, json_cols);
+                            (label, v)
+                        })
+                        .collect();
+                    Value::Object(obj)
+                })
+                .collect(),
+        ),
+        Payload::SelectMap(maps) => Value::Array(
+            maps.into_iter()
+                .map(|m| {
+                    let obj: Map<String, Value> = m
+                        .iter()
+                        .map(|(k, v)| (k.clone(), reinflate_json(k, sql_value_to_json(v), json_cols)))
+                        .collect();
+                    Value::Object(obj)
+                })
+                .collect(),
+        ),
+        other => payload_to_json(other),
+    };
+    if payloads.len() == 1 {
+        one(payloads.into_iter().next().unwrap())
+    } else {
+        Value::Array(payloads.into_iter().map(one).collect())
+    }
+}
+
+/// Parse a JSON column's stored text back to a real JSON value. Leaves non-JSON
+/// columns, non-string cells, and unparseable text untouched.
+fn reinflate_json(label: &str, v: Value, json_cols: &[String]) -> Value {
+    if json_cols.iter().any(|c| c == label) {
+        if let Value::String(s) = &v {
+            if let Ok(parsed) = serde_json::from_str::<Value>(s) {
+                return parsed;
+            }
+        }
+    }
+    v
+}
+
+/// Re-inflate JSON columns in an array of row objects — the analytical path's
+/// [`record_batches_to_json`] output, where a JSON column arrives as `Utf8` text.
+/// The `/tables` GlueSQL fast path does this via [`select_to_json`]; this is the
+/// equivalent for a read routed to DataFusion, so both surfaces return identical
+/// JSON for a JSON column.
+fn reinflate_rows(value: Value, json_cols: &[String]) -> Value {
+    if json_cols.is_empty() {
+        return value;
+    }
+    let Value::Array(rows) = value else {
+        return value;
+    };
+    Value::Array(
+        rows.into_iter()
+            .map(|row| {
+                let Value::Object(mut map) = row else {
+                    return row;
+                };
+                for col in json_cols {
+                    let parsed = match map.get(col) {
+                        Some(Value::String(s)) => serde_json::from_str::<Value>(s).ok(),
+                        _ => None,
+                    };
+                    if let Some(p) = parsed {
+                        map.insert(col.clone(), p);
+                    }
+                }
+                Value::Object(map)
+            })
+            .collect(),
+    )
+}
+
+/// True if the request asked for the affected rows back (`Prefer:
+/// return=representation`, PostgREST). `Prefer` may carry several
+/// comma-separated preferences.
+fn wants_representation(headers: &axum::http::HeaderMap) -> bool {
+    prefers(headers, "return=representation")
+}
+
+/// True if the request asked for an exact total (`Prefer: count=exact`).
+fn wants_count(headers: &axum::http::HeaderMap) -> bool {
+    prefers(headers, "count=exact")
+}
+
+/// True if any `Prefer` header carries the given comma-separated preference.
+fn prefers(headers: &axum::http::HeaderMap, pref: &str) -> bool {
+    headers
+        .get_all("prefer")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|p| p.trim().eq_ignore_ascii_case(pref))
+}
+
+/// The PostgREST `Content-Range` value for a page: `offset-end/total`, or
+/// `*/total` when the page is empty.
+fn content_range(offset: usize, returned: usize, total: i64) -> String {
+    if returned == 0 {
+        format!("*/{total}")
+    } else {
+        format!("{}-{}/{}", offset, offset + returned - 1, total)
+    }
+}
+
+/// The exact row count for `rq`'s filters (`Prefer: count=exact`). A JSON-path
+/// filter must run on the analytical engine (GlueSQL has no JSON functions);
+/// everything else counts on an unguarded SlateDB connection — the client opted
+/// into the scan, and the count reflects fresh OLTP state.
+async fn count_rows(state: &AppState, tenant: &str, rq: &bluedb_rest::RestQuery) -> Result<i64, AppError> {
+    let (sql, params) = rq.to_count_sql_with_params().map_err(EngineError::from)?;
+    if rq.has_json_path() {
+        let manager = state.lakehouse().await.ok_or_else(|| {
+            AppError::internal("analytical path unavailable: lakehouse manager not bound")
+        })?;
+        let engine = manager
+            .engine_for(tenant)
+            .await
+            .map_err(|e| AppError::internal(format!("get lakehouse engine: {e}")))?;
+        let json_params: Vec<Value> = params.iter().map(param_to_json).collect();
+        let batches = bluedb_query::query_via_catalog(engine, &sql, &json_params)
+            .await
+            .map_err(|e| AppError::bad_request(format!("count: {e}")))?;
+        Ok(scalar_count(&record_batches_to_json(&batches)))
+    } else {
+        let mut glue = Glue::new(state.connection_unguarded(tenant).await?);
+        let payloads = rest_sql::execute_sql(&mut glue, &sql, &params, false).await?;
+        Ok(scalar_count(&payloads_to_json(payloads)))
+    }
+}
+
+/// Extract the integer from a `SELECT COUNT(*)` result rendered as JSON (a one-row,
+/// one-column array of objects). `0` if the shape is unexpected.
+fn scalar_count(value: &Value) -> i64 {
+    value
+        .as_array()
+        .and_then(|rows| rows.first())
+        .and_then(|row| row.as_object())
+        .and_then(|obj| obj.values().next())
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+}
+
+/// Read the rows matching `filters` from `table` on an **unguarded** connection
+/// (the `Prefer: return=representation` read-back), serialized as `/tables` JSON
+/// with JSON columns re-inflated. The read is bounded by the mutation's own
+/// filter, so the scan guardrail is intentionally bypassed, and it reads fresh
+/// SlateDB state (not the Iceberg mirror).
+async fn read_affected_json(
+    state: &AppState,
+    tenant: &str,
+    table: &str,
+    filters: Vec<bluedb_rest::Filter>,
+) -> Result<Value, AppError> {
+    let storage = state.connection_unguarded(tenant).await?;
+    let json_cols = storage
+        .json_columns(table)
+        .await
+        .map_err(|e| AppError::internal(format!("read json catalog: {e}")))?
+        .unwrap_or_default();
+    let mut glue = Glue::new(storage);
+    let q = bluedb_rest::RestQuery {
+        table: table.to_string(),
+        select: Vec::new(),
+        filters,
+        order: Vec::new(),
+        limit: None,
+        offset: None,
+    };
+    let payloads = rest_sql::execute_query(&mut glue, &q).await?;
+    Ok(select_to_json(payloads, &json_cols))
+}
+
+/// The PostgREST filters identifying the rows an INSERT just added, from the
+/// table's PK columns + the inserted values. `None` when the rows can't be
+/// identified by PK — a PK column absent from the insert, or a multi-row insert
+/// into a composite-PK table (the per-row AND-of-components OR'd across rows isn't
+/// expressible as AND-only PostgREST filters). The caller falls back to the count.
+fn insert_pk_filters(pk_cols: &[String], req: &InsertRequest) -> Option<Vec<bluedb_rest::Filter>> {
+    use bluedb_rest::{Filter, Operator};
+    if pk_cols.is_empty() {
+        return None;
+    }
+    // Each PK column's position in the insert's column list (all must be present).
+    let idx: Vec<usize> = pk_cols
+        .iter()
+        .map(|pk| req.columns.iter().position(|c| c == pk))
+        .collect::<Option<_>>()?;
+    match req.rows.len() {
+        0 => None,
+        // Single row: AND each PK component (works for single- and composite-PK).
+        1 => Some(
+            pk_cols
+                .iter()
+                .zip(&idx)
+                .map(|(pk, &i)| Filter::new(pk.clone(), Operator::Eq, req.rows[0][i].clone()))
+                .collect(),
+        ),
+        // Multi-row, single-column PK: one IN filter over all the key values.
+        _ if pk_cols.len() == 1 => {
+            let values: Vec<String> = req.rows.iter().map(|r| r[idx[0]].clone()).collect();
+            Some(vec![Filter::new(
+                pk_cols[0].clone(),
+                Operator::In,
+                format!("({})", values.join(",")),
+            )])
+        }
+        _ => None,
     }
 }
 
@@ -1148,11 +1954,70 @@ fn sql_value_to_json(value: &SqlValue) -> Value {
         SqlValue::U128(n) => Value::String(n.to_string()),
         SqlValue::I128(n) => Value::String(n.to_string()),
         SqlValue::Str(s) => Value::String(s.clone()),
+        // Temporal/Decimal types — canonical rendering matches record_batches_to_json.
+        // Decimal → normalized string (trailing fractional zeros stripped) so the
+        // OLTP path matches the analytical path which always has Iceberg scale 18.
+        SqlValue::Decimal(d) => Value::String(d.normalize().to_string()),
+        // Date → ISO-8601 "YYYY-MM-DD".
+        SqlValue::Date(d) => Value::String(d.format("%Y-%m-%d").to_string()),
+        // Timestamp → "YYYY-MM-DDTHH:MM:SS[.ffffff]".
+        SqlValue::Timestamp(dt) => Value::String(format_naive_datetime(dt)),
+        // Time → "HH:MM:SS[.ffffff]".
+        SqlValue::Time(t) => {
+            use chrono::Timelike as _;
+            let micros_frac = t.nanosecond() / 1_000;
+            if micros_frac == 0 {
+                Value::String(t.format("%H:%M:%S").to_string())
+            } else {
+                Value::String(t.format("%H:%M:%S%.6f").to_string())
+            }
+        }
+        // Uuid (stored as u128) → canonical hyphenated 8-4-4-4-12 lowercase hex,
+        // matching gluesql's own `Uuid::from_u128(..).hyphenated()` rendering so the
+        // OLTP wire form agrees with the analytical path.
+        SqlValue::Uuid(n) => {
+            let hex = format!("{n:032x}");
+            Value::String(format!(
+                "{}-{}-{}-{}-{}",
+                &hex[0..8],
+                &hex[8..12],
+                &hex[12..16],
+                &hex[16..20],
+                &hex[20..32]
+            ))
+        }
+        // Bytea → standard base64 (the same encoding the evidence API uses on the wire).
+        SqlValue::Bytea(b) => {
+            use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+            Value::String(B64.encode(b))
+        }
         other => Value::String(format!("{other:?}")),
     }
 }
 
 // --- tests ------------------------------------------------------------------
+
+#[cfg(test)]
+mod value_serialization {
+    use super::sql_value_to_json;
+    use gluesql_core::prelude::Value as SqlValue;
+    use serde_json::Value;
+
+    #[test]
+    fn renders_uuid_as_canonical_hyphenated_string() {
+        let u = SqlValue::Uuid(0x550e8400_e29b_41d4_a716_446655440000u128);
+        assert_eq!(
+            sql_value_to_json(&u),
+            Value::String("550e8400-e29b-41d4-a716-446655440000".into())
+        );
+    }
+
+    #[test]
+    fn renders_bytea_as_base64() {
+        let b = SqlValue::Bytea(vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(sql_value_to_json(&b), Value::String("3q2+7w==".into()));
+    }
+}
 
 #[cfg(test)]
 mod flush_interval_cfg {
@@ -1218,85 +2083,129 @@ mod insert_routing {
 // --- errors -----------------------------------------------------------------
 
 /// An HTTP error: a status plus a message rendered as `{"error": ...}`.
+/// Extra headers (e.g. `X-Bluedb-Watermark` on a freshness 503) can be
+/// attached via [`AppError::with_headers`].
 #[derive(Debug)]
 pub struct AppError {
     status: StatusCode,
     message: String,
+    extra_headers: Option<axum::http::HeaderMap>,
+    /// Stable machine-readable code echoed as `{"code": ...}` so adapters map a
+    /// failure to behavior without parsing the prose `error` message.
+    code: Option<&'static str>,
 }
 
 impl AppError {
+    /// Build a plain error without extra headers.
+    fn plain(status: StatusCode, message: impl Into<String>) -> Self {
+        Self { status, message: message.into(), extra_headers: None, code: None }
+    }
+
+    /// Attach a stable machine-readable code (see [`Self::code`]).
+    pub(crate) fn with_code(mut self, code: &'static str) -> Self {
+        self.code = Some(code);
+        self
+    }
+
+    /// Attach extra response headers to this error (e.g. `X-Bluedb-Watermark`
+    /// on a freshness `503`). Consumes and returns `Self` for chaining.
+    pub(crate) fn with_headers(mut self, headers: axum::http::HeaderMap) -> Self {
+        self.extra_headers = Some(headers);
+        self
+    }
+
     pub(crate) fn bad_request(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            message: message.into(),
-        }
+        Self::plain(StatusCode::BAD_REQUEST, message)
     }
 
     pub(crate) fn internal(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: message.into(),
-        }
+        Self::plain(StatusCode::INTERNAL_SERVER_ERROR, message)
     }
 
     pub(crate) fn not_found(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::NOT_FOUND,
-            message: message.into(),
-        }
+        Self::plain(StatusCode::NOT_FOUND, message)
     }
 
     pub(crate) fn conflict(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::CONFLICT,
-            message: message.into(),
-        }
+        Self::plain(StatusCode::CONFLICT, message)
     }
 
     pub(crate) fn service_unavailable(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            message: message.into(),
-        }
+        Self::plain(StatusCode::SERVICE_UNAVAILABLE, message)
     }
 
     /// `501 Not Implemented` — an optional capability (e.g. digest signing) is
     /// not enabled on this node.
     pub(crate) fn not_implemented(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::NOT_IMPLEMENTED,
-            message: message.into(),
-        }
+        Self::plain(StatusCode::NOT_IMPLEMENTED, message)
     }
 
     /// Map a lease error: another node holds it → `409 Conflict`; otherwise `500`.
     fn from_ha(err: HaError) -> Self {
         match err {
-            HaError::LeaseHeldByAnother => Self {
-                status: StatusCode::CONFLICT,
-                message: "cannot promote: the lease is held by another node".to_string(),
-            },
+            HaError::LeaseHeldByAnother => Self::plain(
+                StatusCode::CONFLICT,
+                "cannot promote: the lease is held by another node",
+            ),
             HaError::Provider(err) => Self::internal(err.to_string()),
         }
     }
 }
 
+/// Map an engine error to an HTTP status + stable machine-readable code, so an
+/// adapter can branch on the code instead of parsing prose. The guardrail reject
+/// is detected by its sentinel prefix; the rest by the top-level GlueSQL `Error`
+/// variant, falling back to the message for the cross-variant cases (table not
+/// found spans Fetch/Execute; duplicate spans the Validate variants).
+fn classify_engine_error(err: &EngineError) -> (StatusCode, Option<&'static str>) {
+    use gluesql_core::error::Error as G;
+    if is_guardrail_reject(err) {
+        return (StatusCode::BAD_REQUEST, Some("NO_INDEX"));
+    }
+    if let EngineError::Sql(g) = err {
+        match g {
+            G::Parser(_) | G::Translate(_) => return (StatusCode::BAD_REQUEST, Some("PARSE_ERROR")),
+            G::Value(_) => return (StatusCode::BAD_REQUEST, Some("TYPE_MISMATCH")),
+            _ => {}
+        }
+    }
+    let msg = err.to_string();
+    if msg.contains("table not found") {
+        return (StatusCode::NOT_FOUND, Some("NOT_FOUND"));
+    }
+    if msg.contains("duplicate entry") {
+        return (StatusCode::CONFLICT, Some("UNIQUE_VIOLATION"));
+    }
+    match err {
+        EngineError::Other(_) => (StatusCode::INTERNAL_SERVER_ERROR, None),
+        _ => (StatusCode::BAD_REQUEST, None),
+    }
+}
+
 impl From<EngineError> for AppError {
     fn from(err: EngineError) -> Self {
-        let status = match &err {
-            EngineError::Rest(_) | EngineError::Sql(_) | EngineError::Rejected(_) => StatusCode::BAD_REQUEST,
-            EngineError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        };
-        Self {
-            status,
-            message: err.to_string(),
+        let (status, code) = classify_engine_error(&err);
+        let e = Self::plain(status, err.to_string());
+        match code {
+            Some(c) => e.with_code(c),
+            None => e,
         }
     }
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        let body: BTreeMap<&str, String> = [("error", self.message)].into_iter().collect();
-        (self.status, Json(body)).into_response()
+        let mut body: BTreeMap<&str, String> = [("error", self.message)].into_iter().collect();
+        if let Some(code) = self.code {
+            body.insert("code", code.to_string());
+        }
+        match self.extra_headers {
+            None => (self.status, Json(body)).into_response(),
+            Some(extra) => (self.status, extra, Json(body)).into_response(),
+        }
     }
 }
+
+// Read SELECTs route to the analytical engine (DataFusion); the scan/sort
+// guardrail no longer gates the `/sql` read path (it still applies on the
+// `GET /tables` REST fast path).

@@ -40,6 +40,23 @@ use gluesql_core::error::{Error, Result as GlueResult};
 
 type SchemaMap = HashMap<String, Schema>;
 
+/// Stable sentinel prefix that every guardrail-reject error message begins with.
+///
+/// Detection in the server (`bluedb-server::is_guardrail_reject`) checks for
+/// this single prefix rather than multiple prose substrings, so it stays correct
+/// even if the human-readable part of the message is later rephrased.
+///
+/// # Why a prefix rather than a Rust type?
+///
+/// `bound_or_reject` runs inside gluesql's `Planner::plan()` method, which is
+/// part of the `gluesql_core::store::Planner` trait.  That trait method **must**
+/// return `gluesql_core::error::Error`; there is no escape hatch for a
+/// bluedb-defined variant above this boundary.  All bluedb storage errors
+/// (including guardrail rejects) therefore reach the server as
+/// `EngineError::Sql(Error::StorageMsg(String))`.  A sentinel prefix in that
+/// `String` is the only reliable, non-fragile discriminant available.
+pub const GUARDRAIL_REJECT_PREFIX: &str = "BLUEDB_GUARDRAIL_REJECT:";
+
 /// The row ceiling an **unfiltered** single-table `SELECT` is bounded to. A bare
 /// `SELECT * FROM t` reads at most this many rows, in primary-key order. To read
 /// more, page with a primary-key predicate (`WHERE pk > cursor`), which is
@@ -278,20 +295,22 @@ fn scan_err(table: &str, unindexed: &[String]) -> Error {
         Some(first) => {
             let list = cols.iter().map(|c| format!("`{c}`")).collect::<Vec<_>>().join(", ");
             Error::StorageMsg(format!(
-                "rejected: query on `{table}` filters only non-indexed column(s) {list} — \
+                "{pfx} query on `{table}` filters only non-indexed column(s) {list} — \
                  this would scan the whole table (a LIMIT can't bound a post-scan filter). \
                  Create an index and retry, e.g.\n    {ddl}\nthen filter on that column \
                  (one index is enough). Or filter on the primary key, or run the scan in \
                  the warehouse via the Iceberg mirror.",
+                pfx = GUARDRAIL_REJECT_PREFIX,
                 ddl = create_index_ddl(table, first),
             ))
         }
         // No nameable column (e.g. a `LIKE`-only predicate) — generic guidance.
         None => Error::StorageMsg(format!(
-            "rejected: query on `{table}` would scan the whole table — it filters no \
+            "{pfx} query on `{table}` would scan the whole table — it filters no \
              indexed column. Filter on the primary key or an indexed column (declare a \
              trigram index to accelerate `LIKE`), or run the scan in the warehouse via \
-             the Iceberg mirror."
+             the Iceberg mirror.",
+            pfx = GUARDRAIL_REJECT_PREFIX,
         )),
     }
 }
@@ -299,15 +318,17 @@ fn scan_err(table: &str, unindexed: &[String]) -> Error {
 fn sort_err(table: &str, column: Option<&str>) -> Error {
     match column {
         Some(col) => Error::StorageMsg(format!(
-            "rejected: ORDER BY `{col}` on `{table}` is an in-memory sort — `{col}` is \
+            "{pfx} ORDER BY `{col}` on `{table}` is an in-memory sort — `{col}` is \
              neither the primary key nor indexed. Create an index and retry, e.g.\n    {ddl}\n\
              then order by `{col}`. Or order by the primary key, or sort in the warehouse \
              via the Iceberg mirror.",
+            pfx = GUARDRAIL_REJECT_PREFIX,
             ddl = create_index_ddl(table, col),
         )),
         None => Error::StorageMsg(format!(
-            "rejected: in-memory sort on `{table}` — ORDER BY must use the primary key or \
-             an indexed column, or be sorted in the warehouse via the Iceberg mirror."
+            "{pfx} in-memory sort on `{table}` — ORDER BY must use the primary key or \
+             an indexed column, or be sorted in the warehouse via the Iceberg mirror.",
+            pfx = GUARDRAIL_REJECT_PREFIX,
         )),
     }
 }

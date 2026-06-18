@@ -60,6 +60,19 @@ This is **deliberate**: `GET /tables/{table}` is served by either the writer or
 a replica, so replicas absorb read load. The trade is freshness — a replica read
 is eventually-consistent, not linearizable.
 
+### Analytical reads — sealed-snapshot freshness
+
+Reads the analytical engine serves (arbitrary filters and sorts, joins,
+aggregates, [JSON](../sql/json.md) — via `POST /sql`, or a `/tables` read routed
+to it) run over the tenant's most recently **sealed** snapshot of the
+[Iceberg mirror](../lakehouse/iceberg-mirror.md). The active writer additionally
+unions its own unsealed tail, so an analytical read on the writer is still
+read-your-writes. A client can require a minimum freshness with the
+`X-Bluedb-Min-Watermark` header; a node that cannot meet it returns `503` rather
+than serve a stale snapshot, and `PRAGMA bluedb_read_wait_seal_n` tunes how many
+seal cycles of staleness a read tolerates. See
+[REST › Read-your-writes & freshness](../api/rest.md#read-your-writes-freshness).
+
 ### Routing across failover
 
 The cluster presents as **one logical store routed through the current writer**:

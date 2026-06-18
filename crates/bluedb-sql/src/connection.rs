@@ -106,6 +106,19 @@ impl Database {
         next_cdc_seq(&self.cdc_seq, &self.substrate, tenant).await
     }
 
+    /// Peek the last CDC sequence allocated for `tenant` **without** incrementing
+    /// the counter. Returns 0 when no CDC write has yet been stamped for this
+    /// tenant in this writer session (i.e. the counter was never seeded). This is
+    /// the CDC watermark the in-memory commit path has advanced to — the sequence
+    /// of the most recent durable write on this writer — usable as the value of
+    /// `X-Bluedb-Watermark` in write-response headers.
+    ///
+    /// Note: returns 0 (not `Option`) so callers can embed it unconditionally in
+    /// headers; a 0 watermark signals "no CDC writes yet this session".
+    pub async fn last_cdc_seq(&self, tenant: &str) -> i64 {
+        self.cdc_seq.lock().await.get(tenant).copied().unwrap_or(0)
+    }
+
     /// Is this a writer handle (vs. a read replica)?
     pub fn is_writer(&self) -> bool {
         self.substrate.is_writer()

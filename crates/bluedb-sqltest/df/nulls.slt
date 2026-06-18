@@ -1,0 +1,59 @@
+# NULL semantics — IS NULL / IS NOT NULL, NULLS FIRST/LAST ordering, NULL-aware
+# aggregates, and three-valued logic — through the DataFusion front door.
+
+statement ok
+CREATE TABLE n (id INTEGER PRIMARY KEY, v INTEGER)
+
+statement ok
+INSERT INTO n VALUES (1, 10), (2, NULL), (3, 30), (4, NULL)
+
+# IS NULL.
+query I
+SELECT id FROM n WHERE v IS NULL ORDER BY id
+----
+2
+4
+
+# IS NOT NULL.
+query I
+SELECT id FROM n WHERE v IS NOT NULL ORDER BY id
+----
+1
+3
+
+# ORDER BY ... NULLS FIRST.
+query I
+SELECT id FROM n ORDER BY v NULLS FIRST, id
+----
+2
+4
+1
+3
+
+# ORDER BY ... NULLS LAST.
+query I
+SELECT id FROM n ORDER BY v NULLS LAST, id
+----
+1
+3
+2
+4
+
+# COUNT(col) ignores NULLs.
+query I
+SELECT COUNT(v) FROM n
+----
+2
+
+# SUM ignores NULLs.
+query I
+SELECT SUM(v) FROM n
+----
+40
+
+# NULL arithmetic is NULL (three-valued logic: NULL row is excluded).
+query I
+SELECT id FROM n WHERE v + 1 > 5 ORDER BY id
+----
+1
+3

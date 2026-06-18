@@ -11,6 +11,7 @@
 | Logical | `AND` `OR` `NOT` |
 | Null test | `IS NULL` `IS NOT NULL` |
 | String | `||` (concatenation) |
+| JSON | `->` `->>` (field access) · `@>` `<@` (containment) — see [JSON](json.md) |
 
 ```sql
 SELECT price * quantity AS total FROM line_items;
@@ -95,7 +96,6 @@ SELECT * FROM users WHERE deleted_at IS NULL;
 `EXISTS`, scalar subqueries, and `IN (SELECT …)` are all valid in expressions —
 see [Query syntax › Subqueries](query-syntax.md#subqueries).
 
-!!! warning
-    **window functions are not supported.** `SUM(x) OVER (…)`,
-    `ROW_NUMBER() OVER (…)`, `RANK()`, etc. are **rejected** with a clear error
-    (the engine has no windowing; rejecting prevents silently wrong results).
+!!! note
+    **Window functions are supported** — `SUM(x) OVER (…)`, `ROW_NUMBER() OVER
+    (…)`, `RANK()`, `LAG`/`LEAD`, and friends.

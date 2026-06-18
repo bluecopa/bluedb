@@ -665,6 +665,60 @@ impl SlateDbStorage {
         self.write_key(key, encode(catalog)?).await
     }
 
+    /// Read a table's JSON-column catalog (the columns declared `JSON`/`JSONB`,
+    /// stored as `TEXT`). `None` for tables with no JSON column.
+    pub(crate) async fn read_json_catalog(
+        &self,
+        table_name: &str,
+    ) -> Result<Option<crate::jsoncat::JsonCatalog>, SqlError> {
+        let key = self.keyspace.jsoncat_key(table_name);
+        match self.read_key(&key).await? {
+            Some(bytes) => Ok(Some(decode(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// The JSON/JSONB column names of `table` (stored as `TEXT`), or `None` for a
+    /// table with no JSON column. Public so the server's `/tables` row serializer
+    /// can re-inflate those columns' text to real JSON. Mirrors [`Self::pk_columns`].
+    pub async fn json_columns(&self, table_name: &str) -> Result<Option<Vec<String>>, SqlError> {
+        Ok(self.read_json_catalog(table_name).await?.map(|c| c.columns))
+    }
+
+    /// The primary-key column names of `table`: the user PK columns of a composite
+    /// key, else the single primary-key column, else empty (no PK / unknown table).
+    /// Public so the server can identify the rows a mutation affected (the
+    /// `Prefer: return=representation` read-back).
+    pub async fn primary_key_columns(&self, table_name: &str) -> Result<Vec<String>, SqlError> {
+        if let Some(cols) = self.pk_columns(table_name).await? {
+            return Ok(cols); // composite-PK user columns
+        }
+        let Some(schema) = Store::fetch_schema(self, table_name)
+            .await
+            .map_err(|e| SqlError::KeyEncode(e.to_string()))?
+        else {
+            return Ok(Vec::new());
+        };
+        Ok(schema
+            .column_defs
+            .into_iter()
+            .flatten()
+            .filter(|c| c.unique.as_ref().is_some_and(|u| u.is_primary))
+            .map(|c| c.name)
+            .collect())
+    }
+
+    /// Persist a table's JSON-column catalog (written at CREATE TABLE, before the
+    /// rewritten DDL runs). A durable, immediate write (no open txn).
+    pub(crate) async fn write_json_catalog(
+        &mut self,
+        table_name: &str,
+        catalog: &crate::jsoncat::JsonCatalog,
+    ) -> Result<(), SqlError> {
+        let key = self.keyspace.jsoncat_key(table_name);
+        self.write_key(key, encode(catalog)?).await
+    }
+
     /// Resolve a table's stable id (assigned at CREATE). Data and index keys are
     /// keyed by this id — not the table name — so it must exist for any table
     /// that has rows. Reading it is how name→id resolution happens on every data
@@ -1638,6 +1692,20 @@ impl Planner for SlateDbStorage {
         let statement = crate::pushdown::pushdown_equijoins(&schema_map, statement);
         crate::pushdown::reject_cross_products(&statement)?;
         let statement = crate::coerce::coerce_comparisons(&schema_map, statement);
+        // Widen bound-param write values (an `I64`/`F64` param into a DECIMAL/FLOAT
+        // column) the way an inline literal already coerces — a CAST insertion, so
+        // the data plane's parameterised INSERT/UPDATE matches inline SQL.
+        // `fetch_schema_map` omits an UPDATE's target table (it covers Query/Insert
+        // only), so top it up here — otherwise the pass has no column types to
+        // widen against.
+        if let gluesql_core::ast::Statement::Update { table_name, .. } = &statement {
+            if !schema_map.contains_key(table_name) {
+                if let Some(schema) = Store::fetch_schema(self, table_name).await? {
+                    schema_map.insert(table_name.clone(), schema);
+                }
+            }
+        }
+        let statement = crate::coerce::coerce_writes(&schema_map, statement);
         // On a guarded (user-facing) connection, bound every read: an unfiltered
         // SELECT is capped to a PK-ordered prefix, and a non-indexed WHERE/ORDER BY
         // is rejected. Internal/admin connections (`strict == false`) are exempt.
