@@ -19,8 +19,8 @@ common ones; signatures are PostgreSQL-style.
 | `SUM(expr)` | Sum |
 | `MIN(expr)` / `MAX(expr)` | Minimum / maximum |
 | `AVG(expr)` | Average (returns a float) |
-| `VARIANCE(expr)` | Variance |
-| `STDEV(expr)` | Standard deviation |
+| `VARIANCE(expr)` | Sample variance (use `var_pop` for population) |
+| `STDEV(expr)` | Sample standard deviation (use `stddev_pop` for population) |
 
 ```sql
 SELECT age, COUNT(*) AS n, AVG(age) FROM users GROUP BY age;
@@ -30,6 +30,24 @@ SELECT age, COUNT(*) AS n, AVG(age) FROM users GROUP BY age;
     An aggregate with **no `GROUP BY`** over a `WHERE` that matches
     **zero rows** returns **no row** (rather than one `NULL`/`0` row). Guard with a
     separate `COUNT` if you need the empty case.
+
+### Approximate aggregates
+
+For high-cardinality dashboards these trade exactness for speed and bounded
+memory:
+
+| Function | Description |
+|----------|-------------|
+| `approx_count_distinct(expr)` | Approximate distinct count (HyperLogLog) |
+| `approx_percentile(expr, p)` / `approx_quantile(expr, p)` | Approximate percentile, `p` in `[0,1]` (t-digest) |
+| `approx_median(expr)` | Approximate median |
+
+```sql
+SELECT region,
+       approx_count_distinct(user_id)      AS uniques,
+       approx_percentile(latency_ms, 0.99) AS p99
+FROM events GROUP BY region;
+```
 
 ## Math
 
@@ -55,7 +73,7 @@ SELECT ROUND(price, 2), SQRT(area), ABS(balance) FROM t;
 | `LPAD` | `RPAD` | `LTRIM` | `RTRIM` / `TRIM` |
 | `CONCAT` | `CONCAT_WS` | `REPLACE` | `REPEAT` |
 | `REVERSE` | `ASCII` | `CHR` | `FIND_IDX` |
-| `FORMAT` | `HEX` | `MD5` | `IS_EMPTY` |
+| `FORMAT` | `HEX` | `MD5` | `SPLIT_PART` |
 
 ```sql
 SELECT UPPER(name), SUBSTR(email, 1, POSITION('@' IN email) - 1) FROM users;
@@ -115,9 +133,14 @@ Field access (`->`, `->>`), containment (`@>`, `<@`), and `jsonb_path_query` /
 | Function | Description |
 |----------|-------------|
 | `GENERATE_UUID()` | Random UUID |
-| `POINT(x, y)`, `GET_X`, `GET_Y`, `CALC_DISTANCE` | Geometry point + helpers |
-| `APPEND`, `PREPEND`, `SLICE`, `SORT`, `DEDUP`, `KEYS`, `VALUES`, `ENTRIES`, `TAKE`, `SKIP` | `LIST` / `MAP` helpers |
 
 ```sql
 SELECT GENERATE_UUID() AS id;
 ```
+
+!!! note "Arrays & maps"
+    For list/map work use the `array_*` / `map_*` family — e.g. `array_append`,
+    `array_prepend`, `array_slice`, `array_sort`, `array_distinct`, `cardinality`,
+    `map_keys`, `map_values`, `map_entries`. Mind the signatures: `array_prepend`
+    is element-first, and `array_distinct` removes **all** duplicates (not just
+    consecutive ones). Geometry types and functions are not available.

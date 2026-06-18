@@ -33,6 +33,7 @@ use iceberg_datafusion::IcebergStaticTableProvider;
 
 mod catalog;
 mod format_udfs;
+mod gluesql_compat;
 mod json_ops;
 mod json_path;
 mod json_udfs;
@@ -41,15 +42,17 @@ pub use catalog::BluedbSchemaProvider;
 pub use provider::{BluedbTableProvider, ProviderStats};
 
 /// Register bluedb's scalar-function extensions on a [`SessionContext`]: the JSON
-/// accessors (`->`, `->>`, `json_get`, `json_get_str`) and the Postgres formatting
-/// functions (`to_number`, `format`, numeric `to_char`). [`query_via_catalog`]
-/// calls this; it is public so other front doors (e.g. the conformance harness)
-/// can build an identical context.
+/// accessors (`->`, `->>`, `json_get`, `json_get_str`), the Postgres formatting
+/// functions (`to_number`, `format`, numeric `to_char`), and the GlueSQL/Postgres
+/// name-compatibility shim ([`gluesql_compat`] — `sign`, `add_month`, `variance`,
+/// `approx_count_distinct`, …). [`query_via_catalog`] calls this; it is public so
+/// other front doors (e.g. the conformance harness) can build an identical context.
 pub fn register_extensions(ctx: &mut SessionContext) -> datafusion::error::Result<()> {
     json_udfs::register(ctx)?;
     json_ops::register(ctx)?;
     json_path::register(ctx)?;
     format_udfs::register(ctx)?;
+    gluesql_compat::register(ctx)?;
     Ok(())
 }
 
