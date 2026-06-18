@@ -2017,12 +2017,21 @@ pub struct AppError {
     status: StatusCode,
     message: String,
     extra_headers: Option<axum::http::HeaderMap>,
+    /// Stable machine-readable code echoed as `{"code": ...}` so adapters map a
+    /// failure to behavior without parsing the prose `error` message.
+    code: Option<&'static str>,
 }
 
 impl AppError {
     /// Build a plain error without extra headers.
     fn plain(status: StatusCode, message: impl Into<String>) -> Self {
-        Self { status, message: message.into(), extra_headers: None }
+        Self { status, message: message.into(), extra_headers: None, code: None }
+    }
+
+    /// Attach a stable machine-readable code (see [`Self::code`]).
+    fn with_code(mut self, code: &'static str) -> Self {
+        self.code = Some(code);
+        self
     }
 
     /// Attach extra response headers to this error (e.g. `X-Bluedb-Watermark`
@@ -2070,19 +2079,53 @@ impl AppError {
     }
 }
 
+/// Map an engine error to an HTTP status + stable machine-readable code, so an
+/// adapter can branch on the code instead of parsing prose. The guardrail reject
+/// is detected by its sentinel prefix; the rest by the top-level GlueSQL `Error`
+/// variant, falling back to the message for the cross-variant cases (table not
+/// found spans Fetch/Execute; duplicate spans the Validate variants).
+fn classify_engine_error(err: &EngineError) -> (StatusCode, Option<&'static str>) {
+    use gluesql_core::error::Error as G;
+    if is_guardrail_reject(err) {
+        return (StatusCode::BAD_REQUEST, Some("NO_INDEX"));
+    }
+    if let EngineError::Sql(g) = err {
+        match g {
+            G::Parser(_) | G::Translate(_) => return (StatusCode::BAD_REQUEST, Some("PARSE_ERROR")),
+            G::Value(_) => return (StatusCode::BAD_REQUEST, Some("TYPE_MISMATCH")),
+            _ => {}
+        }
+    }
+    let msg = err.to_string();
+    if msg.contains("table not found") {
+        return (StatusCode::NOT_FOUND, Some("NOT_FOUND"));
+    }
+    if msg.contains("duplicate entry") {
+        return (StatusCode::CONFLICT, Some("UNIQUE_VIOLATION"));
+    }
+    match err {
+        EngineError::Other(_) => (StatusCode::INTERNAL_SERVER_ERROR, None),
+        _ => (StatusCode::BAD_REQUEST, None),
+    }
+}
+
 impl From<EngineError> for AppError {
     fn from(err: EngineError) -> Self {
-        let status = match &err {
-            EngineError::Rest(_) | EngineError::Sql(_) | EngineError::Rejected(_) => StatusCode::BAD_REQUEST,
-            EngineError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        };
-        Self::plain(status, err.to_string())
+        let (status, code) = classify_engine_error(&err);
+        let e = Self::plain(status, err.to_string());
+        match code {
+            Some(c) => e.with_code(c),
+            None => e,
+        }
     }
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        let body: BTreeMap<&str, String> = [("error", self.message)].into_iter().collect();
+        let mut body: BTreeMap<&str, String> = [("error", self.message)].into_iter().collect();
+        if let Some(code) = self.code {
+            body.insert("code", code.to_string());
+        }
         match self.extra_headers {
             None => (self.status, Json(body)).into_response(),
             Some(extra) => (self.status, extra, Json(body)).into_response(),

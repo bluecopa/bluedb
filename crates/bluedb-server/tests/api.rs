@@ -305,11 +305,26 @@ async fn prefer_representation_returns_affected_rows() {
 }
 
 #[tokio::test]
-async fn unknown_table_select_is_a_400() {
+async fn unknown_table_select_is_a_404() {
     let app = app().await;
-    // Selecting a table that doesn't exist is a SQL error → 400 (client error).
-    let (status, _) = call(&app, "GET", "/tables/ghost", None).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // Selecting a table that doesn't exist → 404 NOT_FOUND (ask #7 taxonomy).
+    let (status, body) = call(&app, "GET", "/tables/ghost", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["code"], json!("NOT_FOUND"), "{body}");
+}
+
+#[tokio::test]
+async fn errors_carry_structured_codes() {
+    let app = app().await;
+    let (status, _) = sql_admin(&app, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)").await;
+    assert_eq!(status, StatusCode::OK);
+
+    // A duplicate primary key → 409 with a stable code, not a parsed-prose 400.
+    let (s, _) = call(&app, "POST", "/tables/t", Some(json!({"id": 1, "v": "a"}))).await;
+    assert_eq!(s, StatusCode::OK);
+    let (status, body) = call(&app, "POST", "/tables/t", Some(json!({"id": 1, "v": "b"}))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "dup pk: {body}");
+    assert_eq!(body["code"], json!("UNIQUE_VIOLATION"), "{body}");
 }
 
 #[tokio::test]
