@@ -3,10 +3,15 @@
 //!
 //! Supported steps: a leading `strict`/`lax` mode word (ignored), `$` (root),
 //! `.key` / `["key"]` (object member), `.*` (all object values), `[n]` (array
-//! index), `[*]` (all array elements). Anything richer — filters `? (...)`,
-//! methods `.type()`, ranges `[1 to 3]`, `starts with`, arithmetic — is treated
-//! as *unsupported*: the path yields no matches and the function returns `NULL`
-//! (it plans and runs, it just can't evaluate that path), never an error.
+//! index), `[*]` (all array elements).
+//!
+//! A supported path that matches nothing returns `NULL` (Postgres-faithful: lax
+//! mode yields no rows). But anything richer — filters `? (...)`, methods
+//! `.type()`, ranges `[1 to 3]`, `starts with`, arithmetic, variables — is
+//! **unevaluable**, and we raise an error rather than returning `NULL`: a silent
+//! `NULL` is indistinguishable from a real no-match, so it would be a silent wrong
+//! answer. Failing loudly lets a caller see exactly which path bluedb can't serve;
+//! simple navigation paths are unaffected.
 //!
 //! **Scalar approximation.** Postgres `jsonb_path_query` is set-returning (one row
 //! per match); a DataFusion `ScalarUDF` returns one value per input row. So
@@ -21,6 +26,7 @@ use datafusion::arrow::array::{Array, ArrayRef, StringArray, StringBuilder};
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::Result as DfResult;
+use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
@@ -169,19 +175,30 @@ enum Output {
     Array,
 }
 
-/// Evaluate `path` against `json` and render per `out`. `None` (→ SQL `NULL`) on
-/// parse failure, an unsupported path, or no match (for `First`).
-fn run(json: &str, path: &str, out: Output) -> Option<String> {
-    let root: Value = serde_json::from_str(json).ok()?;
-    let steps = parse_path(path)?;
+/// Evaluate `path` against `json` and render per `out`.
+///
+/// `Err` if the path uses an unevaluable feature (filter/method/range/var) — we
+/// fail loudly rather than return a `NULL` a caller couldn't distinguish from a
+/// real no-match. `Ok(None)` (→ SQL `NULL`) for a *supported* path that matches
+/// nothing, or for ragged (non-JSON) input data.
+fn run(json: &str, path: &str, out: Output) -> DfResult<Option<String>> {
+    let steps = parse_path(path).ok_or_else(|| {
+        DataFusionError::Execution(format!(
+            "jsonb_path_query: unsupported or malformed JSONPath {path:?}; bluedb supports \
+             navigation paths ($, .key, [\"key\"], .*, [n], [*]) — not filters, methods, \
+             ranges, or variables"
+        ))
+    })?;
+    // Ragged input data (not a valid JSON document) → NULL, not an error: that's a
+    // data issue, not the developer's path. The path itself parsed fine.
+    let Ok(root) = serde_json::from_str::<Value>(json) else {
+        return Ok(None);
+    };
     let matches = eval(&root, &steps);
-    match out {
+    Ok(match out {
         Output::First => matches.first().map(|v| v.to_string()),
-        Output::Array => {
-            let arr = Value::Array(matches.into_iter().cloned().collect());
-            Some(arr.to_string())
-        }
-    }
+        Output::Array => Some(Value::Array(matches.into_iter().cloned().collect()).to_string()),
+    })
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -236,7 +253,9 @@ impl ScalarUDFImpl for JsonPathQuery {
                 b.append_null();
                 continue;
             }
-            match run(json.value(row), path.value(row), self.out) {
+            // An unevaluable path raises (usually the path is a constant, so the
+            // whole query fails fast with a clear message — never a silent NULL).
+            match run(json.value(row), path.value(row), self.out)? {
                 Some(s) => b.append_value(s),
                 None => b.append_null(),
             }
@@ -274,14 +293,27 @@ mod tests {
     #[test]
     fn run_first_and_array() {
         let j = r#"{"a":{"b":7},"items":[10,20,30]}"#;
-        assert_eq!(run(j, "$.a.b", Output::First), Some("7".into()));
-        assert_eq!(run(j, "$.items[1]", Output::First), Some("20".into()));
-        assert_eq!(run(j, "$.items[*]", Output::Array), Some("[10,20,30]".into()));
+        assert_eq!(run(j, "$.a.b", Output::First).unwrap(), Some("7".into()));
+        assert_eq!(run(j, "$.items[1]", Output::First).unwrap(), Some("20".into()));
+        assert_eq!(
+            run(j, "$.items[*]", Output::Array).unwrap(),
+            Some("[10,20,30]".into())
+        );
         // string match keeps JSON quotes (it's jsonb)
-        assert_eq!(run(r#"{"k":"v"}"#, "$.k", Output::First), Some(r#""v""#.into()));
-        // missing / unsupported → None
-        assert_eq!(run(j, "$.nope", Output::First), None);
-        assert_eq!(run(j, "$.a ? (@.b > 1)", Output::First), None);
+        assert_eq!(run(r#"{"k":"v"}"#, "$.k", Output::First).unwrap(), Some(r#""v""#.into()));
+        // supported path, genuine no-match → NULL (Postgres-faithful)
+        assert_eq!(run(j, "$.nope", Output::First).unwrap(), None);
+    }
+
+    #[test]
+    fn unsupported_path_errors_not_null() {
+        let j = r#"{"a":1}"#;
+        // A filter / method / range we can't evaluate must fail loudly, NOT return
+        // NULL (which a caller couldn't tell apart from a real no-match).
+        assert!(run(j, "$.a ? (@.b > 1)", Output::First).is_err());
+        assert!(run(j, "$.type()", Output::First).is_err());
+        assert!(run(j, "$[1 to 3]", Output::First).is_err());
+        assert!(run(j, "garbage", Output::First).is_err());
     }
 
     async fn ctx() -> datafusion::prelude::SessionContext {
@@ -308,11 +340,19 @@ mod tests {
             one(&ctx, r#"SELECT jsonb_path_query_array('{"x":[1,2,3]}', '$.x[*]')"#).await,
             Some("[1,2,3]".into())
         );
-        // unsupported path → NULL, not an error
+        // a supported path that matches nothing → NULL
         assert_eq!(
-            one(&ctx, r#"SELECT jsonb_path_query('{"a":1}', '$ ? (@.a > 0)')"#).await,
+            one(&ctx, r#"SELECT jsonb_path_query('{"a":1}', '$.missing')"#).await,
             None
         );
+        // an unevaluable path (filter) fails the query loudly, rather than NULL
+        let err = ctx
+            .sql(r#"SELECT jsonb_path_query('{"a":1}', '$ ? (@.a > 0)')"#)
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert!(err.is_err(), "unsupported path must error, got {err:?}");
     }
 
     #[tokio::test]
