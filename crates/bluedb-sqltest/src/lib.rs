@@ -14,8 +14,8 @@ use std::any::Any;
 
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
-    Int8Array, LargeStringArray, RecordBatch, StringArray, UInt16Array, UInt32Array, UInt64Array,
-    UInt8Array,
+    Int8Array, LargeStringArray, RecordBatch, StringArray, StringViewArray, UInt16Array,
+    UInt32Array, UInt64Array, UInt8Array,
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use async_trait::async_trait;
@@ -440,11 +440,18 @@ fn render_cell(col: &dyn Array, i: usize) -> String {
         Dt::Float64 => val!(Float64Array).to_string(),
         Dt::Utf8 => val!(StringArray).to_string(),
         Dt::LargeUtf8 => val!(LargeStringArray).to_string(),
+        // DataFusion 52 returns string literals / many string ops as Utf8View — a
+        // very common result type, so render it directly rather than as a debug tag.
+        Dt::Utf8View => val!(StringViewArray).to_string(),
         // An all-null / typed-null column (e.g. `BIT_AND(NULL)`): every cell is
         // null, which the `is_null` guard above already renders, but the column's
         // own type is `Null` — render it as NULL rather than a debug tag.
         Dt::Null => "NULL".to_string(),
-        other => format!("<{other:?}>"),
+        // Everything else (Decimal128, Date32, Time64, Timestamp, …) via arrow's
+        // canonical formatter, which matches the corpora's expected text far more
+        // often than a `{:?}` debug tag.
+        _ => datafusion::arrow::util::display::array_value_to_string(col, i)
+            .unwrap_or_else(|_| format!("<{:?}>", col.data_type())),
     }
 }
 
@@ -528,7 +535,10 @@ async fn query_via_corpus(
     db: Database,
     sql: &str,
 ) -> anyhow::Result<Vec<RecordBatch>> {
-    let ctx = SessionContext::new();
+    let mut ctx = SessionContext::new();
+    // Same scalar-function extensions (JSON accessors + Postgres formatting fns)
+    // the production front door registers, so the corpus exercises them too.
+    bluedb_query::register_extensions(&mut ctx)?;
     ctx.catalog("datafusion")
         .ok_or_else(|| anyhow::anyhow!("default catalog 'datafusion' missing"))?
         .register_schema("public", Arc::new(CorpusSchemaProvider::new(engine, db)))?;

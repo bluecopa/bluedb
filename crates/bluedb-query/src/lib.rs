@@ -38,6 +38,17 @@ mod provider;
 pub use catalog::BluedbSchemaProvider;
 pub use provider::{BluedbTableProvider, ProviderStats};
 
+/// Register bluedb's scalar-function extensions on a [`SessionContext`]: the JSON
+/// accessors (`->`, `->>`, `json_get`, `json_get_str`) and the Postgres formatting
+/// functions (`to_number`, `format`, numeric `to_char`). [`query_via_catalog`]
+/// calls this; it is public so other front doors (e.g. the conformance harness)
+/// can build an identical context.
+pub fn register_extensions(ctx: &mut SessionContext) -> datafusion::error::Result<()> {
+    json_udfs::register(ctx)?;
+    format_udfs::register(ctx)?;
+    Ok(())
+}
+
 /// Run a read `sql` through the DataFusion front door: register the tenant's
 /// tables via [`BluedbSchemaProvider`] and execute, binding positional params.
 ///
@@ -58,10 +69,7 @@ pub async fn query_via_catalog(
     params: &[serde_json::Value],
 ) -> anyhow::Result<Vec<RecordBatch>> {
     let mut ctx = SessionContext::new();
-    // JSON accessors (`->`, `->>`, json_get, json_get_str) over JSON-as-Utf8 cols.
-    json_udfs::register(&mut ctx).with_context(|| "registering JSON functions")?;
-    // Postgres formatting functions (to_number, format, numeric to_char).
-    format_udfs::register(&mut ctx).with_context(|| "registering format functions")?;
+    register_extensions(&mut ctx).with_context(|| "registering bluedb scalar functions")?;
     ctx.catalog("datafusion")
         .ok_or_else(|| anyhow!("default catalog 'datafusion' missing"))?
         .register_schema("public", Arc::new(BluedbSchemaProvider::new(engine)))
