@@ -58,7 +58,7 @@ fn jsonb_contains(a: &serde_json::Value, b: &serde_json::Value) -> bool {
     }
 }
 
-fn str_at<'a>(arr: &'a StringArray, row: usize) -> Option<&'a str> {
+fn str_at(arr: &StringArray, row: usize) -> Option<&str> {
     (!arr.is_null(row)).then(|| arr.value(row))
 }
 
