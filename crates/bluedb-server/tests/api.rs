@@ -187,6 +187,63 @@ async fn json_column_round_trips_as_real_json() {
 }
 
 #[tokio::test]
+async fn arbitrary_and_json_filters_on_tables_route_to_analytical_engine() {
+    let app = app().await;
+
+    // Enable the Iceberg mirror so the analytical engine has the tenant's data.
+    let (status, _) = call(&app, "POST", "/sql",
+        Some(json!({"sql": "PRAGMA lakehouse_mirror = on"}))).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = sql_admin(
+        &app,
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT, data JSON)",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Insert rows; `label` is NOT indexed, `data` is JSON.
+    for (id, label, status_field) in [(1, "alpha", "active"), (2, "beta", "idle"), (3, "alpha", "active")] {
+        let (s, body) = call(
+            &app,
+            "POST",
+            "/tables/items",
+            Some(json!({"id": id, "label": label, "data": {"status": status_field}})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "insert {id}: {body}");
+    }
+
+    // A filter on the NON-indexed `label` 400s on the GlueSQL fast path (guardrail).
+    // It must now route to the analytical engine and return rows (doc ask #4).
+    let (status, body) = call(&app, "GET", "/tables/items?label=eq.alpha&order=id.asc", None).await;
+    assert_eq!(status, StatusCode::OK, "label filter should route, got: {body}");
+    let ids: Vec<i64> = body
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|r| r["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids, vec![1, 3], "both alpha rows: {body}");
+
+    // A JSON-path filter also routes; `data` comes back as a real object. `>` is
+    // percent-encoded as a conformant HTTP client would send it (`%3E%3E`).
+    let (status, body) =
+        call(&app, "GET", "/tables/items?data-%3E%3Estatus=eq.active&order=id.asc", None).await;
+    assert_eq!(status, StatusCode::OK, "json-path filter should route, got: {body}");
+    let rows = body.as_array().expect("rows");
+    assert_eq!(rows.len(), 2, "two active rows: {body}");
+    assert!(rows[0]["data"].is_object(), "data re-inflated to an object: {body}");
+    assert_eq!(rows[0]["data"]["status"], json!("active"));
+
+    // A PK point read still takes the GlueSQL fast path and works unchanged.
+    let (status, body) = call(&app, "GET", "/tables/items?id=eq.2", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_array().expect("rows").len(), 1);
+    assert_eq!(body[0]["label"], json!("beta"));
+}
+
+#[tokio::test]
 async fn unknown_table_select_is_a_400() {
     let app = app().await;
     // Selecting a table that doesn't exist is a SQL error → 400 (client error).

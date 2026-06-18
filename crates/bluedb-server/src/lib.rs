@@ -879,6 +879,32 @@ fn json_to_param(v: &Value) -> Result<bluedb_rest::Param, AppError> {
     })
 }
 
+/// Inverse of [`json_to_param`]: a bound REST [`bluedb_rest::Param`] back to a JSON
+/// value, so a `/tables` query's params can be handed to the analytical front door
+/// ([`bluedb_query::query_via_catalog`], which binds JSON values positionally).
+fn param_to_json(p: &bluedb_rest::Param) -> Value {
+    use bluedb_rest::Param;
+    match p {
+        Param::Null => Value::Null,
+        Param::Bool(b) => Value::Bool(*b),
+        Param::Int(i) => json!(*i),
+        Param::Float(f) => json!(*f),
+        Param::Str(s) => Value::String(s.clone()),
+    }
+}
+
+/// True if `err` is the plan-time scan/sort guardrail rejection (a `/tables` read
+/// whose filter / ORDER BY touches a non-indexed column on the GlueSQL fast path).
+/// Such a read is re-routed to the analytical engine, which can scan/sort the
+/// Iceberg mirror. Detected by the stable sentinel prefix the guardrail emits.
+fn is_guardrail_reject(err: &EngineError) -> bool {
+    matches!(
+        err,
+        EngineError::Sql(gluesql_core::error::Error::StorageMsg(msg))
+            if msg.starts_with(bluedb_sql::GUARDRAIL_REJECT_PREFIX)
+    )
+}
+
 // --- handlers ---------------------------------------------------------------
 
 /// Extract the `Authorization: Bearer <token>` value, if present and well-formed.
@@ -1260,6 +1286,14 @@ async fn select(
     let tenant = state.tenant(&headers)?;
 
     let sealed = state.sealed_watermark(&tenant).await;
+    // Percent-decode the query string: a JSON-path key (`data->>status`) arrives
+    // `%3E%3E`-encoded from any conformant client, and `parse_query` expects
+    // already-decoded text. Separators (`&`/`=`) are literal in the URL, so they
+    // survive; only `%XX` escapes within keys/values are decoded.
+    let decoded_qs = percent_encoding::percent_decode_str(query.as_deref().unwrap_or(""))
+        .decode_utf8_lossy();
+    let rq = bluedb_rest::parse_query(&table, &decoded_qs).map_err(EngineError::from)?;
+
     let mut glue = Glue::new(state.connection(&tenant).await?);
     // JSON/JSONB columns are stored as TEXT; the catalog tells us which to
     // re-inflate to real JSON on the way out.
@@ -1269,10 +1303,80 @@ async fn select(
         .await
         .map_err(|e| AppError::internal(format!("read json catalog: {e}")))?
         .unwrap_or_default();
-    let payloads = rest_sql::execute_query_str(&mut glue, &table, query.as_deref().unwrap_or("")).await?;
+
+    // A JSON-path query (`data->>k`) can only be served by the analytical engine
+    // (GlueSQL has no JSON functions) — route it there directly.
+    if rq.has_json_path() {
+        return route_select_to_analytical(&state, &headers, &tenant, &rq, &json_cols, sealed).await;
+    }
+    // Otherwise take the GlueSQL fast path. A guardrail reject (a filter / ORDER BY
+    // on a non-indexed column) means GlueSQL can't bound the read; re-route it to
+    // the analytical engine, which scans/sorts the Iceberg mirror. This is doc
+    // ask #4: the grid filters/sorts arbitrary columns without a standing index.
+    match rest_sql::execute_query(&mut glue, &rq).await {
+        Ok(payloads) => Ok((
+            watermark_headers(&tenant, sealed),
+            Json(select_to_json(payloads, &json_cols)),
+        )),
+        Err(e) if is_guardrail_reject(&e) => {
+            route_select_to_analytical(&state, &headers, &tenant, &rq, &json_cols, sealed).await
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Serve a `/tables` read the GlueSQL fast path can't (an arbitrary-column filter
+/// / sort, or a JSON-path predicate) through the analytical front door, exactly
+/// like `POST /sql`: render the PostgREST request to SQL, run it on DataFusion
+/// over the tenant's Iceberg mirror (+ writer-local unsealed tail), and re-inflate
+/// JSON columns so the response matches the fast path. Reads only — writes stay on
+/// GlueSQL. The freshness gate applies (routed reads hit the sealed snapshot).
+async fn route_select_to_analytical(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    tenant: &str,
+    rq: &bluedb_rest::RestQuery,
+    json_cols: &[String],
+    sealed: i64,
+) -> Result<(axum::http::HeaderMap, Json<Value>), AppError> {
+    let (sql, params) = rq.to_sql_with_params().map_err(EngineError::from)?;
+    let json_params: Vec<Value> = params.iter().map(param_to_json).collect();
+
+    // Freshness gate: a non-writer node can't satisfy a read demanding a watermark
+    // beyond its sealed snapshot (same rule as `exec_sql_read`).
+    if let Some(min) = parse_min_watermark(headers) {
+        if min > sealed && !state.is_writer() {
+            return Err(AppError::plain(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "read-your-writes freshness not satisfiable on this node: requested \
+                     min-watermark {min} > sealed watermark {sealed}, and this node is not \
+                     the active writer; retry against the writer or after the next seal"
+                ),
+            )
+            .with_headers(watermark_headers_always(tenant, sealed)));
+        }
+    }
+
+    let manager = state.lakehouse().await.ok_or_else(|| {
+        AppError::internal("analytical path unavailable: lakehouse manager not bound")
+    })?;
+    let engine = manager
+        .engine_for(tenant)
+        .await
+        .map_err(|e| AppError::internal(format!("get lakehouse engine: {e}")))?;
+    let batches = bluedb_query::query_via_catalog(engine, &sql, &json_params)
+        .await
+        .map_err(|e| AppError::bad_request(format!("query: {e}")))?;
+
+    let wm = if state.is_writer() {
+        state.write_watermark(tenant).await
+    } else {
+        sealed
+    };
     Ok((
-        watermark_headers(&tenant, sealed),
-        Json(select_to_json(payloads, &json_cols)),
+        watermark_headers(tenant, wm),
+        Json(reinflate_rows(record_batches_to_json(&batches), json_cols)),
     ))
 }
 
@@ -1539,6 +1643,39 @@ fn reinflate_json(label: &str, v: Value, json_cols: &[String]) -> Value {
         }
     }
     v
+}
+
+/// Re-inflate JSON columns in an array of row objects — the analytical path's
+/// [`record_batches_to_json`] output, where a JSON column arrives as `Utf8` text.
+/// The `/tables` GlueSQL fast path does this via [`select_to_json`]; this is the
+/// equivalent for a read routed to DataFusion, so both surfaces return identical
+/// JSON for a JSON column.
+fn reinflate_rows(value: Value, json_cols: &[String]) -> Value {
+    if json_cols.is_empty() {
+        return value;
+    }
+    let Value::Array(rows) = value else {
+        return value;
+    };
+    Value::Array(
+        rows.into_iter()
+            .map(|row| {
+                let Value::Object(mut map) = row else {
+                    return row;
+                };
+                for col in json_cols {
+                    let parsed = match map.get(col) {
+                        Some(Value::String(s)) => serde_json::from_str::<Value>(s).ok(),
+                        _ => None,
+                    };
+                    if let Some(p) = parsed {
+                        map.insert(col.clone(), p);
+                    }
+                }
+                Value::Object(map)
+            })
+            .collect(),
+    )
 }
 
 /// One payload → JSON; many (multi-statement `/sql`) → a JSON array.

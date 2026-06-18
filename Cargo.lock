@@ -889,6 +889,7 @@ dependencies = [
  "http-body-util",
  "object_store",
  "p256",
+ "percent-encoding",
  "reqwest",
  "serde",
  "serde_json",

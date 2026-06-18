@@ -7,8 +7,8 @@
 
 use crate::error::RestError;
 use crate::model::{
-    bind, validate_ident, DeleteRequest, Direction, Filter, InsertRequest, Param, RestQuery,
-    UpdateRequest,
+    bind, render_column_ref, validate_ident, DeleteRequest, Direction, Filter, InsertRequest,
+    Param, RestQuery, UpdateRequest,
 };
 
 /// Param-aware `WHERE …` builder: appends each filter's binds to `params`.
@@ -30,10 +30,10 @@ impl RestQuery {
         let projection = if self.select.is_empty() {
             "*".to_string()
         } else {
-            let cols: Vec<&str> = self
+            let cols: Vec<String> = self
                 .select
                 .iter()
-                .map(|c| validate_ident(c))
+                .map(|c| render_column_ref(c))
                 .collect::<Result<_, _>>()?;
             cols.join(", ")
         };
@@ -47,7 +47,7 @@ impl RestQuery {
                 .order
                 .iter()
                 .map(|k| {
-                    let col = validate_ident(&k.column)?;
+                    let col = render_column_ref(&k.column)?;
                     Ok(format!("{col} {}", direction_sql(k.direction)))
                 })
                 .collect::<Result<_, RestError>>()?;
@@ -271,5 +271,87 @@ mod params_render {
             params,
             vec![Param::Str("amy".into()), Param::Int(1), Param::Int(2)]
         );
+    }
+
+    #[test]
+    fn json_path_filter_renders_text_accessor_function() {
+        let q = RestQuery {
+            table: "docs".into(),
+            select: vec![],
+            filters: vec![Filter::new("data->>status", Operator::Eq, "active")],
+            order: vec![],
+            limit: None,
+            offset: None,
+        };
+        let (sql, params) = q.to_sql_with_params().unwrap();
+        assert_eq!(
+            sql,
+            "SELECT * FROM docs WHERE json_get_str(data, 'status') = $1;"
+        );
+        assert_eq!(params, vec![Param::Str("active".into())]);
+        assert!(q.has_json_path());
+    }
+
+    #[test]
+    fn json_path_in_projection_and_order_render() {
+        let q = RestQuery {
+            table: "docs".into(),
+            select: vec!["id".into(), "data->>name".into()],
+            filters: vec![],
+            order: vec![OrderKey {
+                column: "data->>n".into(),
+                direction: Direction::Desc,
+            }],
+            limit: None,
+            offset: None,
+        };
+        let (sql, _) = q.to_sql_with_params().unwrap();
+        assert_eq!(
+            sql,
+            "SELECT id, json_get_str(data, 'name') FROM docs \
+             ORDER BY json_get_str(data, 'n') DESC;"
+        );
+        assert!(q.has_json_path());
+    }
+
+    #[test]
+    fn single_arrow_renders_json_accessor() {
+        let q = RestQuery {
+            table: "docs".into(),
+            select: vec!["data->meta".into()],
+            filters: vec![],
+            order: vec![],
+            limit: None,
+            offset: None,
+        };
+        let (sql, _) = q.to_sql_with_params().unwrap();
+        assert_eq!(sql, "SELECT json_get(data, 'meta') FROM docs;");
+    }
+
+    #[test]
+    fn json_path_with_unsafe_key_is_rejected() {
+        // The key is validated as an identifier, so it can't break out of quotes.
+        let q = RestQuery {
+            table: "docs".into(),
+            select: vec![],
+            filters: vec![Filter::new("data->>x'; DROP TABLE docs;--", Operator::Eq, "x")],
+            order: vec![],
+            limit: None,
+            offset: None,
+        };
+        assert!(q.to_sql_with_params().is_err());
+    }
+
+    #[test]
+    fn plain_query_has_no_json_path() {
+        let q = RestQuery {
+            table: "t".into(),
+            select: vec!["id".into()],
+            filters: vec![Filter::new("id", Operator::Eq, "1")],
+            order: vec![],
+            limit: None,
+            offset: None,
+        };
+        assert!(!q.has_json_path());
     }
 }

@@ -202,7 +202,7 @@ impl Filter {
     /// (no leading `WHERE`) and appends each value to `params` as a `$N` bind.
     /// Identifiers are still allow-listed (they cannot be parameters).
     pub fn to_sql_with_params(&self, params: &mut Vec<Param>) -> Result<String, RestError> {
-        let col = validate_ident(&self.column)?;
+        let col = render_column_ref(&self.column)?;
         let inner = match self.op {
             Operator::Is => {
                 let predicate = match self.value.to_ascii_lowercase().as_str() {
@@ -317,6 +317,47 @@ pub fn validate_ident(name: &str) -> Result<&str, RestError> {
         Ok(name)
     } else {
         Err(RestError::InvalidIdentifier(name.to_string()))
+    }
+}
+
+/// True if `col` carries a PostgREST JSON path (`col->>key` / `col->key`).
+pub fn is_json_path(col: &str) -> bool {
+    col.contains("->")
+}
+
+/// Render a column reference that may carry a single-level PostgREST JSON path:
+/// `col->>key` → `json_get_str(col, 'key')` (text) and `col->key` →
+/// `json_get(col, 'key')` (JSON), matching the accessor UDFs the analytical
+/// engine registers. The base **and** key are each `validate_ident`'d, so the
+/// key becomes a single-quoted literal whose content is a bare identifier and
+/// cannot break out of the quotes — the same injection guard as a plain column.
+/// A column with no `->` renders as the plain validated identifier.
+///
+/// JSON paths are only ever served by the analytical engine (GlueSQL has no JSON
+/// functions); the server routes a query carrying one there (see
+/// [`RestQuery::has_json_path`]).
+pub(crate) fn render_column_ref(col: &str) -> Result<String, RestError> {
+    if let Some((base, key)) = col.split_once("->>") {
+        let base = validate_ident(base)?;
+        let key = validate_ident(key)?;
+        return Ok(format!("json_get_str({base}, '{key}')"));
+    }
+    if let Some((base, key)) = col.split_once("->") {
+        let base = validate_ident(base)?;
+        let key = validate_ident(key)?;
+        return Ok(format!("json_get({base}, '{key}')"));
+    }
+    validate_ident(col).map(str::to_string)
+}
+
+impl RestQuery {
+    /// True if any filter, order key, or projected column carries a JSON path.
+    /// Such a query can only be served by the analytical engine, so the server
+    /// routes it to DataFusion rather than the GlueSQL fast path.
+    pub fn has_json_path(&self) -> bool {
+        self.filters.iter().any(|f| is_json_path(&f.column))
+            || self.order.iter().any(|k| is_json_path(&k.column))
+            || self.select.iter().any(|c| is_json_path(c))
     }
 }
 
