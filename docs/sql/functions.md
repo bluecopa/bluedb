@@ -49,6 +49,30 @@ SELECT region,
 FROM events GROUP BY region;
 ```
 
+#### Mergeable distinct-count sketches
+
+`approx_count_distinct` is one-shot. To **store** a distinct-count sketch and
+union it later — incremental rollups, or combining per-shard/per-day counts —
+use the HyperLogLog sketch functions. A sketch is a `BYTEA` value you can persist:
+
+| Function | Description |
+|----------|-------------|
+| `hll_build(expr)` | Aggregate: build a sketch (`BYTEA`) from a column |
+| `hll_merge(sketch)` | Aggregate: union sketches into one |
+| `hll_count(sketch)` | Scalar: estimated distinct count from a sketch |
+
+```sql
+-- per-day sketches, persisted once
+SELECT day, hll_build(user_id) AS sketch FROM events GROUP BY day;
+
+-- later: distinct users across an arbitrary day range, no re-scan of events
+SELECT hll_count(hll_merge(sketch)) FROM daily_sketches WHERE day >= '2026-01-01';
+```
+
+!!! note
+    Sketches use bluedb's own format (`p = 14`, ~0.8% standard error) and are
+    portable across bluedb instances, not across other HyperLogLog libraries.
+
 ## Math
 
 | | | | |
