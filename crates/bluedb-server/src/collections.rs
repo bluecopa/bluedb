@@ -1043,8 +1043,70 @@ pub(crate) async fn aggregate(
         .map_err(|e| AppError::bad_request(format!("aggregate: {e}")))?;
 
     let json_cols = vec!["doc".to_string()];
-    let rows = crate::reinflate_rows(crate::record_batches_to_json(&batches), &json_cols);
+    let mut rows = crate::reinflate_rows(crate::record_batches_to_json(&batches), &json_cols);
+
+    // `$lookup` produces its `as` column as a `List<Utf8>` of foreign-document
+    // JSON texts (the serializer renders it as a JSON array of strings). Re-inflate
+    // each `as` field's elements into JSON objects so the client gets
+    // `customer: [{"_id":"c1","name":"Ada"}]`, not `["{\"_id\":...}"]`. A no-match
+    // left row arrives as a NULL `as` cell → normalized to an empty array `[]`.
+    let lookup_as_fields = lookup_as_field_names(&stages);
+    if !lookup_as_fields.is_empty() {
+        reinflate_lookup_arrays(&mut rows, &lookup_as_fields);
+    }
+
     Ok(Json(json!({ "documents": rows })))
+}
+
+/// Collect the `as` output-field names of every `$lookup` stage in a pipeline.
+fn lookup_as_field_names(stages: &[Value]) -> Vec<String> {
+    stages
+        .iter()
+        .filter_map(|stage| {
+            let lookup = stage.as_object()?.get("$lookup")?.as_object()?;
+            lookup.get("as").and_then(Value::as_str).map(str::to_owned)
+        })
+        .collect()
+}
+
+/// Re-inflate each `$lookup` `as` field in `rows` from an array of JSON-text
+/// strings (the `List<Utf8>` serialization) into an array of JSON objects.
+///
+/// - Each string element is parsed into a JSON value; an element that fails to
+///   parse is left as-is.
+/// - JSON `null` elements are dropped (defensive — the `array_agg` FILTER already
+///   excludes them).
+/// - A `null` `as` cell (no-match left row, a SQL NULL list) becomes `[]`.
+fn reinflate_lookup_arrays(rows: &mut Value, fields: &[String]) {
+    let Some(arr) = rows.as_array_mut() else { return };
+    for row in arr {
+        let Some(map) = row.as_object_mut() else { continue };
+        for field in fields {
+            match map.get(field) {
+                // The serialized list: parse each string element, drop nulls.
+                Some(Value::Array(elems)) => {
+                    let inflated: Vec<Value> = elems
+                        .iter()
+                        .filter_map(|e| match e {
+                            Value::Null => None,
+                            Value::String(s) => match serde_json::from_str::<Value>(s) {
+                                Ok(Value::Null) => None,
+                                Ok(v) => Some(v),
+                                Err(_) => Some(e.clone()),
+                            },
+                            other => Some(other.clone()),
+                        })
+                        .collect();
+                    map.insert(field.clone(), Value::Array(inflated));
+                }
+                // No-match left row: NULL list cell → empty array.
+                Some(Value::Null) => {
+                    map.insert(field.clone(), Value::Array(Vec::new()));
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 /// `POST /collections/{coll}/count` — count documents matching a filter.

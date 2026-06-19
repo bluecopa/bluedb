@@ -999,7 +999,36 @@ fn parse_min_watermark(headers: &axum::http::HeaderMap) -> Option<i64> {
 /// - Time64(Microsecond) → `"HH:MM:SS[.ffffff]"`
 /// - Everything else → JSON string via `format!("{:?}", ...)`
 fn record_batches_to_json(batches: &[RecordBatch]) -> Value {
-    use arrow_array::Array;
+    let mut rows: Vec<Value> = Vec::new();
+    for batch in batches {
+        let schema = batch.schema();
+        let n = batch.num_rows();
+        for row_idx in 0..n {
+            let mut obj = Map::new();
+            for (col_idx, field) in schema.fields().iter().enumerate() {
+                let col = batch.column(col_idx);
+                let val = arrow_value_to_json(col.as_ref(), field.data_type(), row_idx);
+                obj.insert(field.name().clone(), val);
+            }
+            rows.push(Value::Object(obj));
+        }
+    }
+    Value::Array(rows)
+}
+
+/// Render `array[row_idx]` (an element of `data_type`) as a JSON value.
+///
+/// This is the single per-value conversion used by [`record_batches_to_json`]
+/// for both top-level columns and the elements of a `List`/`LargeList` column —
+/// so a list is serialized as a JSON array whose elements use exactly the same
+/// rendering as a scalar column of the element type (e.g. `List<Utf8>` →
+/// `["a","b"]`, the `$lookup` `as`-array of foreign-document JSON texts). A null
+/// cell is `Value::Null`; an unhandled type still falls back to a debug string.
+fn arrow_value_to_json(
+    array: &dyn arrow_array::Array,
+    data_type: &arrow_schema::DataType,
+    row_idx: usize,
+) -> Value {
     use arrow_array::cast::AsArray;
     use arrow_array::types::{
         Int8Type, Int16Type, Int32Type, Int64Type,
@@ -1009,84 +1038,92 @@ fn record_batches_to_json(batches: &[RecordBatch]) -> Value {
     };
     use arrow_schema::{DataType, TimeUnit};
 
-    let mut rows: Vec<Value> = Vec::new();
-    for batch in batches {
-        let schema = batch.schema();
-        let n = batch.num_rows();
-        for row_idx in 0..n {
-            let mut obj = Map::new();
-            for (col_idx, field) in schema.fields().iter().enumerate() {
-                let col = batch.column(col_idx);
-                let val: Value = if col.is_null(row_idx) {
-                    Value::Null
-                } else {
-                    match field.data_type() {
-                        DataType::Boolean => {
-                            if let Some(a) = col.as_any().downcast_ref::<arrow_array::BooleanArray>() {
-                                Value::Bool(a.value(row_idx))
-                            } else { Value::Null }
-                        }
-                        DataType::Int8 => json!(col.as_primitive::<Int8Type>().value(row_idx)),
-                        DataType::Int16 => json!(col.as_primitive::<Int16Type>().value(row_idx)),
-                        DataType::Int32 => json!(col.as_primitive::<Int32Type>().value(row_idx)),
-                        DataType::Int64 => json!(col.as_primitive::<Int64Type>().value(row_idx)),
-                        DataType::UInt8 => json!(col.as_primitive::<UInt8Type>().value(row_idx)),
-                        DataType::UInt16 => json!(col.as_primitive::<UInt16Type>().value(row_idx)),
-                        DataType::UInt32 => json!(col.as_primitive::<UInt32Type>().value(row_idx)),
-                        DataType::UInt64 => json!(col.as_primitive::<UInt64Type>().value(row_idx)),
-                        DataType::Float32 => {
-                            let v = col.as_primitive::<Float32Type>().value(row_idx);
-                            serde_json::Number::from_f64(v as f64).map(Value::Number).unwrap_or(Value::Null)
-                        }
-                        DataType::Float64 => {
-                            let v = col.as_primitive::<Float64Type>().value(row_idx);
-                            serde_json::Number::from_f64(v).map(Value::Number).unwrap_or(Value::Null)
-                        }
-                        DataType::Utf8 => {
-                            if let Some(a) = col.as_any().downcast_ref::<arrow_array::StringArray>() {
-                                Value::String(a.value(row_idx).to_string())
-                            } else { Value::Null }
-                        }
-                        DataType::LargeUtf8 => {
-                            if let Some(a) = col.as_any().downcast_ref::<arrow_array::LargeStringArray>() {
-                                Value::String(a.value(row_idx).to_string())
-                            } else { Value::Null }
-                        }
-                        DataType::Decimal128(_precision, scale) => {
-                            let scale = *scale as u32;
-                            let raw = col.as_primitive::<Decimal128Type>().value(row_idx);
-                            Value::String(decimal128_to_string(raw, scale))
-                        }
-                        DataType::Date32 => {
-                            let days = col.as_primitive::<Date32Type>().value(row_idx);
-                            match chrono::NaiveDate::from_epoch_days(days) {
-                                Some(d) => Value::String(d.format("%Y-%m-%d").to_string()),
-                                None => Value::Null,
-                            }
-                        }
-                        DataType::Timestamp(TimeUnit::Microsecond, _) => {
-                            let micros = col.as_primitive::<TimestampMicrosecondType>().value(row_idx);
-                            match chrono::DateTime::from_timestamp_micros(micros) {
-                                Some(dt) => Value::String(format_naive_datetime(&dt.naive_utc())),
-                                None => Value::Null,
-                            }
-                        }
-                        DataType::Time64(TimeUnit::Microsecond) => {
-                            let micros = col.as_primitive::<Time64MicrosecondType>().value(row_idx);
-                            Value::String(format_naive_time_micros(micros))
-                        }
-                        _dt => {
-                            // Fallback: display the array element as debug string.
-                            Value::String(format!("{:?}", col.slice(row_idx, 1)))
-                        }
-                    }
-                };
-                obj.insert(field.name().clone(), val);
+    if array.is_null(row_idx) {
+        return Value::Null;
+    }
+    match data_type {
+        DataType::Boolean => {
+            if let Some(a) = array.as_any().downcast_ref::<arrow_array::BooleanArray>() {
+                Value::Bool(a.value(row_idx))
+            } else { Value::Null }
+        }
+        DataType::Int8 => json!(array.as_primitive::<Int8Type>().value(row_idx)),
+        DataType::Int16 => json!(array.as_primitive::<Int16Type>().value(row_idx)),
+        DataType::Int32 => json!(array.as_primitive::<Int32Type>().value(row_idx)),
+        DataType::Int64 => json!(array.as_primitive::<Int64Type>().value(row_idx)),
+        DataType::UInt8 => json!(array.as_primitive::<UInt8Type>().value(row_idx)),
+        DataType::UInt16 => json!(array.as_primitive::<UInt16Type>().value(row_idx)),
+        DataType::UInt32 => json!(array.as_primitive::<UInt32Type>().value(row_idx)),
+        DataType::UInt64 => json!(array.as_primitive::<UInt64Type>().value(row_idx)),
+        DataType::Float32 => {
+            let v = array.as_primitive::<Float32Type>().value(row_idx);
+            serde_json::Number::from_f64(v as f64).map(Value::Number).unwrap_or(Value::Null)
+        }
+        DataType::Float64 => {
+            let v = array.as_primitive::<Float64Type>().value(row_idx);
+            serde_json::Number::from_f64(v).map(Value::Number).unwrap_or(Value::Null)
+        }
+        DataType::Utf8 => {
+            if let Some(a) = array.as_any().downcast_ref::<arrow_array::StringArray>() {
+                Value::String(a.value(row_idx).to_string())
+            } else { Value::Null }
+        }
+        DataType::LargeUtf8 => {
+            if let Some(a) = array.as_any().downcast_ref::<arrow_array::LargeStringArray>() {
+                Value::String(a.value(row_idx).to_string())
+            } else { Value::Null }
+        }
+        DataType::Decimal128(_precision, scale) => {
+            let scale = *scale as u32;
+            let raw = array.as_primitive::<Decimal128Type>().value(row_idx);
+            Value::String(decimal128_to_string(raw, scale))
+        }
+        DataType::Date32 => {
+            let days = array.as_primitive::<Date32Type>().value(row_idx);
+            match chrono::NaiveDate::from_epoch_days(days) {
+                Some(d) => Value::String(d.format("%Y-%m-%d").to_string()),
+                None => Value::Null,
             }
-            rows.push(Value::Object(obj));
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            let micros = array.as_primitive::<TimestampMicrosecondType>().value(row_idx);
+            match chrono::DateTime::from_timestamp_micros(micros) {
+                Some(dt) => Value::String(format_naive_datetime(&dt.naive_utc())),
+                None => Value::Null,
+            }
+        }
+        DataType::Time64(TimeUnit::Microsecond) => {
+            let micros = array.as_primitive::<Time64MicrosecondType>().value(row_idx);
+            Value::String(format_naive_time_micros(micros))
+        }
+        // A list cell renders as a JSON array; each element uses the same
+        // per-value rendering, recursing on the element type. This is what lets
+        // the `$lookup` `as` column (`List<Utf8>` of foreign-document JSON texts)
+        // reach the client as a real JSON array rather than a debug string.
+        DataType::List(elem_field) => {
+            let list = array.as_list::<i32>();
+            let values = list.value(row_idx);
+            list_values_to_json(values.as_ref(), elem_field.data_type())
+        }
+        DataType::LargeList(elem_field) => {
+            let list = array.as_list::<i64>();
+            let values = list.value(row_idx);
+            list_values_to_json(values.as_ref(), elem_field.data_type())
+        }
+        _dt => {
+            // Fallback: display the array element as debug string.
+            Value::String(format!("{:?}", array.slice(row_idx, 1)))
         }
     }
-    Value::Array(rows)
+}
+
+/// Render every element of a list cell's child array as a JSON array, using the
+/// shared per-value conversion for the element `data_type`.
+fn list_values_to_json(values: &dyn arrow_array::Array, data_type: &arrow_schema::DataType) -> Value {
+    let elems = (0..values.len())
+        .map(|i| arrow_value_to_json(values, data_type, i))
+        .collect();
+    Value::Array(elems)
 }
 
 /// Format a `Decimal128` raw mantissa + scale as a normalized decimal string.

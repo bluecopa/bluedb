@@ -271,32 +271,41 @@ fn project_value(out: &str, spec: &Value, ctx: &Ctx<'_>) -> Result<Expr, MqlErro
     }
 }
 
-/// `$lookup: {from, localField, foreignField, as}` — left-outer join that brings
-/// the matched foreign document through under the `as` name.
+/// `$lookup: {from, localField, foreignField, as}` — left-outer join that nests
+/// the matched foreign documents into an **array** field `as`, matching MongoDB.
 ///
 /// The join keys are *materialized* first so the join works on document fields,
 /// not just real columns:
 /// - left key: `col("_id")` if `localField == "_id"`, else `json_get_str(doc, localField)`;
 /// - right key: the same over `from`'s `doc`.
 ///
-/// ## What the output looks like (flat, not nested)
-/// MongoDB nests the matched foreign docs into an **array** field `as`. Producing
-/// that array in DataFusion 52 would mean `array_agg(right.doc)` grouped back to
-/// the left row — but the resulting `List<Utf8>` column cannot be serialized to a
-/// JSON array by the server's response encoder (it renders list columns via a
-/// debug fallback, and only the `doc` column is re-inflated from JSON text). The
-/// nested shape would therefore reach the client as a garbage debug string.
+/// ## How the nested `as` array is produced
+/// After a `Left` join (one row per left×match, plus one NULL-foreign row for an
+/// unmatched left document), the result is **grouped back to one row per left
+/// document** — group key = the left identity columns (`_id` is unique, so this is
+/// safe; `doc` and any prior-stage columns ride along in the key) — and the matched
+/// foreign `doc` texts are collected with `array_agg(<foreign doc>)`, aliased to
+/// the `as` name. The result is a `List<Utf8>` column of foreign-document JSON
+/// texts, which the server response encoder now serializes as a real JSON array
+/// (`record_batches_to_json`'s `List` arm).
 ///
-/// So this is a **flat left join**: the matched foreign `doc` is projected through
-/// as a single JSON-text column named `as` (one output row per match; left rows
-/// with no match get a NULL `as`). The left collection's own `_id` / `doc` are
-/// preserved unchanged. Callers that want the strict MongoDB array shape should
-/// wrap the `as` value themselves; this is documented as a known limitation.
+/// ## No-match shape
+/// `array_agg` carries a `FILTER (<foreign doc> IS NOT NULL)`, so an unmatched
+/// left document aggregates over **zero** values and `array_agg` returns a SQL
+/// NULL list (not `[null]`). That NULL `as` cell is normalized to an empty array
+/// `[]` by the `aggregate` handler when it re-inflates the `as` elements — so the
+/// client sees `[]` for no-match and `[{…}]` / `[{…},{…}]` for matches.
+///
+/// The `as` array elements are still JSON **text** at this layer; the `aggregate`
+/// handler parses each element into a JSON object on the way out.
 async fn stage_lookup(
     ctx: &mut Ctx<'_>,
     df: DataFrame,
     body: &Value,
 ) -> Result<DataFrame, MqlError> {
+    use datafusion::functions_aggregate::expr_fn::array_agg;
+    use datafusion::logical_expr::ExprFunctionExt;
+
     let obj = body
         .as_object()
         .ok_or_else(|| MqlError::Malformed("$lookup takes an object".into()))?;
@@ -317,16 +326,27 @@ async fn stage_lookup(
         .and_then(Value::as_str)
         .ok_or_else(|| MqlError::Malformed("$lookup requires `as`".into()))?;
 
-    // Temp join-key columns — names that can't collide with `_id`/`doc`/`as`.
+    // Temp columns — names that can't collide with `_id`/`doc`/`as`.
     let left_key = "__lookup_lkey";
     let right_key = "__lookup_rkey";
+    let right_doc = "__lookup_rdoc";
 
-    // Left side: keep `_id` + `doc`, add the materialized local key.
+    // The left identity columns to group by after the join: every current left
+    // column (`_id`, `doc`, and anything a prior stage added). `_id` is unique, so
+    // grouping by these collapses the per-match rows back to one row per left doc.
+    let left_cols: Vec<String> = df
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+
+    // Left side: keep the left columns, add the materialized local key.
     let left = df
         .with_column(left_key, key_expr(local, &ctx.get_str))
         .map_err(df_err)?;
 
-    // Right side: project to JUST the foreign `doc` (aliased to `as`) + its key,
+    // Right side: project to JUST the foreign `doc` (under a temp name) + its key,
     // so the post-join schema has no `_id`/`doc` collision with the left side.
     let right = ctx
         .session
@@ -334,29 +354,31 @@ async fn stage_lookup(
         .await
         .map_err(|e| MqlError::Malformed(format!("$lookup from '{from}': {e}")))?
         .select(vec![
-            col("doc").alias(as_name),
+            col("doc").alias(right_doc),
             key_expr(foreign, &ctx.get_str).alias(right_key),
         ])
         .map_err(df_err)?;
 
-    // Left-outer join on the materialized keys; drop the temp key columns so the
-    // output is the left fields plus the `as` (foreign doc) column.
+    // Left-outer join on the materialized keys.
     let joined = left
         .join(right, JoinType::Left, &[left_key], &[right_key], None)
         .map_err(df_err)?;
 
-    // Project away the two temp key columns, keeping `_id`, `doc`, and `as`.
-    let keep: Vec<Expr> = joined
-        .schema()
-        .fields()
-        .iter()
-        .filter(|f| f.name() != left_key && f.name() != right_key)
-        .map(|f| col(f.name()))
-        .collect();
-    let out = joined.select(keep).map_err(df_err)?;
+    // Group back to one row per left document; collect the matched foreign docs
+    // into the `as` array. The FILTER drops the NULL foreign doc of an unmatched
+    // left row, so no-match yields a NULL list (→ `[]` after re-inflation) rather
+    // than `[null]`.
+    let group_expr: Vec<Expr> = left_cols.iter().map(col).collect();
+    let agg_expr = array_agg(col(right_doc))
+        .filter(col(right_doc).is_not_null())
+        .build()
+        .map_err(df_err)?
+        .alias(as_name);
+    let out = joined.aggregate(group_expr, vec![agg_expr]).map_err(df_err)?;
 
-    // The `as` column is foreign JSON text, not a materialized scalar field, so it
-    // is NOT added to `materialized`. (It re-inflates as JSON in the response.)
+    // The `as` column is a `List<Utf8>` of foreign JSON texts, re-inflated to an
+    // array of objects by the `aggregate` handler — not a materialized scalar
+    // field, so it is NOT added to `materialized`.
     Ok(out)
 }
 

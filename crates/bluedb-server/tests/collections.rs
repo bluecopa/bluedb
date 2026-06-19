@@ -840,15 +840,11 @@ async fn aggregate_unwind_array_field_then_group() {
 }
 
 /// `$lookup` joining `orders` to `customers` on `cust == _id`. The matched foreign
-/// document is brought through under the `as` name (`customer`).
-///
-/// NOTE on shape: this implementation produces a **flat** left join — `customer`
-/// is the matched foreign `doc` as a JSON string (one output row per match), not
-/// MongoDB's nested single-element array. (See `stage_lookup` docs: a nested
-/// `List` column cannot be serialized to a JSON array by the response encoder.)
-/// The test therefore parses the `customer` JSON string and asserts `name=="Ada"`.
+/// document is nested into the `as` array (`customer`), matching MongoDB: exactly
+/// one output row per left document, and `customer` is a JSON **array** of the
+/// matched foreign documents as objects (here a single-element array `[{…}]`).
 #[tokio::test]
-async fn aggregate_lookup_brings_matched_foreign_doc() {
+async fn lookup_nests_matched_docs_as_array() {
     let (app, state) = app_with_state().await;
 
     // orders: one order referencing customer c1.
@@ -893,30 +889,82 @@ async fn aggregate_lookup_brings_matched_foreign_doc() {
 
     assert_eq!(status, StatusCode::OK, "aggregate failed: {body}");
     let docs = body["documents"].as_array().expect("documents array");
-    assert_eq!(docs.len(), 1, "expected the one o1 row, got: {body}");
+    assert_eq!(docs.len(), 1, "expected exactly the one o1 row, got: {body}");
 
     // The o1 row carries its own _id plus the matched customer under `customer`.
     assert_eq!(docs[0]["_id"].as_str().unwrap(), "o1", "left _id: {body}");
 
-    // `customer` is the matched foreign doc. It arrives as a JSON-text string
-    // (flat shape — not reinflated by the aggregate handler, which only reinflates
-    // `doc`). Parse it and assert the matched customer's name is reachable.
-    let customer_val = &docs[0]["customer"];
-    let name = match customer_val {
-        Value::String(s) => serde_json::from_str::<Value>(s)
-            .ok()
-            .and_then(|v| v.get("name").and_then(Value::as_str).map(str::to_owned)),
-        // Be tolerant if the encoder ever reinflates it to an object.
-        Value::Object(_) => customer_val
-            .get("name")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        _ => None,
-    };
+    // `customer` is a JSON ARRAY of matched foreign documents (objects).
+    let customer = docs[0]["customer"]
+        .as_array()
+        .unwrap_or_else(|| panic!("`customer` must be a JSON array, got: {body}"));
+    assert_eq!(customer.len(), 1, "one matched customer: {body}");
+    assert!(customer[0].is_object(), "array element must be an object: {body}");
     assert_eq!(
-        name.as_deref(),
+        customer[0]["name"].as_str(),
         Some("Ada"),
-        "matched customer name must be reachable as 'Ada', got customer={customer_val}"
+        "matched customer name: {body}"
+    );
+}
+
+/// `$lookup` where the left document references a non-existent foreign key: the
+/// `as` array must be an **empty array** `[]`, not `[null]` and not a NULL/string.
+#[tokio::test]
+async fn lookup_no_match_is_empty_array() {
+    let (app, state) = app_with_state().await;
+
+    // orders: one order referencing a customer that does not exist.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/orders/insert",
+        Some(json!({ "documents": [{ "_id": "o1", "cust": "missing" }] })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "insert order: {body}");
+
+    // customers: a single unrelated customer (so the table exists and seals).
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/customers/insert",
+        Some(json!({ "documents": [{ "_id": "c1", "name": "Ada" }] })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "insert customer: {body}");
+
+    // Seal both collections so the DataFusion join sees both tables.
+    state.seal_now().await.expect("seal");
+
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/collections/orders/aggregate",
+        Some(json!({
+            "pipeline": [
+                { "$lookup": {
+                    "from": "customers",
+                    "localField": "cust",
+                    "foreignField": "_id",
+                    "as": "customer"
+                }}
+            ]
+        })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "aggregate failed: {body}");
+    let docs = body["documents"].as_array().expect("documents array");
+    assert_eq!(docs.len(), 1, "expected the one o1 row, got: {body}");
+    assert_eq!(docs[0]["_id"].as_str().unwrap(), "o1", "left _id: {body}");
+
+    // No-match → empty array `[]`.
+    let customer = docs[0]["customer"]
+        .as_array()
+        .unwrap_or_else(|| panic!("`customer` must be a JSON array, got: {body}"));
+    assert!(
+        customer.is_empty(),
+        "no-match `customer` must be an empty array, got: {body}"
     );
 }
 
