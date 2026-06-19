@@ -40,7 +40,7 @@ fn obj<'a>(q: &'a Value, key: &str) -> Result<&'a serde_json::Map<String, Value>
 }
 
 /// Pull the `{field: <leaf>}` shape used by match/term/match_phrase.
-fn single_field<'a>(m: &'a serde_json::Map<String, Value>) -> Result<(&'a String, &'a Value)> {
+fn single_field(m: &serde_json::Map<String, Value>) -> Result<(&String, &Value)> {
     let mut it = m.iter();
     let first = it
         .next()
