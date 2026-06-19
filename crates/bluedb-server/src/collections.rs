@@ -13,6 +13,7 @@
 //! - `POST /collections/{coll}/delete`              — delete by filter
 
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -432,6 +433,10 @@ pub(crate) struct CreateIndexOptions {
     /// or `"string"`. When absent, the type is inferred from existing documents.
     #[serde(rename = "type")]
     pub index_type_hint: Option<String>,
+    /// When present, turns this into a TTL index: documents expire N seconds
+    /// after the epoch timestamp stored in the indexed field.
+    #[serde(rename = "expireAfterSeconds")]
+    pub expire_after_seconds: Option<i64>,
 }
 
 /// Body for `POST /collections/{coll}/update`.
@@ -836,6 +841,19 @@ pub(crate) async fn create_index(
         run_ddl(&state, &tenant, &create_idx_sql).await?;
     }
 
+    // Step 4 (TTL only): register the expiry config in __bluedb_ttl.
+    if let Some(secs) = req.options.expire_after_seconds {
+        if secs < 0 {
+            return Err(AppError::bad_request(
+                "expireAfterSeconds must be >= 0",
+            )
+            .with_code("PARSE_ERROR")
+            .into());
+        }
+        ensure_ttl_registry(&state, &tenant).await?;
+        upsert_ttl_config(&state, &tenant, &coll, &path, secs).await?;
+    }
+
     Ok(Json(json!({ "name": index_name })))
 }
 
@@ -1173,6 +1191,170 @@ pub(crate) async fn count(
         .unwrap_or(0);
 
     Ok(Json(json!({ "count": n })))
+}
+
+// ---------------------------------------------------------------------------
+// TTL index support
+// ---------------------------------------------------------------------------
+
+/// The per-tenant metadata table that tracks TTL configurations.
+const TTL_TABLE: &str = "__bluedb_ttl";
+
+/// Ensure the `__bluedb_ttl(collection TEXT PRIMARY KEY, field TEXT, seconds
+/// INTEGER)` metadata table exists for `tenant`.
+async fn ensure_ttl_registry(state: &AppState, tenant: &str) -> Result<(), AppError> {
+    let sql = format!(
+        "CREATE TABLE IF NOT EXISTS {TTL_TABLE} \
+         (collection TEXT PRIMARY KEY, field TEXT, seconds INTEGER);"
+    );
+    run_ddl(state, tenant, &sql).await
+}
+
+/// Upsert a TTL config `(collection, field, seconds)` into the registry.
+async fn upsert_ttl_config(
+    state: &AppState,
+    tenant: &str,
+    coll: &str,
+    field: &str,
+    seconds: i64,
+) -> Result<(), AppError> {
+    // GlueSQL has no ON CONFLICT; delete-then-insert is idempotent for a PRIMARY KEY table.
+    let del_sql = format!("DELETE FROM {TTL_TABLE} WHERE collection = $1;");
+    run_write(state, tenant, &del_sql, &[bluedb_rest::Param::Str(coll.to_string())]).await?;
+    let ins_sql = format!(
+        "INSERT INTO {TTL_TABLE} (collection, field, seconds) VALUES ($1, $2, $3);"
+    );
+    run_write(state, tenant, &ins_sql, &[
+        bluedb_rest::Param::Str(coll.to_string()),
+        bluedb_rest::Param::Str(field.to_string()),
+        bluedb_rest::Param::Int(seconds),
+    ])
+    .await
+}
+
+/// Delete documents in `coll` whose TTL `field` value + `seconds` <= `now_epoch`.
+///
+/// - A numeric field value is treated as an epoch in **seconds**.
+/// - A string field value is parsed as RFC 3339 / ISO-8601; parsing failure → skip.
+/// - A missing or null field → skip (document never expires).
+///
+/// `now_epoch` is injected so callers (tests) can control time deterministically.
+/// Returns the number of documents deleted.
+pub(crate) async fn sweep_ttl(
+    state: &AppState,
+    tenant: &str,
+    coll: &str,
+    field: &str,
+    seconds: i64,
+    now_epoch: i64,
+) -> Result<usize, AppError> {
+    // Read all docs — the TTL sweep is infrequent (60s cadence) and the scan is
+    // necessary because an expired doc by definition has no dedicated index.
+    let sql = format!("SELECT _id, doc FROM {coll} WHERE TRUE;");
+    let rows = match run_read_routed(state, tenant, &sql, &[]).await {
+        Ok(r) => r,
+        // Collection not yet sealed / not in Iceberg → fall through to the
+        // GlueSQL path. If the table truly doesn't exist, we get 0 rows.
+        Err(ref e)
+            if e.message().contains("planning SQL")
+                || e.message().contains("table not found") =>
+        {
+            vec![]
+        }
+        Err(e) => return Err(e),
+    };
+
+    let mut deleted = 0usize;
+    for row in &rows {
+        let id = match row.get("_id") {
+            Some(Value::String(s)) => s.clone(),
+            _ => continue,
+        };
+        let doc: Value = match row.get("doc") {
+            Some(Value::String(s)) => serde_json::from_str(s).unwrap_or(Value::Null),
+            Some(v) => v.clone(),
+            None => continue,
+        };
+
+        // Navigate to the TTL field (simple single-level name for now).
+        let field_val = doc.get(field);
+        let field_epoch: i64 = match field_val {
+            None | Some(Value::Null) => continue,
+            Some(Value::Number(n)) => {
+                if let Some(i) = n.as_i64() {
+                    i
+                } else if let Some(f) = n.as_f64() {
+                    f as i64
+                } else {
+                    continue;
+                }
+            }
+            Some(Value::String(s)) => {
+                // Try RFC 3339 / ISO-8601 via chrono.
+                if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+                    dt.timestamp()
+                } else {
+                    // Try date-only "YYYY-MM-DD".
+                    if let Ok(nd) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+                        use chrono::TimeZone;
+                        chrono::Utc.from_utc_datetime(&nd.and_hms_opt(0, 0, 0).unwrap_or_default()).timestamp()
+                    } else {
+                        continue; // unparseable → skip
+                    }
+                }
+            }
+            _ => continue, // arrays, objects → skip
+        };
+
+        if field_epoch + seconds <= now_epoch {
+            let del_sql = format!("DELETE FROM {coll} WHERE _id = $1;");
+            run_write(state, tenant, &del_sql, &[bluedb_rest::Param::Str(id)]).await?;
+            deleted += 1;
+        }
+    }
+
+    Ok(deleted)
+}
+
+/// Read every TTL config from `__bluedb_ttl` for `tenant` and sweep each
+/// collection using the current wall-clock time.  Called by the background task.
+pub(crate) async fn sweep_all_ttl(state: &AppState, tenant: &str) -> Result<(), AppError> {
+    // If the TTL registry table doesn't exist yet, nothing to sweep.
+    let sql = format!("SELECT collection, field, seconds FROM {TTL_TABLE} WHERE TRUE;");
+    let rows = match run_read_routed(state, tenant, &sql, &[]).await {
+        Ok(r) => r,
+        Err(ref e)
+            if e.message().contains("planning SQL")
+                || e.message().contains("table not found") =>
+        {
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
+
+    let now_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    for row in &rows {
+        let coll = match row.get("collection").and_then(Value::as_str) {
+            Some(s) => s.to_owned(),
+            None => continue,
+        };
+        let field = match row.get("field").and_then(Value::as_str) {
+            Some(s) => s.to_owned(),
+            None => continue,
+        };
+        let seconds: i64 = match row.get("seconds") {
+            Some(Value::Number(n)) => n.as_i64().unwrap_or(0),
+            _ => continue,
+        };
+        if let Err(e) = sweep_ttl(state, tenant, &coll, &field, seconds, now_epoch).await {
+            eprintln!("bluedb-server: TTL sweep {tenant}/{coll}: {:?}", e);
+        }
+    }
+    Ok(())
 }
 
 /// Collect all leaf paths referenced by a `Filter` (for `Cmp` nodes only).

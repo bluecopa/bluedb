@@ -242,6 +242,10 @@ struct Inner {
     /// The background seal/compaction scheduler for the durable FTS engine, spawned
     /// on promote and aborted on demote / re-promote. `None` until the first promote.
     seal_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Background TTL-sweep task: periodically calls `sweep_all_ttl` across all
+    /// tenants on the active writer. Aborted on demote / re-promote. `None` until
+    /// the first promote. Interval = `BLUEDB_TTL_SWEEP_INTERVAL_SECS` (default 60).
+    ttl_sweep_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Shared CDC control for the lakehouse mirror — installed on every write
     /// connection so mutations on mirror-enabled tables land in the CDC log, and
     /// mutated by `PRAGMA lakehouse_mirror`. Lives for the node's lifetime so the
@@ -298,6 +302,7 @@ impl AppState {
                 authz: OnceLock::new(),
                 fts: RwLock::new(FtsEngine::new()),
                 seal_handle: Mutex::new(None),
+                ttl_sweep_handle: Mutex::new(None),
                 cdc: CdcConfig::default(),
                 lakehouse_base: String::new(),
                 lakehouse: RwLock::new(None),
@@ -531,6 +536,34 @@ impl AppState {
         *self.inner.seal_handle.lock().unwrap() = Some(handle);
         *self.inner.fts.write().await = fts;
 
+        // Start the TTL sweep background task. Sweeps DEFAULT_TENANT every
+        // `BLUEDB_TTL_SWEEP_INTERVAL_SECS` seconds (default 60). A demote
+        // aborts the task; re-promote replaces it.
+        {
+            let ttl_interval = {
+                let secs = std::env::var("BLUEDB_TTL_SWEEP_INTERVAL_SECS")
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .unwrap_or(60);
+                Duration::from_secs(secs)
+            };
+            if let Some(h) = self.inner.ttl_sweep_handle.lock().unwrap().take() {
+                h.abort();
+            }
+            let ttl_state = self.clone();
+            let ttl_handle = tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(ttl_interval);
+                ticker.tick().await; // skip the immediate first tick
+                loop {
+                    ticker.tick().await;
+                    if let Err(e) = collections::sweep_all_ttl(&ttl_state, DEFAULT_TENANT).await {
+                        eprintln!("bluedb-server: TTL sweep error: {:?}", e);
+                    }
+                }
+            });
+            *self.inner.ttl_sweep_handle.lock().unwrap() = Some(ttl_handle);
+        }
+
         // Reopen the lakehouse mirror over the SAME object store + writer database
         // (the Iceberg tables live alongside the SQL data, in the same bucket the
         // warehouse reads). Restores the durable opt-out registry, then spawns the
@@ -581,6 +614,10 @@ impl AppState {
         // `require_active`), so an empty in-memory engine is safe and drops the
         // durable handles.
         if let Some(h) = self.inner.seal_handle.lock().unwrap().take() {
+            h.abort();
+        }
+        // Stop the TTL sweep background task — a passive node must not mutate data.
+        if let Some(h) = self.inner.ttl_sweep_handle.lock().unwrap().take() {
             h.abort();
         }
         *self.inner.fts.write().await = FtsEngine::new();
@@ -796,6 +833,21 @@ impl AppState {
     /// HTAP analytical freshness gate to decide writer-local-serve vs. redirect.
     pub(crate) fn is_writer(&self) -> bool {
         self.inner.writer.is_active() && self.inner.writer_bound.load(Ordering::Acquire)
+    }
+
+    /// Sweep expired documents from `coll` for `tenant`, using an injected
+    /// `now_epoch` (seconds since Unix epoch). Returns the number of documents
+    /// deleted. Exposed as `pub` so integration tests can call it deterministically
+    /// without waiting for the background task interval.
+    pub async fn sweep_ttl_for_test(
+        &self,
+        tenant: &str,
+        coll: &str,
+        field: &str,
+        seconds: i64,
+        now_epoch: i64,
+    ) -> Result<usize, AppError> {
+        collections::sweep_ttl(self, tenant, coll, field, seconds, now_epoch).await
     }
 }
 

@@ -1530,6 +1530,123 @@ async fn find_sorts_by_nested_path() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// TTL index tests
+// ---------------------------------------------------------------------------
+
+/// Verify that `sweep_ttl` deletes expired documents and leaves live ones.
+///
+/// Setup: collection "sessions" with two docs —
+///   {_id:"old", created: 1000}  — expires at epoch 1100 (1000 + 100)
+///   {_id:"new", created: 1_000_000}  — expires at epoch 1_000_100
+///
+/// Sweep with now_epoch = 2000, expireAfterSeconds = 100.
+///   "old": 1000 + 100 = 1100 ≤ 2000 → deleted
+///   "new": 1_000_000 + 100 = 1_000_100 > 2000 → survives
+///
+/// After sweep, find {} must return exactly one document: "new".
+#[tokio::test]
+async fn ttl_sweep_deletes_expired_docs() {
+    let (app, state) = app_with_state().await;
+
+    // Insert the two documents.
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/collections/sessions/insert",
+        Some(json!({
+            "documents": [
+                { "_id": "old", "created": 1000 },
+                { "_id": "new", "created": 1_000_000_i64 }
+            ]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "insert failed: {body}");
+    assert_eq!(body["insertedCount"].as_i64().unwrap(), 2);
+
+    // Call createIndex with expireAfterSeconds so the TTL registry row is written.
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/collections/sessions/createIndex",
+        Some(json!({
+            "keys": { "created": 1 },
+            "options": { "expireAfterSeconds": 100, "type": "number" }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "createIndex failed: {body}");
+
+    // Sweep with deterministic now_epoch = 2000 (100 s past "old"'s expiry).
+    let deleted = state
+        .sweep_ttl_for_test("_", "sessions", "created", 100, 2000)
+        .await
+        .expect("sweep_ttl failed");
+    assert_eq!(deleted, 1, "expected 1 doc deleted, got {deleted}");
+
+    // find {} — only "new" must remain.
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/collections/sessions/find",
+        Some(json!({ "filter": {} })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "find after sweep failed: {body}");
+    let docs = body["documents"].as_array().expect("documents array");
+    assert_eq!(docs.len(), 1, "expected 1 doc remaining after sweep, got: {body}");
+    let remaining_id = docs[0].get("_id").and_then(Value::as_str).unwrap_or("");
+    assert_eq!(remaining_id, "new", "expected 'new' to survive, got: {docs:?}");
+}
+
+/// Verify that a document with an ISO-8601 string timestamp is also swept.
+#[tokio::test]
+async fn ttl_sweep_handles_iso8601_string_field() {
+    let (app, state) = app_with_state().await;
+
+    // 2000-01-01T00:00:00Z = epoch 946684800
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/collections/iso_sessions/insert",
+        Some(json!({
+            "documents": [
+                { "_id": "expired_iso", "ts": "2000-01-01T00:00:00Z" },
+                { "_id": "future_iso",  "ts": "2099-01-01T00:00:00Z" }
+            ]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "insert failed: {body}");
+
+    // now_epoch = 946684900 (100 s after the expired doc, well before the future one).
+    // expireAfterSeconds = 0 → the doc is expired iff its ts ≤ now.
+    let deleted = state
+        .sweep_ttl_for_test("_", "iso_sessions", "ts", 0, 946_684_900)
+        .await
+        .expect("sweep_ttl (iso8601) failed");
+    assert_eq!(deleted, 1, "expected 1 iso8601 doc deleted, got {deleted}");
+}
+
+/// Verify that `createIndex` with a negative expireAfterSeconds is rejected.
+#[tokio::test]
+async fn ttl_create_index_rejects_negative_seconds() {
+    let app = app().await;
+
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/collections/neg_ttl/createIndex",
+        Some(json!({
+            "keys": { "ts": 1 },
+            "options": { "expireAfterSeconds": -1 }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "expected 400 for negative expireAfterSeconds, got: {body}");
+}
+
 /// Helper: read a string field that may have arrived as a JSON object's member
 /// or directly. The aggregate result projects `_id` plus extracted columns; a
 /// `$match`+`$sort` pipeline with no `$project` returns the base table columns
