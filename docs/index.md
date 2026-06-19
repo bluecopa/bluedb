@@ -72,6 +72,10 @@ flowchart TD
 - **[Collections](collections/README.md)** — a MongoDB-style document API over
   HTTP/JSON: schema-free collections, MQL `find`/`aggregate`, and secondary,
   compound, and TTL indexes — no MongoDB driver required.
+- **[Collections search](collections/search.md)** — an Elasticsearch-shaped search
+  surface over collections documents: BM25 relevance, the ES query DSL
+  (`match`/`term`/`range`/`bool`/`exists`), and the ES hits-envelope response — no
+  ES client or Kibana required.
 - **`bluedb-engine`** — composes the pillars behind one facade.
 - **`bluedb-server`** — the HTTP/REST service (axum): CRUD, `/sql`, admin.
 - **[`bluedb-ha`](ha/active-passive.md)** — single-writer high availability:
