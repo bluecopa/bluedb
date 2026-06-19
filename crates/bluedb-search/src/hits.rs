@@ -66,11 +66,15 @@ fn highlight_text(text: &str, terms: &[String]) -> Option<String> {
 }
 
 /// Build the hits envelope. `ranked` is the page slice (already `[from, from+size)`),
-/// in display order; `total` is the full match count.
+/// in display order; `total` is the full match count and `total_relation` is the
+/// ES total relation (`"eq"` for an exact count, `"gte"` when the count was
+/// capped and is a lower bound).
+#[allow(clippy::too_many_arguments)]
 pub fn assemble(
     index: &str,
     ranked: &[(String, f32)],
     total: usize,
+    total_relation: &'static str,
     mut sources: HashMap<String, Value>,
     source_spec: &SourceSpec,
     highlight_fields: &[String],
@@ -114,7 +118,7 @@ pub fn assemble(
         });
     }
     HitsBlock {
-        total: HitsTotal { value: total, relation: "eq" },
+        total: HitsTotal { value: total, relation: total_relation },
         max_score,
         hits,
     }
@@ -137,7 +141,7 @@ mod tests {
         sources.insert("a".to_string(), src("a", "Dogs", "good dogs"));
         sources.insert("b".to_string(), src("b", "Cats", "ok cats"));
         let out = assemble(
-            "pets", &ranked, 2, sources, &SourceSpec::Bool(true), &[], &HashMap::new(),
+            "pets", &ranked, 2, "eq", sources, &SourceSpec::Bool(true), &[], &HashMap::new(),
         );
         assert_eq!(out.total.value, 2);
         assert_eq!(out.max_score, Some(2.0));
@@ -151,7 +155,7 @@ mod tests {
         let ranked = vec![("a".to_string(), 1.0f32)];
         let mut sources = HashMap::new();
         sources.insert("a".to_string(), src("a", "x", "y"));
-        let out = assemble("c", &ranked, 1, sources, &SourceSpec::Bool(false), &[], &HashMap::new());
+        let out = assemble("c", &ranked, 1, "eq", sources, &SourceSpec::Bool(false), &[], &HashMap::new());
         assert!(out.hits[0]._source.is_none());
     }
 
@@ -161,7 +165,7 @@ mod tests {
         let mut sources = HashMap::new();
         sources.insert("a".to_string(), src("a", "x", "y"));
         let out = assemble(
-            "c", &ranked, 1, sources,
+            "c", &ranked, 1, "eq", sources,
             &SourceSpec::Fields(vec!["title".into()]), &[], &HashMap::new(),
         );
         let s = out.hits[0]._source.as_ref().unwrap();
@@ -177,7 +181,7 @@ mod tests {
         let mut terms = HashMap::new();
         terms.insert("body".to_string(), vec!["dogs".to_string()]);
         let out = assemble(
-            "c", &ranked, 1, sources, &SourceSpec::Bool(true),
+            "c", &ranked, 1, "eq", sources, &SourceSpec::Bool(true),
             &["body".to_string()], &terms,
         );
         let hl = out.hits[0].highlight.as_ref().unwrap();

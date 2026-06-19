@@ -50,7 +50,8 @@ impl<'de> Deserialize<'de> for SortClause {
         D: serde::Deserializer<'de>,
     {
         match Value::deserialize(d)? {
-            Value::String(field) => Ok(SortClause { field, descending: true }),
+            // Bare field name defaults to ascending, matching Elasticsearch.
+            Value::String(field) => Ok(SortClause { field, descending: false }),
             Value::Object(map) => {
                 let (field, dir) = map.into_iter().next().ok_or_else(|| {
                     serde::de::Error::custom("empty sort clause")
@@ -61,8 +62,8 @@ impl<'de> Deserialize<'de> for SortClause {
                         .get("order")
                         .and_then(|v| v.as_str())
                         .map(|s| s.eq_ignore_ascii_case("desc"))
-                        .unwrap_or(true),
-                    _ => true,
+                        .unwrap_or(false),
+                    _ => false,
                 };
                 Ok(SortClause { field, descending })
             }
@@ -130,7 +131,7 @@ pub struct FieldSpec {
 #[derive(Debug, Clone, Serialize)]
 pub struct HitsTotal {
     pub value: usize,
-    pub relation: &'static str, // always "eq" in v1
+    pub relation: &'static str, // "eq" for an exact count, "gte" when capped
 }
 
 #[derive(Debug, Clone, Serialize)]

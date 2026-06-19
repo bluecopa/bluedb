@@ -128,6 +128,10 @@ Response — the Elasticsearch hits envelope:
 }
 ```
 
+`hits.total.value` is the number of matching documents and `hits.total.relation`
+is `"eq"` for an exact count. Match counts above ~100,000 are reported with
+`"relation": "gte"` — the value is a lower bound, not an exact total.
+
 **Required scope:** `data:read`.
 
 ### Request fields
@@ -197,7 +201,11 @@ Results default to descending `_score` (BM25 relevance). To sort by a field:
 |-----------------|-----------|-------|
 | `{"_score": "desc"}` | yes | Default; descending relevance score |
 | `{"<integer-field>": "asc"\|"desc"}` | yes | Numeric sort on a mapped `integer` field |
+| `"<integer-field>"` (bare string) | yes | Ascending numeric sort (matches Elasticsearch's bare-field default) |
 | `{"<text-field>": …}` | **no** | Sorting on an analyzed `text` or `keyword` field returns a 400 error in v1 |
+
+Documents missing the sort field sort **last** regardless of direction (the
+Elasticsearch `missing: _last` default).
 
 ### `_source`
 
@@ -254,6 +262,10 @@ write on a reader replica, route the request to the active writer.
 
 `searchIndex` declarations and per-document index maintenance are **active-writer
 only**.
+
+If search-index maintenance fails during a write, the document is still stored
+durably and the write reports success; the search index may lag until that
+document is next written or the mapping is re-declared (which backfills it).
 
 ## Authorization and tenancy
 

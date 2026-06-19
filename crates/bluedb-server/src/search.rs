@@ -18,7 +18,13 @@ use bluedb_storage::{SlateDbBlobStore, Substrate};
 use serde_json::Value;
 use tokio::sync::RwLock;
 
+use crate::schema::ident;
 use crate::{authz::Scope, AppError, AppState};
+
+/// Maximum `from + size` result window for a single search request. Mirrors
+/// Elasticsearch's `index.max_result_window` default — a DoS guard against a
+/// request asking the ranker to materialize an unbounded page.
+const MAX_RESULT_WINDOW: usize = 10_000;
 
 /// Tenant-isolated index id. One shared SlateDB Db, tenant-prefixed blob keys.
 pub(crate) fn index_id(tenant: &str, coll: &str) -> String {
@@ -377,6 +383,7 @@ pub(crate) async fn create_search_index(
 ) -> Result<Json<Value>, AppError> {
     state.authorize(&headers, Scope::SchemaAdmin)?;
     let tenant = state.tenant(&headers)?;
+    let coll = ident(&coll)?.to_string();
     state.require_active()?;
 
     let spec: MappingSpec = serde_json::from_value(body)
@@ -424,6 +431,7 @@ pub(crate) async fn get_search_index(
 ) -> Result<Json<Value>, AppError> {
     state.authorize(&headers, Scope::DataRead)?;
     let tenant = state.tenant(&headers)?;
+    let coll = ident(&coll)?.to_string();
     match get_mapping(&state, &tenant, &coll).await? {
         Some(spec) => {
             let mut m = serde_json::Map::new();
@@ -445,10 +453,18 @@ pub(crate) async fn search(
 ) -> Result<Json<Value>, AppError> {
     state.authorize(&headers, Scope::DataRead)?;
     let tenant = state.tenant(&headers)?;
+    let coll = ident(&coll)?.to_string();
     let started = Instant::now();
 
     let req: bluedb_search::model::SearchRequest =
         serde_json::from_value(body).map_err(|e| AppError::bad_request(format!("bad search body: {e}")))?;
+
+    if req.from.saturating_add(req.size) > MAX_RESULT_WINDOW {
+        return Err(AppError::bad_request(format!(
+            "result window (from + size = {}) exceeds the maximum of {MAX_RESULT_WINDOW}",
+            req.from.saturating_add(req.size)
+        )));
+    }
 
     let spec = get_mapping(&state, &tenant, &coll)
         .await?
@@ -490,6 +506,9 @@ pub(crate) async fn search(
         .count_query(compiled.query.as_ref())
         .await
         .map_err(|e| AppError::internal(format!("count: {e}")))?;
+    // The count is capped per split (see `bluedb_fts::search::COUNT_CAP`); a
+    // dedup'd total at the cap is a lower bound, surfaced ES-style as `"gte"`.
+    let total_relation = if total >= bluedb_fts::search::COUNT_CAP { "gte" } else { "eq" };
 
     let page_slice: Vec<(String, f32)> = ranked
         .into_iter()
@@ -507,6 +526,7 @@ pub(crate) async fn search(
         &coll,
         &page_slice,
         total,
+        total_relation,
         sources,
         &req.source,
         &req.highlight_fields(),

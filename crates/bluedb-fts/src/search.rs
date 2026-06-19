@@ -18,6 +18,11 @@ use tantivy::{DocAddress, Index, TantivyDocument};
 use crate::tombstones::Tombstones;
 use crate::{doc_id_string, IdField};
 
+/// Per-split match-collection cap for [`multi_split_count_query_filtered`]. A
+/// dedup'd total at or above this value is a lower bound, not an exact count
+/// (callers surface that as `"relation": "gte"`).
+pub const COUNT_CAP: usize = 100_000;
+
 /// Deterministic merged ordering for multi-split hits: descending score, then
 /// ascending `(split_ord, segment_ord, doc_id)` so results are stable across
 /// runs. Shared by every search variant.
@@ -539,7 +544,7 @@ pub fn multi_split_count_query_filtered(
     for handle in splits.iter() {
         let reader = handle.index.reader()?;
         let searcher = reader.searcher();
-        let hits = searcher.search(query, &TopDocs::with_limit(100_000).order_by_score())?;
+        let hits = searcher.search(query, &TopDocs::with_limit(COUNT_CAP).order_by_score())?;
         for (_score, doc_address) in hits {
             let stored: TantivyDocument = searcher.doc(doc_address)?;
             if let Some(id) = id_field.extract(&stored) {
@@ -622,14 +627,19 @@ pub fn multi_split_search_query_sorted_ids(
         .filter(|(i, _)| keep.contains(i))
         .map(|(_, c)| c)
         .collect();
+    // Present-before-missing holds in BOTH directions: only the present/present
+    // comparison is reversed for descending, so docs missing the sort field
+    // always sort last regardless of direction (ES `missing: _last` default).
     kept.sort_by(|a, b| {
-        let cmp = match (a.sort, b.sort) {
-            (Some(x), Some(y)) => x.cmp(&y),
+        match (a.sort, b.sort) {
+            (Some(x), Some(y)) => {
+                let c = x.cmp(&y);
+                if descending { c.reverse() } else { c }
+            }
             (Some(_), None) => std::cmp::Ordering::Less,
             (None, Some(_)) => std::cmp::Ordering::Greater,
             (None, None) => std::cmp::Ordering::Equal,
-        };
-        if descending { cmp.reverse() } else { cmp }
+        }
     });
     let mut out: Vec<(String, f32)> = kept.into_iter().map(|c| (c.id.clone(), 0.0f32)).collect();
     out.truncate(limit);

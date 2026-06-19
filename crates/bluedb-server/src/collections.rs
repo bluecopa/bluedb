@@ -717,7 +717,12 @@ pub(crate) async fn insert(
         inserted_ids.push(id);
     }
 
-    crate::search::maintain_on_upsert(&state, &tenant, &coll, &inserted_docs).await?;
+    // Search-index maintenance runs AFTER the durable SQL write has committed.
+    // A failure here must NOT fail the already-committed write — log and swallow;
+    // the index self-heals on the next write or mapping re-declare (backfill).
+    if let Err(e) = crate::search::maintain_on_upsert(&state, &tenant, &coll, &inserted_docs).await {
+        eprintln!("bluedb-server: search index maintenance failed for collection {coll}: {e:?}");
+    }
 
     Ok(Json(json!({
         "insertedIds": inserted_ids,
@@ -1240,7 +1245,10 @@ pub(crate) async fn update(
         upserted_id = json!(id);
     }
 
-    crate::search::maintain_on_upsert(&state, &tenant, &coll, &updated_docs).await?;
+    // See `insert`: a post-commit index-maintenance failure must not fail the write.
+    if let Err(e) = crate::search::maintain_on_upsert(&state, &tenant, &coll, &updated_docs).await {
+        eprintln!("bluedb-server: search index maintenance failed for collection {coll}: {e:?}");
+    }
 
     Ok(Json(json!({
         "matchedCount": matched,
@@ -1312,7 +1320,10 @@ pub(crate) async fn delete(
         .await?;
     }
 
-    crate::search::maintain_on_delete(&state, &tenant, &coll, &to_delete).await?;
+    // See `insert`: a post-commit index-maintenance failure must not fail the write.
+    if let Err(e) = crate::search::maintain_on_delete(&state, &tenant, &coll, &to_delete).await {
+        eprintln!("bluedb-server: search index maintenance failed for collection {coll}: {e:?}");
+    }
 
     Ok(Json(json!({ "deletedCount": deleted_count })))
 }

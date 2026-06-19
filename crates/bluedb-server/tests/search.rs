@@ -663,3 +663,89 @@ async fn search_without_mapping_404() {
     let (status, body) = search(&app, "ghost", json!({ "query": { "match_all": {} } })).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "missing collection → 404: {body}");
 }
+
+// ---------------------------------------------------------------------------
+// 16. an invalid collection identifier is rejected (400) on the search surface
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn rejects_invalid_collection_name() {
+    let app = app().await;
+    // `1bad` starts with a digit → rejected by `ident` (^[A-Za-z_][A-Za-z0-9_]*$),
+    // but is URL-safe so it reaches the handler (where the validation lives).
+    // Must be a 400 — NOT a 200, and NOT a 500 from interpolating it into SQL.
+    let (status, body) =
+        search(&app, "1bad", json!({ "query": { "match_all": {} } })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "search bad name → 400: {body}");
+
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/collections/1bad/searchIndex",
+        Some(standard_mapping()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "searchIndex bad name → 400: {body}");
+}
+
+// ---------------------------------------------------------------------------
+// 17. an oversized result window (from + size) is rejected (400)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn rejects_oversized_window() {
+    let app = app().await;
+    declare_index(&app, "window", standard_mapping()).await;
+    insert_docs(
+        &app,
+        "window",
+        json!([{ "title": "a", "body": "x", "tag": "t", "year": 2020 }]),
+    )
+    .await;
+
+    let (status, body) = search(
+        &app,
+        "window",
+        json!({ "query": { "match_all": {} }, "size": 20000 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "size beyond max window → 400: {body}");
+}
+
+// ---------------------------------------------------------------------------
+// 18. a bare-field sort string defaults to ascending (ES fidelity)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn bare_field_sort_defaults_ascending() {
+    let app = app().await;
+    declare_index(&app, "bare_sort", standard_mapping()).await;
+
+    insert_docs(
+        &app,
+        "bare_sort",
+        json!([
+            { "title": "y2024", "body": "x", "tag": "s", "year": 2024 },
+            { "title": "y2019", "body": "x", "tag": "s", "year": 2019 },
+            { "title": "y2021", "body": "x", "tag": "s", "year": 2021 }
+        ]),
+    )
+    .await;
+
+    // Bare field name (no explicit order) → ascending, like Elasticsearch.
+    let (status, body) = search(
+        &app,
+        "bare_sort",
+        json!({ "query": { "match_all": {} }, "sort": ["year"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "search failed: {body}");
+
+    let hs = hits(&body);
+    assert_eq!(hs.len(), 3, "all three docs: {body}");
+    assert_eq!(
+        hs[0]["_source"]["year"].as_i64().unwrap(),
+        2019,
+        "bare-field sort is ascending → smallest year first: {body}"
+    );
+}

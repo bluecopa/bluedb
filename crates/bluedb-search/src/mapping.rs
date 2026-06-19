@@ -59,13 +59,6 @@ impl SearchSchema {
         self.fields.get(name)
     }
 
-    pub fn is_text_or_keyword(&self, name: &str) -> bool {
-        matches!(
-            self.fields.get(name).map(|r| r.kind),
-            Some(FieldKindInfo::Text(_)) | Some(FieldKindInfo::Keyword)
-        )
-    }
-
     /// Tokenize `text` with the analyzer of field `name` (mirrors indexing).
     /// Keyword fields produce the single, whole, untouched value.
     pub fn analyze(&self, name: &str, text: &str) -> Result<Vec<String>> {
