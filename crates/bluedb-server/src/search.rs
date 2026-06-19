@@ -7,8 +7,11 @@ use std::sync::Arc;
 
 use bluedb_engine::FtsIndex;
 use bluedb_fts::policy::CompactionPolicy;
+use bluedb_rest::Param;
 use bluedb_search::mapping::SearchSchema;
+use bluedb_search::model::MappingSpec;
 use bluedb_storage::{SlateDbBlobStore, Substrate};
+use serde_json::Value;
 use tokio::sync::RwLock;
 
 use crate::{AppError, AppState};
@@ -115,4 +118,140 @@ pub(crate) fn search_err(e: bluedb_search::SearchError) -> AppError {
         Other(_) => AppError::internal(e.to_string()),
         _ => AppError::bad_request(e.to_string()),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Search-mapping registry
+// ---------------------------------------------------------------------------
+
+/// Per-tenant table that records each collection's mapping JSON.
+const SEARCH_CONFIG_TABLE: &str = "__bluedb_search_config";
+
+/// Global table (in the DEFAULT_TENANT keyspace) recording every tenant that
+/// has at least one search mapping, so the background sweep can enumerate them.
+const SEARCH_TENANTS_TABLE: &str = "__bluedb_search_tenants";
+
+async fn ensure_search_config_registry(state: &AppState, tenant: &str) -> Result<(), AppError> {
+    crate::collections::run_ddl(
+        state,
+        tenant,
+        &format!("CREATE TABLE IF NOT EXISTS {SEARCH_CONFIG_TABLE} (collection TEXT PRIMARY KEY, mapping TEXT);"),
+    )
+    .await
+}
+
+async fn ensure_search_tenants_registry(state: &AppState) -> Result<(), AppError> {
+    crate::collections::run_ddl(
+        state,
+        bluedb_sql::DEFAULT_TENANT,
+        &format!("CREATE TABLE IF NOT EXISTS {SEARCH_TENANTS_TABLE} (tenant TEXT PRIMARY KEY);"),
+    )
+    .await
+}
+
+/// Persist (replace) the mapping JSON for a collection.
+pub(crate) async fn upsert_mapping(
+    state: &AppState,
+    tenant: &str,
+    coll: &str,
+    mapping: &MappingSpec,
+) -> Result<(), AppError> {
+    ensure_search_config_registry(state, tenant).await?;
+    let json = serde_json::to_string(mapping)
+        .map_err(|e| AppError::internal(format!("serialize mapping: {e}")))?;
+    crate::collections::run_write(
+        state,
+        tenant,
+        &format!("DELETE FROM {SEARCH_CONFIG_TABLE} WHERE collection = $1;"),
+        &[Param::Str(coll.to_string())],
+    )
+    .await?;
+    crate::collections::run_write(
+        state,
+        tenant,
+        &format!("INSERT INTO {SEARCH_CONFIG_TABLE} (collection, mapping) VALUES ($1, $2);"),
+        &[Param::Str(coll.to_string()), Param::Str(json)],
+    )
+    .await?;
+    register_search_tenant(state, tenant).await
+}
+
+async fn register_search_tenant(state: &AppState, tenant: &str) -> Result<(), AppError> {
+    ensure_search_tenants_registry(state).await?;
+    let _ = crate::collections::run_write(
+        state,
+        bluedb_sql::DEFAULT_TENANT,
+        &format!("INSERT INTO {SEARCH_TENANTS_TABLE} (tenant) VALUES ($1);"),
+        &[Param::Str(tenant.to_string())],
+    )
+    .await;
+    Ok(())
+}
+
+/// Load a collection's mapping spec, if any.
+pub(crate) async fn get_mapping(
+    state: &AppState,
+    tenant: &str,
+    coll: &str,
+) -> Result<Option<MappingSpec>, AppError> {
+    let rows = match crate::collections::run_read_routed_for_mutation(
+        state,
+        tenant,
+        &format!("SELECT mapping FROM {SEARCH_CONFIG_TABLE} WHERE collection = $1;"),
+        &[Value::String(coll.to_string())],
+    )
+    .await
+    {
+        Ok(rows) => rows,
+        Err(_) => return Ok(None),
+    };
+    let Some(row) = rows.into_iter().next() else { return Ok(None) };
+    let json = row.get("mapping").and_then(Value::as_str).unwrap_or("");
+    if json.is_empty() {
+        return Ok(None);
+    }
+    let spec: MappingSpec = serde_json::from_str(json)
+        .map_err(|e| AppError::internal(format!("parse stored mapping: {e}")))?;
+    Ok(Some(spec))
+}
+
+/// All collections (per tenant) that have a search mapping (for the sweep).
+pub(crate) async fn list_mapped_collections(
+    state: &AppState,
+    tenant: &str,
+) -> Result<Vec<String>, AppError> {
+    let rows = match crate::collections::run_read_routed_for_mutation(
+        state,
+        tenant,
+        &format!("SELECT collection FROM {SEARCH_CONFIG_TABLE};"),
+        &[],
+    )
+    .await
+    {
+        Ok(rows) => rows,
+        Err(_) => return Ok(vec![]),
+    };
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| r.get("collection").and_then(Value::as_str).map(str::to_string))
+        .collect())
+}
+
+/// All tenants that have at least one search mapping.
+pub(crate) async fn list_search_tenants(state: &AppState) -> Result<Vec<String>, AppError> {
+    let rows = match crate::collections::run_read_routed_for_mutation(
+        state,
+        bluedb_sql::DEFAULT_TENANT,
+        &format!("SELECT tenant FROM {SEARCH_TENANTS_TABLE};"),
+        &[],
+    )
+    .await
+    {
+        Ok(rows) => rows,
+        Err(_) => return Ok(vec![]),
+    };
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| r.get("tenant").and_then(Value::as_str).map(str::to_string))
+        .collect())
 }

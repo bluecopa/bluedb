@@ -108,7 +108,7 @@ async fn ensure_collection(state: &AppState, tenant: &str, coll: &str) -> Result
 /// Run a single parameterized write statement (`INSERT`, `UPDATE`) through the
 /// FTS commit-observer path so the live index is maintained. Mirrors the write
 /// branch of `exec_sql`.
-async fn run_write(
+pub(crate) async fn run_write(
     state: &AppState,
     tenant: &str,
     sql: &str,
@@ -122,7 +122,7 @@ async fn run_write(
 /// Run a DDL statement (ALTER TABLE, CREATE INDEX) with `allow_arbitrary = true`.
 /// DDL does not go through the FTS rewriter (which would reject it via the DML
 /// guard). Uses a serialized connection for write ordering.
-async fn run_ddl(
+pub(crate) async fn run_ddl(
     state: &AppState,
     tenant: &str,
     sql: &str,
@@ -140,7 +140,7 @@ async fn run_ddl(
 /// query (`table not found`), but that just means there are no rows to match —
 /// upsert should still proceed. Genuine I/O errors (storage failures, etc.) are
 /// still propagated via `?`.
-async fn run_read_routed_for_mutation(
+pub(crate) async fn run_read_routed_for_mutation(
     state: &AppState,
     tenant: &str,
     sql: &str,
