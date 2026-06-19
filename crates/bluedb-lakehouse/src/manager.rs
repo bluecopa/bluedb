@@ -164,6 +164,9 @@ impl LakehouseManager {
     /// mode). Call right after [`open`], before any writes.
     pub fn set_default_mirror(&self, on: bool) {
         self.default_mirror_on.store(on, Ordering::Relaxed);
+        // Retain CDC for every tenant's writes (no per-tenant default needed),
+        // so a freshly-written tenant has a CDC trail for seal to drain.
+        self.cdc.set_global_default(on);
     }
 
     /// Apply a `PRAGMA lakehouse_mirror` for `tenant` (creating its engine).
@@ -173,6 +176,13 @@ impl LakehouseManager {
 
     /// Seal every tenant's pending CDC into Iceberg (a no-op per idle tenant).
     pub async fn seal_all(&self) -> Result<()> {
+        // Ensure an engine exists for every tenant that has written CDC, so a
+        // freshly-written tenant is sealed even without a prior `PRAGMA
+        // lakehouse_mirror` (mirror mode). In prod (global default off) the seen
+        // set holds only already-mirrored tenants, so these are cache hits.
+        for tenant in self.cdc.seen_tenants() {
+            let _ = self.engine_for(&tenant).await;
+        }
         for engine in self.snapshot_engines().await {
             if let Err(err) = engine.seal().await {
                 eprintln!("lakehouse: seal({}) failed: {err}", engine.namespace());

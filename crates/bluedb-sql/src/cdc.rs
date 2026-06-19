@@ -13,6 +13,7 @@
 //! and seals every tenant's pending changes.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use gluesql_core::data::Key;
@@ -67,17 +68,47 @@ pub struct CdcConfig {
     /// `(tenant, table)` pairs whose mirror state is the negation of that
     /// tenant's default.
     overrides: Arc<RwLock<HashSet<(String, String)>>>,
-    /// Per-tenant opt-out default. An absent tenant defaults to `false` (opt-in).
+    /// Per-tenant opt-out default. An absent tenant falls back to `global_default`.
     defaults: Arc<RwLock<HashMap<String, bool>>>,
+    /// Fallback mirror default for tenants with no explicit per-tenant setting.
+    /// The testkit's mirror mode flips this on so every tenant mirrors by default;
+    /// prod leaves it false (opt-in via `PRAGMA lakehouse_mirror`).
+    global_default: Arc<AtomicBool>,
+    /// Tenants that have written CDC entries this process, so the seal path can
+    /// ensure a lakehouse engine exists for each — auto-mirror of arbitrary
+    /// tenants without a per-tenant PRAGMA.
+    seen: Arc<RwLock<HashSet<String>>>,
     /// Pinged after a commit writes CDC entries, so the lakehouse seal loop wakes
     /// promptly (event-driven freshness) instead of polling on a fixed interval.
     seal_signal: Arc<Notify>,
 }
 
 impl CdcConfig {
-    /// The opt-out default for `tenant` (false ⇒ opt-in, the initial state).
+    /// The opt-out default for `tenant`: its explicit per-tenant setting if any,
+    /// else the process-wide `global_default` (false ⇒ opt-in, the initial state).
     pub fn default_for(&self, tenant: &str) -> bool {
-        self.defaults.read().unwrap().get(tenant).copied().unwrap_or(false)
+        self.defaults
+            .read()
+            .unwrap()
+            .get(tenant)
+            .copied()
+            .unwrap_or_else(|| self.global_default.load(Ordering::Relaxed))
+    }
+
+    /// Set the fallback mirror default for tenants without an explicit setting
+    /// (testkit mirror mode). A per-tenant `set_default` still overrides it.
+    pub fn set_global_default(&self, on: bool) {
+        self.global_default.store(on, Ordering::Relaxed);
+    }
+
+    /// Record that `tenant` has written CDC entries (so seal can ensure its engine).
+    pub fn mark_seen(&self, tenant: &str) {
+        self.seen.write().unwrap().insert(tenant.to_string());
+    }
+
+    /// Tenants that have written CDC entries this process.
+    pub fn seen_tenants(&self) -> Vec<String> {
+        self.seen.read().unwrap().iter().cloned().collect()
     }
 
     /// Set `tenant`'s opt-out default. Per-table overrides are unaffected — a
