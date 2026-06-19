@@ -972,6 +972,10 @@ pub fn build_app(state: AppState) -> Router {
         .route("/collections/{coll}/delete", post(collections::delete))
         .route("/collections/{coll}/aggregate", post(collections::aggregate))
         .route("/collections/{coll}/count", post(collections::count))
+        .route(
+            "/collections/{coll}/searchIndex",
+            post(search::create_search_index).get(search::get_search_index),
+        )
         .with_state(state)
 }
 

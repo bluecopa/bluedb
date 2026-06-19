@@ -5,16 +5,19 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use axum::extract::{Path, State};
+use axum::http::HeaderMap;
+use axum::Json;
 use bluedb_engine::FtsIndex;
 use bluedb_fts::policy::CompactionPolicy;
 use bluedb_rest::Param;
-use bluedb_search::mapping::SearchSchema;
+use bluedb_search::mapping::{FieldKindInfo, SearchSchema, ID_FIELD};
 use bluedb_search::model::MappingSpec;
 use bluedb_storage::{SlateDbBlobStore, Substrate};
 use serde_json::Value;
 use tokio::sync::RwLock;
 
-use crate::{AppError, AppState};
+use crate::{authz::Scope, AppError, AppState};
 
 /// Tenant-isolated index id. One shared SlateDB Db, tenant-prefixed blob keys.
 pub(crate) fn index_id(tenant: &str, coll: &str) -> String {
@@ -254,4 +257,125 @@ pub(crate) async fn list_search_tenants(state: &AppState) -> Result<Vec<String>,
         .into_iter()
         .filter_map(|r| r.get("tenant").and_then(Value::as_str).map(str::to_string))
         .collect())
+}
+
+// ---------------------------------------------------------------------------
+// Document → tantivy conversion
+// ---------------------------------------------------------------------------
+
+/// Build a tantivy document from a collection document JSON for a compiled
+/// mapping. Returns `None` if the document has no `_id` field.
+pub(crate) fn doc_to_tantivy(
+    ss: &SearchSchema,
+    spec: &MappingSpec,
+    doc: &Value,
+) -> Option<tantivy::TantivyDocument> {
+    let id = doc.get(ID_FIELD).and_then(Value::as_str)?;
+    let mut td = tantivy::TantivyDocument::default();
+    let id_resolved = ss.field(ID_FIELD)?;
+    td.add_text(id_resolved.field, id);
+    for (name, _fspec) in &spec.fields {
+        let Some(resolved) = ss.field(name) else { continue };
+        let Some(v) = doc.get(name) else { continue };
+        match resolved.kind {
+            FieldKindInfo::Text(_) | FieldKindInfo::Keyword => {
+                if let Some(s) = v.as_str() {
+                    td.add_text(resolved.field, s);
+                } else if !v.is_null() {
+                    td.add_text(resolved.field, &v.to_string());
+                }
+            }
+            FieldKindInfo::Integer => {
+                if let Some(n) = v.as_i64() {
+                    td.add_i64(resolved.field, n);
+                }
+            }
+        }
+    }
+    Some(td)
+}
+
+/// Read a `doc` cell as a JSON object, accepting both a JSON string (the
+/// pre-`run_read_routed` shape) and an already-parsed object. The `find`
+/// handler notes that `run_read_routed` re-inflates the `doc` column, so in
+/// practice it arrives as an object, but we guard both for safety.
+fn read_doc_value(cell: Option<&Value>) -> Option<Value> {
+    match cell {
+        Some(Value::String(s)) => serde_json::from_str(s).ok(),
+        Some(v @ Value::Object(_)) => Some(v.clone()),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP handlers
+// ---------------------------------------------------------------------------
+
+/// `POST /collections/{coll}/searchIndex` — declare/replace a search mapping
+/// and backfill existing documents into the tantivy index.
+pub(crate) async fn create_search_index(
+    State(state): State<crate::AppState>,
+    headers: HeaderMap,
+    Path(coll): Path<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, AppError> {
+    state.authorize(&headers, Scope::SchemaAdmin)?;
+    let tenant = state.tenant(&headers)?;
+    state.require_active()?;
+
+    let spec: MappingSpec = serde_json::from_value(body)
+        .map_err(|e| AppError::bad_request(format!("bad mapping: {e}")))?;
+    let ss = bluedb_search::mapping::compile(&spec).map_err(search_err)?;
+
+    upsert_mapping(&state, &tenant, &coll, &spec).await?;
+    let engine = state.search().await;
+    engine.forget(&tenant, &coll).await;
+    let idx = engine.index_for(&tenant, &coll, &ss).await?;
+
+    // Backfill existing documents from the collection table.
+    let rows = crate::collections::run_read_routed_for_mutation(
+        &state,
+        &tenant,
+        &format!("SELECT doc FROM \"{coll}\";"),
+        &[],
+    )
+    .await
+    .unwrap_or_default();
+
+    let mut tdocs = Vec::with_capacity(rows.len());
+    for row in &rows {
+        if let Some(doc) = read_doc_value(row.get("doc")) {
+            if let Some(td) = doc_to_tantivy(&ss, &spec, &doc) {
+                tdocs.push(td);
+            }
+        }
+    }
+    let backfilled = tdocs.len();
+    if !tdocs.is_empty() {
+        idx.append(tdocs)
+            .await
+            .map_err(|e| AppError::internal(format!("backfill index: {e}")))?;
+    }
+
+    Ok(Json(serde_json::json!({"acknowledged": true, "backfilled": backfilled})))
+}
+
+/// `GET /collections/{coll}/searchIndex` — describe the persisted mapping.
+pub(crate) async fn get_search_index(
+    State(state): State<crate::AppState>,
+    headers: HeaderMap,
+    Path(coll): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    state.authorize(&headers, Scope::DataRead)?;
+    let tenant = state.tenant(&headers)?;
+    match get_mapping(&state, &tenant, &coll).await? {
+        Some(spec) => {
+            let mut m = serde_json::Map::new();
+            m.insert(coll.clone(), serde_json::json!({"mappings": spec}));
+            Ok(Json(Value::Object(m)))
+        }
+        None => Err(AppError::not_found(format!(
+            "no search mapping for collection [{coll}]"
+        ))),
+    }
 }
