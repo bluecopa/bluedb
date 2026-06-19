@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use arrow_array::Int64Array;
 use bluedb_lakehouse::{object_store_file_io, LakehouseEngine};
-use bluedb_query::BluedbSchemaProvider;
+use bluedb_query::{session_with_catalog, BluedbSchemaProvider};
 use bluedb_sql::{CdcConfig, Database};
 use datafusion::prelude::SessionContext;
 use gluesql_core::prelude::Glue;
@@ -95,4 +95,23 @@ async fn schema_provider_resolves_join_without_explicit_registration() {
         vec![("alice".to_string(), 100), ("bob".to_string(), 250)],
         "join resolved via the schema provider, with tail freshness: {out:?}"
     );
+}
+
+/// [`session_with_catalog`] returns a context where `ctx.table(name)` resolves
+/// to a `DataFrame` without any explicit `register_table`. This is the
+/// DataFrame-ready entry point for the MongoDB aggregation pipeline (Task 16).
+#[tokio::test]
+async fn session_with_catalog_table_resolves_to_dataframe() {
+    let (db, cdc, eng) = make_engine().await;
+    eng.enable_table("orders").await.unwrap();
+    ddl(&db, "CREATE TABLE orders (id INTEGER PRIMARY KEY, amount INTEGER);").await;
+    dml(&db, &cdc, "INSERT INTO orders VALUES (1, 100), (2, 200);").await;
+    eng.seal().await.unwrap();
+
+    let ctx = session_with_catalog(eng).await.unwrap();
+    // ctx.table("orders") must succeed — the collection is resolvable as a DataFrame.
+    let df = ctx.table("orders").await.unwrap();
+    let batches = df.limit(0, Some(1)).unwrap().collect().await.unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 1, "limit(1) returned one row from 'orders' DataFrame");
 }

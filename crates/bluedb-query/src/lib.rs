@@ -76,6 +76,31 @@ pub fn analytical_context() -> datafusion::error::Result<SessionContext> {
     Ok(ctx)
 }
 
+/// Build the analytical [`SessionContext`] with the tenant's collections/tables
+/// registered (via [`BluedbSchemaProvider`]), ready for `ctx.table(name).await?`
+/// → `DataFrame`. This is the same context [`query_via_catalog`] runs SQL against.
+///
+/// Callers (e.g. MongoDB aggregation pipeline builders) can obtain a `DataFrame`
+/// per collection directly:
+/// ```ignore
+/// let ctx = session_with_catalog(engine).await?;
+/// let df = ctx.table("orders").await?;
+/// ```
+///
+/// # Errors
+///
+/// - [`analytical_context`] fails (e.g. UDF registration conflict).
+/// - The default `datafusion` catalog is missing (should never happen with
+///   DataFusion's own `SessionContext`).
+pub async fn session_with_catalog(engine: Arc<LakehouseEngine>) -> anyhow::Result<SessionContext> {
+    let ctx = analytical_context().with_context(|| "building analytical context")?;
+    ctx.catalog("datafusion")
+        .ok_or_else(|| anyhow!("default catalog 'datafusion' missing"))?
+        .register_schema("public", Arc::new(BluedbSchemaProvider::new(engine)))
+        .with_context(|| "registering bluedb schema provider")?;
+    Ok(ctx)
+}
+
 /// Run a read `sql` through the DataFusion front door: register the tenant's
 /// tables via [`BluedbSchemaProvider`] and execute, binding positional params.
 ///
@@ -95,11 +120,7 @@ pub async fn query_via_catalog(
     sql: &str,
     params: &[serde_json::Value],
 ) -> anyhow::Result<Vec<RecordBatch>> {
-    let ctx = analytical_context().with_context(|| "building analytical context")?;
-    ctx.catalog("datafusion")
-        .ok_or_else(|| anyhow!("default catalog 'datafusion' missing"))?
-        .register_schema("public", Arc::new(BluedbSchemaProvider::new(engine)))
-        .with_context(|| "registering bluedb schema provider")?;
+    let ctx = session_with_catalog(engine).await?;
 
     let sql = rewrite_placeholders(sql);
     let df = ctx
