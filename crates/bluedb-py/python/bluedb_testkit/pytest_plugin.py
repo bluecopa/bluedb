@@ -25,3 +25,13 @@ def bluedb_session():
     isolation (faster)."""
     with serve() as db:
         yield db
+
+
+@pytest.fixture
+def bluedb_mirrored():
+    """Function-scoped: a fresh instance with the Iceberg mirror on, backed by a
+    local temp dir. Write, then call ``db.seal()``, then read from the mirror /
+    ``/catalog/v1`` (its ``loadTable`` URIs are ``file://`` paths a warehouse can
+    open)."""
+    with serve(mirror=True) as db:
+        yield db

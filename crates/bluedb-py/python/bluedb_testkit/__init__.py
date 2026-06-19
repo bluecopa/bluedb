@@ -35,6 +35,16 @@ class Handle:
     def token(self) -> str | None:
         return self._server.token
 
+    @property
+    def warehouse_path(self) -> str | None:
+        """Local warehouse dir when started with ``mirror=True``, else ``None``."""
+        return self._server.warehouse_path
+
+    def seal(self) -> None:
+        """Synchronously seal buffered writes into the Iceberg mirror (mirror
+        mode), so a just-written row is in the mirror/catalog before you read."""
+        self._server.seal()
+
     def url(self, path: str) -> str:
         return self._server.base_url + path
 
@@ -58,7 +68,8 @@ class Handle:
 def serve(**kwargs):
     """Start an in-process bluedb and yield a :class:`Handle`. Accepts the same
     keyword args as :class:`TestServer` (``authz``, ``token``, ``admin_sql``,
-    ``flush_interval_ms``, ``db_path``, ``evidence_signing``)."""
+    ``flush_interval_ms``, ``db_path``, ``evidence_signing``, ``mirror``).
+    ``mirror=True`` runs the Iceberg mirror on, backed by a local temp dir."""
     server = TestServer(**kwargs)
     handle = Handle(server)
     try:
