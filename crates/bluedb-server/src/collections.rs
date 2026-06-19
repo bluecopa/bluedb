@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 use bluedb_engine::rest_sql;
 use bluedb_collections::{
     filter::parse_filter,
-    index::{derive_value, derived_col},
+    index::{derive_value, derived_col, valid_path},
     project::apply_projection,
 };
 
@@ -345,6 +345,10 @@ pub(crate) async fn create_index(
     // Take the first key as the path to index.
     let (path, _) = req.keys.iter().next().unwrap();
     let path = path.clone();
+
+    if !valid_path(&path) {
+        return Err(AppError::bad_request(format!("invalid index field path: {path:?}")).with_code("PARSE_ERROR"));
+    }
 
     let dcol = derived_col(&path);
     let unique_kw = if req.options.unique { "UNIQUE " } else { "" };

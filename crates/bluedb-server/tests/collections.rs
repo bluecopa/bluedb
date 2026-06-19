@@ -328,6 +328,45 @@ async fn create_index_backfills_pre_existing_docs() {
     assert_eq!(docs[0]["name"].as_str().unwrap(), "widget");
 }
 
+/// createIndex with a malformed path (DDL-injection attempt) is rejected with a
+/// 4xx and leaves the collection intact: inserts still work after the rejection.
+#[tokio::test]
+async fn create_index_invalid_path_is_rejected_and_collection_intact() {
+    let app = app().await;
+
+    // Create the collection first.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/people/insert",
+        Some(json!({ "documents": [{ "name": "ada" }] })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "insert before injection attempt: {body}");
+
+    // Attempt the injection — must be rejected.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/people/createIndex",
+        Some(json!({ "keys": { "x) TEXT; DROP TABLE people; --": 1 } })),
+    )
+    .await;
+    assert!(s.is_client_error(), "expected 4xx for injection path, got {s}: {body}");
+
+    // The collection is intact: inserting another document must still succeed,
+    // proving that no DROP TABLE was executed.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/people/insert",
+        Some(json!({ "documents": [{ "name": "lin" }] })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "insert after injection attempt should succeed: {body}");
+    assert_eq!(body["insertedCount"].as_i64().unwrap(), 1);
+}
+
 /// createIndex is idempotent — calling it twice on the same field succeeds and
 /// the find still works.
 #[tokio::test]
