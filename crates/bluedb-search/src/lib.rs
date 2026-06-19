@@ -6,4 +6,5 @@
 pub mod error;
 pub mod mapping;
 pub mod model;
+pub mod query;
 pub use error::{Result, SearchError};
