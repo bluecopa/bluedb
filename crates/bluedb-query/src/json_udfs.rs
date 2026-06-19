@@ -10,6 +10,9 @@
 //! * `json_get(json, key)` → the field as **JSON** (Postgres `->`): the sub-value's
 //!   JSON serialization (a string stays quoted).
 //! * the `->` / `->>` operators, rewritten to those functions via an [`ExprPlanner`].
+//! * `json_array(json, path)` → Arrow `List<Utf8>` of the array field at `path`
+//!   (dotted). Used by the `$unwind` aggregation stage to unnest a JSON array
+//!   field into a real Arrow list column that DataFusion can `unnest`.
 //!
 //! `key` is a string (object field) or an integer (array index). A parse failure,
 //! a missing key, or a non-object/array all yield `NULL` — never an error — so a
@@ -18,8 +21,10 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, ArrayRef, Int64Array, StringArray, StringBuilder};
-use datafusion::arrow::datatypes::DataType;
+use datafusion::arrow::array::{
+    Array, ArrayRef, Int64Array, ListBuilder, StringArray, StringBuilder,
+};
+use datafusion::arrow::datatypes::{DataType, Field};
 use datafusion::common::{DFSchema, Result as DfResult};
 use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawBinaryExpr, TypePlanner};
 use datafusion::logical_expr::{
@@ -40,6 +45,7 @@ pub fn register(ctx: &mut datafusion::prelude::SessionContext) -> DfResult<()> {
     ctx.register_udf(get.clone())?;
     ctx.register_udf(get_str.clone())?;
     ctx.register_expr_planner(Arc::new(JsonExprPlanner { get, get_str }))?;
+    ctx.register_udf(Arc::new(ScalarUDF::new_from_impl(JsonArrayUdf::new())))?;
     Ok(())
 }
 
@@ -167,6 +173,110 @@ impl ExprPlanner for JsonExprPlanner {
         Ok(PlannerResult::Planned(
             udf.as_ref().clone().call(vec![expr.left, expr.right]),
         ))
+    }
+}
+
+// ── json_array UDF ─────────────────────────────────────────────────────────
+
+/// Extract the value at a dotted `path` from `doc_text` as a list of strings.
+///
+/// Semantics (mirrors MongoDB `$unwind` input handling):
+/// - The target value is a JSON array → each element, strings unquoted and
+///   other scalars/objects rendered as their compact JSON text.
+/// - The target value is a non-array scalar or object → treated as a
+///   single-element list (MongoDB wraps it, so we do too).
+/// - Path is missing, value is JSON `null`, JSON parse fails, or any
+///   intermediate navigation step fails → empty list (the row will be dropped
+///   by the `$unwind` unnest, which is Mongo's default behaviour).
+///
+/// Path navigation: dot-separated field names (`"a.b.c"`).
+pub(crate) fn extract_array(doc_text: &str, path: &str) -> Vec<String> {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(doc_text) else {
+        return vec![];
+    };
+    // Navigate each segment of the dotted path.
+    for segment in path.split('.') {
+        match value {
+            serde_json::Value::Object(mut map) => match map.remove(segment) {
+                Some(v) => value = v,
+                None => return vec![],
+            },
+            _ => return vec![],
+        }
+    }
+    // Render the reached value as a list of strings.
+    match value {
+        serde_json::Value::Null => vec![],
+        serde_json::Value::Array(arr) => arr
+            .into_iter()
+            .map(|elem| match elem {
+                serde_json::Value::String(s) => s,
+                other => other.to_string(),
+            })
+            .collect(),
+        // Non-array: wrap in a single-element list (Mongo's scalar-as-array rule).
+        serde_json::Value::String(s) => vec![s],
+        other => vec![other.to_string()],
+    }
+}
+
+/// Return type for `json_array`: `List<item: Utf8 nullable>`.
+fn json_array_return_type() -> DataType {
+    DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)))
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct JsonArrayUdf {
+    signature: Signature,
+}
+
+impl JsonArrayUdf {
+    fn new() -> Self {
+        Self {
+            signature: Signature::any(2, Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for JsonArrayUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "json_array"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> DfResult<DataType> {
+        Ok(json_array_return_type())
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DfResult<ColumnarValue> {
+        let arrays = ColumnarValue::values_to_arrays(&args.args)?;
+        let json_col = arrays[0].as_any().downcast_ref::<StringArray>();
+        let path_col = arrays[1].as_any().downcast_ref::<StringArray>();
+
+        let n = args.number_rows;
+        let mut builder = ListBuilder::new(StringBuilder::new());
+        for row in 0..n {
+            let doc = json_col.and_then(|c| (!c.is_null(row)).then(|| c.value(row)));
+            let path = path_col.and_then(|c| (!c.is_null(row)).then(|| c.value(row)));
+            match (doc, path) {
+                (Some(doc_text), Some(path_str)) => {
+                    let elems = extract_array(doc_text, path_str);
+                    for elem in &elems {
+                        builder.values().append_value(elem);
+                    }
+                    builder.append(true);
+                }
+                _ => {
+                    // NULL input → empty (non-null) list so $unwind drops the row.
+                    builder.append(true);
+                }
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(builder.finish()) as ArrayRef))
     }
 }
 
@@ -306,5 +416,79 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(b2[0].column(0).as_string::<i32>().value(0), "1");
+    }
+
+    // ── extract_array unit tests ────────────────────────────────────────────
+
+    #[test]
+    fn extract_array_string_elements() {
+        let elems = extract_array(r#"{"tags":["a","b"]}"#, "tags");
+        assert_eq!(elems, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn extract_array_numeric_elements_stringified() {
+        let elems = extract_array(r#"{"x":[1,2]}"#, "x");
+        assert_eq!(elems, vec!["1", "2"]);
+    }
+
+    #[test]
+    fn extract_array_non_array_scalar_wrapped() {
+        // A non-array value is treated as a single-element list.
+        let elems = extract_array(r#"{"x":"solo"}"#, "x");
+        assert_eq!(elems, vec!["solo"]);
+    }
+
+    #[test]
+    fn extract_array_missing_path_empty() {
+        let elems = extract_array(r#"{"x":1}"#, "y");
+        assert!(elems.is_empty());
+    }
+
+    #[test]
+    fn extract_array_bad_json_empty() {
+        let elems = extract_array("not json", "tags");
+        assert!(elems.is_empty());
+    }
+
+    #[test]
+    fn extract_array_json_null_empty() {
+        let elems = extract_array(r#"{"tags":null}"#, "tags");
+        assert!(elems.is_empty());
+    }
+
+    #[test]
+    fn extract_array_nested_dotted_path() {
+        let elems = extract_array(r#"{"a":{"b":["v"]}}"#, "a.b");
+        assert_eq!(elems, vec!["v"]);
+    }
+
+    // ── json_array UDF integration test ────────────────────────────────────
+
+    #[tokio::test]
+    async fn json_array_udf_returns_list_column() {
+        use datafusion::arrow::array::AsArray;
+
+        let ctx = crate::analytical_context().unwrap();
+        let batches = ctx
+            .sql(r#"SELECT json_array('{"t":["a","b","c"]}', 't') AS arr"#)
+            .await
+            .expect("plan json_array")
+            .collect()
+            .await
+            .expect("run json_array");
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 1, "one row out");
+
+        let col = batches[0].column(0);
+        // The column is a ListArray; cast and inspect the inner string values.
+        let list = col.as_list::<i32>();
+        let inner = list.value(0); // the single list for row 0
+        let strings = inner.as_string::<i32>();
+        assert_eq!(strings.len(), 3);
+        assert_eq!(strings.value(0), "a");
+        assert_eq!(strings.value(1), "b");
+        assert_eq!(strings.value(2), "c");
     }
 }

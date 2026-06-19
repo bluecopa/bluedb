@@ -16,14 +16,15 @@ path = "src/main.rs"
 kubernetes = ["bluedb-ha/kubernetes"]
 
 [dependencies]
-bluedb-engine    = { workspace = true }
-bluedb-sql       = { workspace = true }
-bluedb-ledger    = { workspace = true }
-bluedb-rest      = { workspace = true }
-bluedb-lakehouse = { workspace = true }
-bluedb-evidence  = { workspace = true }
-bluedb-query     = { path = "../bluedb-query" }
-bluedb-cache     = { path = "../bluedb-cache" }
+bluedb-engine       = { workspace = true }
+bluedb-sql          = { workspace = true }
+bluedb-ledger       = { workspace = true }
+bluedb-rest         = { workspace = true }
+bluedb-lakehouse    = { workspace = true }
+bluedb-evidence     = { workspace = true }
+bluedb-query        = { path = "../bluedb-query" }
+bluedb-cache        = { path = "../bluedb-cache" }
+bluedb-collections  = { path = "../bluedb-collections" }
 arrow-json       = "57"
 arrow-array      = "57"
 arrow-schema     = "57"

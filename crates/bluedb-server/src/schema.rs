@@ -131,7 +131,7 @@ fn validate_type(ty: &str) -> Result<&'static str, AppError> {
 }
 
 /// Wrap [`validate_ident`] to return an [`AppError`] (400) on rejection.
-fn ident(name: &str) -> Result<&str, AppError> {
+pub(crate) fn ident(name: &str) -> Result<&str, AppError> {
     validate_ident(name).map_err(|_| AppError::bad_request(format!("invalid identifier '{name}'")))
 }
 

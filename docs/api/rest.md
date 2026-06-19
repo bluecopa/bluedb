@@ -370,6 +370,14 @@ prose:
 A write sent to a passive (non-writer) node returns `503` — re-resolve the active
 writer (see [Administration](../operations/admin.md)).
 
+## Collections — document API
+
+bluedb exposes a MongoDB-style document API at `/collections/{collection}/{verb}`. It speaks HTTP/JSON (not the MongoDB wire protocol), so any HTTP client works. Supported verbs:
+
+`insert` · `find` · `update` · `delete` · `aggregate` · `count` · `createIndex`
+
+Tenant selection and bearer scopes are the same as the rest of the API: pass `X-Bluedb-Tenant` to target a tenant (default `_`), and use `data:read` / `data:write` / `schema:admin` scopes as appropriate. See the full reference at [Collections](../collections/README.md).
+
 ## Ledger
 
 `/ledger/accounts` and `/ledger/transfers` (batched create + lookup) expose the

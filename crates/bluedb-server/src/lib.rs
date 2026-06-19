@@ -48,6 +48,7 @@ use bluedb_ha::{HaError, NodeRegistry, Status, WriterController};
 use bluedb_ledger::Ledger;
 use arrow_array::RecordBatch;
 
+mod collections;
 mod ledger_api;
 mod evidence_api;
 mod graph_api;
@@ -241,6 +242,10 @@ struct Inner {
     /// The background seal/compaction scheduler for the durable FTS engine, spawned
     /// on promote and aborted on demote / re-promote. `None` until the first promote.
     seal_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Background TTL-sweep task: periodically calls `sweep_all_ttl` across all
+    /// tenants on the active writer. Aborted on demote / re-promote. `None` until
+    /// the first promote. Interval = `BLUEDB_TTL_SWEEP_INTERVAL_SECS` (default 60).
+    ttl_sweep_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Shared CDC control for the lakehouse mirror — installed on every write
     /// connection so mutations on mirror-enabled tables land in the CDC log, and
     /// mutated by `PRAGMA lakehouse_mirror`. Lives for the node's lifetime so the
@@ -297,6 +302,7 @@ impl AppState {
                 authz: OnceLock::new(),
                 fts: RwLock::new(FtsEngine::new()),
                 seal_handle: Mutex::new(None),
+                ttl_sweep_handle: Mutex::new(None),
                 cdc: CdcConfig::default(),
                 lakehouse_base: String::new(),
                 lakehouse: RwLock::new(None),
@@ -530,6 +536,35 @@ impl AppState {
         *self.inner.seal_handle.lock().unwrap() = Some(handle);
         *self.inner.fts.write().await = fts;
 
+        // Start the TTL sweep background task. On each tick, reads the global
+        // tenant registry and sweeps every tenant that has a TTL index.
+        // Interval = `BLUEDB_TTL_SWEEP_INTERVAL_SECS` (default 60 s).
+        // A demote aborts the task; re-promote replaces it.
+        {
+            let ttl_interval = {
+                let secs = std::env::var("BLUEDB_TTL_SWEEP_INTERVAL_SECS")
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .unwrap_or(60);
+                Duration::from_secs(secs)
+            };
+            if let Some(h) = self.inner.ttl_sweep_handle.lock().unwrap().take() {
+                h.abort();
+            }
+            let ttl_state = self.clone();
+            let ttl_handle = tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(ttl_interval);
+                ticker.tick().await; // skip the immediate first tick
+                loop {
+                    ticker.tick().await;
+                    if let Err(e) = collections::sweep_all_tenants_ttl(&ttl_state).await {
+                        eprintln!("bluedb-server: TTL sweep error: {:?}", e);
+                    }
+                }
+            });
+            *self.inner.ttl_sweep_handle.lock().unwrap() = Some(ttl_handle);
+        }
+
         // Reopen the lakehouse mirror over the SAME object store + writer database
         // (the Iceberg tables live alongside the SQL data, in the same bucket the
         // warehouse reads). Restores the durable opt-out registry, then spawns the
@@ -580,6 +615,10 @@ impl AppState {
         // `require_active`), so an empty in-memory engine is safe and drops the
         // durable handles.
         if let Some(h) = self.inner.seal_handle.lock().unwrap().take() {
+            h.abort();
+        }
+        // Stop the TTL sweep background task — a passive node must not mutate data.
+        if let Some(h) = self.inner.ttl_sweep_handle.lock().unwrap().take() {
             h.abort();
         }
         *self.inner.fts.write().await = FtsEngine::new();
@@ -796,6 +835,21 @@ impl AppState {
     pub(crate) fn is_writer(&self) -> bool {
         self.inner.writer.is_active() && self.inner.writer_bound.load(Ordering::Acquire)
     }
+
+    /// Sweep expired documents from `coll` for `tenant`, using an injected
+    /// `now_epoch` (seconds since Unix epoch). Returns the number of documents
+    /// deleted. Exposed as `pub` so integration tests can call it deterministically
+    /// without waiting for the background task interval.
+    pub async fn sweep_ttl_for_test(
+        &self,
+        tenant: &str,
+        coll: &str,
+        field: &str,
+        seconds: i64,
+        now_epoch: i64,
+    ) -> Result<usize, AppError> {
+        collections::sweep_ttl(self, tenant, coll, field, seconds, now_epoch).await
+    }
 }
 
 /// Build the HTTP router over `state`.
@@ -862,6 +916,14 @@ pub fn build_app(state: AppState) -> Router {
             "/catalog/v1/namespaces/{ns}/tables/{table}",
             get(catalog::load_table),
         )
+        // Document-oriented collections API.
+        .route("/collections/{coll}/insert", post(collections::insert))
+        .route("/collections/{coll}/find", post(collections::find))
+        .route("/collections/{coll}/createIndex", post(collections::create_index))
+        .route("/collections/{coll}/update", post(collections::update))
+        .route("/collections/{coll}/delete", post(collections::delete))
+        .route("/collections/{coll}/aggregate", post(collections::aggregate))
+        .route("/collections/{coll}/count", post(collections::count))
         .with_state(state)
 }
 
@@ -990,7 +1052,36 @@ fn parse_min_watermark(headers: &axum::http::HeaderMap) -> Option<i64> {
 /// - Time64(Microsecond) → `"HH:MM:SS[.ffffff]"`
 /// - Everything else → JSON string via `format!("{:?}", ...)`
 fn record_batches_to_json(batches: &[RecordBatch]) -> Value {
-    use arrow_array::Array;
+    let mut rows: Vec<Value> = Vec::new();
+    for batch in batches {
+        let schema = batch.schema();
+        let n = batch.num_rows();
+        for row_idx in 0..n {
+            let mut obj = Map::new();
+            for (col_idx, field) in schema.fields().iter().enumerate() {
+                let col = batch.column(col_idx);
+                let val = arrow_value_to_json(col.as_ref(), field.data_type(), row_idx);
+                obj.insert(field.name().clone(), val);
+            }
+            rows.push(Value::Object(obj));
+        }
+    }
+    Value::Array(rows)
+}
+
+/// Render `array[row_idx]` (an element of `data_type`) as a JSON value.
+///
+/// This is the single per-value conversion used by [`record_batches_to_json`]
+/// for both top-level columns and the elements of a `List`/`LargeList` column —
+/// so a list is serialized as a JSON array whose elements use exactly the same
+/// rendering as a scalar column of the element type (e.g. `List<Utf8>` →
+/// `["a","b"]`, the `$lookup` `as`-array of foreign-document JSON texts). A null
+/// cell is `Value::Null`; an unhandled type still falls back to a debug string.
+fn arrow_value_to_json(
+    array: &dyn arrow_array::Array,
+    data_type: &arrow_schema::DataType,
+    row_idx: usize,
+) -> Value {
     use arrow_array::cast::AsArray;
     use arrow_array::types::{
         Int8Type, Int16Type, Int32Type, Int64Type,
@@ -1000,84 +1091,92 @@ fn record_batches_to_json(batches: &[RecordBatch]) -> Value {
     };
     use arrow_schema::{DataType, TimeUnit};
 
-    let mut rows: Vec<Value> = Vec::new();
-    for batch in batches {
-        let schema = batch.schema();
-        let n = batch.num_rows();
-        for row_idx in 0..n {
-            let mut obj = Map::new();
-            for (col_idx, field) in schema.fields().iter().enumerate() {
-                let col = batch.column(col_idx);
-                let val: Value = if col.is_null(row_idx) {
-                    Value::Null
-                } else {
-                    match field.data_type() {
-                        DataType::Boolean => {
-                            if let Some(a) = col.as_any().downcast_ref::<arrow_array::BooleanArray>() {
-                                Value::Bool(a.value(row_idx))
-                            } else { Value::Null }
-                        }
-                        DataType::Int8 => json!(col.as_primitive::<Int8Type>().value(row_idx)),
-                        DataType::Int16 => json!(col.as_primitive::<Int16Type>().value(row_idx)),
-                        DataType::Int32 => json!(col.as_primitive::<Int32Type>().value(row_idx)),
-                        DataType::Int64 => json!(col.as_primitive::<Int64Type>().value(row_idx)),
-                        DataType::UInt8 => json!(col.as_primitive::<UInt8Type>().value(row_idx)),
-                        DataType::UInt16 => json!(col.as_primitive::<UInt16Type>().value(row_idx)),
-                        DataType::UInt32 => json!(col.as_primitive::<UInt32Type>().value(row_idx)),
-                        DataType::UInt64 => json!(col.as_primitive::<UInt64Type>().value(row_idx)),
-                        DataType::Float32 => {
-                            let v = col.as_primitive::<Float32Type>().value(row_idx);
-                            serde_json::Number::from_f64(v as f64).map(Value::Number).unwrap_or(Value::Null)
-                        }
-                        DataType::Float64 => {
-                            let v = col.as_primitive::<Float64Type>().value(row_idx);
-                            serde_json::Number::from_f64(v).map(Value::Number).unwrap_or(Value::Null)
-                        }
-                        DataType::Utf8 => {
-                            if let Some(a) = col.as_any().downcast_ref::<arrow_array::StringArray>() {
-                                Value::String(a.value(row_idx).to_string())
-                            } else { Value::Null }
-                        }
-                        DataType::LargeUtf8 => {
-                            if let Some(a) = col.as_any().downcast_ref::<arrow_array::LargeStringArray>() {
-                                Value::String(a.value(row_idx).to_string())
-                            } else { Value::Null }
-                        }
-                        DataType::Decimal128(_precision, scale) => {
-                            let scale = *scale as u32;
-                            let raw = col.as_primitive::<Decimal128Type>().value(row_idx);
-                            Value::String(decimal128_to_string(raw, scale))
-                        }
-                        DataType::Date32 => {
-                            let days = col.as_primitive::<Date32Type>().value(row_idx);
-                            match chrono::NaiveDate::from_epoch_days(days) {
-                                Some(d) => Value::String(d.format("%Y-%m-%d").to_string()),
-                                None => Value::Null,
-                            }
-                        }
-                        DataType::Timestamp(TimeUnit::Microsecond, _) => {
-                            let micros = col.as_primitive::<TimestampMicrosecondType>().value(row_idx);
-                            match chrono::DateTime::from_timestamp_micros(micros) {
-                                Some(dt) => Value::String(format_naive_datetime(&dt.naive_utc())),
-                                None => Value::Null,
-                            }
-                        }
-                        DataType::Time64(TimeUnit::Microsecond) => {
-                            let micros = col.as_primitive::<Time64MicrosecondType>().value(row_idx);
-                            Value::String(format_naive_time_micros(micros))
-                        }
-                        _dt => {
-                            // Fallback: display the array element as debug string.
-                            Value::String(format!("{:?}", col.slice(row_idx, 1)))
-                        }
-                    }
-                };
-                obj.insert(field.name().clone(), val);
+    if array.is_null(row_idx) {
+        return Value::Null;
+    }
+    match data_type {
+        DataType::Boolean => {
+            if let Some(a) = array.as_any().downcast_ref::<arrow_array::BooleanArray>() {
+                Value::Bool(a.value(row_idx))
+            } else { Value::Null }
+        }
+        DataType::Int8 => json!(array.as_primitive::<Int8Type>().value(row_idx)),
+        DataType::Int16 => json!(array.as_primitive::<Int16Type>().value(row_idx)),
+        DataType::Int32 => json!(array.as_primitive::<Int32Type>().value(row_idx)),
+        DataType::Int64 => json!(array.as_primitive::<Int64Type>().value(row_idx)),
+        DataType::UInt8 => json!(array.as_primitive::<UInt8Type>().value(row_idx)),
+        DataType::UInt16 => json!(array.as_primitive::<UInt16Type>().value(row_idx)),
+        DataType::UInt32 => json!(array.as_primitive::<UInt32Type>().value(row_idx)),
+        DataType::UInt64 => json!(array.as_primitive::<UInt64Type>().value(row_idx)),
+        DataType::Float32 => {
+            let v = array.as_primitive::<Float32Type>().value(row_idx);
+            serde_json::Number::from_f64(v as f64).map(Value::Number).unwrap_or(Value::Null)
+        }
+        DataType::Float64 => {
+            let v = array.as_primitive::<Float64Type>().value(row_idx);
+            serde_json::Number::from_f64(v).map(Value::Number).unwrap_or(Value::Null)
+        }
+        DataType::Utf8 => {
+            if let Some(a) = array.as_any().downcast_ref::<arrow_array::StringArray>() {
+                Value::String(a.value(row_idx).to_string())
+            } else { Value::Null }
+        }
+        DataType::LargeUtf8 => {
+            if let Some(a) = array.as_any().downcast_ref::<arrow_array::LargeStringArray>() {
+                Value::String(a.value(row_idx).to_string())
+            } else { Value::Null }
+        }
+        DataType::Decimal128(_precision, scale) => {
+            let scale = *scale as u32;
+            let raw = array.as_primitive::<Decimal128Type>().value(row_idx);
+            Value::String(decimal128_to_string(raw, scale))
+        }
+        DataType::Date32 => {
+            let days = array.as_primitive::<Date32Type>().value(row_idx);
+            match chrono::NaiveDate::from_epoch_days(days) {
+                Some(d) => Value::String(d.format("%Y-%m-%d").to_string()),
+                None => Value::Null,
             }
-            rows.push(Value::Object(obj));
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            let micros = array.as_primitive::<TimestampMicrosecondType>().value(row_idx);
+            match chrono::DateTime::from_timestamp_micros(micros) {
+                Some(dt) => Value::String(format_naive_datetime(&dt.naive_utc())),
+                None => Value::Null,
+            }
+        }
+        DataType::Time64(TimeUnit::Microsecond) => {
+            let micros = array.as_primitive::<Time64MicrosecondType>().value(row_idx);
+            Value::String(format_naive_time_micros(micros))
+        }
+        // A list cell renders as a JSON array; each element uses the same
+        // per-value rendering, recursing on the element type. This is what lets
+        // the `$lookup` `as` column (`List<Utf8>` of foreign-document JSON texts)
+        // reach the client as a real JSON array rather than a debug string.
+        DataType::List(elem_field) => {
+            let list = array.as_list::<i32>();
+            let values = list.value(row_idx);
+            list_values_to_json(values.as_ref(), elem_field.data_type())
+        }
+        DataType::LargeList(elem_field) => {
+            let list = array.as_list::<i64>();
+            let values = list.value(row_idx);
+            list_values_to_json(values.as_ref(), elem_field.data_type())
+        }
+        _dt => {
+            // Fallback: display the array element as debug string.
+            Value::String(format!("{:?}", array.slice(row_idx, 1)))
         }
     }
-    Value::Array(rows)
+}
+
+/// Render every element of a list cell's child array as a JSON array, using the
+/// shared per-value conversion for the element `data_type`.
+fn list_values_to_json(values: &dyn arrow_array::Array, data_type: &arrow_schema::DataType) -> Value {
+    let elems = (0..values.len())
+        .map(|i| arrow_value_to_json(values, data_type, i))
+        .collect();
+    Value::Array(elems)
 }
 
 /// Format a `Decimal128` raw mantissa + scale as a normalized decimal string.
@@ -1408,6 +1507,57 @@ async fn route_select_to_analytical(
         watermark_headers(tenant, wm),
         Json(reinflate_rows(record_batches_to_json(&batches), json_cols)),
     ))
+}
+
+/// Execute a read `sql` (with `$N` params from a `bluedb_collections` filter)
+/// on the GlueSQL fast path first. On a scan/sort guardrail reject **or** a
+/// GlueSQL translate error (e.g. `doc->>'field'` — a JSON path operator GlueSQL
+/// doesn't support), fall through to DataFusion over the tenant's Iceberg mirror.
+/// Returns each result row as a JSON object, with JSON columns already re-inflated.
+///
+/// Called by `collections::find`; lives here because it needs the private
+/// `json_to_param`, `select_to_json`, `record_batches_to_json`, `reinflate_rows`,
+/// and `is_guardrail_reject` helpers that are all defined in this module.
+pub(crate) async fn run_read_routed(
+    state: &AppState,
+    tenant: &str,
+    sql: &str,
+    params: &[serde_json::Value],
+) -> Result<Vec<serde_json::Value>, AppError> {
+    let rest_params = params
+        .iter()
+        .map(json_to_param)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut glue = Glue::new(state.connection(tenant).await?);
+    match rest_sql::execute_sql(&mut glue, sql, &rest_params, false).await {
+        Ok(payloads) => {
+            let json_cols = vec!["doc".to_string()];
+            let rows = select_to_json(payloads, &json_cols);
+            return Ok(rows.as_array().cloned().unwrap_or_default());
+        }
+        // Plan-time guardrail reject: non-indexed filter / ORDER BY.
+        Err(ref e) if is_guardrail_reject(e) => {}
+        // GlueSQL translate error: JSON path operators (`->>`, `->`) that GlueSQL
+        // doesn't support — route to DataFusion which handles them natively.
+        Err(EngineError::Sql(gluesql_core::error::Error::Translate(_))) => {}
+        Err(e) => return Err(e.into()),
+    }
+
+    // Route to DataFusion over the tenant's Iceberg mirror.
+    let manager = state.lakehouse().await.ok_or_else(|| {
+        AppError::internal("analytical path unavailable: lakehouse manager not bound")
+    })?;
+    let engine = manager
+        .engine_for(tenant)
+        .await
+        .map_err(|e| AppError::internal(format!("get lakehouse engine: {e}")))?;
+    let batches = bluedb_query::query_via_catalog(engine, sql, params)
+        .await
+        .map_err(|e| AppError::bad_request(format!("query: {e}")))?;
+    let json_cols = vec!["doc".to_string()];
+    let rows = reinflate_rows(record_batches_to_json(&batches), &json_cols);
+    Ok(rows.as_array().cloned().unwrap_or_default())
 }
 
 /// `POST /tables/{table}` — INSERT (JSON object → autocommit; array → one txn batch).
@@ -2150,6 +2300,18 @@ impl AppError {
             HaError::Provider(err) => Self::internal(err.to_string()),
         }
     }
+
+    pub(crate) fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
+
+    pub(crate) fn error_code(&self) -> Option<&'static str> {
+        self.code
+    }
 }
 
 /// Map an engine error to an HTTP status + stable machine-readable code, so an
@@ -2173,7 +2335,7 @@ fn classify_engine_error(err: &EngineError) -> (StatusCode, Option<&'static str>
     if msg.contains("table not found") {
         return (StatusCode::NOT_FOUND, Some("NOT_FOUND"));
     }
-    if msg.contains("duplicate entry") {
+    if msg.contains("duplicate entry") || msg.contains("unique constraint violation") {
         return (StatusCode::CONFLICT, Some("UNIQUE_VIOLATION"));
     }
     match err {

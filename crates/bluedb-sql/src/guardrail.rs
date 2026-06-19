@@ -118,6 +118,7 @@ fn classify(schema_map: &SchemaMap, statement: &Statement) -> GlueResult<Decisio
     };
 
     let indexable = indexable_columns(schema);
+    let pk_cols = primary_key_columns(schema);
 
     // ORDER BY must be served by PK order or an index, with or without a WHERE,
     // else it is a real in-memory sort that a LIMIT would not make cheap.
@@ -135,7 +136,7 @@ fn classify(schema_map: &SchemaMap, statement: &Statement) -> GlueResult<Decisio
         // it at any size. A WHERE on only non-indexed columns is NOT bounded by a
         // LIMIT (the filter runs post-scan), so it is rejected.
         Some(expr) => {
-            if where_hits_index(expr, &indexable) {
+            if where_hits_index(schema_map, &pk_cols, expr, &indexable) {
                 Ok(Decision::PassThrough)
             } else {
                 // Name the non-indexed columns the filter uses, so the error can
@@ -190,29 +191,145 @@ fn indexable_columns(schema: &Schema) -> HashSet<String> {
     set
 }
 
+/// The set of primary-key column names of a schema. Used to recognise the
+/// `<pk> IN (SELECT …)` shape: an `InSubquery` is only index-served when its left
+/// side is the table's own primary key (PK-membership), never an arbitrary column.
+fn primary_key_columns(schema: &Schema) -> HashSet<String> {
+    let mut set = HashSet::new();
+    if let Some(defs) = &schema.column_defs {
+        for col in defs {
+            if col.unique.as_ref().is_some_and(|u| u.is_primary) {
+                set.insert(col.name.clone());
+            }
+        }
+    }
+    set
+}
+
 /// True if some top-level `AND` conjunct is a sargable predicate against an
 /// indexable column. A disjunction (`OR`) is treated conservatively — not
 /// index-served unless we can prove otherwise (we don't try), so it fails here.
-fn where_hits_index(expr: &Expr, indexable: &HashSet<String>) -> bool {
+///
+/// `pk_cols` is the *current* table's primary-key column set (for recognising a
+/// `<pk> IN (SELECT …)` membership); `schema_map` is threaded so a PK-IN-subquery
+/// can resolve the subquery table's own indexes (which it must hit for the whole
+/// shape to be index-served). See [`in_subquery_hits_index`].
+fn where_hits_index(
+    schema_map: &SchemaMap,
+    pk_cols: &HashSet<String>,
+    expr: &Expr,
+    indexable: &HashSet<String>,
+) -> bool {
     for conjunct in split_and(expr) {
-        if conjunct_hits_index(conjunct, indexable) {
+        if conjunct_hits_index(schema_map, pk_cols, conjunct, indexable) {
             return true;
         }
     }
     false
 }
 
-fn conjunct_hits_index(expr: &Expr, indexable: &HashSet<String>) -> bool {
+fn conjunct_hits_index(
+    schema_map: &SchemaMap,
+    pk_cols: &HashSet<String>,
+    expr: &Expr,
+    indexable: &HashSet<String>,
+) -> bool {
     match expr {
-        Expr::Nested(inner) => conjunct_hits_index(inner, indexable),
+        Expr::Nested(inner) => conjunct_hits_index(schema_map, pk_cols, inner, indexable),
         Expr::BinaryOp { left, op, right } if is_sargable_op(op) => {
             (is_indexable(left, indexable) && column_of(right).is_none())
                 || (is_indexable(right, indexable) && column_of(left).is_none())
         }
         Expr::Between { expr, negated: false, .. } => is_indexable(expr, indexable),
         Expr::InList { expr, negated: false, .. } => is_indexable(expr, indexable),
+        // `<pk> IN (SELECT <one col> FROM <one table> WHERE <indexed conjunct>)`.
+        // PK membership is itself an index lookup, and the subquery must be
+        // index-served on its *own* table — so the whole shape is bounded. Any
+        // looser shape (negated, non-PK left, complex/joined subquery, or a
+        // subquery WHERE that scans a non-indexed column) is rejected. See
+        // [`in_subquery_hits_index`].
+        Expr::InSubquery { expr, subquery, negated: false } => {
+            in_subquery_hits_index(schema_map, pk_cols, expr, subquery)
+        }
         _ => false,
     }
+}
+
+/// Decide whether a `<pk> IN (SELECT …)` conjunct is genuinely index-served, and
+/// therefore safe for the guardrail to accept (rather than route to a full scan).
+///
+/// **Deliberately narrow.** It accepts *only* this shape, and rejects everything
+/// else by returning `false`:
+///
+/// * `left` is a bare reference to the current table's primary-key column
+///   (`pk_cols`) — membership in a PK set is a point/seek lookup, not a scan.
+/// * the subquery is a single `SELECT` (not `VALUES`/`UNION`) with **no joins**,
+///   **no `GROUP BY`**, **no `HAVING`**, **no `LIMIT`/`OFFSET`**, and exactly one
+///   projected column (the membership column).
+/// * the subquery reads exactly **one base table** (a named `TableFactor::Table`,
+///   not a derived/sub-subquery) whose schema we can resolve from `schema_map`
+///   (gluesql's `fetch_schema_map` already walks `InSubquery`, so the side
+///   table's `Schema` — including its secondary indexes — is present).
+/// * the subquery has a `WHERE` whose conjunct hits an index **on that subquery
+///   table** — checked by recursing with the subquery table's own PK + indexable
+///   sets, so a subquery filtering a non-indexed column is *not* accepted.
+///
+/// The recursion bottoms out quickly in practice: the only nested `InSubquery`
+/// this would chase is another `<pk> IN (SELECT …)`, and the outer-table set it
+/// is checked against is the subquery table's, so it cannot loop on the same
+/// table set.
+fn in_subquery_hits_index(
+    schema_map: &SchemaMap,
+    pk_cols: &HashSet<String>,
+    left: &Expr,
+    subquery: &gluesql_core::ast::Query,
+) -> bool {
+    // Left side must be the *current* table's primary key.
+    if !column_of(left).is_some_and(|c| pk_cols.contains(&c)) {
+        return false;
+    }
+
+    // No ORDER BY / LIMIT / OFFSET on the subquery (keep it a plain membership set).
+    if !subquery.order_by.is_empty() || subquery.limit.is_some() || subquery.offset.is_some() {
+        return false;
+    }
+
+    let SetExpr::Select(select) = &subquery.body else {
+        return false; // VALUES (or any non-Select set expression) — reject.
+    };
+
+    // Plain single-table SELECT: no joins, no GROUP BY, no HAVING.
+    if !select.from.joins.is_empty()
+        || !select.group_by.is_empty()
+        || select.having.is_some()
+    {
+        return false;
+    }
+
+    // Exactly one projected column (the membership column). Aggregates would be a
+    // `SelectItem::Expr` carrying a function call — still a single item, but the
+    // GROUP BY / HAVING guards above already exclude the grouped-aggregate shape,
+    // and a bare aggregate without GROUP BY collapses to one row (membership in a
+    // single value), which we conservatively decline by requiring a plain column.
+    if select.projection.len() != 1 {
+        return false;
+    }
+
+    // The subquery must read exactly one *named base table* we can resolve.
+    let TableFactor::Table { name: sub_table, .. } = &select.from.relation else {
+        return false; // derived subquery / series / dictionary — reject.
+    };
+    let Some(sub_schema) = schema_map.get(sub_table) else {
+        return false; // can't resolve its schema → can't prove it's indexed → reject.
+    };
+
+    // The subquery MUST have a WHERE that hits an index on its own table.
+    let Some(sub_where) = &select.selection else {
+        return false; // unfiltered subquery = full scan of the side table — reject.
+    };
+    let sub_indexable = indexable_columns(sub_schema);
+    let sub_pk = primary_key_columns(sub_schema);
+    where_hits_index(schema_map, &sub_pk, sub_where, &sub_indexable)
 }
 
 fn is_indexable(expr: &Expr, indexable: &HashSet<String>) -> bool {
@@ -495,6 +612,109 @@ mod tests {
         assert!(
             err.to_string().contains("CREATE INDEX t_name ON t (name);"),
             "hands back the exact DDL for the sort column: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PK-IN-subquery (multikey side-table membership) — the conservative arm.
+    // -----------------------------------------------------------------------
+    //
+    // The collections layer rewrites a multikey `find {tags:"x"}` to
+    //   SELECT doc FROM t WHERE _id IN (SELECT _id FROM t__mk_tags WHERE val = 'x')
+    // This is index-served (PK membership + an indexed subquery scan) and so must
+    // be ACCEPTED on the fast path — but only when the subquery's filter column is
+    // actually indexed. The negative cases below are the conservative guarantee.
+
+    /// Outer collection `t(_id PK, doc)` plus its multikey side table
+    /// `t__mk_tags(rid PK, _id, val)`. `side_val_indexed` controls whether the
+    /// side table carries the secondary index on `val` that makes the membership
+    /// subquery index-served.
+    fn collection_with_side_table(side_val_indexed: bool) -> SchemaMap {
+        let side_idx: &[&str] = if side_val_indexed { &["val"] } else { &[] };
+        map(vec![
+            schema("t", &[("_id", true), ("doc", false)], &[]),
+            schema("t__mk_tags", &[("rid", true), ("_id", false), ("val", false)], side_idx),
+        ])
+    }
+
+    #[test]
+    fn pk_in_indexed_subquery_is_accepted() {
+        // `_id` (the outer PK) IN (SELECT _id FROM side WHERE val = 'x'), and the
+        // side table HAS an index on `val` → genuinely index-served → not capped,
+        // not rejected (stays on the GlueSQL fast path).
+        let m = collection_with_side_table(true);
+        let stmt = run(&m, "SELECT doc FROM t WHERE _id IN (SELECT _id FROM t__mk_tags WHERE val = 'x')")
+            .expect("PK-IN-(indexed subquery) is index-served, must be accepted");
+        assert_eq!(limit_of(&stmt), None, "index-served reads are not capped");
+    }
+
+    #[test]
+    fn pk_in_unindexed_subquery_is_rejected() {
+        // SAME shape, but the side table has NO index on `val`: the subquery would
+        // full-scan the side table, so the guardrail must STILL reject it. This is
+        // the conservative guarantee — acceptance hinges on the subquery being
+        // index-served on its own table.
+        let m = collection_with_side_table(false);
+        assert!(
+            run(&m, "SELECT doc FROM t WHERE _id IN (SELECT _id FROM t__mk_tags WHERE val = 'x')").is_err(),
+            "PK-IN-(non-indexed subquery) is a side-table scan — must be rejected"
+        );
+    }
+
+    #[test]
+    fn pk_not_in_subquery_is_rejected() {
+        // Negation is never index-served (anti-join over the whole table), even
+        // when the subquery itself is indexed.
+        let m = collection_with_side_table(true);
+        assert!(
+            run(&m, "SELECT doc FROM t WHERE _id NOT IN (SELECT _id FROM t__mk_tags WHERE val = 'x')").is_err(),
+            "NOT IN (SELECT …) must still be rejected"
+        );
+    }
+
+    #[test]
+    fn non_pk_in_indexed_subquery_is_rejected() {
+        // Left side is a non-PK, non-indexed column of `t` (`doc`), not the PK.
+        // Membership of an arbitrary column is a post-scan filter, so reject even
+        // though the subquery is indexed.
+        let m = collection_with_side_table(true);
+        assert!(
+            run(&m, "SELECT doc FROM t WHERE doc IN (SELECT _id FROM t__mk_tags WHERE val = 'x')").is_err(),
+            "<non-pk> IN (SELECT …) must be rejected"
+        );
+    }
+
+    #[test]
+    fn pk_in_unfiltered_subquery_is_rejected() {
+        // No WHERE in the subquery → it scans the entire side table → reject, even
+        // though the side table is indexed on `val`.
+        let m = collection_with_side_table(true);
+        assert!(
+            run(&m, "SELECT doc FROM t WHERE _id IN (SELECT _id FROM t__mk_tags)").is_err(),
+            "PK-IN-(unfiltered subquery) is a full side-table scan — must be rejected"
+        );
+    }
+
+    #[test]
+    fn pk_in_subquery_with_unknown_table_is_rejected() {
+        // The subquery table's schema is not resolvable (we can't prove it is
+        // indexed) → reject. Here only the outer table is in the map.
+        let m = map(vec![schema("t", &[("_id", true), ("doc", false)], &[])]);
+        assert!(
+            run(&m, "SELECT doc FROM t WHERE _id IN (SELECT _id FROM mystery WHERE val = 'x')").is_err(),
+            "PK-IN-(unresolvable subquery table) must be rejected"
+        );
+    }
+
+    #[test]
+    fn pk_in_indexed_subquery_anded_with_unindexed_is_accepted() {
+        // A PK-IN-(indexed subquery) conjunct is sargable; gluesql filters the
+        // rest. One index-served conjunct is enough — mirrors the plain
+        // `indexed AND unindexed` rule.
+        let m = collection_with_side_table(true);
+        assert!(
+            run(&m, "SELECT doc FROM t WHERE _id IN (SELECT _id FROM t__mk_tags WHERE val = 'x') AND doc = 'y'").is_ok(),
+            "an index-served IN-subquery conjunct ANDed with an unindexed one is accepted"
         );
     }
 }
