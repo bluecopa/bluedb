@@ -98,6 +98,48 @@ curl -s -X POST localhost:8081/collections/orders/createIndex \
 # {"name":"cidx_orders_status"}
 ```
 
+**Create a compound index** (accelerates full-key equality lookups):
+
+```bash
+curl -s -X POST localhost:8081/collections/orders/createIndex \
+  -H 'content-type: application/json' \
+  -H 'authorization: Bearer mytoken' \
+  -H 'x-bluedb-tenant: acme' \
+  -d '{"keys": {"customer": 1, "status": 1}}'
+# {"name":"cidx_orders_customer_status"}
+```
+
+**Aggregate with `$unwind` and `$group`:**
+
+```bash
+curl -s -X POST localhost:8081/collections/orders/aggregate \
+  -H 'content-type: application/json' \
+  -H 'authorization: Bearer mytoken' \
+  -H 'x-bluedb-tenant: acme' \
+  -d '{"pipeline": [
+        {"$unwind": "$tags"},
+        {"$group": {"_id": "$tags", "count": {"$sum": 1}}}
+      ]}'
+```
+
+**`$lookup` join** (one output row per match):
+
+```bash
+curl -s -X POST localhost:8081/collections/orders/aggregate \
+  -H 'content-type: application/json' \
+  -H 'authorization: Bearer mytoken' \
+  -H 'x-bluedb-tenant: acme' \
+  -d '{"pipeline": [
+        {"$lookup": {
+          "from": "customers",
+          "localField": "customer",
+          "foreignField": "name",
+          "as": "customerDoc"
+        }}
+      ]}'
+# Note: "customerDoc" is a flat JSON value per match, not a nested array.
+```
+
 ---
 
 ## Compatibility matrix
@@ -160,8 +202,8 @@ Any unrecognized operator (key starting with `$`) is rejected with an error.
 | `$group` | yes | `_id` must be `"$field"` or `null`; accumulators: `$sum`, `$avg`, `$min`, `$max`, `$count` |
 | `$project` | yes (best-effort) | Inclusion `{field: 1}` and `{out: "$field"}` renaming work; field exclusion `{field: 0}` is silently skipped |
 | `$addFields` / `$set` | yes (best-effort) | Appends computed fields; same limitations as `$project` |
-| `$lookup` | yes (best-effort) | Left join. Works correctly when `localField` and `foreignField` are plain column names (e.g. `_id`-to-`_id` join). Joining on a JSON sub-field path is **not supported** — the join is on the raw column name, not via the JSON accessor |
-| `$unwind` | yes (best-effort) | Expands a **real Arrow array column**. Does not expand a field that is stored as a JSON-text array inside the `doc` blob |
+| `$lookup` | yes | Left join on **document fields** (not limited to `_id`). Join keys are materialized from the document store; one output row is produced per match. **Limitation:** the `as` value is a flat per-match JSON value — not Mongo's nested single-element array (Arrow list columns are not yet rendered as JSON arrays in responses). Joining on a JSON sub-field path (e.g. `"a.b"`) is **not supported** — the join key must be a plain field name. |
+| `$unwind` | yes | Expands a JSON array field stored in the document (`"$arrayField"`) into one row per element. The expanded element is referenceable by subsequent stages (e.g. `$group {_id: "$arrayField"}`). A missing or empty array yields no rows (MongoDB default behavior). |
 | `$facet` | **no** | `UnsupportedStage` |
 | `$graphLookup` | **no** | `UnsupportedStage` |
 | `$bucket` / `$bucketAuto` | **no** | `UnsupportedStage` |
@@ -180,7 +222,7 @@ see [Freshness](#freshness) below.
 |---------|-----------|-------|
 | Single-field index | yes | `{"keys": {"field": 1}}` |
 | Unique index | yes | `{"options": {"unique": true}}` |
-| Compound index | **no** | Only the first key in `keys` is used |
+| Compound index | yes | `{"keys": {"a": 1, "b": 1}}` — accelerates **full-key equality** lookups (`{a: x, b: y}`) on the fresh fast path. Prefix-only queries (`{a: x}`) or range queries on the last component are not accelerated by the compound index — they fall to single-field indexes or the analytical engine. |
 | Multikey index (array field) | **no** | |
 | Geospatial index | **no** | |
 | TTL index | **no** | |
@@ -194,14 +236,25 @@ Indexes are **gateway-maintained**: the server adds a derived column
 `update`, and `delete`. The path must be a valid dot-separated identifier (e.g.
 `address.city`); slashes and other special characters are rejected.
 
-!!! note "String-indexed fields vs numeric/boolean fields"
-    The derived column `__cidx_<path>` is always TEXT. A `find` filter on an
-    **indexed field** uses that column only when the comparison value is a
-    **string** (e.g. `{status: "active"}`). For **numeric or boolean** values
-    (e.g. `{age: 36}`, `{enabled: true}`) the filter is served by the
-    analytical engine (seconds-fresh, requires a prior seal) regardless of
-    whether an index exists. `$exists` always uses the derived column (it is a
-    NULL check and is type-agnostic).
+!!! note "Index type inference: string, integer/bool, and float fields"
+    `createIndex` infers the column type by sampling existing documents in the
+    collection. You can also override it explicitly via the `options` field:
+    `{"options": {"type": "number"}}`, `{"options": {"type": "bool"}}`, or
+    `{"options": {"type": "string"}}`.
+
+    - **String fields** — the derived column is TEXT; equality and range filters
+      on string values (`{status: "active"}`) use the fast path.
+    - **Integer/boolean fields** — the derived column is an INTEGER or BOOLEAN
+      column. Filters on integer values (e.g. `{age: 36}`) or boolean values
+      (e.g. `{enabled: true}`) are served on the **fresh fast path** (read-your-writes),
+      just like string fields. `5` and `5.0` are treated as the same value.
+    - **Fractional/float fields** — a field whose sampled values include a
+      fractional part (e.g. `3.14`) cannot use the fast INT index. Queries on
+      that field are served by the **analytical engine** (seconds-fresh, correct
+      results). This is automatic — type inference picks the right column type.
+
+    `$exists` always uses the derived column regardless of type (it is a NULL
+    check and is type-agnostic).
 
 !!! note "Sort on nested/dotted paths not supported"
     The `sort` field in a `find` request supports **top-level** field names
@@ -217,18 +270,20 @@ bluedb has two read paths for collections. The one that serves a given request
 depends on whether the filter field is indexed:
 
 **Transactional fast path (read-your-writes)**
-: Queries on `_id` or any field that has a gateway-maintained index
-  (`createIndex` was called for that path) are served by the transactional
-  engine directly. Writes you just issued are immediately visible. `insert`,
-  `update`, and `delete` always write through this path.
+: Queries on `_id`, or any field that has a gateway-maintained index
+  (`createIndex` was called for that path) **and** whose filter value is a
+  string, integer, or boolean, are served by the transactional engine directly.
+  Writes you just issued are immediately visible. `insert`, `update`, and
+  `delete` always write through this path.
 
 **Analytical path (seconds-fresh)**
-: Queries on a field that is **not** indexed — and all `aggregate` requests —
-  are served by the analytical engine over the Iceberg mirror. The mirror
-  reflects data as of the last **seal cycle** (typically sub-second to a few
-  seconds, depending on write cadence and deployment topology). Data written
-  in the current seal window may not yet be visible. Clients that need
-  read-your-writes guarantees on a non-indexed field should either:
+: Queries on a field that is **not** indexed — all `aggregate` requests — and
+  queries on an indexed field whose values are fractional/float — are served by
+  the analytical engine over the Iceberg mirror. The mirror reflects data as of
+  the last **seal cycle** (typically sub-second to a few seconds, depending on
+  write cadence and deployment topology). Data written in the current seal window
+  may not yet be visible. Clients that need read-your-writes guarantees on a
+  non-indexed field should either:
   - add an index for that field with `createIndex`, or
   - wait for the seal by polling `count` or an indexed field as a watermark.
 
@@ -252,12 +307,16 @@ The following MongoDB features are not implemented in this release:
 
 - **MongoDB wire protocol** — native `mongosh` / `MongoClient` drivers cannot connect.
 - **Server-side cursors** — all results are returned in a single response body.
-- **Compound, multikey, geospatial, TTL, text, partial, sparse, and hashed indexes.**
+- **Multikey, geospatial, TTL, text, partial, sparse, and hashed indexes.**
+- **Compound index prefix/range acceleration** — a compound index `{a,b}` accelerates full-key equality (`{a:x, b:y}`) but not prefix-only (`{a:x}`) or range queries on the last component; those fall to single-field indexes or the analytical engine.
+- **Fractional/float field fast-path** — queries on a field indexed as float are served by the analytical engine (seconds-fresh, not read-your-writes).
 - **Aggregation stages:** `$facet`, `$graphLookup`, `$bucket`/`$bucketAuto`, `$setWindowFields`, `$merge`, `$out`, `$replaceRoot`, `$replaceWith`, `$unionWith`.
+- **`$lookup` nested-array fidelity** — the `as` field contains a flat JSON value per match, not Mongo's nested single-element array. This is a current serialization limitation (Arrow list columns are not yet rendered as JSON arrays in responses).
+- **`$lookup` on JSON sub-field paths** — the join key must be a plain top-level field name, not a dotted path like `"address.city"`.
+- **`$unwind` on missing/null fields** — a document where the unwound field is absent or null yields no output rows (consistent with MongoDB's default behavior; `preserveNullAndEmptyArrays` is not supported).
 - **Distributed multi-document transactions** — updates are applied document-by-document; there is no multi-document ACID boundary across the collections API.
 - **Heterogeneous `_id` types** — `_id` is always `TEXT`. Integer, ObjectId, and composite `_id` values are stored as their JSON string representation.
 - **Array update operators** — `$`, `$[]`, `$[<identifier>]`, `$addToSet`, `$pop`.
-- **`$lookup` on JSON sub-field paths** — the join key must be a top-level column name.
 - **`$regex` in aggregation pipelines** — `$regex` is rejected in the `$match` stage that runs on the analytical engine.
 
 ## See also
