@@ -785,6 +785,141 @@ async fn indexed_numeric_field_find_returns_correct_results() {
     assert_eq!(docs.len(), 1, "string-indexed field must return 1 doc, got: {body}");
 }
 
+/// `$unwind` of a JSON array field: the array `tags` is materialized into a real
+/// Arrow list column and unnested to one row per element, then grouped+counted.
+/// Two docs `{tags:[x,y]}` and `{tags:[y,z]}` yield element counts x:1, y:2, z:1.
+/// This proves (a) `$unwind` works over a JSON document field (not a real column),
+/// and (b) the downstream `$group {_id:"$tags"}` reads the materialized `tags`
+/// column rather than re-extracting the original array from `doc`.
+#[tokio::test]
+async fn aggregate_unwind_array_field_then_group() {
+    let (app, state) = app_with_state().await;
+
+    for d in [
+        json!({"name": "a", "tags": ["x", "y"]}),
+        json!({"name": "b", "tags": ["y", "z"]}),
+    ] {
+        let (s, body) = call(
+            &app,
+            "POST",
+            "/collections/tags_coll/insert",
+            Some(json!({ "documents": [d] })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "insert: {body}");
+    }
+
+    // Seal so the DataFusion-over-Iceberg read sees the rows.
+    state.seal_now().await.expect("seal");
+
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/collections/tags_coll/aggregate",
+        Some(json!({
+            "pipeline": [
+                { "$unwind": "$tags" },
+                { "$group": { "_id": "$tags", "n": { "$sum": 1 } } },
+                { "$sort": { "_id": 1 } }
+            ]
+        })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "aggregate failed: {body}");
+    let docs = body["documents"].as_array().expect("documents array");
+    assert_eq!(docs.len(), 3, "expected 3 distinct tags (x,y,z), got: {body}");
+
+    // Sorted ascending by _id: x:1, y:2, z:1.
+    assert_eq!(docs[0]["_id"].as_str().unwrap(), "x");
+    assert_eq!(docs[0]["n"].as_i64().unwrap(), 1, "x count: {body}");
+    assert_eq!(docs[1]["_id"].as_str().unwrap(), "y");
+    assert_eq!(docs[1]["n"].as_i64().unwrap(), 2, "y appears in both docs: {body}");
+    assert_eq!(docs[2]["_id"].as_str().unwrap(), "z");
+    assert_eq!(docs[2]["n"].as_i64().unwrap(), 1, "z count: {body}");
+}
+
+/// `$lookup` joining `orders` to `customers` on `cust == _id`. The matched foreign
+/// document is brought through under the `as` name (`customer`).
+///
+/// NOTE on shape: this implementation produces a **flat** left join — `customer`
+/// is the matched foreign `doc` as a JSON string (one output row per match), not
+/// MongoDB's nested single-element array. (See `stage_lookup` docs: a nested
+/// `List` column cannot be serialized to a JSON array by the response encoder.)
+/// The test therefore parses the `customer` JSON string and asserts `name=="Ada"`.
+#[tokio::test]
+async fn aggregate_lookup_brings_matched_foreign_doc() {
+    let (app, state) = app_with_state().await;
+
+    // orders: one order referencing customer c1.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/orders/insert",
+        Some(json!({ "documents": [{ "_id": "o1", "cust": "c1" }] })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "insert order: {body}");
+
+    // customers: c1 = Ada.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/customers/insert",
+        Some(json!({ "documents": [{ "_id": "c1", "name": "Ada" }] })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "insert customer: {body}");
+
+    // Seal both collections so the DataFusion join sees both tables.
+    state.seal_now().await.expect("seal");
+
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/collections/orders/aggregate",
+        Some(json!({
+            "pipeline": [
+                { "$lookup": {
+                    "from": "customers",
+                    "localField": "cust",
+                    "foreignField": "_id",
+                    "as": "customer"
+                }}
+            ]
+        })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "aggregate failed: {body}");
+    let docs = body["documents"].as_array().expect("documents array");
+    assert_eq!(docs.len(), 1, "expected the one o1 row, got: {body}");
+
+    // The o1 row carries its own _id plus the matched customer under `customer`.
+    assert_eq!(docs[0]["_id"].as_str().unwrap(), "o1", "left _id: {body}");
+
+    // `customer` is the matched foreign doc. It arrives as a JSON-text string
+    // (flat shape — not reinflated by the aggregate handler, which only reinflates
+    // `doc`). Parse it and assert the matched customer's name is reachable.
+    let customer_val = &docs[0]["customer"];
+    let name = match customer_val {
+        Value::String(s) => serde_json::from_str::<Value>(s)
+            .ok()
+            .and_then(|v| v.get("name").and_then(Value::as_str).map(str::to_owned)),
+        // Be tolerant if the encoder ever reinflates it to an object.
+        Value::Object(_) => customer_val
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        _ => None,
+    };
+    assert_eq!(
+        name.as_deref(),
+        Some("Ada"),
+        "matched customer name must be reachable as 'Ada', got customer={customer_val}"
+    );
+}
+
 /// An unknown aggregation stage is a 400 with the PARSE_ERROR code.
 #[tokio::test]
 async fn aggregate_unknown_stage_is_400() {

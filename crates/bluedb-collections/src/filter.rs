@@ -259,6 +259,7 @@ fn in_sql_nin(col: &str, value: &Value, params: &mut Vec<Value>) -> String {
 
 use datafusion::arrow::datatypes::DataType;
 use datafusion::logical_expr::{cast, col, lit, Expr, ScalarUDF};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// Lower a JSON scalar to a DataFusion literal [`Expr`], preserving its JSON type
@@ -298,56 +299,72 @@ impl Filter {
     /// `(_id TEXT, doc JSON-as-Utf8)` shape, for the aggregation `$match` stage.
     ///
     /// `get_str` is the runtime-registered `json_get_str` UDF (resolved from the
-    /// session context by the caller). A field path maps to a column expression:
-    /// `_id` → `col("_id")`; any other path → `get_str(col("doc"), lit(path))`,
-    /// which extracts the field as text.
+    /// session context by the caller). `materialized` is the set of fields that an
+    /// earlier stage (e.g. `$unwind`) has already turned into real Arrow columns.
+    /// A field path maps to a column expression:
+    /// `_id` → `col("_id")`; a path in `materialized` → `col(path)`; any other path
+    /// → `get_str(col("doc"), lit(path))`, which extracts the field as text.
     ///
     /// Because `json_get_str` returns text, a comparison against a **numeric**
     /// literal casts the accessor to `Float64` first so the comparison is numeric,
-    /// not lexical. String comparisons compare text directly.
+    /// not lexical. String comparisons compare text directly. (A materialized
+    /// column is compared as-is — it is not re-cast.)
     ///
     /// `$regex` is not supported on this path and returns
     /// [`MqlError::UnsupportedOperator`].
-    pub fn to_df_expr(&self, get_str: &Arc<ScalarUDF>) -> Result<Expr, MqlError> {
+    pub fn to_df_expr(
+        &self,
+        get_str: &Arc<ScalarUDF>,
+        materialized: &HashSet<String>,
+    ) -> Result<Expr, MqlError> {
         match self {
             Filter::True => Ok(lit(true)),
             Filter::And(v) => {
                 let mut it = v.iter();
                 let first = match it.next() {
-                    Some(f) => f.to_df_expr(get_str)?,
+                    Some(f) => f.to_df_expr(get_str, materialized)?,
                     None => return Ok(lit(true)),
                 };
-                it.try_fold(first, |acc, f| Ok(acc.and(f.to_df_expr(get_str)?)))
+                it.try_fold(first, |acc, f| Ok(acc.and(f.to_df_expr(get_str, materialized)?)))
             }
             Filter::Or(v) => {
                 let mut it = v.iter();
                 let first = match it.next() {
-                    Some(f) => f.to_df_expr(get_str)?,
+                    Some(f) => f.to_df_expr(get_str, materialized)?,
                     None => return Ok(lit(true)),
                 };
-                it.try_fold(first, |acc, f| Ok(acc.or(f.to_df_expr(get_str)?)))
+                it.try_fold(first, |acc, f| Ok(acc.or(f.to_df_expr(get_str, materialized)?)))
             }
-            Filter::Not(f) => Ok(!f.to_df_expr(get_str)?),
-            Filter::Cmp { path, op, value } => cmp_df_expr(path, op, value, get_str),
+            Filter::Not(f) => Ok(!f.to_df_expr(get_str, materialized)?),
+            Filter::Cmp { path, op, value } => cmp_df_expr(path, op, value, get_str, materialized),
         }
     }
 }
 
-/// Build the column expression for a field `path`: `_id` is the PK column; any
-/// other path extracts the field as text via `json_get_str(col("doc"), path)`.
-fn path_expr(path: &str, get_str: &Arc<ScalarUDF>) -> Expr {
+/// Build the column expression for a field `path`: `_id` is the PK column; a path
+/// already materialized into a real column is `col(path)`; any other path extracts
+/// the field as text via `json_get_str(col("doc"), path)`.
+fn path_expr(path: &str, get_str: &Arc<ScalarUDF>, materialized: &HashSet<String>) -> Expr {
     if path == "_id" {
         col("_id")
+    } else if materialized.contains(path) {
+        col(path)
     } else {
         get_str.as_ref().clone().call(vec![col("doc"), lit(path)])
     }
 }
 
 /// Like [`path_expr`] but casts the (text) accessor to `Float64` when the literal
-/// being compared is numeric, so the comparison is numeric. `_id` is left as-is.
-fn path_expr_for(path: &str, value: &Value, get_str: &Arc<ScalarUDF>) -> Expr {
-    let base = path_expr(path, get_str);
-    if path != "_id" && is_numeric(value) {
+/// being compared is numeric, so the comparison is numeric. `_id` and materialized
+/// columns are left as-is (already typed, not text accessors).
+fn path_expr_for(
+    path: &str,
+    value: &Value,
+    get_str: &Arc<ScalarUDF>,
+    materialized: &HashSet<String>,
+) -> Expr {
+    let base = path_expr(path, get_str, materialized);
+    if path != "_id" && !materialized.contains(path) && is_numeric(value) {
         cast(base, DataType::Float64)
     } else {
         base
@@ -359,27 +376,28 @@ fn cmp_df_expr(
     op: &Cmp,
     value: &Value,
     get_str: &Arc<ScalarUDF>,
+    materialized: &HashSet<String>,
 ) -> Result<Expr, MqlError> {
     Ok(match op {
-        Cmp::Eq => path_expr_for(path, value, get_str).eq(json_to_lit(value)),
-        Cmp::Ne => path_expr_for(path, value, get_str).not_eq(json_to_lit(value)),
-        Cmp::Gt => path_expr_for(path, value, get_str).gt(json_to_lit(value)),
-        Cmp::Gte => path_expr_for(path, value, get_str).gt_eq(json_to_lit(value)),
-        Cmp::Lt => path_expr_for(path, value, get_str).lt(json_to_lit(value)),
-        Cmp::Lte => path_expr_for(path, value, get_str).lt_eq(json_to_lit(value)),
+        Cmp::Eq => path_expr_for(path, value, get_str, materialized).eq(json_to_lit(value)),
+        Cmp::Ne => path_expr_for(path, value, get_str, materialized).not_eq(json_to_lit(value)),
+        Cmp::Gt => path_expr_for(path, value, get_str, materialized).gt(json_to_lit(value)),
+        Cmp::Gte => path_expr_for(path, value, get_str, materialized).gt_eq(json_to_lit(value)),
+        Cmp::Lt => path_expr_for(path, value, get_str, materialized).lt(json_to_lit(value)),
+        Cmp::Lte => path_expr_for(path, value, get_str, materialized).lt_eq(json_to_lit(value)),
         Cmp::In => {
             let items = value.as_array().cloned().unwrap_or_default();
             let lits: Vec<Expr> = items.iter().map(json_to_lit).collect();
-            path_expr_for(path, value, get_str).in_list(lits, false)
+            path_expr_for(path, value, get_str, materialized).in_list(lits, false)
         }
         Cmp::Nin => {
             let items = value.as_array().cloned().unwrap_or_default();
             let lits: Vec<Expr> = items.iter().map(json_to_lit).collect();
-            path_expr_for(path, value, get_str).in_list(lits, true)
+            path_expr_for(path, value, get_str, materialized).in_list(lits, true)
         }
         Cmp::Exists => {
             let want = value.as_bool().unwrap_or(true);
-            let base = path_expr(path, get_str);
+            let base = path_expr(path, get_str, materialized);
             if want { base.is_not_null() } else { base.is_null() }
         }
         // `$regex` in the DataFusion expr path is out of scope (the SQL `find`
@@ -681,10 +699,15 @@ mod tests {
             Arc::new(ScalarUDF::new_from_impl(FakeGetStr::new()))
         }
 
+        /// No materialized fields — the common case for these structural tests.
+        fn mat() -> HashSet<String> {
+            HashSet::new()
+        }
+
         #[test]
         fn string_field_eq_builds_a_binary_expr() {
             let f = parse_filter(&json!({"status": "active"})).unwrap();
-            let e = f.to_df_expr(&udf()).unwrap();
+            let e = f.to_df_expr(&udf(), &mat()).unwrap();
             // A string comparison is a BinaryExpr; the accessor is NOT cast.
             let s = format!("{e}");
             assert!(s.contains("json_get_str"), "expr was: {s}");
@@ -694,7 +717,7 @@ mod tests {
         #[test]
         fn numeric_field_compare_casts_to_float() {
             let f = parse_filter(&json!({"age": {"$gte": 30}})).unwrap();
-            let e = f.to_df_expr(&udf()).unwrap();
+            let e = f.to_df_expr(&udf(), &mat()).unwrap();
             let s = format!("{e}");
             assert!(s.contains("CAST"), "numeric compare should cast: {s}");
         }
@@ -702,9 +725,33 @@ mod tests {
         #[test]
         fn id_path_is_a_bare_column() {
             let f = parse_filter(&json!({"_id": "x"})).unwrap();
-            let e = f.to_df_expr(&udf()).unwrap();
+            let e = f.to_df_expr(&udf(), &mat()).unwrap();
             let s = format!("{e}");
             assert!(!s.contains("json_get_str"), "_id must be a bare column: {s}");
+        }
+
+        /// A field that an earlier stage materialized resolves to a bare column,
+        /// NOT json_get_str(doc, …) — and a numeric comparison against it is not
+        /// re-cast (the materialized element is already the right type).
+        #[test]
+        fn materialized_field_is_a_bare_column_not_accessor() {
+            let mat: HashSet<String> = ["tags".to_string()].into_iter().collect();
+
+            let f = parse_filter(&json!({"tags": "x"})).unwrap();
+            let e = f.to_df_expr(&udf(), &mat).unwrap();
+            let s = format!("{e}");
+            assert!(
+                !s.contains("json_get_str"),
+                "materialized field must be a bare column, got: {s}"
+            );
+
+            // A non-materialized field in the SAME filter still uses the accessor.
+            let f2 = parse_filter(&json!({"other": "y"})).unwrap();
+            let s2 = format!("{}", f2.to_df_expr(&udf(), &mat).unwrap());
+            assert!(
+                s2.contains("json_get_str"),
+                "non-materialized field must use accessor, got: {s2}"
+            );
         }
 
         #[test]
@@ -716,22 +763,22 @@ mod tests {
                 ]
             }))
             .unwrap();
-            assert!(f.to_df_expr(&udf()).is_ok());
+            assert!(f.to_df_expr(&udf(), &mat()).is_ok());
 
             let f = parse_filter(&json!({"$not": {"status": "active"}})).unwrap();
-            assert!(f.to_df_expr(&udf()).is_ok());
+            assert!(f.to_df_expr(&udf(), &mat()).is_ok());
 
             let f = parse_filter(&json!({"role": {"$in": ["a", "b"]}})).unwrap();
-            assert!(f.to_df_expr(&udf()).is_ok());
+            assert!(f.to_df_expr(&udf(), &mat()).is_ok());
 
             let f = parse_filter(&json!({})).unwrap();
-            assert!(f.to_df_expr(&udf()).is_ok()); // True → lit(true)
+            assert!(f.to_df_expr(&udf(), &mat()).is_ok()); // True → lit(true)
         }
 
         #[test]
         fn regex_is_rejected_on_the_df_path() {
             let f = parse_filter(&json!({"name": {"$regex": "^a"}})).unwrap();
-            let e = f.to_df_expr(&udf()).unwrap_err();
+            let e = f.to_df_expr(&udf(), &mat()).unwrap_err();
             assert!(e.to_string().contains("$regex"), "got: {e}");
         }
     }
