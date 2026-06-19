@@ -69,6 +69,9 @@ flowchart TD
   inclusion/consistency proofs, GDPR-grade redaction) plus a **native graph
   store** with weighted-edge adjacency and **snapshot-isolated** traversal
   (`reachable`, `widest_path`).
+- **[Collections](collections/README.md)** — a MongoDB-style document API over
+  HTTP/JSON: schema-free collections, MQL `find`/`aggregate`, and secondary,
+  compound, and TTL indexes — no MongoDB driver required.
 - **`bluedb-engine`** — composes the pillars behind one facade.
 - **`bluedb-server`** — the HTTP/REST service (axum): CRUD, `/sql`, admin.
 - **[`bluedb-ha`](ha/active-passive.md)** — single-writer high availability:

@@ -122,7 +122,7 @@ curl -s -X POST localhost:8081/collections/orders/aggregate \
       ]}'
 ```
 
-**`$lookup` join** (one output row per match):
+**`$lookup` join** (matched documents nested into the `as` field as a JSON array):
 
 ```bash
 curl -s -X POST localhost:8081/collections/orders/aggregate \
@@ -137,7 +137,7 @@ curl -s -X POST localhost:8081/collections/orders/aggregate \
           "as": "customerDoc"
         }}
       ]}'
-# Note: "customerDoc" is a flat JSON value per match, not a nested array.
+# → each order gains  "customerDoc": [ { …matched customer… } ]   (JSON array of objects; [] when no match)
 ```
 
 ---
@@ -202,7 +202,7 @@ Any unrecognized operator (key starting with `$`) is rejected with an error.
 | `$group` | yes | `_id` must be `"$field"` or `null`; accumulators: `$sum`, `$avg`, `$min`, `$max`, `$count` |
 | `$project` | yes (best-effort) | Inclusion `{field: 1}` and `{out: "$field"}` renaming work; field exclusion `{field: 0}` is silently skipped |
 | `$addFields` / `$set` | yes (best-effort) | Appends computed fields; same limitations as `$project` |
-| `$lookup` | yes | Left join on **document fields** (not limited to `_id`). Join keys are materialized from the document store; one output row is produced per match. **Limitation:** the `as` value is a flat per-match JSON value — not Mongo's nested single-element array (Arrow list columns are not yet rendered as JSON arrays in responses). Joining on a JSON sub-field path (e.g. `"a.b"`) is **not supported** — the join key must be a plain field name. |
+| `$lookup` | yes | Left join on **document fields** (not limited to `_id`). Matched foreign documents are nested into the `as` field as a **JSON array of objects** (`[]` on no match). Join keys are materialized from the document store; join on a plain field name or `_id`, **not** a JSON sub-field path (e.g. `"a.b"`). Array element order is unspecified. |
 | `$unwind` | yes | Expands a JSON array field stored in the document (`"$arrayField"`) into one row per element. The expanded element is referenceable by subsequent stages (e.g. `$group {_id: "$arrayField"}`). A missing or empty array yields no rows (MongoDB default behavior). |
 | `$facet` | **no** | `UnsupportedStage` |
 | `$graphLookup` | **no** | `UnsupportedStage` |
@@ -342,7 +342,6 @@ The following MongoDB features are not implemented in this release:
 - **Multikey index on the transactional fast path** — multikey `find` queries route to the analytical engine (correct results, seconds-fresh; not GlueSQL index-fast in v1).
 - **TTL indexes on non-default tenants** — the sweep loop runs for the default tenant only; non-default-tenant TTL creation is rejected.
 - **Aggregation stages:** `$facet`, `$graphLookup`, `$bucket`/`$bucketAuto`, `$setWindowFields`, `$merge`, `$out`, `$replaceRoot`, `$replaceWith`, `$unionWith`.
-- **`$lookup` nested-array fidelity** — the `as` field contains a flat JSON value per match, not Mongo's nested single-element array. This is a current serialization limitation (Arrow list columns are not yet rendered as JSON arrays in responses).
 - **`$lookup` on JSON sub-field paths** — the join key must be a plain top-level field name, not a dotted path like `"address.city"`.
 - **`$unwind` on missing/null fields** — a document where the unwound field is absent or null yields no output rows (consistent with MongoDB's default behavior; `preserveNullAndEmptyArrays` is not supported).
 - **Distributed multi-document transactions** — updates are applied document-by-document; there is no multi-document ACID boundary across the collections API.
