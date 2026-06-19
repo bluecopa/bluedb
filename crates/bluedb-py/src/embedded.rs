@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use bluedb_ha::{LocalLeaseProvider, SystemClock, WriterController};
 use bluedb_server::{build_app, AppState};
+use slatedb::object_store::local::LocalFileSystem;
 use slatedb::object_store::memory::InMemory;
+use tokio::runtime::Handle;
 use tokio::sync::oneshot;
 
 use crate::authz_cfg::AuthzSpec;
@@ -21,6 +23,8 @@ pub struct EmbeddedConfig {
     pub authz: AuthzSpec,
     pub evidence_signing: bool,
     pub flush_interval_ms: Option<u64>,
+    /// Run with the lakehouse mirror on, backed by a local temp object store.
+    pub mirror: bool,
 }
 
 impl Default for EmbeddedConfig {
@@ -31,6 +35,7 @@ impl Default for EmbeddedConfig {
             authz: AuthzSpec::default(),
             evidence_signing: false,
             flush_interval_ms: None,
+            mirror: false,
         }
     }
 }
@@ -41,14 +46,26 @@ pub struct EmbeddedServer {
     token: Option<String>,
     shutdown: Option<oneshot::Sender<()>>,
     thread: Option<JoinHandle<()>>,
+    /// Mirror mode: the temp warehouse dir, kept alive so `Drop` cleans it.
+    warehouse: Option<tempfile::TempDir>,
+    /// Handle to the server's runtime, for driving `seal()` synchronously.
+    runtime_handle: Handle,
+    /// A clone of the running app's state (shared `Arc` inner) for `seal()`.
+    app_state: AppState,
 }
 
 impl EmbeddedServer {
     /// Boot the server. Blocks until the listener is bound (or boot fails).
     pub fn start(cfg: EmbeddedConfig) -> anyhow::Result<EmbeddedServer> {
         let (authz, token) = cfg.authz.resolve()?;
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<anyhow::Result<SocketAddr>>();
+        let (ready_tx, ready_rx) =
+            std::sync::mpsc::channel::<anyhow::Result<(SocketAddr, Handle, AppState)>>();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+        // Mirror mode: a temp warehouse dir kept alive on this (caller) side so
+        // `Drop` cleans it; the runtime thread builds a LocalFileSystem over its path.
+        let warehouse = if cfg.mirror { Some(tempfile::tempdir()?) } else { None };
+        let warehouse_path = warehouse.as_ref().map(|d| d.path().to_path_buf());
 
         let EmbeddedConfig { db_path, admin_sql, evidence_signing, flush_interval_ms, .. } = cfg;
 
@@ -62,6 +79,9 @@ impl EmbeddedServer {
                         return;
                     }
                 };
+                // The caller drives `seal()` via this handle; the runtime stays
+                // alive for the server's lifetime under `rt.block_on` below.
+                let handle = rt.handle().clone();
                 rt.block_on(async move {
                     if let Some(ms) = flush_interval_ms {
                         // Read by bluedb-server at writer-open time. Process-global;
@@ -83,6 +103,23 @@ impl EmbeddedServer {
                     ));
                     let mut state = AppState::new(object_store, db_path, writer)
                         .with_admin_sql_enabled(admin_sql);
+                    if let Some(p) = &warehouse_path {
+                        // Mirror to a local temp dir under a file:// base so the
+                        // Iceberg metadata a warehouse (DuckDB) loads has resolvable
+                        // locations; default mirroring on for every tenant.
+                        let abs = match std::fs::canonicalize(p) {
+                            Ok(a) => a,
+                            Err(e) => { let _ = ready_tx.send(Err(e.into())); return; }
+                        };
+                        let fs = match LocalFileSystem::new_with_prefix(&abs) {
+                            Ok(f) => Arc::new(f),
+                            Err(e) => { let _ = ready_tx.send(Err(e.into())); return; }
+                        };
+                        state = state
+                            .with_lakehouse_object_store(fs)
+                            .with_lakehouse_base(format!("file://{}", abs.display()))
+                            .with_lakehouse_default_on(true);
+                    }
                     if evidence_signing {
                         state = state.with_local_signer_for_tests();
                     }
@@ -93,6 +130,7 @@ impl EmbeddedServer {
                         let _ = ready_tx.send(Err(anyhow::anyhow!("promote failed: {e:?}")));
                         return;
                     }
+                    let state_for_handle = state.clone();
                     let app = build_app(state);
                     let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
                         Ok(l) => l,
@@ -108,7 +146,7 @@ impl EmbeddedServer {
                             return;
                         }
                     };
-                    let _ = ready_tx.send(Ok(addr));
+                    let _ = ready_tx.send(Ok((addr, handle.clone(), state_for_handle)));
                     let _ = axum::serve(listener, app)
                         .with_graceful_shutdown(async move {
                             let _ = shutdown_rx.await;
@@ -117,12 +155,15 @@ impl EmbeddedServer {
                 });
             })?;
 
-        let addr = ready_rx.recv()??;
+        let (addr, runtime_handle, app_state) = ready_rx.recv()??;
         Ok(EmbeddedServer {
             base_url: format!("http://{addr}"),
             token,
             shutdown: Some(shutdown_tx),
             thread: Some(thread),
+            warehouse,
+            runtime_handle,
+            app_state,
         })
     }
 
@@ -132,6 +173,19 @@ impl EmbeddedServer {
 
     pub fn token(&self) -> Option<&str> {
         self.token.as_deref()
+    }
+
+    /// Synchronously seal buffered writes into the Iceberg mirror (mirror mode).
+    /// On a non-mirror server this is a no-op (no manager bound).
+    pub fn seal(&self) -> anyhow::Result<()> {
+        self.runtime_handle
+            .block_on(self.app_state.seal_now())
+            .map_err(|e| anyhow::anyhow!("seal failed: {e:?}"))
+    }
+
+    /// The local warehouse directory (mirror mode), else `None`.
+    pub fn warehouse_path(&self) -> Option<String> {
+        self.warehouse.as_ref().map(|d| d.path().display().to_string())
     }
 
     /// Signal graceful shutdown and join the runtime thread. Idempotent.
@@ -199,5 +253,66 @@ mod tests {
         if let Err(ureq::Error::Status(code, _)) = r {
             assert_ne!(code, 401, "open mode must not require a token");
         }
+    }
+
+    #[test]
+    fn mirror_mode_seals_and_serves_file_uris_with_type_fidelity() {
+        let s = EmbeddedServer::start(EmbeddedConfig { mirror: true, ..Default::default() }).unwrap();
+        let bearer = format!("Bearer {}", s.token().unwrap());
+        let sql = |body: &str| {
+            ureq::post(&format!("{}/admin/sql", s.base_url()))
+                .set("Authorization", &bearer)
+                .set("Content-Type", "application/json")
+                .send_string(body)
+                .unwrap()
+        };
+        sql(r#"{"sql":"CREATE TABLE t (id INTEGER PRIMARY KEY, amt DECIMAL(10,2), d DATE, ts TIMESTAMP, uid UUID)"}"#);
+        sql(r#"{"sql":"INSERT INTO t VALUES (1, 9.99, DATE '2026-01-01', TIMESTAMP '2026-01-01 00:00:00', GENERATE_UUID())"}"#);
+
+        s.seal().expect("seal");
+
+        let body = ureq::get(&format!("{}/catalog/v1/namespaces/default/tables/t", s.base_url()))
+            .set("Authorization", &bearer)
+            .call()
+            .unwrap()
+            .into_string()
+            .unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let loc = meta["metadata-location"].as_str().expect("metadata-location");
+        assert!(loc.starts_with("file://"), "loadTable URI must be file://, got {loc}");
+        // Type fidelity: the Iceberg schema reports uuid + decimal + date + timestamp.
+        let fields = meta["metadata"]["schemas"][0]["fields"].to_string();
+        for ty in ["uuid", "decimal", "date", "timestamp"] {
+            assert!(fields.contains(ty), "{ty} type must survive into the mirror: {fields}");
+        }
+        assert!(!s.warehouse_path().unwrap().is_empty());
+    }
+
+    #[test]
+    fn watermark_header_and_underscore_tenant_namespace() {
+        let s = EmbeddedServer::start(EmbeddedConfig { mirror: true, ..Default::default() }).unwrap();
+        let bearer = format!("Bearer {}", s.token().unwrap());
+        let tenant = "ws1_sol2_copa_collection_v2";
+        ureq::post(&format!("{}/admin/sql", s.base_url()))
+            .set("Authorization", &bearer)
+            .set("X-Bluedb-Tenant", tenant)
+            .set("Content-Type", "application/json")
+            .send_string(r#"{"sql":"CREATE TABLE t (id INTEGER PRIMARY KEY)"}"#)
+            .unwrap();
+        let w = ureq::post(&format!("{}/tables/t", s.base_url()))
+            .set("Authorization", &bearer)
+            .set("X-Bluedb-Tenant", tenant)
+            .set("Content-Type", "application/json")
+            .send_string(r#"{"id":1}"#)
+            .unwrap();
+        assert!(w.header("X-Bluedb-Watermark").is_some(), "write must surface a watermark");
+        s.seal().unwrap();
+        let body = ureq::get(&format!("{}/catalog/v1/namespaces/{tenant}/tables", s.base_url()))
+            .set("Authorization", &bearer)
+            .call()
+            .unwrap()
+            .into_string()
+            .unwrap();
+        assert!(body.contains("\"name\":\"t\""), "namespace==tenant lists the table: {body}");
     }
 }
