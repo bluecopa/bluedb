@@ -1062,6 +1062,130 @@ async fn numeric_index_queried_with_string_does_not_error() {
     assert!(body["documents"].is_array(), "response must have documents array");
 }
 
+/// Numeric index unifies integer and whole-float encoding.
+///
+/// A doc stored with `{"qty": 5}` (integer) and one with `{"qty": 6.0}` (whole
+/// float) must both be findable by `{qty:5}` and `{qty:6}` respectively on the
+/// GlueSQL fast path — no seal required, because the index column is used.
+#[tokio::test]
+async fn numeric_index_unifies_int_and_float_encoding() {
+    let app = app().await;
+
+    // Create an explicit number index on "qty".
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/qtyidx/createIndex",
+        Some(json!({ "keys": { "qty": 1 }, "options": { "type": "number" } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "createIndex: {body}");
+
+    // Insert one doc with integer qty=5 and another with float qty=6.0.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/qtyidx/insert",
+        Some(json!({ "documents": [
+            { "label": "int-five",   "qty": 5   },
+            { "label": "float-six",  "qty": 6.0 }
+        ]})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "insert: {body}");
+
+    // find {qty:5} — must find the integer-5 doc on the fast path (no seal).
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/qtyidx/find",
+        Some(json!({ "filter": { "qty": 5 } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "find qty=5: {body}");
+    let docs = body["documents"].as_array().expect("documents array");
+    assert_eq!(docs.len(), 1, "expected 1 doc for qty=5, got: {body}");
+    assert_eq!(docs[0]["label"].as_str().unwrap(), "int-five");
+
+    // find {qty:6} — must find the float-6.0 doc on the fast path.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/qtyidx/find",
+        Some(json!({ "filter": { "qty": 6 } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "find qty=6: {body}");
+    let docs = body["documents"].as_array().expect("documents array");
+    assert_eq!(
+        docs.len(), 1,
+        "float-6.0 doc must be found by integer query {{qty:6}}, got: {body}"
+    );
+    assert_eq!(docs[0]["label"].as_str().unwrap(), "float-six");
+}
+
+/// Fractional field find is correct — routes to analytical path, not silently empty.
+///
+/// A doc stored with `{"price": 3.14}` must be findable by `{price: 3.14}`.
+/// Because 3.14 is fractional the index column stores NULL for it; the query
+/// must route to the JSON accessor (analytical path after seal) and still
+/// return the doc.  `{price: 2}` must return 0 docs.
+#[tokio::test]
+async fn fractional_field_find_is_correct() {
+    let (app, state) = app_with_state().await;
+
+    // Create an explicit number index on "price" (will store NULL for 3.14).
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/priceidx/createIndex",
+        Some(json!({ "keys": { "price": 1 }, "options": { "type": "number" } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "createIndex: {body}");
+
+    // Insert a doc with a fractional price.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/priceidx/insert",
+        Some(json!({ "documents": [{ "label": "pi-price", "price": 3.14 }] })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "insert: {body}");
+
+    // Seal so the analytical path (DataFusion/Iceberg) can serve the query.
+    state.seal_now().await.expect("seal");
+
+    // find {price: 3.14} — must return 1 doc via the analytical path (not 0).
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/priceidx/find",
+        Some(json!({ "filter": { "price": 3.14 } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "find price=3.14: {body}");
+    let docs = body["documents"].as_array().expect("documents array");
+    assert_eq!(
+        docs.len(), 1,
+        "fractional price query must return 1 doc (not silently empty), got: {body}"
+    );
+    assert_eq!(docs[0]["label"].as_str().unwrap(), "pi-price");
+
+    // find {price: 2} — must return 0 docs.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/priceidx/find",
+        Some(json!({ "filter": { "price": 2 } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "find price=2: {body}");
+    let docs = body["documents"].as_array().expect("documents array");
+    assert_eq!(docs.len(), 0, "price=2 must return 0 docs, got: {body}");
+}
+
 /// Helper: read a string field that may have arrived as a JSON object's member
 /// or directly. The aggregate result projects `_id` plus extracted columns; a
 /// `$match`+`$sort` pipeline with no `$project` returns the base table columns

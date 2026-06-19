@@ -128,9 +128,14 @@ fn join_indexed(v: &[Filter], sep: &str, params: &mut Vec<Value>, indexed: &Hash
 }
 
 /// Return `true` when the JSON value's type matches the expected [`IndexType`].
+///
+/// For `Number`, only **whole** numbers match (integers, or floats with no
+/// fractional part like `5.0`).  Truly fractional values like `3.14` do NOT
+/// match — they route to the JSON accessor (analytical) path instead, which
+/// compares correctly without silently returning an empty result.
 fn value_matches_type(v: &Value, t: IndexType) -> bool {
     match t {
-        IndexType::Number => v.is_number(),
+        IndexType::Number => crate::index::is_whole_number(v),
         IndexType::Bool => v.is_boolean(),
         IndexType::Text => v.is_string(),
     }
@@ -512,6 +517,45 @@ mod tests {
         assert!(
             sql.contains("__cidx_age"),
             "$in(numbers) on Number index should use derived column, got: {sql}"
+        );
+    }
+
+    /// A fractional query value on a Number-indexed path must NOT use the derived
+    /// column (it would silently produce NULL = empty result); it must fall back to
+    /// the JSON accessor so the comparison is correct on the analytical path.
+    #[test]
+    fn to_sql_indexed_falls_back_for_fractional_value_on_number_index() {
+        let f = parse_filter(&json!({"price": 3.14})).unwrap();
+        let indexed: HashMap<String, IndexType> =
+            [("__cidx_price".to_string(), IndexType::Number)].into();
+
+        let mut params = Vec::new();
+        let sql = f.to_sql_indexed(&mut params, &indexed);
+
+        assert!(
+            !sql.contains("__cidx_"),
+            "fractional value on Number index must fall back to JSON accessor, got: {sql}"
+        );
+        assert!(
+            sql.contains("doc->>'price'"),
+            "fractional value on Number index should use JSON accessor, got: {sql}"
+        );
+    }
+
+    /// A whole-float query value (5.0) on a Number-indexed path DOES use the
+    /// derived column — it is canonically an integer.
+    #[test]
+    fn to_sql_indexed_uses_derived_col_for_whole_float_on_number_index() {
+        let f = parse_filter(&json!({"qty": 5.0})).unwrap();
+        let indexed: HashMap<String, IndexType> =
+            [("__cidx_qty".to_string(), IndexType::Number)].into();
+
+        let mut params = Vec::new();
+        let sql = f.to_sql_indexed(&mut params, &indexed);
+
+        assert!(
+            sql.contains("__cidx_qty"),
+            "whole-float value on Number index should use derived column, got: {sql}"
         );
     }
 

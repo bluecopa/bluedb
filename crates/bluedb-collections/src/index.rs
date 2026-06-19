@@ -52,11 +52,23 @@ pub enum IndexType {
     Text,
 }
 
+/// True if `v` is a JSON number with no fractional part (an INT index can hold it):
+/// integers (`i64`/`u64`), and whole-valued floats like `5.0`, within `i64` range.
+pub fn is_whole_number(v: &serde_json::Value) -> bool {
+    if v.is_i64() || v.is_u64() {
+        return true;
+    }
+    matches!(v.as_f64(), Some(f) if f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64)
+}
+
 /// Infer the index column type from a sample of the field's values across docs.
-/// All-number → `Number`, all-bool → `Bool`, otherwise (incl. empty or mixed)
-/// → `Text`.
+/// All-whole-number → `Number`, all-bool → `Bool`, otherwise (incl. empty,
+/// mixed, or any truly-fractional value) → `Text`.
+///
+/// A field containing any fractional value (e.g. `3.14`) falls to `Text` because
+/// the derived column is `INT` and cannot hold fractional values without data loss.
 pub fn infer_index_type(values: &[serde_json::Value]) -> IndexType {
-    if !values.is_empty() && values.iter().all(|v| v.is_number()) {
+    if !values.is_empty() && values.iter().all(is_whole_number) {
         return IndexType::Number;
     }
     if !values.is_empty() && values.iter().all(|v| v.is_boolean()) {
@@ -105,7 +117,7 @@ pub fn derive_typed_value(
         cur = cur.get(part)?;
     }
     match t {
-        IndexType::Number => cur.is_number().then(|| cur.clone()),
+        IndexType::Number => is_whole_number(cur).then(|| cur.clone()),
         IndexType::Bool => cur.is_boolean().then(|| cur.clone()),
         IndexType::Text => Some(serde_json::Value::String(match cur {
             serde_json::Value::String(s) => s.clone(),
@@ -218,6 +230,27 @@ mod tests {
     }
 
     #[test]
+    fn infer_index_type_whole_floats_are_number() {
+        // 5.0 and 6.0 have no fractional part — an INT column can hold them.
+        assert_eq!(
+            infer_index_type(&[json!(5.0), json!(6.0)]),
+            IndexType::Number
+        );
+    }
+
+    #[test]
+    fn infer_index_type_fractional_is_text() {
+        // 3.14 is genuinely fractional — cannot be held by an INT column.
+        assert_eq!(infer_index_type(&[json!(3.14)]), IndexType::Text);
+    }
+
+    #[test]
+    fn infer_index_type_mixed_int_and_fractional_is_text() {
+        // Any fractional value in the sample forces the whole field to Text.
+        assert_eq!(infer_index_type(&[json!(1), json!(3.14)]), IndexType::Text);
+    }
+
+    #[test]
     fn infer_index_type_all_bools() {
         assert_eq!(
             infer_index_type(&[json!(true), json!(false)]),
@@ -277,6 +310,20 @@ mod tests {
     fn derive_typed_value_number_type_mismatch_is_none() {
         let doc = json!({"age": "x"});
         assert_eq!(derive_typed_value(&doc, "age", IndexType::Number), None);
+    }
+
+    #[test]
+    fn derive_typed_value_fractional_number_is_none_for_number_index() {
+        // 3.14 is fractional — an INT column cannot hold it, so None (→ NULL).
+        let doc = json!({"price": 3.14});
+        assert_eq!(derive_typed_value(&doc, "price", IndexType::Number), None);
+    }
+
+    #[test]
+    fn derive_typed_value_whole_float_is_some_for_number_index() {
+        // 5.0 has no fractional part — treated as a whole number.
+        let doc = json!({"qty": 5.0});
+        assert!(derive_typed_value(&doc, "qty", IndexType::Number).is_some());
     }
 
     #[test]

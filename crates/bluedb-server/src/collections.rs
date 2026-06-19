@@ -316,11 +316,26 @@ fn json_value_to_param(v: &Value) -> bluedb_rest::Param {
         Value::Bool(b) => bluedb_rest::Param::Bool(*b),
         Value::Number(n) => {
             // Prefer integer representation so the param type matches the INT
-            // column type exactly. Fractional floats (e.g. 3.14) cannot be
-            // stored in an INT column without truncation — store NULL instead
-            // so the row simply has no index entry for that field.
+            // column type exactly.
+            //
+            // Whole-valued floats like `5.0` also canonicalize to `Int` so a
+            // doc stored as `{"qty":5}` and one stored as `{"qty":5.0}` unify
+            // on the same index entry — and a query `{qty:5}` also finds
+            // a stored `5.0` document and vice-versa.
+            //
+            // Truly fractional floats (e.g. `3.14`) cannot be stored in an INT
+            // column without data loss. `derive_typed_value` will have returned
+            // `None` for them (→ NULL stored) and `value_matches_type` will
+            // not have routed the query here; but as a belt-and-suspenders
+            // guard, map them to `Null` so the INT column gets no entry.
             if let Some(i) = n.as_i64() {
                 bluedb_rest::Param::Int(i)
+            } else if let Some(f) = n.as_f64() {
+                if f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
+                    bluedb_rest::Param::Int(f as i64)
+                } else {
+                    bluedb_rest::Param::Null // truly fractional → no INT entry
+                }
             } else {
                 bluedb_rest::Param::Null
             }
