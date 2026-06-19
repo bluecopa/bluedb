@@ -54,6 +54,70 @@ fn parse_field(path: &str, val: &Value) -> Result<Filter, MqlError> {
     Ok(Filter::Cmp { path: path.into(), op: Cmp::Eq, value: val.clone() })
 }
 
+impl Filter {
+    /// Lower to a SQL boolean expression over `_id` / `doc`. Appends bound values
+    /// to `params`; placeholders are `$1..$N` by params.len().
+    pub fn to_sql(&self, params: &mut Vec<Value>) -> String {
+        match self {
+            Filter::True => "TRUE".into(),
+            Filter::And(v) => join(v, " AND ", params),
+            Filter::Or(v)  => join(v, " OR ", params),
+            Filter::Not(f) => format!("NOT ({})", f.to_sql(params)),
+            Filter::Cmp { path, op, value } => cmp_sql(path, op, value, params),
+        }
+    }
+}
+
+fn join(v: &[Filter], sep: &str, params: &mut Vec<Value>) -> String {
+    let parts: Vec<String> = v.iter().map(|f| format!("({})", f.to_sql(params))).collect();
+    parts.join(sep)
+}
+
+/// `_id` → the PK column (bare); any other path → `(doc->>'a'->>'b'...)` text accessor.
+/// The outer parens on the json accessor avoid operator-precedence surprises (e.g. `->>`
+/// binding tighter than `=` in some SQL dialects).
+fn col_ref(path: &str) -> String {
+    if path == "_id" { return "_id".into(); }
+    let parts: Vec<&str> = path.split('.').collect();
+    let mut expr = "doc".to_string();
+    for (i, p) in parts.iter().enumerate() {
+        let arrow = if i == parts.len() - 1 { "->>" } else { "->" };
+        expr = format!("{expr}{arrow}'{}'", p.replace('\'', "''"));
+    }
+    format!("({expr})")
+}
+
+fn bind(params: &mut Vec<Value>, v: &Value) -> String {
+    params.push(v.clone());
+    format!("${}", params.len())
+}
+
+fn cmp_sql(path: &str, op: &Cmp, value: &Value, params: &mut Vec<Value>) -> String {
+    let col = col_ref(path);
+    match op {
+        Cmp::Eq  => format!("{col} = {}", bind(params, value)),
+        Cmp::Ne  => format!("{col} <> {}", bind(params, value)),
+        Cmp::Gt  => format!("{col} > {}", bind(params, value)),
+        Cmp::Gte => format!("{col} >= {}", bind(params, value)),
+        Cmp::Lt  => format!("{col} < {}", bind(params, value)),
+        Cmp::Lte => format!("{col} <= {}", bind(params, value)),
+        Cmp::In  => in_sql(&col, value, params, false),
+        Cmp::Nin => in_sql(&col, value, params, true),
+        Cmp::Exists => {
+            let want = value.as_bool().unwrap_or(true);
+            if want { format!("{col} IS NOT NULL") } else { format!("{col} IS NULL") }
+        }
+        Cmp::Regex => format!("{col} ~ {}", bind(params, value)),
+    }
+}
+
+fn in_sql(col: &str, value: &Value, params: &mut Vec<Value>, negate: bool) -> String {
+    let items = value.as_array().cloned().unwrap_or_default();
+    let placeholders: Vec<String> = items.iter().map(|v| bind(params, v)).collect();
+    let kw = if negate { "NOT IN" } else { "IN" };
+    format!("{col} {kw} ({})", placeholders.join(", "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -71,5 +135,18 @@ mod tests {
     fn rejects_unsupported_operator() {
         let e = parse_filter(&json!({"x": {"$where": "1"}})).unwrap_err();
         assert!(e.to_string().contains("$where"));
+    }
+    #[test]
+    fn to_sql_uses_json_accessors_and_bound_params() {
+        let f = parse_filter(&serde_json::json!({"status": "active"})).unwrap();
+        let mut params = Vec::new();
+        let sql = f.to_sql(&mut params);
+        assert_eq!(sql, "(doc->>'status') = $1");
+        assert_eq!(params, vec![serde_json::json!("active")]);
+
+        let f = parse_filter(&serde_json::json!({"_id": "x"})).unwrap();
+        let mut params = Vec::new();
+        // _id maps to the PK column directly, not a json accessor
+        assert_eq!(f.to_sql(&mut params), "_id = $1");
     }
 }
