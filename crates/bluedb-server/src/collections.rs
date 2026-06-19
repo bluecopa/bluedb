@@ -1143,23 +1143,11 @@ pub(crate) async fn create_index(
             .with_code("PARSE_ERROR")
             .into());
         }
-        // FIX I3: the TTL background sweep only runs for the default tenant.
-        // Registering a TTL index for a non-default tenant would silently never
-        // expire any documents. Reject it clearly instead of silently failing.
-        //
-        // (The sweep loop in `AppState::promote` calls `sweep_all_ttl` with
-        // `DEFAULT_TENANT` only; there is no per-tenant enumeration available to
-        // the scheduler. Tenant-aware sweeps are a v2 item.)
-        if tenant != bluedb_sql::DEFAULT_TENANT {
-            return Err(AppError::bad_request(
-                "TTL indexes are supported only on the default tenant in v1 \
-                 (the sweep loop runs for the default tenant only)"
-            )
-            .with_code("PARSE_ERROR")
-            .into());
-        }
+        // Register the per-tenant TTL config and record this tenant in the
+        // global registry so the sweep loop picks it up on every tick.
         ensure_ttl_registry(&state, &tenant).await?;
         upsert_ttl_config(&state, &tenant, &coll, &path, secs).await?;
+        register_ttl_tenant(&state, &tenant).await?;
     }
 
     Ok(Json(json!({ "name": index_name })))
@@ -1511,6 +1499,16 @@ pub(crate) async fn count(
 /// The per-tenant metadata table that tracks TTL configurations.
 const TTL_TABLE: &str = "__bluedb_ttl";
 
+/// Global registry (lives in the DEFAULT_TENANT keyspace) that records every
+/// tenant name that has at least one TTL index. The sweep loop reads this once
+/// per tick and calls [`sweep_all_ttl`] for each registered tenant.
+///
+/// Schema: `tenant TEXT PRIMARY KEY`
+///
+/// Durability: the table is a regular SlateDB-backed GlueSQL table in the
+/// DEFAULT_TENANT keyspace, so it survives restarts automatically.
+const TTL_TENANTS_TABLE: &str = "__bluedb_ttl_tenants";
+
 /// Ensure the `__bluedb_ttl(collection TEXT PRIMARY KEY, field TEXT, seconds
 /// INTEGER)` metadata table exists for `tenant`.
 async fn ensure_ttl_registry(state: &AppState, tenant: &str) -> Result<(), AppError> {
@@ -1541,6 +1539,51 @@ async fn upsert_ttl_config(
         bluedb_rest::Param::Int(seconds),
     ])
     .await
+}
+
+/// Ensure the `__bluedb_ttl_tenants(tenant TEXT PRIMARY KEY)` table exists in
+/// the DEFAULT_TENANT keyspace (the global TTL tenant registry).
+async fn ensure_ttl_tenants_registry(state: &AppState) -> Result<(), AppError> {
+    let sql = format!(
+        "CREATE TABLE IF NOT EXISTS {TTL_TENANTS_TABLE} (tenant TEXT PRIMARY KEY);"
+    );
+    run_ddl(state, bluedb_sql::DEFAULT_TENANT, &sql).await
+}
+
+/// Register `tenant` in the global TTL tenant registry so it gets swept.
+/// Idempotent: re-registering an already-present tenant is a no-op.
+async fn register_ttl_tenant(state: &AppState, tenant: &str) -> Result<(), AppError> {
+    ensure_ttl_tenants_registry(state).await?;
+    // DELETE-then-INSERT is idempotent for a PRIMARY KEY table (GlueSQL has no ON CONFLICT).
+    let del = format!("DELETE FROM {TTL_TENANTS_TABLE} WHERE tenant = $1;");
+    run_write(state, bluedb_sql::DEFAULT_TENANT, &del, &[bluedb_rest::Param::Str(tenant.to_string())]).await?;
+    let ins = format!("INSERT INTO {TTL_TENANTS_TABLE} (tenant) VALUES ($1);");
+    run_write(state, bluedb_sql::DEFAULT_TENANT, &ins, &[bluedb_rest::Param::Str(tenant.to_string())]).await
+}
+
+/// Return all tenants that have at least one TTL index registered.
+/// Returns an empty list if the global registry table doesn't exist yet (no
+/// TTL index has ever been created on this cluster node).
+pub(crate) async fn list_ttl_tenants(state: &AppState) -> Result<Vec<String>, AppError> {
+    let sql = format!("SELECT tenant FROM {TTL_TENANTS_TABLE} WHERE TRUE;");
+    let rows = match run_read_routed(state, bluedb_sql::DEFAULT_TENANT, &sql, &[]).await {
+        Ok(r) => r,
+        Err(ref e)
+            if e.message().contains("planning SQL")
+                || e.message().contains("table not found") =>
+        {
+            return Ok(vec![]);
+        }
+        Err(e) => return Err(e),
+    };
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            row.get("tenant")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect())
 }
 
 /// Delete documents in `coll` whose TTL `field` value + `seconds` <= `now_epoch`.
@@ -1672,6 +1715,27 @@ pub(crate) async fn sweep_all_ttl(state: &AppState, tenant: &str) -> Result<(), 
         };
         if let Err(e) = sweep_ttl(state, tenant, &coll, &field, seconds, now_epoch).await {
             eprintln!("bluedb-server: TTL sweep {tenant}/{coll}: {:?}", e);
+        }
+    }
+    Ok(())
+}
+
+/// Sweep TTL indexes for **all registered tenants**.
+///
+/// Called by the background scheduler on the active writer. Reads the global
+/// tenant registry (`__bluedb_ttl_tenants` in the DEFAULT_TENANT keyspace) and
+/// calls [`sweep_all_ttl`] for each tenant that has a TTL index configured.
+///
+/// The `is_writer()` guard inside [`sweep_all_ttl`] provides defence-in-depth
+/// against a demote that races the loop between the registry read and the sweep.
+pub(crate) async fn sweep_all_tenants_ttl(state: &AppState) -> Result<(), AppError> {
+    if !state.is_writer() {
+        return Ok(());
+    }
+    let tenants = list_ttl_tenants(state).await?;
+    for tenant in tenants {
+        if let Err(e) = sweep_all_ttl(state, &tenant).await {
+            eprintln!("bluedb-server: TTL sweep for tenant '{tenant}': {:?}", e);
         }
     }
     Ok(())

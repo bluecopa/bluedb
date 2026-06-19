@@ -1979,21 +1979,100 @@ async fn numeric_index_whole_float_query_does_not_error() {
 }
 
 // ---------------------------------------------------------------------------
-// FIX I3: TTL index on non-default tenant is rejected
+// Multi-tenant TTL sweep
 // ---------------------------------------------------------------------------
 
-/// FIX I3: createIndex with expireAfterSeconds on a non-default tenant must
-/// return a 4xx error (the TTL sweep only runs for the default tenant).
+/// TTL sweep works on a non-default tenant.
+///
+/// Setup: collection "acme_sessions" in tenant "acme" with two docs —
+///   {_id:"old", created: 1000}  — expires at epoch 1100 (1000 + 100)
+///   {_id:"new", created: 1_000_000}  — expires at epoch 1_000_100
+///
+/// Sweep with now_epoch = 2000, expireAfterSeconds = 100.
+///   "old": 1000 + 100 = 1100 ≤ 2000 → deleted
+///   "new": 1_000_000 + 100 = 1_000_100 > 2000 → survives
 #[tokio::test]
-async fn ttl_index_rejected_for_non_default_tenant() {
-    let app = app().await;
+async fn ttl_sweep_works_on_non_default_tenant() {
+    let (app, state) = app_with_state().await;
 
-    // Issue the createIndex on a non-default tenant.
+    // Insert the two documents under tenant "acme".
     let request = Request::builder()
         .method("POST")
-        .uri("/collections/ndt_coll/createIndex")
+        .uri("/collections/acme_sessions/insert")
         .header("content-type", "application/json")
-        .header("X-Bluedb-Tenant", "other_tenant")
+        .header("X-Bluedb-Tenant", "acme")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "documents": [
+                    { "_id": "old", "created": 1000 },
+                    { "_id": "new", "created": 1_000_000_i64 }
+                ]
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "insert failed");
+
+    // createIndex with expireAfterSeconds on non-default tenant "acme" — must succeed.
+    let request = Request::builder()
+        .method("POST")
+        .uri("/collections/acme_sessions/createIndex")
+        .header("content-type", "application/json")
+        .header("X-Bluedb-Tenant", "acme")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "keys": { "created": 1 },
+                "options": { "expireAfterSeconds": 100, "type": "number" }
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    assert_eq!(status, StatusCode::OK, "createIndex on non-default tenant failed: {body}");
+
+    // Sweep using sweep_ttl_for_test on the "acme" tenant with now_epoch = 2000.
+    let deleted = state
+        .sweep_ttl_for_test("acme", "acme_sessions", "created", 100, 2000)
+        .await
+        .expect("sweep_ttl failed");
+    assert_eq!(deleted, 1, "expected 1 doc deleted, got {deleted}");
+
+    // find {} on "acme" — only "new" must remain.
+    let request = Request::builder()
+        .method("POST")
+        .uri("/collections/acme_sessions/find")
+        .header("content-type", "application/json")
+        .header("X-Bluedb-Tenant", "acme")
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "filter": {} })).unwrap(),
+        ))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    assert_eq!(status, StatusCode::OK, "find after sweep failed: {body}");
+    let docs = body["documents"].as_array().expect("documents array");
+    assert_eq!(docs.len(), 1, "expected 1 doc remaining after sweep, got: {body}");
+    let remaining_id = docs[0].get("_id").and_then(Value::as_str).unwrap_or("");
+    assert_eq!(remaining_id, "new", "expected 'new' to survive, got: {docs:?}");
+}
+
+/// TTL createIndex on a non-default tenant is now accepted and registers the
+/// tenant in the global TTL registry.
+#[tokio::test]
+async fn ttl_create_index_accepted_for_non_default_tenant() {
+    let app = app().await;
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/collections/reg_coll/createIndex")
+        .header("content-type", "application/json")
+        .header("X-Bluedb-Tenant", "reg_tenant")
         .body(Body::from(
             serde_json::to_vec(&json!({
                 "keys": { "created": 1 },
@@ -2009,13 +2088,8 @@ async fn ttl_index_rejected_for_non_default_tenant() {
 
     assert_eq!(
         status,
-        StatusCode::BAD_REQUEST,
-        "TTL createIndex on non-default tenant must return 400, got: {body}"
-    );
-    let errmsg = body["errmsg"].as_str().unwrap_or("");
-    assert!(
-        errmsg.contains("default tenant") || errmsg.contains("TTL"),
-        "error message must mention TTL / default tenant, got: {errmsg}"
+        StatusCode::OK,
+        "TTL createIndex on non-default tenant must now succeed, got: {body}"
     );
 }
 

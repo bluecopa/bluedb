@@ -224,7 +224,7 @@ see [Freshness](#freshness) below.
 | Unique index | yes | `{"options": {"unique": true}}` |
 | Compound index | yes | `{"keys": {"a": 1, "b": 1}}` — accelerates **full-key equality** lookups (`{a: x, b: y}`). Top-level fields only; dotted (nested) paths are rejected. Prefix-only queries or range queries fall to single-field indexes or the analytical engine. |
 | Multikey index (array field or scalar) | yes | `{"keys": {"tags": 1}}` — element-membership `find` is index-accelerated on the fast path. Top-level fields only; dotted (nested) paths are rejected. See note below. |
-| TTL index | yes (default tenant only, v1) | `{"options": {"expireAfterSeconds": N}}` — see note below |
+| TTL index | yes (all tenants) | `{"options": {"expireAfterSeconds": N}}` — see note below |
 | Geospatial index | **no** | |
 | Text index | **no** | Use [SQL full-text search](../sql/full-text-search.md) instead |
 | Partial index | **no** | |
@@ -272,16 +272,17 @@ Indexes are **gateway-maintained**: the server adds a derived column
     `createIndex` will reject `{"keys": {"a.b": 1}, "options": {"multikey": true}}`
     with a `BadValue` error.
 
-!!! note "TTL index: epoch-seconds; default tenant only (v1)"
+!!! note "TTL index: epoch-seconds; all tenants supported"
     A TTL index expires documents whose TTL field value (plus `expireAfterSeconds`)
     is in the past. The numeric TTL field is interpreted as **epoch seconds**
     (Unix timestamp). A field storing epoch **milliseconds** (e.g.
     `Date.now()` in JavaScript) will never expire as expected — convert to seconds
     before storing, or use an ISO-8601 string field (e.g. `"2026-06-15T00:00:00Z"`).
 
-    In v1, TTL indexes are supported **on the default tenant only**. Creating a
-    TTL index on a non-default tenant returns a `BadValue` error. Tenant-aware TTL
-    sweeps are planned for v2.
+    TTL indexes are supported on **all tenants**. Each tenant that creates a TTL
+    index is registered in a durable global registry (`__bluedb_ttl_tenants` in
+    the default-tenant keyspace); the sweep task reads this registry on every
+    tick and sweeps all registered tenants.
 
 !!! note "Sort on nested/dotted paths not supported"
     The `sort` field in a `find` request supports **top-level** field names

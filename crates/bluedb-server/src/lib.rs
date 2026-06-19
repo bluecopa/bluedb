@@ -536,9 +536,10 @@ impl AppState {
         *self.inner.seal_handle.lock().unwrap() = Some(handle);
         *self.inner.fts.write().await = fts;
 
-        // Start the TTL sweep background task. Sweeps DEFAULT_TENANT every
-        // `BLUEDB_TTL_SWEEP_INTERVAL_SECS` seconds (default 60). A demote
-        // aborts the task; re-promote replaces it.
+        // Start the TTL sweep background task. On each tick, reads the global
+        // tenant registry and sweeps every tenant that has a TTL index.
+        // Interval = `BLUEDB_TTL_SWEEP_INTERVAL_SECS` (default 60 s).
+        // A demote aborts the task; re-promote replaces it.
         {
             let ttl_interval = {
                 let secs = std::env::var("BLUEDB_TTL_SWEEP_INTERVAL_SECS")
@@ -556,7 +557,7 @@ impl AppState {
                 ticker.tick().await; // skip the immediate first tick
                 loop {
                     ticker.tick().await;
-                    if let Err(e) = collections::sweep_all_ttl(&ttl_state, DEFAULT_TENANT).await {
+                    if let Err(e) = collections::sweep_all_tenants_ttl(&ttl_state).await {
                         eprintln!("bluedb-server: TTL sweep error: {:?}", e);
                     }
                 }
