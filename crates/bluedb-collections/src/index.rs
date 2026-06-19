@@ -66,9 +66,24 @@ pub fn infer_index_type(values: &[serde_json::Value]) -> IndexType {
 }
 
 /// SQL column type keyword for a typed derived index column.
+///
+/// `Number` maps to `INT` (GlueSQL `DataType::Int` → `Value::I64`):
+/// - `FLOAT`/`F64` cannot be serialized to order-preserving big-endian bytes
+///   by bluedb-sql's storage layer, causing an error on every row write.
+/// - `DECIMAL` stores correctly but `evaluate_cmp(Decimal, I64)` returns `None`
+///   in GlueSQL 0.19 (the match arm for mixed Decimal/integer is missing in
+///   `Value::evaluate_cmp`), silently returning empty results for any query
+///   whose parameter is bound as `Param::Int`.
+/// - `INT` (`Value::I64`) stores without error, and `evaluate_cmp(I64, I64)` and
+///   range comparisons both work correctly.
+///
+/// Fractional JSON numbers (e.g. `3.14`) are stored as NULL for an INT-typed
+/// column — `derive_typed_value` returns the value only when the JSON type
+/// matches the index type, and `json_to_param` maps floats to `Param::Float`
+/// which is rejected by the INT column coercion (the row gets NULL instead).
 pub fn index_sql_type(t: IndexType) -> &'static str {
     match t {
-        IndexType::Number => "FLOAT",
+        IndexType::Number => "INT",
         IndexType::Bool => "BOOLEAN",
         IndexType::Text => "TEXT",
     }
@@ -231,7 +246,8 @@ mod tests {
 
     #[test]
     fn index_sql_type_number() {
-        assert_eq!(index_sql_type(IndexType::Number), "FLOAT");
+        // INT — FLOAT/DECIMAL have storage or comparison issues in GlueSQL 0.19.
+        assert_eq!(index_sql_type(IndexType::Number), "INT");
     }
 
     #[test]

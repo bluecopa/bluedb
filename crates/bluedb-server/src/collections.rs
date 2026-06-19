@@ -12,12 +12,13 @@
 //! - `POST /collections/{coll}/update`              — read-modify-write (+ upsert)
 //! - `POST /collections/{coll}/delete`              — delete by filter
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use gluesql_core::ast::DataType as GlueDataType;
 use gluesql_core::prelude::Glue;
 use gluesql_core::store::Store;
 use serde::Deserialize;
@@ -27,7 +28,10 @@ use bluedb_engine::rest_sql;
 use bluedb_collections::{
     error::MqlError,
     filter::parse_filter,
-    index::{derive_value, derived_col, valid_path},
+    index::{
+        derive_typed_value, derived_col, index_sql_type, infer_index_type,
+        valid_path, IndexType,
+    },
     model::ensure_id,
     project::apply_projection,
     update::apply_update,
@@ -153,55 +157,82 @@ async fn run_read_routed_for_mutation(
     }
 }
 
-/// Return the set of JSON paths that have a gateway-maintained derived column
-/// (`__cidx_<path>`) for `coll` in `tenant`. Used by `insert` and `find` to
-/// keep derived columns in sync and to route queries through the index.
+/// Return a map from derived-column name (`__cidx_<path>`) to [`IndexType`] for
+/// every gateway-maintained index column in `coll` for `tenant`.
 ///
-/// Introspects the table's `column_defs` from the SlateDB schema, filters for
-/// names starting with `__cidx_`, then strips the prefix to reconstruct the
-/// path (dots were turned into underscores — this is lossy, so callers use the
-/// returned paths to build a `HashSet<String>` and check membership via
-/// `derived_col(path)` rather than reversing). For lookup correctness we return
-/// the paths exactly as stored in the column names (underscores only) — callers
-/// call `derived_col(path_from_filter)` and check if that column name is present.
+/// The column's GlueSQL `DataType` is mapped to `IndexType`:
+/// - `Float` / `Float32` / any integer variant → `Number`
+/// - `Boolean`                                 → `Bool`
+/// - anything else (incl. `Text`)              → `Text`
 ///
-/// Returns an empty set if the table doesn't exist yet.
-async fn indexed_col_names(
+/// Returns an empty map if the table doesn't exist yet.
+async fn indexed_col_types(
     state: &AppState,
     tenant: &str,
     coll: &str,
-) -> Result<HashSet<String>, AppError> {
+) -> Result<HashMap<String, IndexType>, AppError> {
     let storage = state.connection(tenant).await?;
     let schema = match Store::fetch_schema(&storage, coll).await {
         Ok(Some(s)) => s,
-        Ok(None) => return Ok(HashSet::new()),
+        Ok(None) => return Ok(HashMap::new()),
         Err(e) => return Err(AppError::internal(format!("fetch schema: {e}"))),
     };
-    let cols: HashSet<String> = schema
+    let map: HashMap<String, IndexType> = schema
         .column_defs
         .unwrap_or_default()
         .into_iter()
         .filter_map(|c| {
-            c.name
-                .strip_prefix("__cidx_")
-                .map(|_| c.name.clone())
+            if !c.name.starts_with("__cidx_") {
+                return None;
+            }
+            let idx_type = glue_data_type_to_index_type(&c.data_type);
+            Some((c.name, idx_type))
         })
         .collect();
-    Ok(cols)
+    Ok(map)
+}
+
+/// Map a GlueSQL [`DataType`] to the [`IndexType`] used for filter routing.
+///
+/// Numeric columns: `INT` (`DataType::Int` → `Value::I64`) is the type we
+/// store for `Number` indexes.  FLOAT can't be serialized as an index key in
+/// bluedb-sql; DECIMAL stores but `evaluate_cmp(Decimal, I64)` returns None
+/// in GlueSQL 0.19.  All integer variants and Float32/Float are also mapped to
+/// `Number` for completeness (e.g. a column created via a legacy DDL path).
+fn glue_data_type_to_index_type(dt: &GlueDataType) -> IndexType {
+    match dt {
+        GlueDataType::Int
+        | GlueDataType::Int8
+        | GlueDataType::Int16
+        | GlueDataType::Int32
+        | GlueDataType::Int128
+        | GlueDataType::Uint8
+        | GlueDataType::Uint16
+        | GlueDataType::Uint32
+        | GlueDataType::Uint64
+        | GlueDataType::Uint128
+        | GlueDataType::Float
+        | GlueDataType::Float32
+        | GlueDataType::Decimal => IndexType::Number,
+        GlueDataType::Boolean => IndexType::Bool,
+        _ => IndexType::Text,
+    }
 }
 
 /// INSERT a complete document into `coll`, setting `_id`, `doc`, and every
 /// `__cidx_*` column. Shared by `insert` (per doc) and `upsert` (single doc).
 ///
 /// The caller must have already called `ensure_collection` and must pass `dcols`
-/// (from `indexed_col_names`) so the derived columns are populated atomically
-/// with the main row. `doc` must already contain `_id`.
+/// (from `indexed_col_types`) so the derived columns are populated atomically
+/// with the main row. Each derived column is populated with a typed value
+/// (FLOAT/BOOLEAN/TEXT) matching the column's declared [`IndexType`].
+/// `doc` must already contain `_id`.
 async fn write_full_doc(
     state: &AppState,
     tenant: &str,
     coll: &str,
     doc: &Value,
-    dcols: &HashSet<String>,
+    dcols: &HashMap<String, IndexType>,
 ) -> Result<(), AppError> {
     let id = doc
         .get("_id")
@@ -216,11 +247,11 @@ async fn write_full_doc(
         bluedb_rest::Param::Str(doc_text),
     ];
 
-    for dcol in dcols {
+    for (dcol, &idx_type) in dcols {
         let path = dcol.strip_prefix("__cidx_").unwrap_or(dcol);
         col_names.push(dcol.clone());
-        match derive_value(doc, path) {
-            Some(v) => params.push(bluedb_rest::Param::Str(v)),
+        match derive_typed_value(doc, path, idx_type) {
+            Some(v) => params.push(json_value_to_param(&v)),
             None => params.push(bluedb_rest::Param::Null),
         }
     }
@@ -243,7 +274,7 @@ async fn rewrite_doc_row(
     coll: &str,
     id: &str,
     doc: &Value,
-    dcols: &HashSet<String>,
+    dcols: &HashMap<String, IndexType>,
 ) -> Result<(), AppError> {
     let doc_text = doc.to_string();
 
@@ -251,12 +282,12 @@ async fn rewrite_doc_row(
     let mut set_clauses = vec!["doc = $1".to_string()];
     let mut params: Vec<bluedb_rest::Param> = vec![bluedb_rest::Param::Str(doc_text)];
 
-    for dcol in dcols {
+    for (dcol, &idx_type) in dcols {
         let path = dcol.strip_prefix("__cidx_").unwrap_or(dcol);
         let idx = params.len() + 1;
         set_clauses.push(format!("{dcol} = ${idx}"));
-        match derive_value(doc, path) {
-            Some(v) => params.push(bluedb_rest::Param::Str(v)),
+        match derive_typed_value(doc, path, idx_type) {
+            Some(v) => params.push(json_value_to_param(&v)),
             None => params.push(bluedb_rest::Param::Null),
         }
     }
@@ -269,6 +300,37 @@ async fn rewrite_doc_row(
         sets = set_clauses.join(", "),
     );
     run_write(state, tenant, &sql, &params).await
+}
+
+/// Convert a typed JSON value (as returned by [`derive_typed_value`]) to the
+/// appropriate [`bluedb_rest::Param`] variant for a parameterized SQL statement.
+///
+/// `derive_typed_value` returns exactly the JSON type that matches the column:
+/// - `Number` column → `Value::Number` → prefer `Param::Int` (i64); fractional
+///   floats map to `Param::Null` because the column type is `INT` and GlueSQL
+///   cannot coerce a fractional float into an integer without data loss.
+/// - `Bool`   column → `Value::Bool`   → `Param::Bool`
+/// - `Text`   column → `Value::String` → `Param::Str`
+fn json_value_to_param(v: &Value) -> bluedb_rest::Param {
+    match v {
+        Value::Bool(b) => bluedb_rest::Param::Bool(*b),
+        Value::Number(n) => {
+            // Prefer integer representation so the param type matches the INT
+            // column type exactly. Fractional floats (e.g. 3.14) cannot be
+            // stored in an INT column without truncation — store NULL instead
+            // so the row simply has no index entry for that field.
+            if let Some(i) = n.as_i64() {
+                bluedb_rest::Param::Int(i)
+            } else {
+                bluedb_rest::Param::Null
+            }
+        }
+        Value::String(s) => bluedb_rest::Param::Str(s.clone()),
+        Value::Null => bluedb_rest::Param::Null,
+        // Arrays/objects should not appear from derive_typed_value for our index
+        // types, but fall back to their JSON text form for safety.
+        other => bluedb_rest::Param::Str(other.to_string()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -291,6 +353,10 @@ pub(crate) struct CreateIndexRequest {
 pub(crate) struct CreateIndexOptions {
     #[serde(default)]
     pub unique: bool,
+    /// Optional explicit column type hint: `"number"`, `"bool"` / `"boolean"`,
+    /// or `"string"`. When absent, the type is inferred from existing documents.
+    #[serde(rename = "type")]
+    pub index_type_hint: Option<String>,
 }
 
 /// Body for `POST /collections/{coll}/update`.
@@ -359,8 +425,8 @@ pub(crate) async fn insert(
     // Ensure the backing table exists (idempotent).
     ensure_collection(&state, &tenant, &coll).await?;
 
-    // Fetch the set of derived-column names (may be empty on a fresh collection).
-    let dcols = indexed_col_names(&state, &tenant, &coll).await?;
+    // Fetch the map of derived-column names → IndexType (may be empty on a fresh collection).
+    let dcols = indexed_col_types(&state, &tenant, &coll).await?;
 
     let mut inserted_ids: Vec<String> = Vec::with_capacity(docs_arr.len());
 
@@ -409,14 +475,15 @@ pub(crate) async fn find(
     let filter = parse_filter(filter_val)
         .map_err(|e| AppError::bad_request(e.to_string()).with_code("PARSE_ERROR"))?;
 
-    // Build the set of indexed paths: for each filter path, check whether
-    // `derived_col(path)` exists as a column in the table. This avoids the
-    // lossy dot→underscore round-trip (we let `derived_col` do the mapping and
-    // check membership against the live column set).
-    let dcol_names = indexed_col_names(&state, &tenant, &coll).await.unwrap_or_default();
-    let indexed: HashSet<String> = collect_filter_paths(&filter)
+    // Build the map of indexed paths: derived column name → IndexType.
+    // The filter's to_sql_indexed takes this map keyed by derived column name.
+    let col_types = indexed_col_types(&state, &tenant, &coll).await.unwrap_or_default();
+    let indexed: HashMap<String, IndexType> = collect_filter_paths(&filter)
         .into_iter()
-        .filter(|p| dcol_names.contains(&derived_col(p)))
+        .filter_map(|p| {
+            let dcol = derived_col(&p);
+            col_types.get(&dcol).map(|&t| (dcol, t))
+        })
         .collect();
 
     // Build the WHERE clause and collect bound parameters.
@@ -475,12 +542,18 @@ pub(crate) async fn find(
 
 /// `POST /collections/{coll}/createIndex` — create a gateway-maintained JSON-path index.
 ///
-/// Body: `{"keys": {"<path>": 1}, "options": {"unique": false}}`.
+/// Body: `{"keys": {"<path>": 1}, "options": {"unique": false, "type": "number"}}`.
 /// Only the first key in `keys` is used (compound indexes are not supported).
 ///
+/// The derived column type is determined by:
+/// 1. `options.type` hint, if present: `"number"` → `FLOAT`, `"bool"`/`"boolean"` → `BOOLEAN`,
+///    `"string"` → `TEXT`.
+/// 2. Otherwise: infer from existing documents — sample the field's values, then
+///    `infer_index_type` chooses `Number`/`Bool`/`Text`.
+///
 /// Steps:
-/// 1. `ALTER TABLE {coll} ADD COLUMN __cidx_<path> TEXT` (skipped if already present).
-/// 2. Backfill from existing rows (`UPDATE ... SET __cidx_<path> = $1 WHERE _id = $2`).
+/// 1. `ALTER TABLE {coll} ADD COLUMN __cidx_<path> {FLOAT|BOOLEAN|TEXT}` (skipped if already present).
+/// 2. Backfill existing rows with typed values (`derive_typed_value`).
 /// 3. `CREATE [UNIQUE] INDEX cidx_{coll}_{path_with_underscores} ON {coll} (__cidx_<path>)`.
 ///
 /// Returns `{"name": "<index_name>"}`.
@@ -519,13 +592,60 @@ pub(crate) async fn create_index(
     ensure_collection(&state, &tenant, &coll).await?;
 
     // Step 1: Add the derived column if it doesn't already exist.
-    let existing_cols = indexed_col_names(&state, &tenant, &coll).await?;
-    if !existing_cols.contains(&dcol) {
-        let alter_sql = format!("ALTER TABLE {coll} ADD COLUMN {dcol} TEXT;");
+    let existing_col_types = indexed_col_types(&state, &tenant, &coll).await?;
+    if !existing_col_types.contains_key(&dcol) {
+        // Resolve the index type from hint or by sampling existing docs.
+        let idx_type = if let Some(hint) = req.options.index_type_hint.as_deref() {
+            match hint.to_ascii_lowercase().as_str() {
+                "number" => IndexType::Number,
+                "bool" | "boolean" => IndexType::Bool,
+                "string" | "text" => IndexType::Text,
+                other => {
+                    return Err(AppError::bad_request(format!(
+                        "unknown index type hint {other:?}; expected \"number\", \"bool\", or \"string\""
+                    ))
+                    .with_code("PARSE_ERROR")
+                    .into());
+                }
+            }
+        } else {
+            // Read existing docs and sample the field's values.
+            let select_sql = format!("SELECT doc FROM {coll} WHERE TRUE;");
+            let rows = run_read_routed(&state, &tenant, &select_sql, &[]).await?;
+            let sample_values: Vec<serde_json::Value> = rows
+                .iter()
+                .filter_map(|row| {
+                    let doc: Value = match row.get("doc") {
+                        Some(Value::String(s)) => serde_json::from_str(s).ok()?,
+                        Some(v) => v.clone(),
+                        None => return None,
+                    };
+                    // Navigate to the field; skip absent fields.
+                    let mut cur = &doc;
+                    for part in path.split('.') {
+                        cur = cur.get(part)?;
+                    }
+                    if cur.is_null() {
+                        None
+                    } else {
+                        Some(cur.clone())
+                    }
+                })
+                .collect();
+            infer_index_type(&sample_values)
+        };
+
+        let sql_type = index_sql_type(idx_type);
+        let alter_sql = format!("ALTER TABLE {coll} ADD COLUMN {dcol} {sql_type};");
         run_ddl(&state, &tenant, &alter_sql).await?;
     }
 
-    // Step 2: Backfill existing rows.
+    // Re-fetch type map so we know the column's type for backfill (whether we
+    // just added it or it already existed).
+    let col_type_map = indexed_col_types(&state, &tenant, &coll).await?;
+    let idx_type = col_type_map.get(&dcol).copied().unwrap_or(IndexType::Text);
+
+    // Step 2: Backfill existing rows with typed values.
     // Read all existing _id + doc pairs (unindexed scan — only at createIndex time).
     let select_sql = format!("SELECT _id, doc FROM {coll} WHERE TRUE;");
     let rows = run_read_routed(&state, &tenant, &select_sql, &[]).await?;
@@ -539,10 +659,10 @@ pub(crate) async fn create_index(
             Some(v) => v.clone(),
             None => continue,
         };
-        if let Some(val) = derive_value(&doc, &path) {
+        if let Some(val) = derive_typed_value(&doc, &path, idx_type) {
             let update_sql = format!("UPDATE {coll} SET {dcol} = $1 WHERE _id = $2;");
             let params = vec![
-                bluedb_rest::Param::Str(val),
+                json_value_to_param(&val),
                 bluedb_rest::Param::Str(id),
             ];
             run_write(&state, &tenant, &update_sql, &params).await?;
@@ -591,12 +711,15 @@ pub(crate) async fn update(
         .map_err(|e| AppError::bad_request(e.to_string()).with_code("PARSE_ERROR"))?;
 
     // Fetch index columns once — used for both the SELECT routing and the UPDATE.
-    let dcols = indexed_col_names(&state, &tenant, &coll).await.unwrap_or_default();
+    let dcols = indexed_col_types(&state, &tenant, &coll).await.unwrap_or_default();
 
-    // Build the set of indexed paths for query routing.
-    let indexed: HashSet<String> = collect_filter_paths(&filter)
+    // Build the typed indexed map for query routing.
+    let indexed: HashMap<String, IndexType> = collect_filter_paths(&filter)
         .into_iter()
-        .filter(|p| dcols.contains(&derived_col(p)))
+        .filter_map(|p| {
+            let dcol = derived_col(&p);
+            dcols.get(&dcol).map(|&t| (dcol, t))
+        })
         .collect();
 
     let mut params: Vec<Value> = Vec::new();
@@ -671,11 +794,14 @@ pub(crate) async fn delete(
     let filter = parse_filter(&req.filter)
         .map_err(|e| AppError::bad_request(e.to_string()).with_code("PARSE_ERROR"))?;
 
-    let dcols = indexed_col_names(&state, &tenant, &coll).await.unwrap_or_default();
+    let dcols = indexed_col_types(&state, &tenant, &coll).await.unwrap_or_default();
 
-    let indexed: HashSet<String> = collect_filter_paths(&filter)
+    let indexed: HashMap<String, IndexType> = collect_filter_paths(&filter)
         .into_iter()
-        .filter(|p| dcols.contains(&derived_col(p)))
+        .filter_map(|p| {
+            let dcol = derived_col(&p);
+            dcols.get(&dcol).map(|&t| (dcol, t))
+        })
         .collect();
 
     let mut params: Vec<Value> = Vec::new();
@@ -792,10 +918,13 @@ pub(crate) async fn count(
         .map_err(|e| AppError::bad_request(e.to_string()).with_code("PARSE_ERROR"))?;
 
     // Resolve indexed paths — same logic as `find`.
-    let dcol_names = indexed_col_names(&state, &tenant, &coll).await.unwrap_or_default();
-    let indexed: HashSet<String> = collect_filter_paths(&filter)
+    let col_types = indexed_col_types(&state, &tenant, &coll).await.unwrap_or_default();
+    let indexed: HashMap<String, IndexType> = collect_filter_paths(&filter)
         .into_iter()
-        .filter(|p| dcol_names.contains(&derived_col(p)))
+        .filter_map(|p| {
+            let dcol = derived_col(&p);
+            col_types.get(&dcol).map(|&t| (dcol, t))
+        })
         .collect();
 
     let mut params: Vec<Value> = Vec::new();

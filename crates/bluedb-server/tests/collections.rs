@@ -913,6 +913,155 @@ async fn unsupported_operator_is_mongo_bad_value() {
     assert_eq!(body["codeName"].as_str().unwrap_or(""), "BadValue", "expected BadValue, got: {body}");
 }
 
+// ---------------------------------------------------------------------------
+// Typed index tests (numeric / bool fast path, no seal needed)
+// ---------------------------------------------------------------------------
+
+/// createIndex on a numeric field (inferred type), insert a doc, find by
+/// numeric equality **without sealing** — proves the FLOAT derived column is
+/// used on the GlueSQL fast path (read-your-writes).
+/// Also tests `{age: {"$gte": 30}}` to exercise the range fast path.
+#[tokio::test]
+async fn numeric_indexed_field_is_fast_and_fresh() {
+    let app = app().await;
+
+    // Create a numeric index on "age" (type inferred from empty collection → Text,
+    // but we pass an explicit hint so it is always FLOAT regardless of order).
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/numidx/createIndex",
+        Some(json!({ "keys": { "age": 1 }, "options": { "type": "number" } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "createIndex: {body}");
+
+    // Insert without sealing.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/numidx/insert",
+        Some(json!({ "documents": [{ "name": "ada", "age": 36 }] })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "insert: {body}");
+
+    // find {age: 36} — no seal needed (fast path via FLOAT column).
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/numidx/find",
+        Some(json!({ "filter": { "age": 36 } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "find age=36: {body}");
+    let docs = body["documents"].as_array().expect("documents array");
+    assert_eq!(
+        docs.len(), 1,
+        "numeric fast path: expected 1 doc for age=36 (no seal), got: {body}"
+    );
+    assert_eq!(docs[0]["name"].as_str().unwrap(), "ada");
+
+    // find {age: {$gte: 30}} — range on FLOAT column, still fast path.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/numidx/find",
+        Some(json!({ "filter": { "age": { "$gte": 30 } } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "find age>=30: {body}");
+    let docs = body["documents"].as_array().expect("documents array");
+    assert_eq!(
+        docs.len(), 1,
+        "numeric range fast path: expected 1 doc for age>=30, got: {body}"
+    );
+}
+
+/// createIndex on a boolean field (`{type:"bool"}`), insert, find without sealing.
+#[tokio::test]
+async fn bool_indexed_field_is_fast() {
+    let app = app().await;
+
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/boolidx/createIndex",
+        Some(json!({ "keys": { "active": 1 }, "options": { "type": "bool" } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "createIndex: {body}");
+
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/boolidx/insert",
+        Some(json!({ "documents": [{ "active": true, "name": "ada" }] })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "insert: {body}");
+
+    // find {active: true} — no seal (fast path via BOOLEAN column).
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/boolidx/find",
+        Some(json!({ "filter": { "active": true } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "find active=true: {body}");
+    let docs = body["documents"].as_array().expect("documents array");
+    assert_eq!(
+        docs.len(), 1,
+        "bool fast path: expected 1 doc for active=true (no seal), got: {body}"
+    );
+    assert_eq!(docs[0]["name"].as_str().unwrap(), "ada");
+}
+
+/// A numeric-indexed field queried with a **string** value must not error —
+/// it falls back to the JSON accessor path and returns a sensible result
+/// (may be empty or analytical; the point is no crash and string index unaffected).
+#[tokio::test]
+async fn numeric_index_queried_with_string_does_not_error() {
+    let (app, state) = app_with_state().await;
+
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/mixidx/createIndex",
+        Some(json!({ "keys": { "score": 1 }, "options": { "type": "number" } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "createIndex: {body}");
+
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/mixidx/insert",
+        Some(json!({ "documents": [{ "score": 99 }] })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "insert: {body}");
+
+    // Seal so the analytical fallback can also see the row.
+    state.seal_now().await.expect("seal");
+
+    // Query with a string value on a numeric-indexed field — must not panic or 500.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/mixidx/find",
+        Some(json!({ "filter": { "score": "99" } })),
+    )
+    .await;
+    assert!(
+        !s.is_server_error(),
+        "string query on numeric index must not 500, got {s}: {body}"
+    );
+    // Result may be 0 or 1 depending on routing; we only require no crash.
+    assert!(body["documents"].is_array(), "response must have documents array");
+}
+
 /// Helper: read a string field that may have arrived as a JSON object's member
 /// or directly. The aggregate result projects `_id` plus extracted columns; a
 /// `$match`+`$sort` pipeline with no `$project` returns the base table columns

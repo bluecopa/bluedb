@@ -1,7 +1,7 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 use serde_json::Value;
 use crate::error::MqlError;
-use crate::index::derived_col;
+use crate::index::{derived_col, IndexType};
 
 #[derive(Debug, PartialEq)]
 pub enum Cmp { Eq, Ne, Gt, Gte, Lt, Lte, In, Nin, Exists, Regex }
@@ -69,50 +69,49 @@ impl Filter {
         }
     }
 
-    /// Like [`Self::to_sql`] but, for a `Cmp` whose `path` is in `indexed`, uses
-    /// the derived column `__cidx_<path>` (a plain column with a secondary index)
-    /// instead of the `(doc->>'...')` JSON accessor — so GlueSQL can use the index.
-    /// `_id` and non-indexed paths behave exactly as [`Self::to_sql`].
+    /// Like [`Self::to_sql`] but, for a `Cmp` whose `path` has a typed entry in
+    /// `indexed` (keyed by the derived column name `__cidx_<path>`), uses the
+    /// derived column instead of the `(doc->>'...')` JSON accessor — so GlueSQL
+    /// can use the secondary index.  `_id` and non-indexed paths behave exactly
+    /// as [`Self::to_sql`].
     ///
-    /// The derived column is always TEXT (stores the field's JSON-text rendering),
-    /// so using it for a non-string comparison would silently return empty results
-    /// (e.g. `__cidx_age = 36` where the column holds the string `"36"`).
-    /// Therefore the indexed column is used **only** when the comparison value is a
-    /// JSON string (or, for `$in`/`$nin`, when ALL elements are strings).
-    /// For non-string comparisons, the expression falls through to the regular
-    /// `to_sql` path (the `(doc->>'...')` JSON accessor) even if an index exists.
-    /// `$exists` may always use the derived column (it is a NULL check, not a value
-    /// comparison, and works correctly regardless of the stored type).
-    pub fn to_sql_indexed(&self, params: &mut Vec<Value>, indexed: &HashSet<String>) -> String {
+    /// The derived column is typed (`FLOAT`, `BOOLEAN`, or `TEXT`) and the fast
+    /// path is taken only when the comparison value's JSON type **matches** the
+    /// column's [`IndexType`]:
+    /// - `IndexType::Number` → value is `Value::Number` (or, for `$in`/`$nin`,
+    ///   all elements are numbers).
+    /// - `IndexType::Bool`   → value is `Value::Bool` (or all-bool array).
+    /// - `IndexType::Text`   → value is `Value::String` (or all-string array).
+    ///
+    /// `$exists` always uses the derived column (it is a NULL check, type-agnostic).
+    /// Type-mismatched comparisons fall through to the JSON accessor path.
+    pub fn to_sql_indexed(&self, params: &mut Vec<Value>, indexed: &HashMap<String, IndexType>) -> String {
         match self {
             Filter::True => "TRUE".into(),
             Filter::And(v) => join_indexed(v, " AND ", params, indexed),
             Filter::Or(v)  => join_indexed(v, " OR ", params, indexed),
             Filter::Not(f) => format!("NOT ({})", f.to_sql_indexed(params, indexed)),
             Filter::Cmp { path, op, value } => {
-                if path != "_id" && indexed.contains(path.as_str()) {
-                    let col = derived_col(path);
-                    // Only route to the derived column when the comparison is safe
-                    // for a TEXT column. $exists is always safe (NULL check).
-                    // For $in/$nin, require ALL array elements to be strings.
-                    // For all other ops, require the value to be a string.
-                    let use_index = match op {
-                        Cmp::Exists => true,
-                        Cmp::In | Cmp::Nin => {
-                            value.as_array()
-                                .map(|arr| arr.iter().all(|v| v.is_string()))
-                                .unwrap_or(false)
+                let col = derived_col(path);
+                if path != "_id" {
+                    if let Some(&idx_type) = indexed.get(&col) {
+                        // Route to the derived column only when the comparison
+                        // value's JSON type matches the column's stored type.
+                        let use_index = match op {
+                            Cmp::Exists => true,
+                            Cmp::In | Cmp::Nin => {
+                                value.as_array()
+                                    .map(|arr| !arr.is_empty() && arr.iter().all(|v| value_matches_type(v, idx_type)))
+                                    .unwrap_or(false)
+                            }
+                            _ => value_matches_type(value, idx_type),
+                        };
+                        if use_index {
+                            return cmp_sql_col(&col, op, value, params);
                         }
-                        _ => value.is_string(),
-                    };
-                    if use_index {
-                        cmp_sql_col(&col, op, value, params)
-                    } else {
-                        cmp_sql(path, op, value, params)
                     }
-                } else {
-                    cmp_sql(path, op, value, params)
                 }
+                cmp_sql(path, op, value, params)
             }
         }
     }
@@ -123,9 +122,18 @@ fn join(v: &[Filter], sep: &str, params: &mut Vec<Value>) -> String {
     parts.join(sep)
 }
 
-fn join_indexed(v: &[Filter], sep: &str, params: &mut Vec<Value>, indexed: &HashSet<String>) -> String {
+fn join_indexed(v: &[Filter], sep: &str, params: &mut Vec<Value>, indexed: &HashMap<String, IndexType>) -> String {
     let parts: Vec<String> = v.iter().map(|f| format!("({})", f.to_sql_indexed(params, indexed))).collect();
     parts.join(sep)
+}
+
+/// Return `true` when the JSON value's type matches the expected [`IndexType`].
+fn value_matches_type(v: &Value, t: IndexType) -> bool {
+    match t {
+        IndexType::Number => v.is_number(),
+        IndexType::Bool => v.is_boolean(),
+        IndexType::Text => v.is_string(),
+    }
 }
 
 /// Like `cmp_sql` but uses a pre-computed plain column reference (no JSON accessor).
@@ -381,7 +389,9 @@ mod tests {
     #[test]
     fn to_sql_indexed_uses_derived_col_when_indexed() {
         let f = parse_filter(&json!({"status": "active"})).unwrap();
-        let indexed: HashSet<String> = ["status".to_string()].into();
+        // Key is the derived column name; value is the IndexType.
+        let indexed: HashMap<String, IndexType> =
+            [("__cidx_status".to_string(), IndexType::Text)].into();
 
         let mut params = Vec::new();
         let sql = f.to_sql_indexed(&mut params, &indexed);
@@ -393,7 +403,7 @@ mod tests {
     #[test]
     fn to_sql_indexed_falls_back_to_json_accessor_when_not_indexed() {
         let f = parse_filter(&json!({"status": "active"})).unwrap();
-        let indexed: HashSet<String> = HashSet::new();
+        let indexed: HashMap<String, IndexType> = HashMap::new();
 
         let mut params_indexed = Vec::new();
         let sql_indexed = f.to_sql_indexed(&mut params_indexed, &indexed);
@@ -409,32 +419,49 @@ mod tests {
     fn to_sql_indexed_does_not_use_derived_col_for_id() {
         let f = parse_filter(&json!({"_id": "abc"})).unwrap();
         // Even if someone (mistakenly) listed "_id" as indexed, it must stay as _id.
-        let indexed: HashSet<String> = ["_id".to_string()].into();
+        let indexed: HashMap<String, IndexType> =
+            [("__cidx__id".to_string(), IndexType::Text)].into();
         let mut params = Vec::new();
         let sql = f.to_sql_indexed(&mut params, &indexed);
         assert_eq!(sql, "_id = $1");
     }
 
-    /// FIX 1: a numeric comparison on an indexed field must NOT use the derived
-    /// column (which is TEXT) — it must fall back to the JSON accessor so the
-    /// type match is correct. Comparing `__cidx_age = 36` where the column holds
-    /// the string "36" would silently return nothing.
+    /// A numeric index on `age`: a numeric comparison DOES use the derived column
+    /// (fast path) because the column is typed FLOAT and the value is a number.
     #[test]
-    fn to_sql_indexed_falls_back_for_numeric_value() {
+    fn to_sql_indexed_uses_derived_col_for_numeric_index_and_numeric_value() {
         let f = parse_filter(&json!({"age": 36})).unwrap();
-        let indexed: HashSet<String> = ["age".to_string()].into();
+        let indexed: HashMap<String, IndexType> =
+            [("__cidx_age".to_string(), IndexType::Number)].into();
 
         let mut params = Vec::new();
         let sql = f.to_sql_indexed(&mut params, &indexed);
 
-        // Must use the JSON accessor path, NOT the derived column.
+        assert!(
+            sql.contains("__cidx_age"),
+            "numeric comparison on numeric index should use derived column, got: {sql}"
+        );
+    }
+
+    /// A TEXT index on `age` (old/wrong setup): a numeric comparison falls back
+    /// to the JSON accessor because the types don't match.
+    #[test]
+    fn to_sql_indexed_falls_back_for_numeric_value_on_text_index() {
+        let f = parse_filter(&json!({"age": 36})).unwrap();
+        // TEXT index but value is numeric → mismatch → fall back.
+        let indexed: HashMap<String, IndexType> =
+            [("__cidx_age".to_string(), IndexType::Text)].into();
+
+        let mut params = Vec::new();
+        let sql = f.to_sql_indexed(&mut params, &indexed);
+
         assert!(
             !sql.contains("__cidx_"),
-            "numeric comparison must not use the derived TEXT column, got: {sql}"
+            "numeric value on TEXT index must fall back to JSON accessor, got: {sql}"
         );
         assert!(
             sql.contains("doc->>'age'"),
-            "numeric comparison should use json accessor, got: {sql}"
+            "numeric value on TEXT index should use JSON accessor, got: {sql}"
         );
     }
 
@@ -443,7 +470,8 @@ mod tests {
     #[test]
     fn to_sql_indexed_uses_derived_col_for_exists() {
         let f = parse_filter(&json!({"age": {"$exists": true}})).unwrap();
-        let indexed: HashSet<String> = ["age".to_string()].into();
+        let indexed: HashMap<String, IndexType> =
+            [("__cidx_age".to_string(), IndexType::Number)].into();
 
         let mut params = Vec::new();
         let sql = f.to_sql_indexed(&mut params, &indexed);
@@ -454,33 +482,52 @@ mod tests {
         );
     }
 
-    /// FIX 1: $in with ALL string elements uses the derived column (fast path).
+    /// FIX 1: $in with ALL string elements uses the derived column (fast path) for
+    /// a TEXT-indexed column.
     #[test]
     fn to_sql_indexed_uses_derived_col_for_string_in() {
         let f = parse_filter(&json!({"status": {"$in": ["a", "b"]}})).unwrap();
-        let indexed: HashSet<String> = ["status".to_string()].into();
+        let indexed: HashMap<String, IndexType> =
+            [("__cidx_status".to_string(), IndexType::Text)].into();
 
         let mut params = Vec::new();
         let sql = f.to_sql_indexed(&mut params, &indexed);
 
         assert!(
             sql.contains("__cidx_status"),
-            "$in(strings) should use derived column, got: {sql}"
+            "$in(strings) on TEXT index should use derived column, got: {sql}"
         );
     }
 
-    /// FIX 1: $in with numeric elements must fall back to the JSON accessor.
+    /// $in with numeric elements on a Number-indexed column uses the derived col.
     #[test]
-    fn to_sql_indexed_falls_back_for_numeric_in() {
+    fn to_sql_indexed_uses_derived_col_for_numeric_in() {
         let f = parse_filter(&json!({"age": {"$in": [30, 40]}})).unwrap();
-        let indexed: HashSet<String> = ["age".to_string()].into();
+        let indexed: HashMap<String, IndexType> =
+            [("__cidx_age".to_string(), IndexType::Number)].into();
+
+        let mut params = Vec::new();
+        let sql = f.to_sql_indexed(&mut params, &indexed);
+
+        assert!(
+            sql.contains("__cidx_age"),
+            "$in(numbers) on Number index should use derived column, got: {sql}"
+        );
+    }
+
+    /// $in with numeric elements on a TEXT-indexed column falls back.
+    #[test]
+    fn to_sql_indexed_falls_back_for_numeric_in_on_text_index() {
+        let f = parse_filter(&json!({"age": {"$in": [30, 40]}})).unwrap();
+        let indexed: HashMap<String, IndexType> =
+            [("__cidx_age".to_string(), IndexType::Text)].into();
 
         let mut params = Vec::new();
         let sql = f.to_sql_indexed(&mut params, &indexed);
 
         assert!(
             !sql.contains("__cidx_"),
-            "$in(numbers) must not use derived column, got: {sql}"
+            "$in(numbers) on TEXT index must fall back, got: {sql}"
         );
     }
 
