@@ -799,6 +799,57 @@ async fn count_with_filter() {
     assert_eq!(n_all, 3, "expected 3 total docs, got: {body}");
 }
 
+// ---------------------------------------------------------------------------
+// MongoDB-shaped error tests
+// ---------------------------------------------------------------------------
+
+/// Inserting a document with a duplicate `_id` returns a MongoDB-shaped
+/// `{ok:0, code:11000, codeName:"DuplicateKey"}` body, not the generic
+/// bluedb `{error, code}` shape.
+#[tokio::test]
+async fn duplicate_id_returns_mongo_duplicate_key() {
+    let app = app().await;
+    let body = json!({ "documents": [{ "_id": "dup", "x": 1 }] });
+
+    // First insert — must succeed.
+    let (s1, b1) = call(&app, "POST", "/collections/dup_test/insert", Some(body.clone())).await;
+    assert_eq!(s1, StatusCode::OK, "first insert failed: {b1}");
+
+    // Second insert of the same _id — must error with DuplicateKey.
+    let (s2, b2) = call(&app, "POST", "/collections/dup_test/insert", Some(body)).await;
+    assert!(s2.is_client_error() || s2.is_server_error(), "expected error, got {s2}: {b2}");
+    assert_eq!(b2["ok"].as_i64().unwrap_or(1), 0, "expected ok:0, got: {b2}");
+    assert_eq!(b2["code"].as_i64().unwrap_or(0), 11000, "expected code 11000, got: {b2}");
+    assert_eq!(b2["codeName"].as_str().unwrap_or(""), "DuplicateKey", "expected DuplicateKey, got: {b2}");
+}
+
+/// Sending an unsupported MQL operator in a filter returns a MongoDB-shaped
+/// `{ok:0, code:2, codeName:"BadValue"}` body.
+#[tokio::test]
+async fn unsupported_operator_is_mongo_bad_value() {
+    let app = app().await;
+    // Insert one doc so the collection exists (filter parse fires before the scan).
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/collections/bad_op/insert",
+        Some(json!({ "documents": [{ "x": 1 }] })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/collections/bad_op/find",
+        Some(json!({ "filter": { "x": { "$where": "1" } } })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "expected 400, got {status}: {body}");
+    assert_eq!(body["ok"].as_i64().unwrap_or(1), 0, "expected ok:0, got: {body}");
+    assert_eq!(body["codeName"].as_str().unwrap_or(""), "BadValue", "expected BadValue, got: {body}");
+}
+
 /// Helper: read a string field that may have arrived as a JSON object's member
 /// or directly. The aggregate result projects `_id` plus extracted columns; a
 /// `$match`+`$sort` pipeline with no `$project` returns the base table columns

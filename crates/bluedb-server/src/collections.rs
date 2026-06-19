@@ -15,6 +15,8 @@
 use std::collections::HashSet;
 
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use gluesql_core::prelude::Glue;
 use gluesql_core::store::Store;
@@ -23,6 +25,7 @@ use serde_json::{json, Value};
 
 use bluedb_engine::rest_sql;
 use bluedb_collections::{
+    error::MqlError,
     filter::parse_filter,
     index::{derive_value, derived_col, valid_path},
     model::ensure_id,
@@ -31,6 +34,52 @@ use bluedb_collections::{
 };
 
 use crate::{authz::Scope, run_read_routed, schema::ident, AppError, AppState};
+
+// ---------------------------------------------------------------------------
+// MongoDB-shaped error for the /collections surface
+// ---------------------------------------------------------------------------
+
+/// MongoDB-shaped error: `{"ok":0,"code":<mongo_code>,"codeName":<name>,"errmsg":<msg>}`.
+///
+/// All `/collections` handlers return this instead of the generic `AppError`
+/// so clients that speak the MongoDB wire protocol get a familiar error shape.
+pub(crate) struct CollError(StatusCode, serde_json::Value);
+
+impl IntoResponse for CollError {
+    fn into_response(self) -> Response {
+        (self.0, Json(self.1)).into_response()
+    }
+}
+
+impl From<AppError> for CollError {
+    fn from(e: AppError) -> Self {
+        let (code, code_name): (i32, &'static str) = match e.error_code() {
+            Some("UNIQUE_VIOLATION") => (11000, "DuplicateKey"),
+            Some("NOT_FOUND")        => (26,    "NamespaceNotFound"),
+            Some("PARSE_ERROR") | Some("TYPE_MISMATCH") | Some("NO_INDEX") => (2, "BadValue"),
+            _                        => (8,     "UnknownError"),
+        };
+        let body = json!({
+            "ok": 0,
+            "code": code,
+            "codeName": code_name,
+            "errmsg": e.message(),
+        });
+        CollError(e.status(), body)
+    }
+}
+
+impl From<MqlError> for CollError {
+    fn from(e: MqlError) -> Self {
+        let body = json!({
+            "ok": 0,
+            "code": e.mongo_code(),
+            "codeName": e.mongo_code_name(),
+            "errmsg": e.to_string(),
+        });
+        CollError(StatusCode::BAD_REQUEST, body)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -264,7 +313,7 @@ pub(crate) async fn insert(
     headers: axum::http::HeaderMap,
     Path(coll): Path<String>,
     Json(body): Json<Value>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<Value>, CollError> {
     state.authorize(&headers, Scope::DataWrite)?;
     let tenant = state.tenant(&headers)?;
     state.require_active()?;
@@ -293,7 +342,7 @@ pub(crate) async fn insert(
         let mut doc = raw_doc.clone();
         // ensure_id requires a mutable JSON object.
         if !doc.is_object() {
-            return Err(AppError::bad_request("each document must be a JSON object"));
+            return Err(AppError::bad_request("each document must be a JSON object").into());
         }
         let id = ensure_id(&mut doc);
         write_full_doc(&state, &tenant, &coll, &doc, &dcols).await?;
@@ -321,7 +370,7 @@ pub(crate) async fn find(
     headers: axum::http::HeaderMap,
     Path(coll): Path<String>,
     Json(req): Json<Value>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<Value>, CollError> {
     state.authorize(&headers, Scope::DataRead)?;
     let tenant = state.tenant(&headers)?;
     // Reads are allowed anywhere — no `require_active()`.
@@ -414,7 +463,7 @@ pub(crate) async fn create_index(
     headers: axum::http::HeaderMap,
     Path(coll): Path<String>,
     Json(req): Json<CreateIndexRequest>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<Value>, CollError> {
     state.authorize(&headers, Scope::SchemaAdmin)?;
     let tenant = state.tenant(&headers)?;
     state.require_active()?;
@@ -422,7 +471,7 @@ pub(crate) async fn create_index(
     let coll = ident(&coll)?.to_string();
 
     if req.keys.is_empty() {
-        return Err(AppError::bad_request("'keys' must not be empty"));
+        return Err(AppError::bad_request("'keys' must not be empty").into());
     }
 
     // Take the first key as the path to index.
@@ -430,7 +479,7 @@ pub(crate) async fn create_index(
     let path = path.clone();
 
     if !valid_path(&path) {
-        return Err(AppError::bad_request(format!("invalid index field path: {path:?}")).with_code("PARSE_ERROR"));
+        return Err(AppError::bad_request(format!("invalid index field path: {path:?}")).with_code("PARSE_ERROR").into());
     }
 
     let dcol = derived_col(&path);
@@ -505,7 +554,7 @@ pub(crate) async fn update(
     headers: axum::http::HeaderMap,
     Path(coll): Path<String>,
     Json(req): Json<UpdateRequest>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<Value>, CollError> {
     state.authorize(&headers, Scope::DataWrite)?;
     let tenant = state.tenant(&headers)?;
     state.require_active()?;
@@ -588,7 +637,7 @@ pub(crate) async fn delete(
     headers: axum::http::HeaderMap,
     Path(coll): Path<String>,
     Json(req): Json<DeleteRequest>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<Value>, CollError> {
     state.authorize(&headers, Scope::DataWrite)?;
     let tenant = state.tenant(&headers)?;
     state.require_active()?;
@@ -656,7 +705,7 @@ pub(crate) async fn aggregate(
     headers: axum::http::HeaderMap,
     Path(coll): Path<String>,
     Json(req): Json<Value>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<Value>, CollError> {
     state.authorize(&headers, Scope::DataRead)?;
     let tenant = state.tenant(&headers)?;
     // Reads are allowed anywhere — no `require_active()`.
@@ -709,7 +758,7 @@ pub(crate) async fn count(
     headers: axum::http::HeaderMap,
     Path(coll): Path<String>,
     Json(req): Json<Value>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<Value>, CollError> {
     state.authorize(&headers, Scope::DataRead)?;
     let tenant = state.tenant(&headers)?;
     // Reads are allowed anywhere — no `require_active()`.

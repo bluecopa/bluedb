@@ -2211,6 +2211,18 @@ impl AppError {
             HaError::Provider(err) => Self::internal(err.to_string()),
         }
     }
+
+    pub(crate) fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
+
+    pub(crate) fn error_code(&self) -> Option<&'static str> {
+        self.code
+    }
 }
 
 /// Map an engine error to an HTTP status + stable machine-readable code, so an
@@ -2234,7 +2246,7 @@ fn classify_engine_error(err: &EngineError) -> (StatusCode, Option<&'static str>
     if msg.contains("table not found") {
         return (StatusCode::NOT_FOUND, Some("NOT_FOUND"));
     }
-    if msg.contains("duplicate entry") {
+    if msg.contains("duplicate entry") || msg.contains("unique constraint violation") {
         return (StatusCode::CONFLICT, Some("UNIQUE_VIOLATION"));
     }
     match err {
