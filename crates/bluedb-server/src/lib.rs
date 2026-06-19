@@ -976,6 +976,7 @@ pub fn build_app(state: AppState) -> Router {
             "/collections/{coll}/searchIndex",
             post(search::create_search_index).get(search::get_search_index),
         )
+        .route("/collections/{coll}/search", post(search::search))
         .with_state(state)
 }
 

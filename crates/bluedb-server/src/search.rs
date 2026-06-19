@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
@@ -437,4 +438,119 @@ pub(crate) async fn get_search_index(
             "no search mapping for collection [{coll}]"
         ))),
     }
+}
+
+/// `POST /collections/{c}/search` — ES-shaped search.
+pub(crate) async fn search(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(coll): Path<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, AppError> {
+    state.authorize(&headers, Scope::DataRead)?;
+    let tenant = state.tenant(&headers)?;
+    let started = Instant::now();
+
+    let req: bluedb_search::model::SearchRequest =
+        serde_json::from_value(body).map_err(|e| AppError::bad_request(format!("bad search body: {e}")))?;
+
+    let spec = get_mapping(&state, &tenant, &coll)
+        .await?
+        .ok_or_else(|| AppError::not_found(format!("no search mapping for collection [{coll}]")))?;
+    let ss = bluedb_search::mapping::compile(&spec).map_err(search_err)?;
+
+    let compiled = bluedb_search::query::compile_query(&ss, &req.query).map_err(search_err)?;
+
+    let blob = search_blob(&state).await?;
+    let idx = build_fts_index(blob, &tenant, &coll, &ss);
+
+    let page = req.from.saturating_add(req.size);
+
+    let ranked: Vec<(String, f32)> = if let Some(sc) = req.sort.first() {
+        if sc.field == "_score" {
+            idx.search_query_ids(compiled.query.as_ref(), page)
+                .await
+                .map_err(|e| AppError::internal(format!("search: {e}")))?
+        } else {
+            match ss.field(&sc.field).map(|r| r.kind) {
+                Some(FieldKindInfo::Integer) => idx
+                    .search_query_sorted_ids(compiled.query.as_ref(), &sc.field, sc.descending, page)
+                    .await
+                    .map_err(|e| AppError::internal(format!("search: {e}")))?,
+                _ => {
+                    return Err(search_err(bluedb_search::SearchError::UnsortableField(
+                        sc.field.clone(),
+                    )))
+                }
+            }
+        }
+    } else {
+        idx.search_query_ids(compiled.query.as_ref(), page)
+            .await
+            .map_err(|e| AppError::internal(format!("search: {e}")))?
+    };
+
+    let total = idx
+        .count_query(compiled.query.as_ref())
+        .await
+        .map_err(|e| AppError::internal(format!("count: {e}")))?;
+
+    let page_slice: Vec<(String, f32)> = ranked
+        .into_iter()
+        .skip(req.from)
+        .take(req.size)
+        .collect();
+
+    let sources = if matches!(req.source, bluedb_search::model::SourceSpec::Bool(false)) {
+        HashMap::new()
+    } else {
+        fetch_sources(&state, &tenant, &coll, &page_slice).await?
+    };
+
+    let block = bluedb_search::hits::assemble(
+        &coll,
+        &page_slice,
+        total,
+        sources,
+        &req.source,
+        &req.highlight_fields(),
+        &compiled.terms_by_field,
+    );
+
+    let resp = bluedb_search::model::SearchResponse {
+        took: started.elapsed().as_millis() as u64,
+        timed_out: false,
+        hits: block,
+    };
+    Ok(Json(serde_json::to_value(resp).map_err(|e| AppError::internal(e.to_string()))?))
+}
+
+/// Fetch `_source` JSON for the ranked ids, returning id -> doc.
+async fn fetch_sources(
+    state: &AppState,
+    tenant: &str,
+    coll: &str,
+    ranked: &[(String, f32)],
+) -> Result<HashMap<String, Value>, AppError> {
+    if ranked.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let placeholders: Vec<String> = (1..=ranked.len()).map(|i| format!("${i}")).collect();
+    let sql = format!(
+        "SELECT _id, doc FROM \"{coll}\" WHERE _id IN ({});",
+        placeholders.join(", ")
+    );
+    let params: Vec<Value> = ranked.iter().map(|(id, _)| Value::String(id.clone())).collect();
+    let rows = crate::collections::run_read_routed_for_mutation(state, tenant, &sql, &params)
+        .await
+        .unwrap_or_default();
+    let mut map = HashMap::with_capacity(rows.len());
+    for row in rows {
+        let id = row.get("_id").and_then(Value::as_str).map(str::to_string);
+        let doc = read_doc_value(row.get("doc"));
+        if let (Some(id), Some(doc)) = (id, doc) {
+            map.insert(id, doc);
+        }
+    }
+    Ok(map)
 }
