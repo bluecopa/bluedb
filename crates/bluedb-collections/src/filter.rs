@@ -199,6 +199,19 @@ fn cmp_sql_col(col: &str, op: &Cmp, value: &Value, params: &mut Vec<Value>) -> S
 /// The outer parens on the json accessor avoid operator-precedence surprises (e.g. `->>`
 /// binding tighter than `=` in some SQL dialects).
 fn col_ref(path: &str) -> String {
+    sort_accessor(path)
+}
+
+/// Return the SQL column expression for a sort key path.
+///
+/// - `"_id"` → `"_id"` (bare PK column).
+/// - `"field"` → `"(doc->>'field')"` (single-level JSON text accessor).
+/// - `"a.b"` → `"(doc->'a'->>'b')"` (chained: intermediate levels use `->`, final uses `->>`).
+///
+/// Single-quotes inside segment names are escaped by doubling (`'` → `''`).
+/// Used by both the filter SQL lowering (`col_ref`) and the `find` sort builder in
+/// `bluedb-server` so the two paths use identical accessors.
+pub fn sort_accessor(path: &str) -> String {
     if path == "_id" { return "_id".into(); }
     let parts: Vec<&str> = path.split('.').collect();
     let mut expr = "doc".to_string();
@@ -649,6 +662,33 @@ mod tests {
             sql.contains("IS NULL"),
             "$nin must include IS NULL for missing-field semantics, got: {sql}"
         );
+    }
+
+    // --- sort_accessor -------------------------------------------------
+
+    #[test]
+    fn sort_accessor_id_is_bare() {
+        assert_eq!(super::sort_accessor("_id"), "_id");
+    }
+
+    #[test]
+    fn sort_accessor_top_level_wraps_in_parens() {
+        assert_eq!(super::sort_accessor("name"), "(doc->>'name')");
+    }
+
+    #[test]
+    fn sort_accessor_nested_uses_chained_arrows() {
+        assert_eq!(super::sort_accessor("addr.city"), "(doc->'addr'->>'city')");
+    }
+
+    #[test]
+    fn sort_accessor_three_levels() {
+        assert_eq!(super::sort_accessor("a.b.c"), "(doc->'a'->'b'->>'c')");
+    }
+
+    #[test]
+    fn sort_accessor_escapes_single_quotes() {
+        assert_eq!(super::sort_accessor("it's"), "(doc->>'it''s')");
     }
 
     // --- to_df_expr (DataFusion lowering) ---------------------------------

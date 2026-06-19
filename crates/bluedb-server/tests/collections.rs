@@ -1428,6 +1428,60 @@ async fn compound_index_partial_filter_still_correct() {
     assert_eq!(docs.len(), 2, "expected 2 docs for region=EU only, got: {body}");
 }
 
+/// Sorting on a nested document path (e.g. `{"addr.city": 1}`) must resolve the
+/// chained accessor `(doc->'addr'->>'city')`, not the broken single-level
+/// `(doc->>'addr.city')`.  A sort on a non-indexed nested path routes to the
+/// analytical engine, so a seal is required after insert.
+#[tokio::test]
+async fn find_sorts_by_nested_path() {
+    let (app, state) = app_with_state().await;
+
+    for d in [
+        serde_json::json!({"name": "a", "addr": {"city": "Zurich"}}),
+        serde_json::json!({"name": "b", "addr": {"city": "Austin"}}),
+        serde_json::json!({"name": "c", "addr": {"city": "Madrid"}}),
+    ] {
+        let (s, body) = call(
+            &app,
+            "POST",
+            "/collections/nested_sort/insert",
+            Some(serde_json::json!({ "documents": [d] })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "insert failed: {body}");
+    }
+
+    // Seal so the Iceberg mirror has the data (analytical path required for
+    // a non-indexed nested sort).
+    state.seal_now().await.expect("seal");
+
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/collections/nested_sort/find",
+        Some(serde_json::json!({
+            "filter": {},
+            "sort": { "addr.city": 1 }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "find failed: {body}");
+
+    let docs = body["documents"].as_array().expect("documents array");
+    assert_eq!(docs.len(), 3, "expected 3 docs, got: {body}");
+
+    // Ascending by city: Austin(b) < Madrid(c) < Zurich(a).
+    let names: Vec<&str> = docs
+        .iter()
+        .map(|d| d["name"].as_str().expect("name"))
+        .collect();
+    assert_eq!(
+        names,
+        vec!["b", "c", "a"],
+        "expected sort order Austin→Madrid→Zurich (b,c,a), got: {names:?}"
+    );
+}
+
 /// Helper: read a string field that may have arrived as a JSON object's member
 /// or directly. The aggregate result projects `_id` plus extracted columns; a
 /// `$match`+`$sort` pipeline with no `$project` returns the base table columns

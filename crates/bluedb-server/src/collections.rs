@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 use bluedb_engine::rest_sql;
 use bluedb_collections::{
     error::MqlError,
-    filter::parse_filter,
+    filter::{parse_filter, sort_accessor},
     index::{
         compound_col, compound_key, derive_typed_value, derived_col, encode_compound,
         index_sql_type, infer_index_type, valid_path, IndexType,
@@ -582,11 +582,7 @@ pub(crate) async fn find(
             let mut order_parts: Vec<String> = Vec::new();
             for (field, dir_val) in sort_obj {
                 let dir = if dir_val.as_i64().unwrap_or(1) < 0 { "DESC" } else { "ASC" };
-                let col_expr = if field == "_id" {
-                    "_id".to_string()
-                } else {
-                    format!("(doc->>'{}') ", field.replace('\'', "''"))
-                };
+                let col_expr = sort_accessor(field);
                 order_parts.push(format!("{col_expr} {dir}"));
             }
             sql.push_str(" ORDER BY ");
