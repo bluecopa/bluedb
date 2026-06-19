@@ -40,6 +40,65 @@ pub fn derive_value(doc: &Value, path: &str) -> Option<String> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Typed index helpers
+// ---------------------------------------------------------------------------
+
+/// The SQL column type to use for a gateway-maintained derived index column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexType {
+    Number,
+    Bool,
+    Text,
+}
+
+/// Infer the index column type from a sample of the field's values across docs.
+/// All-number → `Number`, all-bool → `Bool`, otherwise (incl. empty or mixed)
+/// → `Text`.
+pub fn infer_index_type(values: &[serde_json::Value]) -> IndexType {
+    if !values.is_empty() && values.iter().all(|v| v.is_number()) {
+        return IndexType::Number;
+    }
+    if !values.is_empty() && values.iter().all(|v| v.is_boolean()) {
+        return IndexType::Bool;
+    }
+    IndexType::Text
+}
+
+/// SQL column type keyword for a typed derived index column.
+pub fn index_sql_type(t: IndexType) -> &'static str {
+    match t {
+        IndexType::Number => "FLOAT",
+        IndexType::Bool => "BOOLEAN",
+        IndexType::Text => "TEXT",
+    }
+}
+
+/// Extract `path` from `doc` as a typed value for the derived column.
+///
+/// For `Number`/`Bool`, returns `None` unless the field is exactly that JSON
+/// type (type-mismatched or absent fields store NULL). For `Text`, returns the
+/// field's text form: a string unquoted; other scalars/objects as their JSON
+/// text.
+pub fn derive_typed_value(
+    doc: &serde_json::Value,
+    path: &str,
+    t: IndexType,
+) -> Option<serde_json::Value> {
+    let mut cur = doc;
+    for part in path.split('.') {
+        cur = cur.get(part)?;
+    }
+    match t {
+        IndexType::Number => cur.is_number().then(|| cur.clone()),
+        IndexType::Bool => cur.is_boolean().then(|| cur.clone()),
+        IndexType::Text => Some(serde_json::Value::String(match cur {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        })),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,5 +191,119 @@ mod tests {
     #[test]
     fn valid_path_single_quote_is_rejected() {
         assert!(!valid_path("a'b"));
+    }
+
+    // ---------------------------------------------------------------------------
+    // infer_index_type
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn infer_index_type_all_numbers() {
+        assert_eq!(infer_index_type(&[json!(1), json!(2)]), IndexType::Number);
+    }
+
+    #[test]
+    fn infer_index_type_all_bools() {
+        assert_eq!(
+            infer_index_type(&[json!(true), json!(false)]),
+            IndexType::Bool
+        );
+    }
+
+    #[test]
+    fn infer_index_type_strings_are_text() {
+        assert_eq!(infer_index_type(&[json!("a")]), IndexType::Text);
+    }
+
+    #[test]
+    fn infer_index_type_mixed_is_text() {
+        assert_eq!(infer_index_type(&[json!(1), json!("a")]), IndexType::Text);
+    }
+
+    #[test]
+    fn infer_index_type_empty_is_text() {
+        assert_eq!(infer_index_type(&[]), IndexType::Text);
+    }
+
+    // ---------------------------------------------------------------------------
+    // index_sql_type
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn index_sql_type_number() {
+        assert_eq!(index_sql_type(IndexType::Number), "FLOAT");
+    }
+
+    #[test]
+    fn index_sql_type_bool() {
+        assert_eq!(index_sql_type(IndexType::Bool), "BOOLEAN");
+    }
+
+    #[test]
+    fn index_sql_type_text() {
+        assert_eq!(index_sql_type(IndexType::Text), "TEXT");
+    }
+
+    // ---------------------------------------------------------------------------
+    // derive_typed_value
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn derive_typed_value_number_match() {
+        let doc = json!({"age": 36});
+        assert_eq!(
+            derive_typed_value(&doc, "age", IndexType::Number),
+            Some(json!(36))
+        );
+    }
+
+    #[test]
+    fn derive_typed_value_number_type_mismatch_is_none() {
+        let doc = json!({"age": "x"});
+        assert_eq!(derive_typed_value(&doc, "age", IndexType::Number), None);
+    }
+
+    #[test]
+    fn derive_typed_value_bool_match() {
+        let doc = json!({"ok": true});
+        assert_eq!(
+            derive_typed_value(&doc, "ok", IndexType::Bool),
+            Some(json!(true))
+        );
+    }
+
+    #[test]
+    fn derive_typed_value_bool_type_mismatch_is_none() {
+        let doc = json!({"ok": 1});
+        assert_eq!(derive_typed_value(&doc, "ok", IndexType::Bool), None);
+    }
+
+    #[test]
+    fn derive_typed_value_text_string() {
+        let doc = json!({"s": "hi"});
+        assert_eq!(
+            derive_typed_value(&doc, "s", IndexType::Text),
+            Some(json!("hi"))
+        );
+    }
+
+    #[test]
+    fn derive_typed_value_text_numeric_serialized() {
+        let doc = json!({"n": 5});
+        assert_eq!(
+            derive_typed_value(&doc, "n", IndexType::Text),
+            Some(json!("5"))
+        );
+    }
+
+    #[test]
+    fn derive_typed_value_missing_path_is_none_for_all_types() {
+        let doc = json!({"x": 1});
+        assert_eq!(
+            derive_typed_value(&doc, "missing", IndexType::Number),
+            None
+        );
+        assert_eq!(derive_typed_value(&doc, "missing", IndexType::Bool), None);
+        assert_eq!(derive_typed_value(&doc, "missing", IndexType::Text), None);
     }
 }
