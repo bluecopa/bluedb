@@ -9,7 +9,7 @@ pub fn apply_projection(doc: &Value, projection: &Value) -> Value {
         _ => return doc.clone(),
     };
     let obj = match doc.as_object() { Some(o) => o, None => return doc.clone() };
-    let inclusion = proj.values().any(|v| truthy(v));
+    let inclusion = proj.values().any(truthy);
     let mut out = Map::new();
     if inclusion {
         let keep_id = proj.get("_id").map(truthy).unwrap_or(true);

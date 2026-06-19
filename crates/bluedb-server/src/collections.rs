@@ -529,7 +529,7 @@ pub(crate) async fn create_index(
     let schema = Store::fetch_schema(&storage, &coll)
         .await
         .map_err(|e| AppError::internal(format!("fetch schema: {e}")))?;
-    let index_exists = schema.map_or(false, |s| s.indexes.iter().any(|i| i.name == index_name));
+    let index_exists = schema.is_some_and(|s| s.indexes.iter().any(|i| i.name == index_name));
     if !index_exists {
         let create_idx_sql = format!(
             "CREATE {unique_kw}INDEX {index_name} ON {coll} ({dcol});"
