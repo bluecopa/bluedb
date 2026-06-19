@@ -1186,6 +1186,113 @@ async fn fractional_field_find_is_correct() {
     assert_eq!(docs.len(), 0, "price=2 must return 0 docs, got: {body}");
 }
 
+// ---------------------------------------------------------------------------
+// Compound index tests
+// ---------------------------------------------------------------------------
+
+/// `createIndex({region:1, status:1})` — compound equality fast path.
+///
+/// Insert three docs without sealing.  A `find {region:"EU", status:"active"}`
+/// must return exactly the one matching doc (n==1), proving:
+/// - the compound `__cidxm_region__status` column is populated on insert,
+/// - the find routes through the compound index (GlueSQL fast path, no DataFusion
+///   round-trip → read-your-writes without a seal).
+#[tokio::test]
+async fn compound_index_equality_is_fast_and_fresh() {
+    let app = app().await;
+
+    // Create compound index before any data.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/cidx_eq/createIndex",
+        Some(json!({ "keys": { "region": 1, "status": 1 } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "createIndex compound: {body}");
+    let name = body["name"].as_str().expect("name in response");
+    assert!(
+        name.contains("cidxm") && name.contains("region") && name.contains("status"),
+        "expected compound index name, got: {name}"
+    );
+
+    // Insert three docs — no seal.
+    for (region, status, n) in [("EU", "active", 1), ("EU", "idle", 2), ("US", "active", 3)] {
+        let (s, body) = call(
+            &app,
+            "POST",
+            "/collections/cidx_eq/insert",
+            Some(json!({ "documents": [{ "region": region, "status": status, "n": n }] })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "insert: {body}");
+    }
+
+    // find {region:"EU", status:"active"} — must return exactly 1 doc (n==1).
+    // No seal_now — compound fast path (GlueSQL, read-your-writes).
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/cidx_eq/find",
+        Some(json!({ "filter": { "region": "EU", "status": "active" } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "find compound eq: {body}");
+    let docs = body["documents"].as_array().expect("documents array");
+    assert_eq!(docs.len(), 1, "expected exactly 1 doc (EU/active), got: {body}");
+    assert_eq!(
+        docs[0]["n"].as_i64().unwrap_or(-1),
+        1,
+        "expected n==1 (EU/active), got: {body}"
+    );
+}
+
+/// `find {region:"EU"}` (prefix-only) on a compound index must still return
+/// the correct 2 docs.  This does NOT use the compound key (single-field
+/// routing or DataFusion fallback); we seal to make the analytical path work.
+#[tokio::test]
+async fn compound_index_partial_filter_still_correct() {
+    let (app, state) = app_with_state().await;
+
+    // Create compound index.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/cidx_partial/createIndex",
+        Some(json!({ "keys": { "region": 1, "status": 1 } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "createIndex: {body}");
+
+    // Insert three docs.
+    for (region, status, n) in [("EU", "active", 1), ("EU", "idle", 2), ("US", "active", 3)] {
+        let (s, body) = call(
+            &app,
+            "POST",
+            "/collections/cidx_partial/insert",
+            Some(json!({ "documents": [{ "region": region, "status": status, "n": n }] })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "insert: {body}");
+    }
+
+    // Seal so the DataFusion/Iceberg path can serve the non-compound query.
+    state.seal_now().await.expect("seal");
+
+    // find {region:"EU"} — only the prefix, no compound match.
+    // Must return exactly 2 docs (EU/active + EU/idle), correctness not compromised.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/cidx_partial/find",
+        Some(json!({ "filter": { "region": "EU" } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "find region-only: {body}");
+    let docs = body["documents"].as_array().expect("documents array");
+    assert_eq!(docs.len(), 2, "expected 2 docs for region=EU only, got: {body}");
+}
+
 /// Helper: read a string field that may have arrived as a JSON object's member
 /// or directly. The aggregate result projects `_id` plus extracted columns; a
 /// `$match`+`$sort` pipeline with no `$project` returns the base table columns

@@ -29,8 +29,8 @@ use bluedb_collections::{
     error::MqlError,
     filter::parse_filter,
     index::{
-        derive_typed_value, derived_col, index_sql_type, infer_index_type,
-        valid_path, IndexType,
+        compound_col, compound_key, derive_typed_value, derived_col, encode_compound,
+        index_sql_type, infer_index_type, valid_path, IndexType,
     },
     model::ensure_id,
     project::apply_projection,
@@ -158,7 +158,7 @@ async fn run_read_routed_for_mutation(
 }
 
 /// Return a map from derived-column name (`__cidx_<path>`) to [`IndexType`] for
-/// every gateway-maintained index column in `coll` for `tenant`.
+/// every gateway-maintained single-field index column in `coll` for `tenant`.
 ///
 /// The column's GlueSQL `DataType` is mapped to `IndexType`:
 /// - `Float` / `Float32` / any integer variant → `Number`
@@ -166,6 +166,8 @@ async fn run_read_routed_for_mutation(
 /// - anything else (incl. `Text`)              → `Text`
 ///
 /// Returns an empty map if the table doesn't exist yet.
+/// Note: compound index columns (`__cidxm_*`) are excluded here — use
+/// [`compound_col_defs`] to retrieve them.
 async fn indexed_col_types(
     state: &AppState,
     tenant: &str,
@@ -182,7 +184,8 @@ async fn indexed_col_types(
         .unwrap_or_default()
         .into_iter()
         .filter_map(|c| {
-            if !c.name.starts_with("__cidx_") {
+            // Only single-field index columns (prefix __cidx_ but NOT __cidxm_).
+            if !c.name.starts_with("__cidx_") || c.name.starts_with("__cidxm_") {
                 return None;
             }
             let idx_type = glue_data_type_to_index_type(&c.data_type);
@@ -190,6 +193,41 @@ async fn indexed_col_types(
         })
         .collect();
     Ok(map)
+}
+
+/// Return the list of compound index columns in `coll` for `tenant`, as
+/// `(col_name, component_paths)` pairs.  The column name has the `__cidxm_`
+/// prefix stripped and the remainder split on `__` to recover the component
+/// paths (with `_` restored — note: this is exact only for top-level fields
+/// without dots in their names, which is v1 scope for compound indexes).
+///
+/// Returns an empty vec if the table doesn't exist yet.
+async fn compound_col_defs(
+    state: &AppState,
+    tenant: &str,
+    coll: &str,
+) -> Result<Vec<(String, Vec<String>)>, AppError> {
+    let storage = state.connection(tenant).await?;
+    let schema = match Store::fetch_schema(&storage, coll).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return Ok(vec![]),
+        Err(e) => return Err(AppError::internal(format!("fetch schema: {e}"))),
+    };
+    let defs: Vec<(String, Vec<String>)> = schema
+        .column_defs
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|c| {
+            let suffix = c.name.strip_prefix("__cidxm_")?;
+            // Split on __ to recover component paths (top-level only in v1).
+            let paths: Vec<String> = suffix.split("__").map(str::to_owned).collect();
+            if paths.len() < 2 {
+                return None;
+            }
+            Some((c.name, paths))
+        })
+        .collect();
+    Ok(defs)
 }
 
 /// Map a GlueSQL [`DataType`] to the [`IndexType`] used for filter routing.
@@ -219,13 +257,15 @@ fn glue_data_type_to_index_type(dt: &GlueDataType) -> IndexType {
     }
 }
 
-/// INSERT a complete document into `coll`, setting `_id`, `doc`, and every
-/// `__cidx_*` column. Shared by `insert` (per doc) and `upsert` (single doc).
+/// INSERT a complete document into `coll`, setting `_id`, `doc`, every
+/// `__cidx_*` (single-field) column, and every `__cidxm_*` (compound) column.
+/// Shared by `insert` (per doc) and `upsert` (single doc).
 ///
 /// The caller must have already called `ensure_collection` and must pass `dcols`
 /// (from `indexed_col_types`) so the derived columns are populated atomically
 /// with the main row. Each derived column is populated with a typed value
 /// (FLOAT/BOOLEAN/TEXT) matching the column's declared [`IndexType`].
+/// Compound columns (`__cidxm_*`) in `cdefs` are always TEXT (NUL-joined key).
 /// `doc` must already contain `_id`.
 async fn write_full_doc(
     state: &AppState,
@@ -233,6 +273,7 @@ async fn write_full_doc(
     coll: &str,
     doc: &Value,
     dcols: &HashMap<String, IndexType>,
+    cdefs: &[(String, Vec<String>)],
 ) -> Result<(), AppError> {
     let id = doc
         .get("_id")
@@ -247,6 +288,7 @@ async fn write_full_doc(
         bluedb_rest::Param::Str(doc_text),
     ];
 
+    // Single-field index columns.
     for (dcol, &idx_type) in dcols {
         let path = dcol.strip_prefix("__cidx_").unwrap_or(dcol);
         col_names.push(dcol.clone());
@@ -254,6 +296,13 @@ async fn write_full_doc(
             Some(v) => params.push(json_value_to_param(&v)),
             None => params.push(bluedb_rest::Param::Null),
         }
+    }
+
+    // Compound index columns — always TEXT (NUL-joined key).
+    for (ccol, paths) in cdefs {
+        col_names.push(ccol.clone());
+        let key = compound_key(doc, paths);
+        params.push(bluedb_rest::Param::Str(key));
     }
 
     let placeholders: Vec<String> = (1..=params.len()).map(|i| format!("${i}")).collect();
@@ -265,9 +314,10 @@ async fn write_full_doc(
     run_write(state, tenant, &sql, &params).await
 }
 
-/// UPDATE a row's `doc` and all `__cidx_*` columns for the given `_id`.
-/// Used by the `update` handler after applying an in-memory MQL update to
-/// the document so the secondary indexes stay consistent.
+/// UPDATE a row's `doc`, all `__cidx_*` (single-field), and all `__cidxm_*`
+/// (compound) columns for the given `_id`.  Used by the `update` handler after
+/// applying an in-memory MQL update to the document so all secondary indexes
+/// stay consistent.
 async fn rewrite_doc_row(
     state: &AppState,
     tenant: &str,
@@ -275,6 +325,7 @@ async fn rewrite_doc_row(
     id: &str,
     doc: &Value,
     dcols: &HashMap<String, IndexType>,
+    cdefs: &[(String, Vec<String>)],
 ) -> Result<(), AppError> {
     let doc_text = doc.to_string();
 
@@ -282,6 +333,7 @@ async fn rewrite_doc_row(
     let mut set_clauses = vec!["doc = $1".to_string()];
     let mut params: Vec<bluedb_rest::Param> = vec![bluedb_rest::Param::Str(doc_text)];
 
+    // Single-field index columns.
     for (dcol, &idx_type) in dcols {
         let path = dcol.strip_prefix("__cidx_").unwrap_or(dcol);
         let idx = params.len() + 1;
@@ -290,6 +342,14 @@ async fn rewrite_doc_row(
             Some(v) => params.push(json_value_to_param(&v)),
             None => params.push(bluedb_rest::Param::Null),
         }
+    }
+
+    // Compound index columns — always TEXT.
+    for (ccol, paths) in cdefs {
+        let idx = params.len() + 1;
+        set_clauses.push(format!("{ccol} = ${idx}"));
+        let key = compound_key(doc, paths);
+        params.push(bluedb_rest::Param::Str(key));
     }
 
     let id_idx = params.len() + 1;
@@ -442,6 +502,8 @@ pub(crate) async fn insert(
 
     // Fetch the map of derived-column names → IndexType (may be empty on a fresh collection).
     let dcols = indexed_col_types(&state, &tenant, &coll).await?;
+    // Fetch compound index column definitions.
+    let cdefs = compound_col_defs(&state, &tenant, &coll).await?;
 
     let mut inserted_ids: Vec<String> = Vec::with_capacity(docs_arr.len());
 
@@ -452,7 +514,7 @@ pub(crate) async fn insert(
             return Err(AppError::bad_request("each document must be a JSON object").into());
         }
         let id = ensure_id(&mut doc);
-        write_full_doc(&state, &tenant, &coll, &doc, &dcols).await?;
+        write_full_doc(&state, &tenant, &coll, &doc, &dcols, &cdefs).await?;
         inserted_ids.push(id);
     }
 
@@ -493,17 +555,23 @@ pub(crate) async fn find(
     // Build the map of indexed paths: derived column name → IndexType.
     // The filter's to_sql_indexed takes this map keyed by derived column name.
     let col_types = indexed_col_types(&state, &tenant, &coll).await.unwrap_or_default();
-    let indexed: HashMap<String, IndexType> = collect_filter_paths(&filter)
-        .into_iter()
-        .filter_map(|p| {
-            let dcol = derived_col(&p);
-            col_types.get(&dcol).map(|&t| (dcol, t))
-        })
-        .collect();
+    let cdefs = compound_col_defs(&state, &tenant, &coll).await.unwrap_or_default();
 
     // Build the WHERE clause and collect bound parameters.
+    // Try the compound fast path first; fall through to single-field indexed routing.
     let mut params: Vec<Value> = Vec::new();
-    let where_sql = filter.to_sql_indexed(&mut params, &indexed);
+    let where_sql = if let Some(sql) = try_compound_match(&filter, &cdefs, &mut params) {
+        sql
+    } else {
+        let indexed: HashMap<String, IndexType> = collect_filter_paths(&filter)
+            .into_iter()
+            .filter_map(|p| {
+                let dcol = derived_col(&p);
+                col_types.get(&dcol).map(|&t| (dcol, t))
+            })
+            .collect();
+        filter.to_sql_indexed(&mut params, &indexed)
+    };
 
     // Build SELECT with optional ORDER BY / LIMIT / OFFSET.
     let mut sql = format!("SELECT doc FROM {coll} WHERE {where_sql}");
@@ -558,18 +626,19 @@ pub(crate) async fn find(
 /// `POST /collections/{coll}/createIndex` — create a gateway-maintained JSON-path index.
 ///
 /// Body: `{"keys": {"<path>": 1}, "options": {"unique": false, "type": "number"}}`.
-/// Only the first key in `keys` is used (compound indexes are not supported).
 ///
-/// The derived column type is determined by:
-/// 1. `options.type` hint, if present: `"number"` → `FLOAT`, `"bool"`/`"boolean"` → `BOOLEAN`,
-///    `"string"` → `TEXT`.
-/// 2. Otherwise: infer from existing documents — sample the field's values, then
-///    `infer_index_type` chooses `Number`/`Bool`/`Text`.
+/// **Single-field** (`keys` has 1 entry): the derived column type is determined by:
+/// 1. `options.type` hint: `"number"` → `INT`, `"bool"`/`"boolean"` → `BOOLEAN`, `"string"` → `TEXT`.
+/// 2. Otherwise: infer from existing documents.
+///
+/// **Compound** (`keys` has >1 entries): always creates a `TEXT` column
+/// (`__cidxm_<a>__<b>`) storing the NUL-joined component values.  The type hint
+/// is ignored (compound keys are always TEXT — equality only in v1).
 ///
 /// Steps:
-/// 1. `ALTER TABLE {coll} ADD COLUMN __cidx_<path> {FLOAT|BOOLEAN|TEXT}` (skipped if already present).
-/// 2. Backfill existing rows with typed values (`derive_typed_value`).
-/// 3. `CREATE [UNIQUE] INDEX cidx_{coll}_{path_with_underscores} ON {coll} (__cidx_<path>)`.
+/// 1. `ALTER TABLE {coll} ADD COLUMN {derived_col} {type}` (skipped if already present).
+/// 2. Backfill existing rows.
+/// 3. `CREATE [UNIQUE] INDEX {name} ON {coll} ({derived_col})`.
 ///
 /// Returns `{"name": "<index_name>"}`.
 pub(crate) async fn create_index(
@@ -588,6 +657,83 @@ pub(crate) async fn create_index(
         return Err(AppError::bad_request("'keys' must not be empty").into());
     }
 
+    // Ensure the collection table exists first (createIndex before any insert).
+    ensure_collection(&state, &tenant, &coll).await?;
+
+    let unique_kw = if req.options.unique { "UNIQUE " } else { "" };
+
+    // -----------------------------------------------------------------------
+    // Compound index: keys.len() > 1
+    // -----------------------------------------------------------------------
+    if req.keys.len() > 1 {
+        // Validate and collect paths in insertion order.
+        let paths: Vec<String> = req.keys.keys().cloned().collect();
+        for p in &paths {
+            if !valid_path(p) {
+                return Err(AppError::bad_request(format!(
+                    "invalid compound index field path: {p:?}"
+                ))
+                .with_code("PARSE_ERROR")
+                .into());
+            }
+        }
+
+        let dcol = compound_col(&paths);
+        let index_name = format!(
+            "cidxm_{coll}_{}",
+            paths.iter().map(|p| p.replace('.', "_")).collect::<Vec<_>>().join("_")
+        );
+
+        // Step 1: Add the TEXT column if not present.
+        let existing_cdefs = compound_col_defs(&state, &tenant, &coll).await?;
+        let already_exists = existing_cdefs.iter().any(|(c, _)| c == &dcol);
+        if !already_exists {
+            let alter_sql = format!("ALTER TABLE {coll} ADD COLUMN {dcol} TEXT;");
+            run_ddl(&state, &tenant, &alter_sql).await?;
+        }
+
+        // Step 2: Backfill existing rows.
+        let select_sql = format!("SELECT _id, doc FROM {coll} WHERE TRUE;");
+        let rows = run_read_routed(&state, &tenant, &select_sql, &[]).await?;
+        for row in rows {
+            let id = match row.get("_id") {
+                Some(Value::String(s)) => s.clone(),
+                _ => continue,
+            };
+            let doc: Value = match row.get("doc") {
+                Some(Value::String(s)) => serde_json::from_str(s).unwrap_or(Value::Null),
+                Some(v) => v.clone(),
+                None => continue,
+            };
+            let key = compound_key(&doc, &paths);
+            let update_sql = format!("UPDATE {coll} SET {dcol} = $1 WHERE _id = $2;");
+            let params = vec![
+                bluedb_rest::Param::Str(key),
+                bluedb_rest::Param::Str(id),
+            ];
+            run_write(&state, &tenant, &update_sql, &params).await?;
+        }
+
+        // Step 3: Create the index.
+        let storage = state.connection(&tenant).await?;
+        let schema = Store::fetch_schema(&storage, &coll)
+            .await
+            .map_err(|e| AppError::internal(format!("fetch schema: {e}")))?;
+        let index_exists = schema.is_some_and(|s| s.indexes.iter().any(|i| i.name == index_name));
+        if !index_exists {
+            let create_idx_sql = format!(
+                "CREATE {unique_kw}INDEX {index_name} ON {coll} ({dcol});"
+            );
+            run_ddl(&state, &tenant, &create_idx_sql).await?;
+        }
+
+        return Ok(Json(json!({ "name": index_name })));
+    }
+
+    // -----------------------------------------------------------------------
+    // Single-field index: keys.len() == 1 (original behavior unchanged)
+    // -----------------------------------------------------------------------
+
     // Take the first key as the path to index.
     let (path, _) = req.keys.iter().next().unwrap();
     let path = path.clone();
@@ -597,14 +743,10 @@ pub(crate) async fn create_index(
     }
 
     let dcol = derived_col(&path);
-    let unique_kw = if req.options.unique { "UNIQUE " } else { "" };
     let index_name = format!(
         "cidx_{coll}_{}",
         path.replace('.', "_")
     );
-
-    // Ensure the collection table exists first (createIndex before any insert).
-    ensure_collection(&state, &tenant, &coll).await?;
 
     // Step 1: Add the derived column if it doesn't already exist.
     let existing_col_types = indexed_col_types(&state, &tenant, &coll).await?;
@@ -727,6 +869,7 @@ pub(crate) async fn update(
 
     // Fetch index columns once — used for both the SELECT routing and the UPDATE.
     let dcols = indexed_col_types(&state, &tenant, &coll).await.unwrap_or_default();
+    let cdefs = compound_col_defs(&state, &tenant, &coll).await.unwrap_or_default();
 
     // Build the typed indexed map for query routing.
     let indexed: HashMap<String, IndexType> = collect_filter_paths(&filter)
@@ -764,7 +907,7 @@ pub(crate) async fn update(
         apply_update(&mut doc, &req.update)
             .map_err(|e| AppError::bad_request(e.to_string()).with_code("PARSE_ERROR"))?;
         if doc != before {
-            rewrite_doc_row(&state, &tenant, &coll, &id, &doc, &dcols).await?;
+            rewrite_doc_row(&state, &tenant, &coll, &id, &doc, &dcols, &cdefs).await?;
             modified += 1;
         }
     }
@@ -776,7 +919,7 @@ pub(crate) async fn update(
         apply_update(&mut doc, &req.update)
             .map_err(|e| AppError::bad_request(e.to_string()).with_code("PARSE_ERROR"))?;
         let id = ensure_id(&mut doc);
-        write_full_doc(&state, &tenant, &coll, &doc, &dcols).await?;
+        write_full_doc(&state, &tenant, &coll, &doc, &dcols, &cdefs).await?;
         upserted_id = json!(id);
     }
 
@@ -934,16 +1077,21 @@ pub(crate) async fn count(
 
     // Resolve indexed paths — same logic as `find`.
     let col_types = indexed_col_types(&state, &tenant, &coll).await.unwrap_or_default();
-    let indexed: HashMap<String, IndexType> = collect_filter_paths(&filter)
-        .into_iter()
-        .filter_map(|p| {
-            let dcol = derived_col(&p);
-            col_types.get(&dcol).map(|&t| (dcol, t))
-        })
-        .collect();
+    let cdefs = compound_col_defs(&state, &tenant, &coll).await.unwrap_or_default();
 
     let mut params: Vec<Value> = Vec::new();
-    let where_sql = filter.to_sql_indexed(&mut params, &indexed);
+    let where_sql = if let Some(sql) = try_compound_match(&filter, &cdefs, &mut params) {
+        sql
+    } else {
+        let indexed: HashMap<String, IndexType> = collect_filter_paths(&filter)
+            .into_iter()
+            .filter_map(|p| {
+                let dcol = derived_col(&p);
+                col_types.get(&dcol).map(|&t| (dcol, t))
+            })
+            .collect();
+        filter.to_sql_indexed(&mut params, &indexed)
+    };
 
     let sql = format!("SELECT COUNT(*) AS n FROM {coll} WHERE {where_sql}");
 
@@ -979,4 +1127,66 @@ fn collect_filter_paths(filter: &bluedb_collections::filter::Filter) -> Vec<Stri
         Filter::And(v) | Filter::Or(v) => v.iter().flat_map(collect_filter_paths).collect(),
         Filter::Not(f) => collect_filter_paths(f),
     }
+}
+
+/// Try to match a filter against the available compound indexes.
+///
+/// Returns `Some((sql_fragment, params))` when the filter's full-key equality
+/// is covered by a compound index (all component paths present as `$eq`
+/// predicates).  The SQL fragment uses the compound column with a single
+/// `= $N` predicate; any equality predicates that are NOT covered by the
+/// chosen compound index are appended as additional AND clauses rendered
+/// via `to_sql` (JSON accessor, analytical fallback if needed).
+///
+/// Returns `None` when no compound index covers the filter.
+fn try_compound_match(
+    filter: &bluedb_collections::filter::Filter,
+    cdefs: &[(String, Vec<String>)],
+    params: &mut Vec<Value>,
+) -> Option<String> {
+    if cdefs.is_empty() {
+        return None;
+    }
+    // Get the top-level equality map — only pure-eq filters qualify.
+    let eq_map = filter.eq_map()?;
+    if eq_map.is_empty() {
+        return None;
+    }
+
+    // Find the first compound index whose component paths are all in the eq map.
+    let (ccol, paths) = cdefs.iter().find(|(_, paths)| {
+        paths.iter().all(|p| eq_map.contains_key(p))
+    })?;
+
+    // Build the compound key value from the equality map (component order = index order).
+    let parts: Vec<String> = paths
+        .iter()
+        .map(|p| {
+            let v = &eq_map[p];
+            match v {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            }
+        })
+        .collect();
+    let compound_val = encode_compound(&parts);
+
+    let placeholder = {
+        params.push(Value::String(compound_val));
+        format!("${}", params.len())
+    };
+
+    let mut clauses = vec![format!("{ccol} = {placeholder}")];
+
+    // Any leftover equality predicates not covered by the compound index.
+    let covered: std::collections::HashSet<&str> = paths.iter().map(|s| s.as_str()).collect();
+    for (p, v) in &eq_map {
+        if !covered.contains(p.as_str()) {
+            use bluedb_collections::filter::{Filter, Cmp};
+            let leftover = Filter::Cmp { path: p.clone(), op: Cmp::Eq, value: v.clone() };
+            clauses.push(format!("({})", leftover.to_sql(params)));
+        }
+    }
+
+    Some(clauses.join(" AND "))
 }

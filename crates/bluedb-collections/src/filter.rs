@@ -57,6 +57,38 @@ fn parse_field(path: &str, val: &Value) -> Result<Filter, MqlError> {
 }
 
 impl Filter {
+    /// If this filter is a conjunction of pure top-level equality (`Cmp{op:Eq}`)
+    /// nodes (or a single such node), return a map `path → value`.  Any non-Eq
+    /// operator, nested `$and`/`$or`, or `Not` node returns `None`.
+    ///
+    /// Used by the gateway to detect whether a compound index's full key is
+    /// covered by the filter so it can route to `{compound_col} = $1`.
+    pub fn eq_map(&self) -> Option<HashMap<String, Value>> {
+        match self {
+            Filter::True => Some(HashMap::new()),
+            Filter::Cmp { path, op: Cmp::Eq, value } => {
+                let mut m = HashMap::new();
+                m.insert(path.clone(), value.clone());
+                Some(m)
+            }
+            Filter::And(v) => {
+                let mut m = HashMap::new();
+                for f in v {
+                    match f {
+                        Filter::Cmp { path, op: Cmp::Eq, value } => {
+                            m.insert(path.clone(), value.clone());
+                        }
+                        // Any non-eq child → can't use compound key.
+                        _ => return None,
+                    }
+                }
+                Some(m)
+            }
+            // Anything else: Or, Not, non-Eq Cmp.
+            _ => None,
+        }
+    }
+
     /// Lower to a SQL boolean expression over `_id` / `doc`. Appends bound values
     /// to `params`; placeholders are `$1..$N` by params.len().
     pub fn to_sql(&self, params: &mut Vec<Value>) -> String {
