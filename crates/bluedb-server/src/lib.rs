@@ -48,6 +48,7 @@ use bluedb_ha::{HaError, NodeRegistry, Status, WriterController};
 use bluedb_ledger::Ledger;
 use arrow_array::RecordBatch;
 
+mod collections;
 mod ledger_api;
 mod evidence_api;
 mod graph_api;
@@ -862,6 +863,8 @@ pub fn build_app(state: AppState) -> Router {
             "/catalog/v1/namespaces/{ns}/tables/{table}",
             get(catalog::load_table),
         )
+        // Document-oriented collections API.
+        .route("/collections/{coll}/insert", post(collections::insert))
         .with_state(state)
 }
 
