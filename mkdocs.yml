@@ -66,6 +66,8 @@ nav:
       - Transactions: sql/transactions.md
       - Metadata: sql/metadata.md
       - Limitations & differences: sql/limitations.md
+  - Collections:
+      - MongoDB-style API: collections/README.md
   - Lakehouse:
       - Iceberg mirror: lakehouse/iceberg-mirror.md
   - Ledger:
