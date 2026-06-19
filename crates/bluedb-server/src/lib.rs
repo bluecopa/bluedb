@@ -866,6 +866,7 @@ pub fn build_app(state: AppState) -> Router {
         // Document-oriented collections API.
         .route("/collections/{coll}/insert", post(collections::insert))
         .route("/collections/{coll}/find", post(collections::find))
+        .route("/collections/{coll}/createIndex", post(collections::create_index))
         .with_state(state)
 }
 

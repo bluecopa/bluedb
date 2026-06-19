@@ -6,16 +6,25 @@
 //! doesn't already carry one.
 //!
 //! ## Endpoints
-//! - `POST /collections/{coll}/insert` — bulk-insert documents
-//! - `POST /collections/{coll}/find` — query documents (MQL filter / sort / limit)
+//! - `POST /collections/{coll}/insert`              — bulk-insert documents
+//! - `POST /collections/{coll}/find`                — query documents (MQL filter / sort / limit)
+//! - `POST /collections/{coll}/createIndex`         — add a gateway-maintained JSON-path index
+
+use std::collections::HashSet;
 
 use axum::extract::{Path, State};
 use axum::Json;
 use gluesql_core::prelude::Glue;
+use gluesql_core::store::Store;
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use bluedb_engine::rest_sql;
-use bluedb_collections::{filter::parse_filter, project::apply_projection};
+use bluedb_collections::{
+    filter::parse_filter,
+    index::{derive_value, derived_col},
+    project::apply_projection,
+};
 
 use crate::{authz::Scope, run_read_routed, schema::ident, AppError, AppState};
 
@@ -37,8 +46,8 @@ async fn ensure_collection(state: &AppState, tenant: &str, coll: &str) -> Result
     Ok(())
 }
 
-/// Run a single parameterized write statement (`INSERT`) through the FTS
-/// commit-observer path so the live index is maintained. Mirrors the write
+/// Run a single parameterized write statement (`INSERT`, `UPDATE`) through the
+/// FTS commit-observer path so the live index is maintained. Mirrors the write
 /// branch of `exec_sql`.
 async fn run_write(
     state: &AppState,
@@ -51,8 +60,81 @@ async fn run_write(
     Ok(())
 }
 
+/// Run a DDL statement (ALTER TABLE, CREATE INDEX) with `allow_arbitrary = true`.
+/// DDL does not go through the FTS rewriter (which would reject it via the DML
+/// guard). Uses a serialized connection for write ordering.
+async fn run_ddl(
+    state: &AppState,
+    tenant: &str,
+    sql: &str,
+) -> Result<(), AppError> {
+    state.require_active()?;
+    let mut glue = Glue::new(state.connection_serialized(tenant).await?);
+    rest_sql::execute_sql(&mut glue, sql, &[], true).await?;
+    Ok(())
+}
+
+/// Return the set of JSON paths that have a gateway-maintained derived column
+/// (`__cidx_<path>`) for `coll` in `tenant`. Used by `insert` and `find` to
+/// keep derived columns in sync and to route queries through the index.
+///
+/// Introspects the table's `column_defs` from the SlateDB schema, filters for
+/// names starting with `__cidx_`, then strips the prefix to reconstruct the
+/// path (dots were turned into underscores — this is lossy, so callers use the
+/// returned paths to build a `HashSet<String>` and check membership via
+/// `derived_col(path)` rather than reversing). For lookup correctness we return
+/// the paths exactly as stored in the column names (underscores only) — callers
+/// call `derived_col(path_from_filter)` and check if that column name is present.
+///
+/// Returns an empty set if the table doesn't exist yet.
+async fn indexed_col_names(
+    state: &AppState,
+    tenant: &str,
+    coll: &str,
+) -> Result<HashSet<String>, AppError> {
+    let storage = state.connection(tenant).await?;
+    let schema = match Store::fetch_schema(&storage, coll).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return Ok(HashSet::new()),
+        Err(e) => return Err(AppError::internal(format!("fetch schema: {e}"))),
+    };
+    let cols: HashSet<String> = schema
+        .column_defs
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|c| {
+            c.name
+                .strip_prefix("__cidx_")
+                .map(|_| c.name.clone())
+        })
+        .collect();
+    Ok(cols)
+}
+
 // ---------------------------------------------------------------------------
-// Handler
+// Request types
+// ---------------------------------------------------------------------------
+
+/// Body for `POST /collections/{coll}/createIndex`.
+///
+/// ```json
+/// {"keys": {"status": 1}, "options": {"unique": false}}
+/// ```
+#[derive(Deserialize)]
+pub(crate) struct CreateIndexRequest {
+    pub keys: serde_json::Map<String, Value>,
+    #[serde(default)]
+    pub options: CreateIndexOptions,
+}
+
+#[derive(Deserialize, Default)]
+pub(crate) struct CreateIndexOptions {
+    #[serde(default)]
+    pub unique: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Handlers
 // ---------------------------------------------------------------------------
 
 /// `POST /collections/{coll}/insert` — insert documents into a collection.
@@ -61,6 +143,10 @@ async fn run_write(
 /// 24-char hex `_id` if it doesn't already carry one. The backing table is
 /// created implicitly on first insert. Returns
 /// `{"insertedIds": [...], "insertedCount": N}`.
+///
+/// If the collection already has gateway-maintained JSON-path index columns
+/// (`__cidx_<path>`), their values are extracted from each document and
+/// included in the INSERT so the secondary index stays current.
 pub(crate) async fn insert(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -86,6 +172,9 @@ pub(crate) async fn insert(
     // Ensure the backing table exists (idempotent).
     ensure_collection(&state, &tenant, &coll).await?;
 
+    // Fetch the set of derived-column names (may be empty on a fresh collection).
+    let dcols = indexed_col_names(&state, &tenant, &coll).await?;
+
     let mut inserted_ids: Vec<String> = Vec::with_capacity(docs_arr.len());
 
     for raw_doc in docs_arr {
@@ -99,11 +188,31 @@ pub(crate) async fn insert(
         // Serialize the whole document (including _id) as the `doc` column value.
         let doc_text = doc.to_string();
 
-        let sql = format!("INSERT INTO {coll} (_id, doc) VALUES ($1, $2);");
-        let params = vec![
+        // Build INSERT with optional derived-column values for each index.
+        // Column order: _id, doc, [__cidx_<path>, ...]
+        let mut col_names = vec!["_id".to_string(), "doc".to_string()];
+        let mut params: Vec<bluedb_rest::Param> = vec![
             bluedb_rest::Param::Str(id.clone()),
             bluedb_rest::Param::Str(doc_text),
         ];
+
+        for dcol in &dcols {
+            // Strip "__cidx_" to get the path (dots became underscores — we use the
+            // column name as the path key since we stored it that way).
+            let path = dcol.strip_prefix("__cidx_").unwrap_or(dcol);
+            col_names.push(dcol.clone());
+            match derive_value(&doc, path) {
+                Some(v) => params.push(bluedb_rest::Param::Str(v)),
+                None => params.push(bluedb_rest::Param::Null),
+            }
+        }
+
+        let placeholders: Vec<String> = (1..=params.len()).map(|i| format!("${i}")).collect();
+        let sql = format!(
+            "INSERT INTO {coll} ({cols}) VALUES ({vals});",
+            cols = col_names.join(", "),
+            vals = placeholders.join(", "),
+        );
         run_write(&state, &tenant, &sql, &params).await?;
         inserted_ids.push(id);
     }
@@ -117,9 +226,11 @@ pub(crate) async fn insert(
 /// `POST /collections/{coll}/find` — query documents with an MQL filter.
 ///
 /// Body: `{"filter": {...}, "projection": {...}, "sort": {field: 1|-1}, "limit": N, "skip": N}`.
-/// All fields are optional. The filter is MQL (a subset of MongoDB query language);
-/// a non-indexed field filter will be guardrail-rejected by GlueSQL and routed to
-/// DataFusion over the tenant's Iceberg mirror.
+/// All fields are optional. For equality filters on indexed fields the derived
+/// column (`__cidx_<path>`) is used — GlueSQL serves this via its secondary
+/// index (read-your-writes fast path, no DataFusion round-trip needed). For
+/// non-indexed fields the filter uses `doc->>'field'` which may be guardrail-
+/// rejected and routed to DataFusion.
 ///
 /// Returns `{"documents": [...]}`.
 pub(crate) async fn find(
@@ -140,9 +251,19 @@ pub(crate) async fn find(
     let filter = parse_filter(filter_val)
         .map_err(|e| AppError::bad_request(e.to_string()).with_code("PARSE_ERROR"))?;
 
+    // Build the set of indexed paths: for each filter path, check whether
+    // `derived_col(path)` exists as a column in the table. This avoids the
+    // lossy dot→underscore round-trip (we let `derived_col` do the mapping and
+    // check membership against the live column set).
+    let dcol_names = indexed_col_names(&state, &tenant, &coll).await.unwrap_or_default();
+    let indexed: HashSet<String> = collect_filter_paths(&filter)
+        .into_iter()
+        .filter(|p| dcol_names.contains(&derived_col(p)))
+        .collect();
+
     // Build the WHERE clause and collect bound parameters.
     let mut params: Vec<Value> = Vec::new();
-    let where_sql = filter.to_sql(&mut params);
+    let where_sql = filter.to_sql_indexed(&mut params, &indexed);
 
     // Build SELECT with optional ORDER BY / LIMIT / OFFSET.
     let mut sql = format!("SELECT doc FROM {coll} WHERE {where_sql}");
@@ -192,4 +313,105 @@ pub(crate) async fn find(
     }
 
     Ok(Json(json!({ "documents": docs })))
+}
+
+/// `POST /collections/{coll}/createIndex` — create a gateway-maintained JSON-path index.
+///
+/// Body: `{"keys": {"<path>": 1}, "options": {"unique": false}}`.
+/// Only the first key in `keys` is used (compound indexes are not supported).
+///
+/// Steps:
+/// 1. `ALTER TABLE {coll} ADD COLUMN __cidx_<path> TEXT` (skipped if already present).
+/// 2. Backfill from existing rows (`UPDATE ... SET __cidx_<path> = $1 WHERE _id = $2`).
+/// 3. `CREATE [UNIQUE] INDEX cidx_{coll}_{path_with_underscores} ON {coll} (__cidx_<path>)`.
+///
+/// Returns `{"name": "<index_name>"}`.
+pub(crate) async fn create_index(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(coll): Path<String>,
+    Json(req): Json<CreateIndexRequest>,
+) -> Result<Json<Value>, AppError> {
+    state.authorize(&headers, Scope::SchemaAdmin)?;
+    let tenant = state.tenant(&headers)?;
+    state.require_active()?;
+
+    let coll = ident(&coll)?.to_string();
+
+    if req.keys.is_empty() {
+        return Err(AppError::bad_request("'keys' must not be empty"));
+    }
+
+    // Take the first key as the path to index.
+    let (path, _) = req.keys.iter().next().unwrap();
+    let path = path.clone();
+
+    let dcol = derived_col(&path);
+    let unique_kw = if req.options.unique { "UNIQUE " } else { "" };
+    let index_name = format!(
+        "cidx_{coll}_{}",
+        path.replace('.', "_")
+    );
+
+    // Ensure the collection table exists first (createIndex before any insert).
+    ensure_collection(&state, &tenant, &coll).await?;
+
+    // Step 1: Add the derived column if it doesn't already exist.
+    let existing_cols = indexed_col_names(&state, &tenant, &coll).await?;
+    if !existing_cols.contains(&dcol) {
+        let alter_sql = format!("ALTER TABLE {coll} ADD COLUMN {dcol} TEXT;");
+        run_ddl(&state, &tenant, &alter_sql).await?;
+    }
+
+    // Step 2: Backfill existing rows.
+    // Read all existing _id + doc pairs (unindexed scan — only at createIndex time).
+    let select_sql = format!("SELECT _id, doc FROM {coll} WHERE TRUE;");
+    let rows = run_read_routed(&state, &tenant, &select_sql, &[]).await?;
+    for row in rows {
+        let id = match row.get("_id") {
+            Some(Value::String(s)) => s.clone(),
+            _ => continue,
+        };
+        let doc: Value = match row.get("doc") {
+            Some(Value::String(s)) => serde_json::from_str(s).unwrap_or(Value::Null),
+            Some(v) => v.clone(),
+            None => continue,
+        };
+        if let Some(val) = derive_value(&doc, &path) {
+            let update_sql = format!("UPDATE {coll} SET {dcol} = $1 WHERE _id = $2;");
+            let params = vec![
+                bluedb_rest::Param::Str(val),
+                bluedb_rest::Param::Str(id),
+            ];
+            run_write(&state, &tenant, &update_sql, &params).await?;
+        }
+    }
+
+    // Step 3: Create the secondary index on the derived column — skip if an
+    // index with this exact name already exists (idempotent createIndex).
+    let storage = state.connection(&tenant).await?;
+    let schema = Store::fetch_schema(&storage, &coll)
+        .await
+        .map_err(|e| AppError::internal(format!("fetch schema: {e}")))?;
+    let index_exists = schema.map_or(false, |s| s.indexes.iter().any(|i| i.name == index_name));
+    if !index_exists {
+        let create_idx_sql = format!(
+            "CREATE {unique_kw}INDEX {index_name} ON {coll} ({dcol});"
+        );
+        run_ddl(&state, &tenant, &create_idx_sql).await?;
+    }
+
+    Ok(Json(json!({ "name": index_name })))
+}
+
+/// Collect all leaf paths referenced by a `Filter` (for `Cmp` nodes only).
+/// Used to build the indexed-path set for `find`.
+fn collect_filter_paths(filter: &bluedb_collections::filter::Filter) -> Vec<String> {
+    use bluedb_collections::filter::Filter;
+    match filter {
+        Filter::True => vec![],
+        Filter::Cmp { path, .. } => vec![path.clone()],
+        Filter::And(v) | Filter::Or(v) => v.iter().flat_map(collect_filter_paths).collect(),
+        Filter::Not(f) => collect_filter_paths(f),
+    }
 }

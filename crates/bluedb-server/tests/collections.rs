@@ -222,3 +222,147 @@ async fn second_insert_reuses_existing_table() {
     assert_eq!(s2, StatusCode::OK, "second insert failed: {body}");
     assert_eq!(body["insertedCount"].as_i64().unwrap(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// createIndex tests
+// ---------------------------------------------------------------------------
+
+/// Implicit collection create via insert, then createIndex, then insert-after-
+/// index, then find by the indexed field — all on the GlueSQL fast path (no
+/// seal needed because the derived column is a real indexed column).
+#[tokio::test]
+async fn create_index_then_find_by_indexed_field_is_fresh() {
+    let app = app().await;
+
+    // Step 1: create the collection implicitly with one insert.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/users/insert",
+        Some(json!({ "documents": [{ "name": "pre", "status": "old" }] })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "first insert: {body}");
+
+    // Step 2: create a JSON-path index on "status".
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/users/createIndex",
+        Some(json!({ "keys": { "status": 1 } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "createIndex: {body}");
+    let index_name = body["name"].as_str().expect("name in response");
+    assert!(index_name.contains("status"), "expected status in index name, got {index_name}");
+
+    // Step 3: insert two more docs after the index exists.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/users/insert",
+        Some(json!({ "documents": [
+            { "name": "ada", "status": "active" },
+            { "name": "lin", "status": "idle" }
+        ]})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "insert after index: {body}");
+    assert_eq!(body["insertedCount"].as_i64().unwrap(), 2);
+
+    // Step 4: find by indexed field — must return exactly the "active" doc.
+    // No seal_now needed: the index-backed find uses the GlueSQL fast path.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/users/find",
+        Some(json!({ "filter": { "status": "active" } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "find: {body}");
+    let docs = body["documents"].as_array().expect("documents array");
+    assert_eq!(docs.len(), 1, "expected 1 doc, got: {body}");
+    assert_eq!(docs[0]["name"].as_str().unwrap(), "ada");
+    let id = docs[0]["_id"].as_str().expect("_id in doc");
+    assert_eq!(id.len(), 24, "expected 24-char _id, got '{id}'");
+}
+
+/// createIndex on a non-empty collection backfills docs that were inserted
+/// BEFORE the index was created, so a subsequent find by that field still
+/// returns them.
+#[tokio::test]
+async fn create_index_backfills_pre_existing_docs() {
+    let app = app().await;
+
+    // Insert a doc first, BEFORE the index exists.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/things/insert",
+        Some(json!({ "documents": [{ "name": "widget", "kind": "tool" }] })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "pre-index insert: {body}");
+
+    // Create the index — this must backfill the doc above.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/things/createIndex",
+        Some(json!({ "keys": { "kind": 1 } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "createIndex: {body}");
+
+    // find by kind — the pre-existing doc must be found on the fast path.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/things/find",
+        Some(json!({ "filter": { "kind": "tool" } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "find: {body}");
+    let docs = body["documents"].as_array().expect("documents array");
+    assert_eq!(docs.len(), 1, "expected 1 backfilled doc, got: {body}");
+    assert_eq!(docs[0]["name"].as_str().unwrap(), "widget");
+}
+
+/// createIndex is idempotent — calling it twice on the same field succeeds and
+/// the find still works.
+#[tokio::test]
+async fn create_index_idempotent_column_add() {
+    let app = app().await;
+
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/collections/items/insert",
+        Some(json!({ "documents": [{ "color": "red" }] })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    // Create the same index twice.
+    for _ in 0..2 {
+        let (s, body) = call(
+            &app,
+            "POST",
+            "/collections/items/createIndex",
+            Some(json!({ "keys": { "color": 1 } })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "createIndex attempt: {body}");
+    }
+
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/items/find",
+        Some(json!({ "filter": { "color": "red" } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "find: {body}");
+    let docs = body["documents"].as_array().expect("documents array");
+    assert_eq!(docs.len(), 1, "expected 1 doc: {body}");
+}

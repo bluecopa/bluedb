@@ -1,5 +1,7 @@
+use std::collections::HashSet;
 use serde_json::Value;
 use crate::error::MqlError;
+use crate::index::derived_col;
 
 #[derive(Debug, PartialEq)]
 pub enum Cmp { Eq, Ne, Gt, Gte, Lt, Lte, In, Nin, Exists, Regex }
@@ -66,11 +68,56 @@ impl Filter {
             Filter::Cmp { path, op, value } => cmp_sql(path, op, value, params),
         }
     }
+
+    /// Like [`Self::to_sql`] but, for a `Cmp` whose `path` is in `indexed`, uses
+    /// the derived column `__cidx_<path>` (a plain column with a secondary index)
+    /// instead of the `(doc->>'...')` JSON accessor — so GlueSQL can use the index.
+    /// `_id` and non-indexed paths behave exactly as [`Self::to_sql`].
+    pub fn to_sql_indexed(&self, params: &mut Vec<Value>, indexed: &HashSet<String>) -> String {
+        match self {
+            Filter::True => "TRUE".into(),
+            Filter::And(v) => join_indexed(v, " AND ", params, indexed),
+            Filter::Or(v)  => join_indexed(v, " OR ", params, indexed),
+            Filter::Not(f) => format!("NOT ({})", f.to_sql_indexed(params, indexed)),
+            Filter::Cmp { path, op, value } => {
+                if path != "_id" && indexed.contains(path.as_str()) {
+                    let col = derived_col(path);
+                    cmp_sql_col(&col, op, value, params)
+                } else {
+                    cmp_sql(path, op, value, params)
+                }
+            }
+        }
+    }
 }
 
 fn join(v: &[Filter], sep: &str, params: &mut Vec<Value>) -> String {
     let parts: Vec<String> = v.iter().map(|f| format!("({})", f.to_sql(params))).collect();
     parts.join(sep)
+}
+
+fn join_indexed(v: &[Filter], sep: &str, params: &mut Vec<Value>, indexed: &HashSet<String>) -> String {
+    let parts: Vec<String> = v.iter().map(|f| format!("({})", f.to_sql_indexed(params, indexed))).collect();
+    parts.join(sep)
+}
+
+/// Like `cmp_sql` but uses a pre-computed plain column reference (no JSON accessor).
+fn cmp_sql_col(col: &str, op: &Cmp, value: &Value, params: &mut Vec<Value>) -> String {
+    match op {
+        Cmp::Eq  => format!("{col} = {}", bind(params, value)),
+        Cmp::Ne  => format!("{col} <> {}", bind(params, value)),
+        Cmp::Gt  => format!("{col} > {}", bind(params, value)),
+        Cmp::Gte => format!("{col} >= {}", bind(params, value)),
+        Cmp::Lt  => format!("{col} < {}", bind(params, value)),
+        Cmp::Lte => format!("{col} <= {}", bind(params, value)),
+        Cmp::In  => in_sql(col, value, params, false),
+        Cmp::Nin => in_sql(col, value, params, true),
+        Cmp::Exists => {
+            let want = value.as_bool().unwrap_or(true);
+            if want { format!("{col} IS NOT NULL") } else { format!("{col} IS NULL") }
+        }
+        Cmp::Regex => format!("{col} ~ {}", bind(params, value)),
+    }
 }
 
 /// `_id` → the PK column (bare); any other path → `(doc->>'a'->>'b'...)` text accessor.
@@ -122,6 +169,7 @@ fn in_sql(col: &str, value: &Value, params: &mut Vec<Value>, negate: bool) -> St
 mod tests {
     use super::*;
     use serde_json::json;
+
     #[test]
     fn parses_implicit_eq_and_operators() {
         let f = parse_filter(&json!({"status": "active"})).unwrap();
@@ -131,11 +179,13 @@ mod tests {
         let f = parse_filter(&json!({"$and": [{"a": 1}, {"b": 2}]})).unwrap();
         assert!(matches!(f, Filter::And(v) if v.len() == 2));
     }
+
     #[test]
     fn rejects_unsupported_operator() {
         let e = parse_filter(&json!({"x": {"$where": "1"}})).unwrap_err();
         assert!(e.to_string().contains("$where"));
     }
+
     #[test]
     fn to_sql_uses_json_accessors_and_bound_params() {
         let f = parse_filter(&serde_json::json!({"status": "active"})).unwrap();
@@ -148,5 +198,42 @@ mod tests {
         let mut params = Vec::new();
         // _id maps to the PK column directly, not a json accessor
         assert_eq!(f.to_sql(&mut params), "_id = $1");
+    }
+
+    #[test]
+    fn to_sql_indexed_uses_derived_col_when_indexed() {
+        let f = parse_filter(&json!({"status": "active"})).unwrap();
+        let indexed: HashSet<String> = ["status".to_string()].into();
+
+        let mut params = Vec::new();
+        let sql = f.to_sql_indexed(&mut params, &indexed);
+        // indexed path → plain derived column, NOT a JSON accessor
+        assert_eq!(sql, "__cidx_status = $1");
+        assert_eq!(params, vec![json!("active")]);
+    }
+
+    #[test]
+    fn to_sql_indexed_falls_back_to_json_accessor_when_not_indexed() {
+        let f = parse_filter(&json!({"status": "active"})).unwrap();
+        let indexed: HashSet<String> = HashSet::new();
+
+        let mut params_indexed = Vec::new();
+        let sql_indexed = f.to_sql_indexed(&mut params_indexed, &indexed);
+
+        let mut params_plain = Vec::new();
+        let sql_plain = f.to_sql(&mut params_plain);
+
+        assert_eq!(sql_indexed, sql_plain);
+        assert_eq!(params_indexed, params_plain);
+    }
+
+    #[test]
+    fn to_sql_indexed_does_not_use_derived_col_for_id() {
+        let f = parse_filter(&json!({"_id": "abc"})).unwrap();
+        // Even if someone (mistakenly) listed "_id" as indexed, it must stay as _id.
+        let indexed: HashSet<String> = ["_id".to_string()].into();
+        let mut params = Vec::new();
+        let sql = f.to_sql_indexed(&mut params, &indexed);
+        assert_eq!(sql, "_id = $1");
     }
 }

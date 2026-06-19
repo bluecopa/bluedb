@@ -4,6 +4,7 @@
 pub mod error;
 pub mod filter;
 pub mod id;
+pub mod index;
 pub mod model;
 pub mod pipeline;
 pub mod project;
