@@ -638,6 +638,63 @@ pub(crate) async fn delete(
     Ok(Json(json!({ "deletedCount": deleted_count })))
 }
 
+/// `POST /collections/{coll}/aggregate` — run a MongoDB aggregation pipeline.
+///
+/// Body: `{"pipeline": [ {"$match": {...}}, {"$group": {...}}, {"$sort": {...}}, ... ]}`.
+/// The pipeline is built directly as a DataFusion `DataFrame` over the tenant's
+/// Iceberg mirror (`bluedb_collections::pipeline::apply_pipeline`), so a stage
+/// reads the **sealed** snapshot — callers seal (or wait for the seal cadence)
+/// before aggregating freshly-written data.
+///
+/// Supported stages: `$match`, `$sort`, `$limit`, `$skip`, `$count`, `$group`
+/// (`$sum`/`$avg`/`$min`/`$max`/`$count`), `$project`/`$addFields`/`$set`,
+/// `$lookup`, `$unwind`. An unknown stage is a 400 (`PARSE_ERROR`).
+///
+/// Returns `{"documents": [...]}` — each result row as a JSON object.
+pub(crate) async fn aggregate(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(coll): Path<String>,
+    Json(req): Json<Value>,
+) -> Result<Json<Value>, AppError> {
+    state.authorize(&headers, Scope::DataRead)?;
+    let tenant = state.tenant(&headers)?;
+    // Reads are allowed anywhere — no `require_active()`.
+
+    let coll = ident(&coll)?.to_string();
+
+    let stages = req
+        .get("pipeline")
+        .and_then(|p| p.as_array())
+        .cloned()
+        .ok_or_else(|| AppError::bad_request("aggregate requires a `pipeline` array"))?;
+
+    // Resolve the tenant's analytical engine (Iceberg mirror via DataFusion).
+    let engine = state
+        .lakehouse()
+        .await
+        .ok_or_else(|| AppError::internal("analytical engine unavailable"))?
+        .engine_for(&tenant)
+        .await
+        .map_err(|e| AppError::internal(format!("get lakehouse engine: {e}")))?;
+
+    let ctx = bluedb_query::session_with_catalog(engine)
+        .await
+        .map_err(|e| AppError::internal(format!("build analytical context: {e}")))?;
+
+    let df = bluedb_collections::pipeline::apply_pipeline(&ctx, &coll, &stages)
+        .await
+        .map_err(|e| AppError::bad_request(e.to_string()).with_code("PARSE_ERROR"))?;
+
+    let batches = df
+        .collect()
+        .await
+        .map_err(|e| AppError::bad_request(format!("aggregate: {e}")))?;
+
+    let rows = crate::record_batches_to_json(&batches);
+    Ok(Json(json!({ "documents": rows })))
+}
+
 /// Collect all leaf paths referenced by a `Filter` (for `Cmp` nodes only).
 /// Used to build the indexed-path set for `find`.
 fn collect_filter_paths(filter: &bluedb_collections::filter::Filter) -> Vec<String> {

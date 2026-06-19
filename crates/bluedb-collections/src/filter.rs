@@ -165,6 +165,141 @@ fn in_sql(col: &str, value: &Value, params: &mut Vec<Value>, negate: bool) -> St
     format!("{col} {kw} ({})", placeholders.join(", "))
 }
 
+// ---------------------------------------------------------------------------
+// DataFusion `Expr` lowering (for the aggregation pipeline `$match` stage)
+// ---------------------------------------------------------------------------
+
+use datafusion::arrow::datatypes::DataType;
+use datafusion::logical_expr::{cast, col, lit, Expr, ScalarUDF};
+use std::sync::Arc;
+
+/// Lower a JSON scalar to a DataFusion literal [`Expr`], preserving its JSON type
+/// (string → `Utf8`, integer → `Int64`, float → `Float64`, bool → `Boolean`).
+/// `null` and composite values fall back to their JSON text.
+fn json_to_lit(v: &Value) -> Expr {
+    match v {
+        Value::String(s) => lit(s.as_str()),
+        Value::Bool(b) => lit(*b),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                lit(i)
+            } else if let Some(f) = n.as_f64() {
+                lit(f)
+            } else {
+                lit(n.to_string())
+            }
+        }
+        // null / array / object: bind as JSON text (rare in a `$match`).
+        Value::Null => lit(serde_json::Value::Null.to_string()),
+        other => lit(other.to_string()),
+    }
+}
+
+/// True if `v` (or, for `$in`/`$nin`, every array element) is a numeric literal —
+/// so the text `json_get_str` accessor must be cast to `Float64` before comparing.
+fn is_numeric(v: &Value) -> bool {
+    match v {
+        Value::Number(_) => true,
+        Value::Array(items) => !items.is_empty() && items.iter().all(|x| x.is_number()),
+        _ => false,
+    }
+}
+
+impl Filter {
+    /// Lower this filter to a DataFusion [`Expr`] over a collection's
+    /// `(_id TEXT, doc JSON-as-Utf8)` shape, for the aggregation `$match` stage.
+    ///
+    /// `get_str` is the runtime-registered `json_get_str` UDF (resolved from the
+    /// session context by the caller). A field path maps to a column expression:
+    /// `_id` → `col("_id")`; any other path → `get_str(col("doc"), lit(path))`,
+    /// which extracts the field as text.
+    ///
+    /// Because `json_get_str` returns text, a comparison against a **numeric**
+    /// literal casts the accessor to `Float64` first so the comparison is numeric,
+    /// not lexical. String comparisons compare text directly.
+    ///
+    /// `$regex` is not supported on this path and returns
+    /// [`MqlError::UnsupportedOperator`].
+    pub fn to_df_expr(&self, get_str: &Arc<ScalarUDF>) -> Result<Expr, MqlError> {
+        match self {
+            Filter::True => Ok(lit(true)),
+            Filter::And(v) => {
+                let mut it = v.iter();
+                let first = match it.next() {
+                    Some(f) => f.to_df_expr(get_str)?,
+                    None => return Ok(lit(true)),
+                };
+                it.try_fold(first, |acc, f| Ok(acc.and(f.to_df_expr(get_str)?)))
+            }
+            Filter::Or(v) => {
+                let mut it = v.iter();
+                let first = match it.next() {
+                    Some(f) => f.to_df_expr(get_str)?,
+                    None => return Ok(lit(true)),
+                };
+                it.try_fold(first, |acc, f| Ok(acc.or(f.to_df_expr(get_str)?)))
+            }
+            Filter::Not(f) => Ok(!f.to_df_expr(get_str)?),
+            Filter::Cmp { path, op, value } => cmp_df_expr(path, op, value, get_str),
+        }
+    }
+}
+
+/// Build the column expression for a field `path`: `_id` is the PK column; any
+/// other path extracts the field as text via `json_get_str(col("doc"), path)`.
+fn path_expr(path: &str, get_str: &Arc<ScalarUDF>) -> Expr {
+    if path == "_id" {
+        col("_id")
+    } else {
+        get_str.as_ref().clone().call(vec![col("doc"), lit(path)])
+    }
+}
+
+/// Like [`path_expr`] but casts the (text) accessor to `Float64` when the literal
+/// being compared is numeric, so the comparison is numeric. `_id` is left as-is.
+fn path_expr_for(path: &str, value: &Value, get_str: &Arc<ScalarUDF>) -> Expr {
+    let base = path_expr(path, get_str);
+    if path != "_id" && is_numeric(value) {
+        cast(base, DataType::Float64)
+    } else {
+        base
+    }
+}
+
+fn cmp_df_expr(
+    path: &str,
+    op: &Cmp,
+    value: &Value,
+    get_str: &Arc<ScalarUDF>,
+) -> Result<Expr, MqlError> {
+    Ok(match op {
+        Cmp::Eq => path_expr_for(path, value, get_str).eq(json_to_lit(value)),
+        Cmp::Ne => path_expr_for(path, value, get_str).not_eq(json_to_lit(value)),
+        Cmp::Gt => path_expr_for(path, value, get_str).gt(json_to_lit(value)),
+        Cmp::Gte => path_expr_for(path, value, get_str).gt_eq(json_to_lit(value)),
+        Cmp::Lt => path_expr_for(path, value, get_str).lt(json_to_lit(value)),
+        Cmp::Lte => path_expr_for(path, value, get_str).lt_eq(json_to_lit(value)),
+        Cmp::In => {
+            let items = value.as_array().cloned().unwrap_or_default();
+            let lits: Vec<Expr> = items.iter().map(json_to_lit).collect();
+            path_expr_for(path, value, get_str).in_list(lits, false)
+        }
+        Cmp::Nin => {
+            let items = value.as_array().cloned().unwrap_or_default();
+            let lits: Vec<Expr> = items.iter().map(json_to_lit).collect();
+            path_expr_for(path, value, get_str).in_list(lits, true)
+        }
+        Cmp::Exists => {
+            let want = value.as_bool().unwrap_or(true);
+            let base = path_expr(path, get_str);
+            if want { base.is_not_null() } else { base.is_null() }
+        }
+        // `$regex` in the DataFusion expr path is out of scope (the SQL `find`
+        // path handles `~`); reject cleanly here.
+        Cmp::Regex => return Err(MqlError::UnsupportedOperator("$regex".into())),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,5 +370,108 @@ mod tests {
         let mut params = Vec::new();
         let sql = f.to_sql_indexed(&mut params, &indexed);
         assert_eq!(sql, "_id = $1");
+    }
+
+    // --- to_df_expr (DataFusion lowering) ---------------------------------
+    //
+    // A minimal stand-in `json_get_str` UDF (2-arg → Utf8). We don't execute it
+    // here — these tests assert the lowering *builds* a structurally correct
+    // `Expr`, with the cast applied only for numeric literals and `_id` left as a
+    // bare column. The end-to-end exercise of the real `json_get_str` (over the
+    // Iceberg mirror) lives in the server's `tests/collections.rs` aggregate test.
+    mod df {
+        use super::*;
+        use datafusion::arrow::datatypes::DataType;
+        use datafusion::logical_expr::{
+            ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+        };
+        use std::any::Any;
+        use std::sync::Arc;
+
+        #[derive(Debug, PartialEq, Eq, Hash)]
+        struct FakeGetStr(Signature);
+        impl FakeGetStr {
+            fn new() -> Self {
+                Self(Signature::any(2, Volatility::Immutable))
+            }
+        }
+        impl ScalarUDFImpl for FakeGetStr {
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+            fn name(&self) -> &str {
+                "json_get_str"
+            }
+            fn signature(&self) -> &Signature {
+                &self.0
+            }
+            fn return_type(&self, _: &[DataType]) -> datafusion::common::Result<DataType> {
+                Ok(DataType::Utf8)
+            }
+            fn invoke_with_args(
+                &self,
+                _: ScalarFunctionArgs,
+            ) -> datafusion::common::Result<ColumnarValue> {
+                unreachable!("structural test never executes the UDF")
+            }
+        }
+
+        fn udf() -> Arc<ScalarUDF> {
+            Arc::new(ScalarUDF::new_from_impl(FakeGetStr::new()))
+        }
+
+        #[test]
+        fn string_field_eq_builds_a_binary_expr() {
+            let f = parse_filter(&json!({"status": "active"})).unwrap();
+            let e = f.to_df_expr(&udf()).unwrap();
+            // A string comparison is a BinaryExpr; the accessor is NOT cast.
+            let s = format!("{e}");
+            assert!(s.contains("json_get_str"), "expr was: {s}");
+            assert!(!s.contains("CAST"), "string compare must not cast: {s}");
+        }
+
+        #[test]
+        fn numeric_field_compare_casts_to_float() {
+            let f = parse_filter(&json!({"age": {"$gte": 30}})).unwrap();
+            let e = f.to_df_expr(&udf()).unwrap();
+            let s = format!("{e}");
+            assert!(s.contains("CAST"), "numeric compare should cast: {s}");
+        }
+
+        #[test]
+        fn id_path_is_a_bare_column() {
+            let f = parse_filter(&json!({"_id": "x"})).unwrap();
+            let e = f.to_df_expr(&udf()).unwrap();
+            let s = format!("{e}");
+            assert!(!s.contains("json_get_str"), "_id must be a bare column: {s}");
+        }
+
+        #[test]
+        fn and_or_not_and_in_build() {
+            let f = parse_filter(&json!({
+                "$and": [
+                    {"status": "active"},
+                    {"$or": [{"role": "admin"}, {"role": "ops"}]}
+                ]
+            }))
+            .unwrap();
+            assert!(f.to_df_expr(&udf()).is_ok());
+
+            let f = parse_filter(&json!({"$not": {"status": "active"}})).unwrap();
+            assert!(f.to_df_expr(&udf()).is_ok());
+
+            let f = parse_filter(&json!({"role": {"$in": ["a", "b"]}})).unwrap();
+            assert!(f.to_df_expr(&udf()).is_ok());
+
+            let f = parse_filter(&json!({})).unwrap();
+            assert!(f.to_df_expr(&udf()).is_ok()); // True → lit(true)
+        }
+
+        #[test]
+        fn regex_is_rejected_on_the_df_path() {
+            let f = parse_filter(&json!({"name": {"$regex": "^a"}})).unwrap();
+            let e = f.to_df_expr(&udf()).unwrap_err();
+            assert!(e.to_string().contains("$regex"), "got: {e}");
+        }
     }
 }

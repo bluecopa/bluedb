@@ -580,3 +580,194 @@ async fn create_index_idempotent_column_add() {
     let docs = body["documents"].as_array().expect("documents array");
     assert_eq!(docs.len(), 1, "expected 1 doc: {body}");
 }
+
+// ---------------------------------------------------------------------------
+// aggregate (MongoDB aggregation pipeline via DataFusion)
+// ---------------------------------------------------------------------------
+
+/// `$group` + `$sum` + `$sort`: insert three sales rows, seal so the Iceberg
+/// mirror has the data (the aggregation reads via DataFusion), then group by
+/// region summing `amt`, sorted by `_id`.
+#[tokio::test]
+async fn aggregate_group_sum_sorted_by_id() {
+    let (app, state) = app_with_state().await;
+
+    for d in [
+        json!({"region": "EU", "amt": 10}),
+        json!({"region": "EU", "amt": 5}),
+        json!({"region": "US", "amt": 7}),
+    ] {
+        let (s, body) = call(
+            &app,
+            "POST",
+            "/collections/sales/insert",
+            Some(json!({ "documents": [d] })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "insert: {body}");
+    }
+
+    // Seal so the DataFusion-over-Iceberg read sees the rows.
+    state.seal_now().await.expect("seal");
+
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/collections/sales/aggregate",
+        Some(json!({
+            "pipeline": [
+                { "$group": { "_id": "$region", "total": { "$sum": "$amt" } } },
+                { "$sort": { "_id": 1 } }
+            ]
+        })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "aggregate failed: {body}");
+    let docs = body["documents"].as_array().expect("documents array");
+    assert_eq!(docs.len(), 2, "expected 2 groups (EU, US), got: {body}");
+
+    assert_eq!(docs[0]["_id"].as_str().unwrap(), "EU");
+    assert_eq!(docs[0]["total"].as_f64().unwrap(), 15.0, "EU total: {body}");
+    assert_eq!(docs[1]["_id"].as_str().unwrap(), "US");
+    assert_eq!(docs[1]["total"].as_f64().unwrap(), 7.0, "US total: {body}");
+}
+
+/// `$match` (string field) + `$sort` + `$limit`: filter to one region, sort by a
+/// string field ascending, cap the count.
+#[tokio::test]
+async fn aggregate_match_sort_limit_over_string_field() {
+    let (app, state) = app_with_state().await;
+
+    for d in [
+        json!({"region": "EU", "name": "delta"}),
+        json!({"region": "EU", "name": "alpha"}),
+        json!({"region": "EU", "name": "charlie"}),
+        json!({"region": "US", "name": "zeta"}),
+    ] {
+        let (s, body) = call(
+            &app,
+            "POST",
+            "/collections/teams/insert",
+            Some(json!({ "documents": [d] })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "insert: {body}");
+    }
+
+    state.seal_now().await.expect("seal");
+
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/collections/teams/aggregate",
+        Some(json!({
+            "pipeline": [
+                { "$match": { "region": "EU" } },
+                { "$sort": { "name": 1 } },
+                { "$limit": 2 }
+            ]
+        })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "aggregate failed: {body}");
+    let docs = body["documents"].as_array().expect("documents array");
+    assert_eq!(docs.len(), 2, "expected 2 (limited from 3 EU), got: {body}");
+
+    // Sorted ascending by name: alpha, charlie (delta is dropped by the limit).
+    let n0 = json_get_field(&docs[0], "name");
+    let n1 = json_get_field(&docs[1], "name");
+    assert_eq!(n0, "alpha", "first by name asc: {body}");
+    assert_eq!(n1, "charlie", "second by name asc: {body}");
+}
+
+/// `$count`: count the documents matching a `$match` over a string field.
+#[tokio::test]
+async fn aggregate_match_then_count() {
+    let (app, state) = app_with_state().await;
+
+    for d in [
+        json!({"region": "EU"}),
+        json!({"region": "EU"}),
+        json!({"region": "US"}),
+    ] {
+        let (s, _) = call(
+            &app,
+            "POST",
+            "/collections/regions/insert",
+            Some(json!({ "documents": [d] })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+    }
+    state.seal_now().await.expect("seal");
+
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/collections/regions/aggregate",
+        Some(json!({
+            "pipeline": [
+                { "$match": { "region": "EU" } },
+                { "$count": "n" }
+            ]
+        })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "aggregate failed: {body}");
+    let docs = body["documents"].as_array().expect("documents array");
+    assert_eq!(docs.len(), 1, "count yields one row: {body}");
+    assert_eq!(docs[0]["n"].as_i64().unwrap(), 2, "EU count: {body}");
+}
+
+/// An unknown aggregation stage is a 400 with the PARSE_ERROR code.
+#[tokio::test]
+async fn aggregate_unknown_stage_is_400() {
+    let (app, _state) = app_with_state().await;
+
+    // Create the collection so the table resolves (the stage check still fires).
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/collections/widgets/insert",
+        Some(json!({ "documents": [{ "x": 1 }] })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    _state.seal_now().await.expect("seal");
+
+    let (status, _body) = call(
+        &app,
+        "POST",
+        "/collections/widgets/aggregate",
+        Some(json!({ "pipeline": [ { "$bogus": {} } ] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "unknown stage should be 400");
+}
+
+/// Helper: read a string field that may have arrived as a JSON object's member
+/// or directly. The aggregate result projects `_id` plus extracted columns; a
+/// `$match`+`$sort` pipeline with no `$project` returns the base table columns
+/// (`_id`, `doc`), so `name` lives inside the re-inflated `doc` text or, when the
+/// row carries a top-level `name` column, directly. Handle both.
+fn json_get_field(doc: &Value, field: &str) -> String {
+    if let Some(s) = doc.get(field).and_then(Value::as_str) {
+        return s.to_string();
+    }
+    // Fall back to the JSON `doc` column (string or object).
+    match doc.get("doc") {
+        Some(Value::String(s)) => serde_json::from_str::<Value>(s)
+            .ok()
+            .and_then(|v| v.get(field).and_then(Value::as_str).map(str::to_owned))
+            .unwrap_or_default(),
+        Some(Value::Object(_)) => doc["doc"]
+            .get(field)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}

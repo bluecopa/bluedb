@@ -869,6 +869,7 @@ pub fn build_app(state: AppState) -> Router {
         .route("/collections/{coll}/createIndex", post(collections::create_index))
         .route("/collections/{coll}/update", post(collections::update))
         .route("/collections/{coll}/delete", post(collections::delete))
+        .route("/collections/{coll}/aggregate", post(collections::aggregate))
         .with_state(state)
 }
 
