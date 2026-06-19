@@ -25,6 +25,7 @@ use arrow_array::{
     Int32Array, Int64Array, LargeBinaryArray, RecordBatch, StringArray, Time64MicrosecondArray,
     TimestampMicrosecondArray,
 };
+use arrow_array::builder::FixedSizeBinaryBuilder;
 use arrow_schema::{DataType as ArrowDataType, TimeUnit};
 use bytes::Bytes;
 use chrono::Timelike;
@@ -1130,6 +1131,20 @@ fn build_arrow_column(arrow_dt: &ArrowDataType, cells: &[&Value]) -> Result<Arra
                     .collect::<Time64MicrosecondArray>(),
             )
         }
+        // iceberg-rust maps Iceberg `uuid` to Arrow `FixedSizeBinary(16)`.
+        // gluesql stores a u128; we write its 16 big-endian bytes.
+        ArrowDataType::FixedSizeBinary(16) => {
+            let mut b = FixedSizeBinaryBuilder::new(16);
+            for v in cells {
+                match v {
+                    Value::Uuid(u) => b
+                        .append_value(u.to_be_bytes())
+                        .map_err(|e| LakehouseError::Schema(format!("uuid array: {e}")))?,
+                    _ => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
         other => {
             return Err(LakehouseError::Schema(format!(
                 "arrow column type {other:?} not supported by the v1 writer yet"
@@ -1324,5 +1339,25 @@ mod reconcile_tests {
         assert_eq!(names(&out), vec![(1, "id".into()), (2, "alpha".into())]);
         // The reused field keeps its id (2) — Iceberg rename, not re-add.
         assert_eq!(out.as_struct().fields()[1].id, 2);
+    }
+}
+
+#[cfg(test)]
+mod uuid_writer_tests {
+    use super::*;
+    use arrow_array::Array;
+
+    #[test]
+    fn build_arrow_column_handles_uuid() {
+        let u: u128 = 0x0123_4567_89ab_cdef_0123_4567_89ab_cdef;
+        let v = Value::Uuid(u);
+        let cells: Vec<&Value> = vec![&v];
+        let arr = build_arrow_column(&ArrowDataType::FixedSizeBinary(16), &cells).unwrap();
+        let fsb = arr
+            .as_any()
+            .downcast_ref::<arrow_array::FixedSizeBinaryArray>()
+            .expect("FixedSizeBinaryArray");
+        assert_eq!(fsb.len(), 1);
+        assert_eq!(fsb.value(0), &u.to_be_bytes()[..]);
     }
 }
