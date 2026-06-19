@@ -339,7 +339,6 @@ The following MongoDB features are not implemented in this release:
 - **Compound index on nested (dotted) paths** — compound and multikey indexes accept top-level field names only; dotted paths (e.g. `"a.b"`) are rejected.
 - **Compound index prefix/range acceleration** — a compound index `{a,b}` accelerates full-key equality (`{a:x, b:y}`) but not prefix-only (`{a:x}`) or range queries on the last component; those fall to single-field indexes or the analytical engine.
 - **Fractional/float field fast-path** — queries on a field indexed as float are served by the analytical engine (seconds-fresh, not read-your-writes).
-- **TTL indexes on non-default tenants** — the sweep loop runs for the default tenant only; non-default-tenant TTL creation is rejected.
 - **Aggregation stages:** `$facet`, `$graphLookup`, `$bucket`/`$bucketAuto`, `$setWindowFields`, `$merge`, `$out`, `$replaceRoot`, `$replaceWith`, `$unionWith`.
 - **`$lookup` on JSON sub-field paths** — the join key must be a plain top-level field name, not a dotted path like `"address.city"`.
 - **`$unwind` on missing/null fields** — a document where the unwound field is absent or null yields no output rows (consistent with MongoDB's default behavior; `preserveNullAndEmptyArrays` is not supported).
