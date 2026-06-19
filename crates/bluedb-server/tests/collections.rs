@@ -1670,3 +1670,220 @@ fn json_get_field(doc: &Value, field: &str) -> String {
         _ => String::new(),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Multikey (array-field) index tests
+// ---------------------------------------------------------------------------
+
+/// Basic multikey index: createIndex auto-detects array field, find by element
+/// membership returns the correct subset. All reads on the GlueSQL fast path
+/// (no seal needed — the side table is a plain indexed table, not a JSON accessor).
+#[tokio::test]
+async fn multikey_find_matches_array_element() {
+    let app = app().await;
+
+    // Insert two docs with an array field `tags`.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/articles/insert",
+        Some(json!({ "documents": [
+            { "name": "a", "tags": ["x", "y"] },
+            { "name": "b", "tags": ["y", "z"] }
+        ]})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "insert: {body}");
+
+    // Create index on `tags` — auto-detected as multikey because existing values are arrays.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/articles/createIndex",
+        Some(json!({ "keys": { "tags": 1 } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "createIndex: {body}");
+    let index_name = body["name"].as_str().expect("name in response");
+    assert!(
+        index_name.contains("mk_") || index_name.contains("tags"),
+        "expected multikey index name, got {index_name}"
+    );
+
+    // find {tags:"y"} → 2 docs (both a and b have "y").
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/articles/find",
+        Some(json!({ "filter": { "tags": "y" } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "find y: {body}");
+    let docs = body["documents"].as_array().expect("documents");
+    assert_eq!(docs.len(), 2, "expected 2 docs for tags:y, got: {body}");
+
+    // find {tags:"x"} → 1 doc (only a has "x").
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/articles/find",
+        Some(json!({ "filter": { "tags": "x" } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "find x: {body}");
+    let docs = body["documents"].as_array().expect("documents");
+    assert_eq!(docs.len(), 1, "expected 1 doc for tags:x, got: {body}");
+    assert_eq!(
+        docs[0]["name"].as_str().unwrap_or(""),
+        "a",
+        "expected doc a for tags:x"
+    );
+
+    // find {tags:"q"} → 0 docs.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/articles/find",
+        Some(json!({ "filter": { "tags": "q" } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "find q: {body}");
+    let docs = body["documents"].as_array().expect("documents");
+    assert_eq!(docs.len(), 0, "expected 0 docs for tags:q, got: {body}");
+}
+
+/// Multikey index stays consistent after update and delete:
+/// - update doc a's tags → old element no longer matches, new element does.
+/// - delete doc b → old element in doc b no longer matches.
+#[tokio::test]
+async fn multikey_stays_consistent_on_update_and_delete() {
+    let app = app().await;
+
+    // Insert two docs.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/posts/insert",
+        Some(json!({ "documents": [
+            { "_id": "doc_a", "tags": ["x", "y"] },
+            { "_id": "doc_b", "tags": ["y", "z"] }
+        ]})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "insert: {body}");
+
+    // Create multikey index (explicit opt-in to avoid auto-detect ambiguity).
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/posts/createIndex",
+        Some(json!({ "keys": { "tags": 1 }, "options": { "multikey": true } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "createIndex: {body}");
+
+    // Sanity: find {tags:"x"} → 1 (doc_a).
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/posts/find",
+        Some(json!({ "filter": { "tags": "x" } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "find x before update: {body}");
+    assert_eq!(
+        body["documents"].as_array().unwrap().len(),
+        1,
+        "expected 1 doc for x before update, got: {body}"
+    );
+
+    // Update doc_a: replace tags with ["z"] (removes x and y, adds z).
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/posts/update",
+        Some(json!({
+            "filter": { "_id": "doc_a" },
+            "update": { "$set": { "tags": ["z"] } }
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "update: {body}");
+    assert_eq!(body["modifiedCount"].as_i64().unwrap(), 1, "modifiedCount: {body}");
+
+    // After update: find {tags:"x"} → 0 (doc_a no longer has x).
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/posts/find",
+        Some(json!({ "filter": { "tags": "x" } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "find x after update: {body}");
+    assert_eq!(
+        body["documents"].as_array().unwrap().len(),
+        0,
+        "expected 0 docs for x after doc_a update, got: {body}"
+    );
+
+    // After update: find {tags:"z"} → 2 (doc_a now has z, doc_b still has z).
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/posts/find",
+        Some(json!({ "filter": { "tags": "z" } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "find z after update: {body}");
+    assert_eq!(
+        body["documents"].as_array().unwrap().len(),
+        2,
+        "expected 2 docs for z after update, got: {body}"
+    );
+
+    // Delete doc_b.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/posts/delete",
+        Some(json!({ "filter": { "_id": "doc_b" } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "delete: {body}");
+    assert_eq!(body["deletedCount"].as_i64().unwrap(), 1, "deletedCount: {body}");
+
+    // After delete: find {tags:"y"} → 0 (doc_a no longer has y, doc_b deleted).
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/posts/find",
+        Some(json!({ "filter": { "tags": "y" } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "find y after delete: {body}");
+    assert_eq!(
+        body["documents"].as_array().unwrap().len(),
+        0,
+        "expected 0 docs for y after update+delete, got: {body}"
+    );
+
+    // find {tags:"z"} → 1 (only doc_a remains with z).
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/posts/find",
+        Some(json!({ "filter": { "tags": "z" } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "find z after delete: {body}");
+    assert_eq!(
+        body["documents"].as_array().unwrap().len(),
+        1,
+        "expected 1 doc for z after doc_b delete, got: {body}"
+    );
+    assert_eq!(
+        body["documents"][0]["_id"].as_str().unwrap_or(""),
+        "doc_a",
+        "expected doc_a for tags:z"
+    );
+}

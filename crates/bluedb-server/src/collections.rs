@@ -29,6 +29,7 @@ use bluedb_engine::rest_sql;
 use bluedb_collections::{
     error::MqlError,
     filter::{parse_filter, sort_accessor},
+    id::new_object_id,
     index::{
         compound_col, compound_key, derive_typed_value, derived_col, encode_compound,
         index_sql_type, infer_index_type, valid_path, IndexType,
@@ -258,6 +259,111 @@ fn glue_data_type_to_index_type(dt: &GlueDataType) -> IndexType {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Multikey (array-field) index helpers
+// ---------------------------------------------------------------------------
+
+/// The name of the multikey side table for a collection field.
+///
+/// `{coll}__mk_{field}` (dots in `field` → underscores).  The convention is
+/// parallel to `derived_col` for single-field indexes but uses a separate table
+/// rather than a derived column, because one row per array element is needed.
+fn multikey_side_table(coll: &str, field: &str) -> String {
+    format!("{coll}__mk_{}", field.replace('.', "_"))
+}
+
+/// Create the multikey side table for `(coll, field)` if it doesn't exist yet.
+///
+/// Schema: `(rid TEXT PRIMARY KEY, _id TEXT, val TEXT)`.
+/// - `rid` is a generated unique id for each (element, parent) pair.
+/// - `_id` is the owning document's `_id`.
+/// - `val` is the element rendered as text (same as `derive_value` would produce).
+async fn ensure_multikey_side_table(
+    state: &AppState,
+    tenant: &str,
+    side: &str,
+) -> Result<(), AppError> {
+    let sql = format!(
+        "CREATE TABLE IF NOT EXISTS {side} (rid TEXT PRIMARY KEY, _id TEXT, val TEXT);"
+    );
+    run_ddl(state, tenant, &sql).await
+}
+
+/// Return the list of multikey side-table field names for `coll`.
+///
+/// Discovers them by listing all tables whose name matches the pattern
+/// `{coll}__mk_*` and stripping the prefix. Returns `(side_table_name,
+/// field_name)` pairs in arbitrary order.
+///
+/// Uses `Store::fetch_all_schemas` to enumerate tables for the tenant.
+/// Returns an empty vec if the collection has no multikey indexes.
+async fn multikey_side_tables(
+    state: &AppState,
+    tenant: &str,
+    coll: &str,
+) -> Result<Vec<(String, String)>, AppError> {
+    let storage = state.connection(tenant).await?;
+    let prefix = format!("{coll}__mk_");
+    let all_schemas = Store::fetch_all_schemas(&storage)
+        .await
+        .map_err(|e| AppError::internal(format!("fetch all schemas: {e}")))?;
+    let result: Vec<(String, String)> = all_schemas
+        .into_iter()
+        .filter_map(|s| {
+            let field = s.table_name.strip_prefix(&prefix)?.to_owned();
+            Some((s.table_name, field))
+        })
+        .collect();
+    Ok(result)
+}
+
+/// Insert side-table rows for one document's array field.
+///
+/// For each element in `arr`, inserts one row `(rid, doc_id, elem_text)` into
+/// `side`. Elements are rendered as text: strings unquoted, other scalars via
+/// `to_string()`. Non-scalar elements (nested arrays/objects) are rendered as
+/// their JSON text form.
+async fn insert_multikey_elements(
+    state: &AppState,
+    tenant: &str,
+    side: &str,
+    doc_id: &str,
+    arr: &[Value],
+) -> Result<(), AppError> {
+    for elem in arr {
+        let val = match elem {
+            Value::String(s) => s.clone(),
+            Value::Null => continue, // nulls are not indexed
+            other => other.to_string(),
+        };
+        let rid = new_object_id();
+        let sql = format!("INSERT INTO {side} (rid, _id, val) VALUES ($1, $2, $3);");
+        let params = &[
+            bluedb_rest::Param::Str(rid),
+            bluedb_rest::Param::Str(doc_id.to_string()),
+            bluedb_rest::Param::Str(val),
+        ];
+        run_write(state, tenant, &sql, params).await?;
+    }
+    Ok(())
+}
+
+/// Delete all side-table entries for a document `_id` from every multikey side
+/// table of `coll`.
+async fn delete_multikey_for_doc(
+    state: &AppState,
+    tenant: &str,
+    coll: &str,
+    doc_id: &str,
+) -> Result<(), AppError> {
+    let sides = multikey_side_tables(state, tenant, coll).await?;
+    for (side, _field) in sides {
+        let sql = format!("DELETE FROM {side} WHERE _id = $1;");
+        run_write(state, tenant, &sql, &[bluedb_rest::Param::Str(doc_id.to_string())]).await?;
+    }
+    Ok(())
+}
+
 /// INSERT a complete document into `coll`, setting `_id`, `doc`, every
 /// `__cidx_*` (single-field) column, and every `__cidxm_*` (compound) column.
 /// Shared by `insert` (per doc) and `upsert` (single doc).
@@ -267,6 +373,7 @@ fn glue_data_type_to_index_type(dt: &GlueDataType) -> IndexType {
 /// with the main row. Each derived column is populated with a typed value
 /// (FLOAT/BOOLEAN/TEXT) matching the column's declared [`IndexType`].
 /// Compound columns (`__cidxm_*`) in `cdefs` are always TEXT (NUL-joined key).
+/// Multikey side tables (from `mk_sides`) receive one row per array element.
 /// `doc` must already contain `_id`.
 async fn write_full_doc(
     state: &AppState,
@@ -306,13 +413,33 @@ async fn write_full_doc(
         params.push(bluedb_rest::Param::Str(key));
     }
 
+    let id_str = doc
+        .get("_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
     let placeholders: Vec<String> = (1..=params.len()).map(|i| format!("${i}")).collect();
     let sql = format!(
         "INSERT INTO {coll} ({cols}) VALUES ({vals});",
         cols = col_names.join(", "),
         vals = placeholders.join(", "),
     );
-    run_write(state, tenant, &sql, &params).await
+    run_write(state, tenant, &sql, &params).await?;
+
+    // Maintain multikey side tables — one row per array element per field.
+    // Note: `field` here is the suffix after `{coll}__mk_`, dots replaced by
+    // underscores. For top-level fields (no dots in path), `field` is the
+    // exact key name in the document; for nested paths this would require extra
+    // metadata. V1 supports top-level multikey fields only.
+    let mk_sides = multikey_side_tables(state, tenant, coll).await?;
+    for (side, field) in &mk_sides {
+        if let Some(Value::Array(arr)) = doc.get(field.as_str()) {
+            insert_multikey_elements(state, tenant, side, &id_str, arr).await?;
+        }
+    }
+
+    Ok(())
 }
 
 /// UPDATE a row's `doc`, all `__cidx_*` (single-field), and all `__cidxm_*`
@@ -360,7 +487,23 @@ async fn rewrite_doc_row(
         "UPDATE {coll} SET {sets} WHERE _id = ${id_idx};",
         sets = set_clauses.join(", "),
     );
-    run_write(state, tenant, &sql, &params).await
+    run_write(state, tenant, &sql, &params).await?;
+
+    // Maintain multikey side tables: delete old entries, re-insert from updated doc.
+    // `field` is the suffix after `{coll}__mk_`, with dots replaced by underscores.
+    // For top-level fields (v1 scope), `field` is the exact document key.
+    let mk_sides = multikey_side_tables(state, tenant, coll).await?;
+    for (side, field) in &mk_sides {
+        // Delete old elements for this document.
+        let del_sql = format!("DELETE FROM {side} WHERE _id = $1;");
+        run_write(state, tenant, &del_sql, &[bluedb_rest::Param::Str(id.to_string())]).await?;
+        // Re-insert new elements.
+        if let Some(Value::Array(arr)) = doc.get(field.as_str()) {
+            insert_multikey_elements(state, tenant, side, id, arr).await?;
+        }
+    }
+
+    Ok(())
 }
 
 /// Convert a typed JSON value (as returned by [`derive_typed_value`]) to the
@@ -437,6 +580,12 @@ pub(crate) struct CreateIndexOptions {
     /// after the epoch timestamp stored in the indexed field.
     #[serde(rename = "expireAfterSeconds")]
     pub expire_after_seconds: Option<i64>,
+    /// Explicit multikey opt-in. When `true`, the index is created as a multikey
+    /// side table regardless of what the sampled values look like. When absent,
+    /// multikey is auto-detected from existing documents (if any sampled value is
+    /// an array, the index is multikey).
+    #[serde(default)]
+    pub multikey: bool,
 }
 
 /// Body for `POST /collections/{coll}/update`.
@@ -561,11 +710,22 @@ pub(crate) async fn find(
     // The filter's to_sql_indexed takes this map keyed by derived column name.
     let col_types = indexed_col_types(&state, &tenant, &coll).await.unwrap_or_default();
     let cdefs = compound_col_defs(&state, &tenant, &coll).await.unwrap_or_default();
+    let mk_sides = multikey_side_tables(&state, &tenant, &coll).await.unwrap_or_default();
 
     // Build the WHERE clause and collect bound parameters.
-    // Try the compound fast path first; fall through to single-field indexed routing.
+    // Priority: multikey single-equality → compound → single-field indexed.
+    //
+    // Multikey element-match: for a filter `{field: "x"}` where `field` has a
+    // multikey side table, rewrite to:
+    //   _id IN (SELECT _id FROM {side} WHERE val = $1)
+    // This is served on the GlueSQL fast path — no DataFusion required.
+    // Only a single-equality-on-a-multikey-field is rewritten here; other shapes
+    // (e.g. `$in` on a multikey field, mixed predicates) fall through to the
+    // existing routing and are handled by the JSON accessor / DataFusion path.
     let mut params: Vec<Value> = Vec::new();
-    let where_sql = if let Some(sql) = try_compound_match(&filter, &cdefs, &mut params) {
+    let where_sql = if let Some(mk_sql) = try_multikey_match(&filter, &mk_sides, &coll, &mut params) {
+        mk_sql
+    } else if let Some(sql) = try_compound_match(&filter, &cdefs, &mut params) {
         sql
     } else {
         let indexed: HashMap<String, IndexType> = collect_filter_paths(&filter)
@@ -732,7 +892,7 @@ pub(crate) async fn create_index(
     }
 
     // -----------------------------------------------------------------------
-    // Single-field index: keys.len() == 1 (original behavior unchanged)
+    // Single-field index: keys.len() == 1
     // -----------------------------------------------------------------------
 
     // Take the first key as the path to index.
@@ -742,6 +902,83 @@ pub(crate) async fn create_index(
     if !valid_path(&path) {
         return Err(AppError::bad_request(format!("invalid index field path: {path:?}")).with_code("PARSE_ERROR").into());
     }
+
+    // Read existing docs to sample the field (needed for multikey detection and backfill).
+    let select_sql = format!("SELECT _id, doc FROM {coll} WHERE TRUE;");
+    let existing_rows = run_read_routed(&state, &tenant, &select_sql, &[]).await?;
+
+    // Collect sample values (non-null field values) for type inference / multikey detection.
+    let sample_values: Vec<Value> = existing_rows
+        .iter()
+        .filter_map(|row| {
+            let doc: Value = match row.get("doc") {
+                Some(Value::String(s)) => serde_json::from_str(s).ok()?,
+                Some(v) => v.clone(),
+                None => return None,
+            };
+            let mut cur = &doc;
+            for part in path.split('.') {
+                cur = cur.get(part)?;
+            }
+            if cur.is_null() { None } else { Some(cur.clone()) }
+        })
+        .collect();
+
+    // Detect multikey: explicit opt-in OR any sampled value is an array.
+    let is_multikey = req.options.multikey
+        || sample_values.iter().any(|v| v.is_array());
+
+    if is_multikey {
+        // -----------------------------------------------------------------------
+        // Multikey index: create a side table {coll}__mk_{field}.
+        //
+        // Element-membership find (field:"x" on an array field) is served via:
+        //   SELECT doc FROM {coll} WHERE _id IN (SELECT _id FROM side WHERE val=$1)
+        // This runs on the GlueSQL fast path (no seal needed) — the side table
+        // is a regular indexed table, not a JSON accessor, so the guardrail is
+        // never triggered.
+        // -----------------------------------------------------------------------
+        let side = multikey_side_table(&coll, &path);
+        let index_name = format!("mk_{coll}_{}", path.replace('.', "_"));
+
+        // Step 1: Create the side table (idempotent).
+        ensure_multikey_side_table(&state, &tenant, &side).await?;
+
+        // Step 2: Backfill existing docs.
+        for row in &existing_rows {
+            let id = match row.get("_id") {
+                Some(Value::String(s)) => s.clone(),
+                _ => continue,
+            };
+            let doc: Value = match row.get("doc") {
+                Some(Value::String(s)) => serde_json::from_str(s).unwrap_or(Value::Null),
+                Some(v) => v.clone(),
+                None => continue,
+            };
+            let mut cur = &doc;
+            let mut found = true;
+            for part in path.split('.') {
+                match cur.get(part) {
+                    Some(v) => cur = v,
+                    None => { found = false; break; }
+                }
+            }
+            if found {
+                if let Value::Array(arr) = cur {
+                    // Clear any prior entries first (idempotent backfill).
+                    let del_sql = format!("DELETE FROM {side} WHERE _id = $1;");
+                    run_write(&state, &tenant, &del_sql, &[bluedb_rest::Param::Str(id.clone())]).await?;
+                    insert_multikey_elements(&state, &tenant, &side, &id, arr).await?;
+                }
+            }
+        }
+
+        return Ok(Json(json!({ "name": index_name })));
+    }
+
+    // -----------------------------------------------------------------------
+    // Regular (non-multikey) single-field index: derived column approach.
+    // -----------------------------------------------------------------------
 
     let dcol = derived_col(&path);
     let index_name = format!(
@@ -767,29 +1004,6 @@ pub(crate) async fn create_index(
                 }
             }
         } else {
-            // Read existing docs and sample the field's values.
-            let select_sql = format!("SELECT doc FROM {coll} WHERE TRUE;");
-            let rows = run_read_routed(&state, &tenant, &select_sql, &[]).await?;
-            let sample_values: Vec<serde_json::Value> = rows
-                .iter()
-                .filter_map(|row| {
-                    let doc: Value = match row.get("doc") {
-                        Some(Value::String(s)) => serde_json::from_str(s).ok()?,
-                        Some(v) => v.clone(),
-                        None => return None,
-                    };
-                    // Navigate to the field; skip absent fields.
-                    let mut cur = &doc;
-                    for part in path.split('.') {
-                        cur = cur.get(part)?;
-                    }
-                    if cur.is_null() {
-                        None
-                    } else {
-                        Some(cur.clone())
-                    }
-                })
-                .collect();
             infer_index_type(&sample_values)
         };
 
@@ -804,10 +1018,7 @@ pub(crate) async fn create_index(
     let idx_type = col_type_map.get(&dcol).copied().unwrap_or(IndexType::Text);
 
     // Step 2: Backfill existing rows with typed values.
-    // Read all existing _id + doc pairs (unindexed scan — only at createIndex time).
-    let select_sql = format!("SELECT _id, doc FROM {coll} WHERE TRUE;");
-    let rows = run_read_routed(&state, &tenant, &select_sql, &[]).await?;
-    for row in rows {
+    for row in &existing_rows {
         let id = match row.get("_id") {
             Some(Value::String(s)) => s.clone(),
             _ => continue,
@@ -994,6 +1205,9 @@ pub(crate) async fn delete(
     let deleted_count = to_delete.len();
 
     for id in &to_delete {
+        // Clean up multikey side-table entries before deleting the main row.
+        delete_multikey_for_doc(&state, &tenant, &coll, id).await?;
+
         let del_sql = format!("DELETE FROM {coll} WHERE _id = $1;");
         run_write(
             &state,
@@ -1429,4 +1643,62 @@ fn try_compound_match(
     }
 
     Some(clauses.join(" AND "))
+}
+
+/// Try to match a **single equality** filter against a multikey side table.
+///
+/// For a filter `{field: scalar}` (i.e. `Filter::Cmp{ op: Eq, value: scalar }`)
+/// where `field` has a multikey side table in `mk_sides`, returns:
+///
+/// ```sql
+/// _id IN (SELECT _id FROM {side} WHERE val = $N)
+/// ```
+///
+/// This is the element-membership fast path: `find {tags:"x"}` on an array
+/// field `tags:["x","y"]` correctly matches (the side table stores one row per
+/// element).
+///
+/// Only the **single-equality-on-a-multikey-field** shape is handled here. Other
+/// shapes (multiple predicates, `$in`, `$ne`, etc. on a multikey field) fall
+/// through to the existing routing (JSON accessor / DataFusion).
+///
+/// Returns `None` when the filter doesn't match this pattern.
+fn try_multikey_match(
+    filter: &bluedb_collections::filter::Filter,
+    mk_sides: &[(String, String)],
+    _coll: &str,
+    params: &mut Vec<Value>,
+) -> Option<String> {
+    use bluedb_collections::filter::{Cmp, Filter};
+
+    if mk_sides.is_empty() {
+        return None;
+    }
+
+    // Only a single top-level equality node qualifies.
+    let (path, value) = match filter {
+        Filter::Cmp { path, op: Cmp::Eq, value } => (path.as_str(), value),
+        _ => return None,
+    };
+
+    // Check if this path has a multikey side table.
+    let (side, _) = mk_sides
+        .iter()
+        .find(|(_, field)| field == &path.replace('.', "_"))?;
+
+    // Render the scalar as text (the side table stores val as TEXT).
+    let val_text = match value {
+        Value::String(s) => s.clone(),
+        Value::Null => return None, // null is not indexed
+        other => other.to_string(),
+    };
+
+    let placeholder = {
+        params.push(Value::String(val_text));
+        format!("${}", params.len())
+    };
+
+    // GlueSQL supports `IN (SELECT ...)` subqueries (verified via rewrite.rs).
+    // `side` is the exact side-table name discovered from the storage schema.
+    Some(format!("_id IN (SELECT _id FROM {side} WHERE val = {placeholder})"))
 }
