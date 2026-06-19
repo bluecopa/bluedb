@@ -1440,20 +1440,19 @@ pub(crate) async fn run_read_routed(
         .collect::<Result<Vec<_>, _>>()?;
 
     let mut glue = Glue::new(state.connection(tenant).await?);
-    let needs_analytical = match rest_sql::execute_sql(&mut glue, sql, &rest_params, false).await {
+    match rest_sql::execute_sql(&mut glue, sql, &rest_params, false).await {
         Ok(payloads) => {
             let json_cols = vec!["doc".to_string()];
             let rows = select_to_json(payloads, &json_cols);
             return Ok(rows.as_array().cloned().unwrap_or_default());
         }
         // Plan-time guardrail reject: non-indexed filter / ORDER BY.
-        Err(ref e) if is_guardrail_reject(e) => true,
+        Err(ref e) if is_guardrail_reject(e) => {}
         // GlueSQL translate error: JSON path operators (`->>`, `->`) that GlueSQL
         // doesn't support — route to DataFusion which handles them natively.
-        Err(EngineError::Sql(gluesql_core::error::Error::Translate(_))) => true,
+        Err(EngineError::Sql(gluesql_core::error::Error::Translate(_))) => {}
         Err(e) => return Err(e.into()),
-    };
-    let _ = needs_analytical; // always true here — kept for clarity
+    }
 
     // Route to DataFusion over the tenant's Iceberg mirror.
     let manager = state.lakehouse().await.ok_or_else(|| {

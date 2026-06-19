@@ -73,6 +73,16 @@ impl Filter {
     /// the derived column `__cidx_<path>` (a plain column with a secondary index)
     /// instead of the `(doc->>'...')` JSON accessor — so GlueSQL can use the index.
     /// `_id` and non-indexed paths behave exactly as [`Self::to_sql`].
+    ///
+    /// The derived column is always TEXT (stores the field's JSON-text rendering),
+    /// so using it for a non-string comparison would silently return empty results
+    /// (e.g. `__cidx_age = 36` where the column holds the string `"36"`).
+    /// Therefore the indexed column is used **only** when the comparison value is a
+    /// JSON string (or, for `$in`/`$nin`, when ALL elements are strings).
+    /// For non-string comparisons, the expression falls through to the regular
+    /// `to_sql` path (the `(doc->>'...')` JSON accessor) even if an index exists.
+    /// `$exists` may always use the derived column (it is a NULL check, not a value
+    /// comparison, and works correctly regardless of the stored type).
     pub fn to_sql_indexed(&self, params: &mut Vec<Value>, indexed: &HashSet<String>) -> String {
         match self {
             Filter::True => "TRUE".into(),
@@ -82,7 +92,24 @@ impl Filter {
             Filter::Cmp { path, op, value } => {
                 if path != "_id" && indexed.contains(path.as_str()) {
                     let col = derived_col(path);
-                    cmp_sql_col(&col, op, value, params)
+                    // Only route to the derived column when the comparison is safe
+                    // for a TEXT column. $exists is always safe (NULL check).
+                    // For $in/$nin, require ALL array elements to be strings.
+                    // For all other ops, require the value to be a string.
+                    let use_index = match op {
+                        Cmp::Exists => true,
+                        Cmp::In | Cmp::Nin => {
+                            value.as_array()
+                                .map(|arr| arr.iter().all(|v| v.is_string()))
+                                .unwrap_or(false)
+                        }
+                        _ => value.is_string(),
+                    };
+                    if use_index {
+                        cmp_sql_col(&col, op, value, params)
+                    } else {
+                        cmp_sql(path, op, value, params)
+                    }
                 } else {
                     cmp_sql(path, op, value, params)
                 }
@@ -105,13 +132,16 @@ fn join_indexed(v: &[Filter], sep: &str, params: &mut Vec<Value>, indexed: &Hash
 fn cmp_sql_col(col: &str, op: &Cmp, value: &Value, params: &mut Vec<Value>) -> String {
     match op {
         Cmp::Eq  => format!("{col} = {}", bind(params, value)),
-        Cmp::Ne  => format!("{col} <> {}", bind(params, value)),
+        Cmp::Ne  => {
+            let b = bind(params, value);
+            format!("({col} <> {b} OR {col} IS NULL)")
+        }
         Cmp::Gt  => format!("{col} > {}", bind(params, value)),
         Cmp::Gte => format!("{col} >= {}", bind(params, value)),
         Cmp::Lt  => format!("{col} < {}", bind(params, value)),
         Cmp::Lte => format!("{col} <= {}", bind(params, value)),
-        Cmp::In  => in_sql(col, value, params, false),
-        Cmp::Nin => in_sql(col, value, params, true),
+        Cmp::In  => in_sql(col, value, params),
+        Cmp::Nin => in_sql_nin(col, value, params),
         Cmp::Exists => {
             let want = value.as_bool().unwrap_or(true);
             if want { format!("{col} IS NOT NULL") } else { format!("{col} IS NULL") }
@@ -143,13 +173,19 @@ fn cmp_sql(path: &str, op: &Cmp, value: &Value, params: &mut Vec<Value>) -> Stri
     let col = col_ref(path);
     match op {
         Cmp::Eq  => format!("{col} = {}", bind(params, value)),
-        Cmp::Ne  => format!("{col} <> {}", bind(params, value)),
+        // MongoDB $ne/$nin match documents where the field is missing/null in
+        // addition to documents where it holds a different value. Emit an OR
+        // clause so GlueSQL/DataFusion include those rows too.
+        Cmp::Ne  => {
+            let b = bind(params, value);
+            format!("({col} <> {b} OR {col} IS NULL)")
+        }
         Cmp::Gt  => format!("{col} > {}", bind(params, value)),
         Cmp::Gte => format!("{col} >= {}", bind(params, value)),
         Cmp::Lt  => format!("{col} < {}", bind(params, value)),
         Cmp::Lte => format!("{col} <= {}", bind(params, value)),
-        Cmp::In  => in_sql(&col, value, params, false),
-        Cmp::Nin => in_sql(&col, value, params, true),
+        Cmp::In  => in_sql(&col, value, params),
+        Cmp::Nin => in_sql_nin(&col, value, params),
         Cmp::Exists => {
             let want = value.as_bool().unwrap_or(true);
             if want { format!("{col} IS NOT NULL") } else { format!("{col} IS NULL") }
@@ -158,11 +194,18 @@ fn cmp_sql(path: &str, op: &Cmp, value: &Value, params: &mut Vec<Value>) -> Stri
     }
 }
 
-fn in_sql(col: &str, value: &Value, params: &mut Vec<Value>, negate: bool) -> String {
+fn in_sql(col: &str, value: &Value, params: &mut Vec<Value>) -> String {
     let items = value.as_array().cloned().unwrap_or_default();
     let placeholders: Vec<String> = items.iter().map(|v| bind(params, v)).collect();
-    let kw = if negate { "NOT IN" } else { "IN" };
-    format!("{col} {kw} ({})", placeholders.join(", "))
+    format!("{col} IN ({})", placeholders.join(", "))
+}
+
+/// `$nin`: NOT IN + IS NULL so documents missing the field are also included
+/// (MongoDB semantics: `$nin` matches docs where the field is absent or null).
+fn in_sql_nin(col: &str, value: &Value, params: &mut Vec<Value>) -> String {
+    let items = value.as_array().cloned().unwrap_or_default();
+    let placeholders: Vec<String> = items.iter().map(|v| bind(params, v)).collect();
+    format!("({col} NOT IN ({}) OR {col} IS NULL)", placeholders.join(", "))
 }
 
 // ---------------------------------------------------------------------------
@@ -370,6 +413,101 @@ mod tests {
         let mut params = Vec::new();
         let sql = f.to_sql_indexed(&mut params, &indexed);
         assert_eq!(sql, "_id = $1");
+    }
+
+    /// FIX 1: a numeric comparison on an indexed field must NOT use the derived
+    /// column (which is TEXT) — it must fall back to the JSON accessor so the
+    /// type match is correct. Comparing `__cidx_age = 36` where the column holds
+    /// the string "36" would silently return nothing.
+    #[test]
+    fn to_sql_indexed_falls_back_for_numeric_value() {
+        let f = parse_filter(&json!({"age": 36})).unwrap();
+        let indexed: HashSet<String> = ["age".to_string()].into();
+
+        let mut params = Vec::new();
+        let sql = f.to_sql_indexed(&mut params, &indexed);
+
+        // Must use the JSON accessor path, NOT the derived column.
+        assert!(
+            !sql.contains("__cidx_"),
+            "numeric comparison must not use the derived TEXT column, got: {sql}"
+        );
+        assert!(
+            sql.contains("doc->>'age'"),
+            "numeric comparison should use json accessor, got: {sql}"
+        );
+    }
+
+    /// FIX 1: an $exists filter on an indexed field MAY use the derived column
+    /// (it is a NULL check and is type-agnostic).
+    #[test]
+    fn to_sql_indexed_uses_derived_col_for_exists() {
+        let f = parse_filter(&json!({"age": {"$exists": true}})).unwrap();
+        let indexed: HashSet<String> = ["age".to_string()].into();
+
+        let mut params = Vec::new();
+        let sql = f.to_sql_indexed(&mut params, &indexed);
+
+        assert!(
+            sql.contains("__cidx_age"),
+            "$exists should use derived column (NULL check), got: {sql}"
+        );
+    }
+
+    /// FIX 1: $in with ALL string elements uses the derived column (fast path).
+    #[test]
+    fn to_sql_indexed_uses_derived_col_for_string_in() {
+        let f = parse_filter(&json!({"status": {"$in": ["a", "b"]}})).unwrap();
+        let indexed: HashSet<String> = ["status".to_string()].into();
+
+        let mut params = Vec::new();
+        let sql = f.to_sql_indexed(&mut params, &indexed);
+
+        assert!(
+            sql.contains("__cidx_status"),
+            "$in(strings) should use derived column, got: {sql}"
+        );
+    }
+
+    /// FIX 1: $in with numeric elements must fall back to the JSON accessor.
+    #[test]
+    fn to_sql_indexed_falls_back_for_numeric_in() {
+        let f = parse_filter(&json!({"age": {"$in": [30, 40]}})).unwrap();
+        let indexed: HashSet<String> = ["age".to_string()].into();
+
+        let mut params = Vec::new();
+        let sql = f.to_sql_indexed(&mut params, &indexed);
+
+        assert!(
+            !sql.contains("__cidx_"),
+            "$in(numbers) must not use derived column, got: {sql}"
+        );
+    }
+
+    /// FIX 3: $ne SQL contains IS NULL (Mongo semantics: match missing/null too).
+    #[test]
+    fn ne_filter_sql_contains_is_null() {
+        let f = parse_filter(&json!({"status": {"$ne": "inactive"}})).unwrap();
+        let mut params = Vec::new();
+        let sql = f.to_sql(&mut params);
+
+        assert!(
+            sql.contains("IS NULL"),
+            "$ne must include IS NULL for missing-field semantics, got: {sql}"
+        );
+    }
+
+    /// FIX 3: $nin SQL contains IS NULL (Mongo semantics: match missing/null too).
+    #[test]
+    fn nin_filter_sql_contains_is_null() {
+        let f = parse_filter(&json!({"role": {"$nin": ["admin", "ops"]}})).unwrap();
+        let mut params = Vec::new();
+        let sql = f.to_sql(&mut params);
+
+        assert!(
+            sql.contains("IS NULL"),
+            "$nin must include IS NULL for missing-field semantics, got: {sql}"
+        );
     }
 
     // --- to_df_expr (DataFusion lowering) ---------------------------------

@@ -11,4 +11,3 @@ thiserror = { workspace = true }
 datafusion = { workspace = true }
 rand = { workspace = true }
 
-[dev-dependencies]

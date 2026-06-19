@@ -108,10 +108,10 @@ curl -s -X POST localhost:8081/collections/orders/createIndex \
 |----------|-----------|-------|
 | `{field: value}` implicit `$eq` | yes | |
 | `$eq` | yes | |
-| `$ne` | yes | |
+| `$ne` | yes | Matches documents where the field is **missing or null** as well as those where it holds a different value (MongoDB semantics) |
 | `$gt`, `$gte`, `$lt`, `$lte` | yes | |
 | `$in` | yes | |
-| `$nin` | yes | |
+| `$nin` | yes | Matches documents where the field is **missing or null** in addition to those where the field value is not in the list (MongoDB semantics) |
 | `$exists` | yes | |
 | `$regex` | yes (SQL fast path) / no (aggregate) | The `~` SQL operator is used on the transactional fast path. `$regex` is **rejected** by the DataFusion analytical path (`aggregate`'s `$match` stage and any `find` routed to the analytical engine). Treat as best-effort. |
 | `$and` | yes | |
@@ -194,6 +194,21 @@ Indexes are **gateway-maintained**: the server adds a derived column
 `update`, and `delete`. The path must be a valid dot-separated identifier (e.g.
 `address.city`); slashes and other special characters are rejected.
 
+!!! note "String-indexed fields vs numeric/boolean fields"
+    The derived column `__cidx_<path>` is always TEXT. A `find` filter on an
+    **indexed field** uses that column only when the comparison value is a
+    **string** (e.g. `{status: "active"}`). For **numeric or boolean** values
+    (e.g. `{age: 36}`, `{enabled: true}`) the filter is served by the
+    analytical engine (seconds-fresh, requires a prior seal) regardless of
+    whether an index exists. `$exists` always uses the derived column (it is a
+    NULL check and is type-agnostic).
+
+!!! note "Sort on nested/dotted paths not supported"
+    The `sort` field in a `find` request supports **top-level** field names
+    only (e.g. `{"sort": {"age": -1}}`). Nested paths such as
+    `{"sort": {"address.city": 1}}` are not supported in v1 and will produce
+    unexpected results.
+
 ---
 
 ## Freshness
@@ -220,6 +235,14 @@ depends on whether the filter field is indexed:
 `find` and `count` may be silently rerouted to the analytical path when the
 query guardrail rejects a non-indexed JSON field scan on the transactional
 engine; the response shape is identical regardless of which path served it.
+
+!!! note "update / delete on non-indexed fields sees sealed data"
+    When the `filter` in an `update` or `delete` targets a **non-indexed**
+    field, the pre-read that identifies matching documents is served by the
+    analytical engine (same seconds-fresh caveat as `find` on non-indexed
+    fields). Documents written in the current seal window may not yet be
+    visible to that pre-read. Filtering on `_id` or an indexed field always
+    uses the transactional engine (read-your-writes).
 
 ---
 

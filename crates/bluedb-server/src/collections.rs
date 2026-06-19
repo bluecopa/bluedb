@@ -127,6 +127,32 @@ async fn run_ddl(
     Ok(())
 }
 
+/// Like [`run_read_routed`] but treats "collection not yet visible in the
+/// analytical engine" as an empty result rather than an error. This is the
+/// correct semantic for the `update`/`delete` pre-read: if the collection has
+/// never been sealed into the Iceberg mirror, the analytical path can't plan the
+/// query (`table not found`), but that just means there are no rows to match —
+/// upsert should still proceed. Genuine I/O errors (storage failures, etc.) are
+/// still propagated via `?`.
+async fn run_read_routed_for_mutation(
+    state: &AppState,
+    tenant: &str,
+    sql: &str,
+    params: &[serde_json::Value],
+) -> Result<Vec<serde_json::Value>, AppError> {
+    match run_read_routed(state, tenant, sql, params).await {
+        Ok(rows) => Ok(rows),
+        Err(ref e)
+            if e.message().contains("planning SQL")
+                || e.message().contains("table not found") =>
+        {
+            // The collection has no Iceberg snapshot yet (never sealed) → 0 matches.
+            Ok(vec![])
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Return the set of JSON paths that have a gateway-maintained derived column
 /// (`__cidx_<path>`) for `coll` in `tenant`. Used by `insert` and `find` to
 /// keep derived columns in sync and to route queries through the index.
@@ -581,9 +607,7 @@ pub(crate) async fn update(
         read_sql.push_str(" LIMIT 1");
     }
 
-    let rows = run_read_routed(&state, &tenant, &read_sql, &params)
-        .await
-        .unwrap_or_default();
+    let rows = run_read_routed_for_mutation(&state, &tenant, &read_sql, &params).await?;
 
     let matched = rows.len();
     let mut modified: usize = 0;
@@ -661,9 +685,7 @@ pub(crate) async fn delete(
     // the DELETE precisely when multi=false. GlueSQL DELETE does not support
     // LIMIT, so we delete by the specific _id set we collected.
     let read_sql = format!("SELECT _id FROM {coll} WHERE {where_sql}");
-    let rows = run_read_routed(&state, &tenant, &read_sql, &params)
-        .await
-        .unwrap_or_default();
+    let rows = run_read_routed_for_mutation(&state, &tenant, &read_sql, &params).await?;
 
     let to_delete: Vec<String> = rows
         .iter()
@@ -740,7 +762,8 @@ pub(crate) async fn aggregate(
         .await
         .map_err(|e| AppError::bad_request(format!("aggregate: {e}")))?;
 
-    let rows = crate::record_batches_to_json(&batches);
+    let json_cols = vec!["doc".to_string()];
+    let rows = crate::reinflate_rows(crate::record_batches_to_json(&batches), &json_cols);
     Ok(Json(json!({ "documents": rows })))
 }
 

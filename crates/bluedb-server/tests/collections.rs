@@ -722,6 +722,69 @@ async fn aggregate_match_then_count() {
     assert_eq!(docs[0]["n"].as_i64().unwrap(), 2, "EU count: {body}");
 }
 
+/// FIX 1: createIndex on a numeric field must not cause the indexed query to
+/// silently return empty. The derived column is TEXT but the filter value is
+/// numeric, so `to_sql_indexed` must fall back to the JSON accessor for numeric
+/// comparisons. A string-indexed field must still work on the fast path.
+#[tokio::test]
+async fn indexed_numeric_field_find_returns_correct_results() {
+    let (app, state) = app_with_state().await;
+
+    // Create index on "age" (numeric) and "name" (string) before insert.
+    for field in ["age", "name"] {
+        let (s, body) = call(
+            &app,
+            "POST",
+            "/collections/agetest/createIndex",
+            Some(json!({ "keys": { field: 1 } })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "createIndex {field}: {body}");
+    }
+
+    // Insert a doc with age=36.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/agetest/insert",
+        Some(json!({ "documents": [{ "name": "ada", "age": 36 }] })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "insert: {body}");
+
+    // Seal so the analytical engine can serve the query if it routes there.
+    state.seal_now().await.expect("seal");
+
+    // find by numeric age=36 — must return exactly 1 doc "ada" (not 0).
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/agetest/find",
+        Some(json!({ "filter": { "age": 36 } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "find age=36: {body}");
+    let docs = body["documents"].as_array().expect("documents array");
+    assert_eq!(docs.len(), 1, "indexed numeric field must return 1 doc for age=36, got: {body}");
+    assert_eq!(
+        docs[0]["name"].as_str().unwrap_or(""),
+        "ada",
+        "expected ada: {body}"
+    );
+
+    // find by string name="ada" (indexed string field) — must still work on the fast path.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/agetest/find",
+        Some(json!({ "filter": { "name": "ada" } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "find name=ada: {body}");
+    let docs = body["documents"].as_array().expect("documents array");
+    assert_eq!(docs.len(), 1, "string-indexed field must return 1 doc, got: {body}");
+}
+
 /// An unknown aggregation stage is a 400 with the PARSE_ERROR code.
 #[tokio::test]
 async fn aggregate_unknown_stage_is_400() {
