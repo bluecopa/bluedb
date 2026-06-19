@@ -257,6 +257,9 @@ struct Inner {
     /// `metadata.json` a warehouse loads contain resolvable locations. Set at
     /// startup via [`AppState::with_lakehouse_base`].
     lakehouse_base: String,
+    /// Testkit mirror mode: default mirroring on for every tenant (set via
+    /// [`AppState::with_lakehouse_default_on`]). Prod leaves it false.
+    lakehouse_default_on: bool,
     /// The active lakehouse mirror manager (one engine per tenant): `Some` only
     /// while this node is the active writer (opened on promote over the writer's
     /// `Database` + the object store, shut down on demote). A passive node
@@ -305,6 +308,7 @@ impl AppState {
                 ttl_sweep_handle: Mutex::new(None),
                 cdc: CdcConfig::default(),
                 lakehouse_base: String::new(),
+                lakehouse_default_on: false,
                 lakehouse: RwLock::new(None),
                 signer: None,
                 node_registry: None,
@@ -350,6 +354,25 @@ impl AppState {
     pub fn with_lakehouse_base(mut self, base: impl Into<String>) -> Self {
         if let Some(inner) = Arc::get_mut(&mut self.inner) {
             inner.lakehouse_base = base.into();
+        }
+        self
+    }
+
+    /// Set the object store the lakehouse mirror writes to, distinct from the
+    /// SlateDB store (e.g. a temp `LocalFileSystem` for the testkit). Startup-only;
+    /// no-op once the `Arc<Inner>` is shared.
+    pub fn with_lakehouse_object_store(mut self, store: Arc<dyn ObjectStore>) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.lakehouse_object_store = store;
+        }
+        self
+    }
+
+    /// Default mirroring on for every tenant (testkit mirror mode). Startup-only;
+    /// no-op once the `Arc<Inner>` is shared.
+    pub fn with_lakehouse_default_on(mut self, on: bool) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.lakehouse_default_on = on;
         }
         self
     }
@@ -594,6 +617,9 @@ impl AppState {
         )
         .await
         .map_err(|e| AppError::internal(format!("open lakehouse: {e}")))?;
+        if self.inner.lakehouse_default_on {
+            lakehouse.set_default_mirror(true);
+        }
         *self.inner.lakehouse.write().await = Some(lakehouse);
         Ok(())
     }
