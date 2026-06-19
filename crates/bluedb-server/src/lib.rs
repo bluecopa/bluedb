@@ -53,6 +53,7 @@ mod ledger_api;
 mod evidence_api;
 mod graph_api;
 mod signer;
+mod search;
 
 /// ES256-DER verification helper, re-exported for Rust consumers (and the e2e
 /// test) to verify Signed Tree Heads against a published SPKI-PEM public key.
@@ -239,6 +240,10 @@ struct Inner {
     /// Installed as a commit observer on every write connection (maintains the live
     /// index) and consulted by `/sql` to rewrite `@@`/`ts_rank` (read-your-writes).
     fts: RwLock<Arc<FtsEngine>>,
+    /// Per-(tenant,collection) tantivy search engine, swapped on promote/demote
+    /// exactly like `fts`. Writer-only on writes (blob = Some); empty on passive
+    /// nodes and before the first promote.
+    search: RwLock<Arc<search::SearchEngine>>,
     /// The background seal/compaction scheduler for the durable FTS engine, spawned
     /// on promote and aborted on demote / re-promote. `None` until the first promote.
     seal_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -304,6 +309,7 @@ impl AppState {
                 writer_bound: AtomicBool::new(false),
                 authz: OnceLock::new(),
                 fts: RwLock::new(FtsEngine::new()),
+                search: RwLock::new(search::SearchEngine::empty()),
                 seal_handle: Mutex::new(None),
                 ttl_sweep_handle: Mutex::new(None),
                 cdc: CdcConfig::default(),
@@ -558,6 +564,7 @@ impl AppState {
         let handle = fts.clone().spawn_seal_scheduler(fts_seal_interval());
         *self.inner.seal_handle.lock().unwrap() = Some(handle);
         *self.inner.fts.write().await = fts;
+        *self.inner.search.write().await = search::SearchEngine::new_durable(database.substrate());
 
         // Start the TTL sweep background task. On each tick, reads the global
         // tenant registry and sweeps every tenant that has a TTL index.
@@ -648,6 +655,7 @@ impl AppState {
             h.abort();
         }
         *self.inner.fts.write().await = FtsEngine::new();
+        *self.inner.search.write().await = search::SearchEngine::empty();
         // Stop the lakehouse seal/compaction loops and drop the manager — a
         // passive node mirrors nothing (the next promote reopens from the tenant
         // index + registries).
@@ -706,6 +714,20 @@ impl AppState {
     /// hold a snapshot of the engine that was active when they asked.
     pub(crate) async fn fts(&self) -> Arc<FtsEngine> {
         self.inner.fts.read().await.clone()
+    }
+
+    /// The currently-bound search engine (for the `/collections` ES-shaped search
+    /// handlers). Mirrors `fts()` — clones the `Arc` out of the role-swap `RwLock`.
+    pub(crate) async fn search(&self) -> Arc<search::SearchEngine> {
+        self.inner.search.read().await.clone()
+    }
+
+    /// A read guard over the currently-bound database option. Used by the search
+    /// read path which needs to build a blob store on any node (writer or replica).
+    pub(crate) async fn db_read(
+        &self,
+    ) -> tokio::sync::RwLockReadGuard<'_, Option<bluedb_sql::Database>> {
+        self.inner.db.read().await
     }
 
     /// A connection to the currently-bound database, or `503` if unbound. Carries
