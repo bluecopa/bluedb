@@ -847,6 +847,7 @@ dependencies = [
  "bluedb-cache",
  "bluedb-lakehouse",
  "bluedb-sql",
+ "chrono",
  "datafusion",
  "gluesql-core",
  "iceberg",
