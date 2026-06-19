@@ -888,6 +888,7 @@ dependencies = [
  "axum",
  "base64",
  "bluedb-cache",
+ "bluedb-collections",
  "bluedb-engine",
  "bluedb-evidence",
  "bluedb-ha",

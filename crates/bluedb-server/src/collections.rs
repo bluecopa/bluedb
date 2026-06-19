@@ -7,6 +7,7 @@
 //!
 //! ## Endpoints
 //! - `POST /collections/{coll}/insert` — bulk-insert documents
+//! - `POST /collections/{coll}/find` — query documents (MQL filter / sort / limit)
 
 use axum::extract::{Path, State};
 use axum::Json;
@@ -14,8 +15,9 @@ use gluesql_core::prelude::Glue;
 use serde_json::{json, Value};
 
 use bluedb_engine::rest_sql;
+use bluedb_collections::{filter::parse_filter, project::apply_projection};
 
-use crate::{authz::Scope, schema::ident, AppError, AppState};
+use crate::{authz::Scope, run_read_routed, schema::ident, AppError, AppState};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -110,4 +112,84 @@ pub(crate) async fn insert(
         "insertedIds": inserted_ids,
         "insertedCount": inserted_ids.len(),
     })))
+}
+
+/// `POST /collections/{coll}/find` — query documents with an MQL filter.
+///
+/// Body: `{"filter": {...}, "projection": {...}, "sort": {field: 1|-1}, "limit": N, "skip": N}`.
+/// All fields are optional. The filter is MQL (a subset of MongoDB query language);
+/// a non-indexed field filter will be guardrail-rejected by GlueSQL and routed to
+/// DataFusion over the tenant's Iceberg mirror.
+///
+/// Returns `{"documents": [...]}`.
+pub(crate) async fn find(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(coll): Path<String>,
+    Json(req): Json<Value>,
+) -> Result<Json<Value>, AppError> {
+    state.authorize(&headers, Scope::DataRead)?;
+    let tenant = state.tenant(&headers)?;
+    // Reads are allowed anywhere — no `require_active()`.
+
+    let coll = ident(&coll)?.to_string();
+
+    // Parse the MQL filter.
+    let empty = json!({});
+    let filter_val = req.get("filter").unwrap_or(&empty);
+    let filter = parse_filter(filter_val)
+        .map_err(|e| AppError::bad_request(e.to_string()).with_code("PARSE_ERROR"))?;
+
+    // Build the WHERE clause and collect bound parameters.
+    let mut params: Vec<Value> = Vec::new();
+    let where_sql = filter.to_sql(&mut params);
+
+    // Build SELECT with optional ORDER BY / LIMIT / OFFSET.
+    let mut sql = format!("SELECT doc FROM {coll} WHERE {where_sql}");
+
+    // ORDER BY — `{"field": 1}` → ASC, `{"field": -1}` → DESC.
+    if let Some(sort_obj) = req.get("sort").and_then(Value::as_object) {
+        if !sort_obj.is_empty() {
+            let mut order_parts: Vec<String> = Vec::new();
+            for (field, dir_val) in sort_obj {
+                let dir = if dir_val.as_i64().unwrap_or(1) < 0 { "DESC" } else { "ASC" };
+                let col_expr = if field == "_id" {
+                    "_id".to_string()
+                } else {
+                    format!("(doc->>'{}') ", field.replace('\'', "''"))
+                };
+                order_parts.push(format!("{col_expr} {dir}"));
+            }
+            sql.push_str(" ORDER BY ");
+            sql.push_str(&order_parts.join(", "));
+        }
+    }
+
+    // LIMIT / OFFSET — server-controlled integers, safe to inline.
+    if let Some(limit) = req.get("limit").and_then(Value::as_u64) {
+        sql.push_str(&format!(" LIMIT {limit}"));
+    }
+    if let Some(skip) = req.get("skip").and_then(Value::as_u64) {
+        sql.push_str(&format!(" OFFSET {skip}"));
+    }
+
+    let rows = run_read_routed(&state, &tenant, &sql, &params).await?;
+
+    // Extract and project the `doc` column from each row.
+    let projection = req.get("projection").cloned().unwrap_or(empty);
+    let mut docs: Vec<Value> = Vec::with_capacity(rows.len());
+    for row in rows {
+        // The `doc` column is stored as JSON text; `run_read_routed` re-inflates
+        // it (via select_to_json / reinflate_rows), so `doc` should already be a
+        // JSON object. Handle the string fallback for safety.
+        let doc = match row.get("doc") {
+            Some(Value::String(s)) => serde_json::from_str::<Value>(s)
+                .unwrap_or_else(|_| Value::String(s.clone())),
+            Some(v) => v.clone(),
+            None => continue,
+        };
+        docs.push(apply_projection(&doc, &projection));
+    }
+
+    Ok(Json(json!({ "documents": docs })))
 }

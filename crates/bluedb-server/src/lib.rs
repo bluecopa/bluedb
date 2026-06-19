@@ -865,6 +865,7 @@ pub fn build_app(state: AppState) -> Router {
         )
         // Document-oriented collections API.
         .route("/collections/{coll}/insert", post(collections::insert))
+        .route("/collections/{coll}/find", post(collections::find))
         .with_state(state)
 }
 
@@ -1411,6 +1412,58 @@ async fn route_select_to_analytical(
         watermark_headers(tenant, wm),
         Json(reinflate_rows(record_batches_to_json(&batches), json_cols)),
     ))
+}
+
+/// Execute a read `sql` (with `$N` params from a `bluedb_collections` filter)
+/// on the GlueSQL fast path first. On a scan/sort guardrail reject **or** a
+/// GlueSQL translate error (e.g. `doc->>'field'` — a JSON path operator GlueSQL
+/// doesn't support), fall through to DataFusion over the tenant's Iceberg mirror.
+/// Returns each result row as a JSON object, with JSON columns already re-inflated.
+///
+/// Called by `collections::find`; lives here because it needs the private
+/// `json_to_param`, `select_to_json`, `record_batches_to_json`, `reinflate_rows`,
+/// and `is_guardrail_reject` helpers that are all defined in this module.
+pub(crate) async fn run_read_routed(
+    state: &AppState,
+    tenant: &str,
+    sql: &str,
+    params: &[serde_json::Value],
+) -> Result<Vec<serde_json::Value>, AppError> {
+    let rest_params = params
+        .iter()
+        .map(json_to_param)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut glue = Glue::new(state.connection(tenant).await?);
+    let needs_analytical = match rest_sql::execute_sql(&mut glue, sql, &rest_params, false).await {
+        Ok(payloads) => {
+            let json_cols = vec!["doc".to_string()];
+            let rows = select_to_json(payloads, &json_cols);
+            return Ok(rows.as_array().cloned().unwrap_or_default());
+        }
+        // Plan-time guardrail reject: non-indexed filter / ORDER BY.
+        Err(ref e) if is_guardrail_reject(e) => true,
+        // GlueSQL translate error: JSON path operators (`->>`, `->`) that GlueSQL
+        // doesn't support — route to DataFusion which handles them natively.
+        Err(EngineError::Sql(gluesql_core::error::Error::Translate(_))) => true,
+        Err(e) => return Err(e.into()),
+    };
+    let _ = needs_analytical; // always true here — kept for clarity
+
+    // Route to DataFusion over the tenant's Iceberg mirror.
+    let manager = state.lakehouse().await.ok_or_else(|| {
+        AppError::internal("analytical path unavailable: lakehouse manager not bound")
+    })?;
+    let engine = manager
+        .engine_for(tenant)
+        .await
+        .map_err(|e| AppError::internal(format!("get lakehouse engine: {e}")))?;
+    let batches = bluedb_query::query_via_catalog(engine, sql, params)
+        .await
+        .map_err(|e| AppError::bad_request(format!("query: {e}")))?;
+    let json_cols = vec!["doc".to_string()];
+    let rows = reinflate_rows(record_batches_to_json(&batches), &json_cols);
+    Ok(rows.as_array().cloned().unwrap_or_default())
 }
 
 /// `POST /tables/{table}` — INSERT (JSON object → autocommit; array → one txn batch).

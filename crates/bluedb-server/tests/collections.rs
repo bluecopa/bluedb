@@ -21,11 +21,16 @@ fn node(node_id: &str, store: Arc<dyn ObjectStore>, lease: Arc<dyn LeaseProvider
     AppState::new(store, "bluedb", writer)
 }
 
-async fn app() -> Router {
+async fn app_with_state() -> (Router, AppState) {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let state = node("test-node", store, Arc::new(LocalLeaseProvider::new()));
     state.promote().await.expect("promote");
-    build_app(state)
+    let router = build_app(state.clone());
+    (router, state)
+}
+
+async fn app() -> Router {
+    app_with_state().await.0
 }
 
 async fn call(
@@ -139,6 +144,58 @@ async fn insert_missing_documents_field_is_400() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn find_by_id_and_by_field_with_sort_limit() {
+    let (app, state) = app_with_state().await;
+
+    // Insert three documents.
+    for d in [
+        serde_json::json!({"name": "ada", "age": 36}),
+        serde_json::json!({"name": "lin", "age": 28}),
+        serde_json::json!({"name": "sam", "age": 41}),
+    ] {
+        let (s, body) = call(
+            &app,
+            "POST",
+            "/collections/people/insert",
+            Some(serde_json::json!({ "documents": [d] })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "insert failed: {body}");
+    }
+
+    // Seal so the Iceberg mirror has the data (DataFusion fallback requires it).
+    state.seal_now().await.expect("seal");
+
+    // Filter by age >= 30 (non-indexed field → guardrail reject → DataFusion),
+    // sorted ascending by age, limit 10.
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/collections/people/find",
+        Some(serde_json::json!({
+            "filter": { "age": { "$gte": 30 } },
+            "sort": { "age": 1 },
+            "limit": 10
+        })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "find failed: {body}");
+
+    let docs = body["documents"].as_array().expect("documents array");
+    assert_eq!(docs.len(), 2, "expected 2 docs (ada + sam), got: {body}");
+
+    let name0 = docs[0]["name"].as_str().expect("docs[0].name");
+    let name1 = docs[1]["name"].as_str().expect("docs[1].name");
+    assert_eq!(name0, "ada", "first doc (age 36) should be ada");
+    assert_eq!(name1, "sam", "second doc (age 41) should be sam");
+
+    // Each document should have a 24-char _id.
+    let id0 = docs[0]["_id"].as_str().expect("docs[0]._id");
+    assert_eq!(id0.len(), 24, "expected 24-char _id, got '{id0}'");
 }
 
 #[tokio::test]
