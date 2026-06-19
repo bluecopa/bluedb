@@ -29,7 +29,7 @@ struct TestServer {
 #[pymethods]
 impl TestServer {
     #[new]
-    #[pyo3(signature = (authz=None, token=None, admin_sql=true, flush_interval_ms=None, db_path=None, evidence_signing=false))]
+    #[pyo3(signature = (authz=None, token=None, admin_sql=true, flush_interval_ms=None, db_path=None, evidence_signing=false, mirror=false))]
     fn new(
         py: Python<'_>,
         authz: Option<Py<PyAny>>,
@@ -38,6 +38,7 @@ impl TestServer {
         flush_interval_ms: Option<u64>,
         db_path: Option<String>,
         evidence_signing: bool,
+        mirror: bool,
     ) -> PyResult<Self> {
         let spec = parse_authz(py, authz, token)?;
         let cfg = EmbeddedConfig {
@@ -46,6 +47,7 @@ impl TestServer {
             authz: spec,
             evidence_signing,
             flush_interval_ms,
+            mirror,
         };
         let server = py
             .detach(|| EmbeddedServer::start(cfg))
@@ -64,6 +66,22 @@ impl TestServer {
             // the interpreter while it drains so other Python threads aren't blocked.
             py.detach(move || s.shutdown());
         }
+    }
+
+    /// Synchronously seal buffered writes into the Iceberg mirror (mirror mode).
+    fn seal(&self) -> PyResult<()> {
+        let s = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("server stopped"))?;
+        s.seal()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// The local warehouse directory (mirror mode), or `None`.
+    #[getter]
+    fn warehouse_path(&self) -> Option<String> {
+        self.inner.as_ref().and_then(|s| s.warehouse_path())
     }
 
     fn __enter__(slf: Py<Self>) -> Py<Self> {

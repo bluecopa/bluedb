@@ -14,6 +14,7 @@
 //! every tenant (an idle tenant's `seal()` is a cheap no-op).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -82,6 +83,9 @@ pub struct LakehouseManager {
     index_lock: tokio::sync::Mutex<()>,
     /// Background seal + compaction task handles (aborted on [`Self::shutdown`]).
     handles: Mutex<Vec<JoinHandle<()>>>,
+    /// Testkit mirror mode: when true, a freshly-opened tenant mirrors by
+    /// default (no per-tenant PRAGMA needed). Prod leaves it false.
+    default_mirror_on: AtomicBool,
 }
 
 impl LakehouseManager {
@@ -107,6 +111,7 @@ impl LakehouseManager {
             engines: RwLock::new(HashMap::new()),
             index_lock: tokio::sync::Mutex::new(()),
             handles: Mutex::new(Vec::new()),
+            default_mirror_on: AtomicBool::new(false),
         });
         mgr.reopen_all().await?;
         mgr.clone().spawn_loops();
@@ -147,8 +152,21 @@ impl LakehouseManager {
             map.insert(tenant.to_string(), engine.clone());
             engine
         };
+        // Testkit mirror mode: a freshly-created tenant mirrors by default.
+        if self.default_mirror_on.load(Ordering::Relaxed) {
+            engine.apply_pragma(LhPragma::GlobalDefault(true)).await?;
+        }
         self.register_tenant(tenant).await?;
         Ok(engine)
+    }
+
+    /// Make every subsequently-opened tenant mirror by default (testkit mirror
+    /// mode). Call right after [`open`], before any writes.
+    pub fn set_default_mirror(&self, on: bool) {
+        self.default_mirror_on.store(on, Ordering::Relaxed);
+        // Retain CDC for every tenant's writes (no per-tenant default needed),
+        // so a freshly-written tenant has a CDC trail for seal to drain.
+        self.cdc.set_global_default(on);
     }
 
     /// Apply a `PRAGMA lakehouse_mirror` for `tenant` (creating its engine).
@@ -158,6 +176,13 @@ impl LakehouseManager {
 
     /// Seal every tenant's pending CDC into Iceberg (a no-op per idle tenant).
     pub async fn seal_all(&self) -> Result<()> {
+        // Ensure an engine exists for every tenant that has written CDC, so a
+        // freshly-written tenant is sealed even without a prior `PRAGMA
+        // lakehouse_mirror` (mirror mode). In prod (global default off) the seen
+        // set holds only already-mirrored tenants, so these are cache hits.
+        for tenant in self.cdc.seen_tenants() {
+            let _ = self.engine_for(&tenant).await;
+        }
         for engine in self.snapshot_engines().await {
             if let Err(err) = engine.seal().await {
                 eprintln!("lakehouse: seal({}) failed: {err}", engine.namespace());

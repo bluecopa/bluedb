@@ -842,7 +842,9 @@ dependencies = [
  "bluedb-ha",
  "bluedb-server",
  "pyo3",
+ "serde_json",
  "slatedb",
+ "tempfile",
  "tokio",
  "ureq",
 ]

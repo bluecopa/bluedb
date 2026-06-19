@@ -1212,6 +1212,9 @@ impl Transaction for SlateDbStorage {
                         wrote_cdc = true;
                     }
                     if wrote_cdc {
+                        // Record the tenant so the seal path can ensure its engine
+                        // exists (auto-mirror of arbitrary tenants in mirror mode).
+                        cdc.mark_seen(&self.tenant);
                         cdc_to_signal = Some(cdc);
                     }
                 }
