@@ -272,21 +272,48 @@ fn multikey_side_table(coll: &str, field: &str) -> String {
     format!("{coll}__mk_{}", field.replace('.', "_"))
 }
 
-/// Create the multikey side table for `(coll, field)` if it doesn't exist yet.
+/// Create the multikey side table for `(coll, field)` if it doesn't exist yet,
+/// including the secondary index on `val`.
 ///
-/// Schema: `(rid TEXT PRIMARY KEY, _id TEXT, val TEXT)`.
+/// Schema: `(rid TEXT PRIMARY KEY, _id TEXT, val TEXT)` with `INDEX(val)`.
 /// - `rid` is a generated unique id for each (element, parent) pair.
 /// - `_id` is the owning document's `_id`.
 /// - `val` is the element rendered as text (same as `derive_value` would produce).
+///
+/// The `val` index is what makes the element-membership find index-served: the
+/// rewrite `_id IN (SELECT _id FROM {side} WHERE val = $1)` runs the subquery's
+/// `WHERE val = $1` against this index (a point lookup on the side table), so the
+/// query guardrail keeps it on the GlueSQL fast path instead of routing it to a
+/// DataFusion full scan. Creating it here (rather than only at `createIndex`
+/// time) also backfills the index onto any side table that predates this change,
+/// since both `createIndex` and the write path call through here.
+///
+/// Both the `CREATE TABLE` and the `CREATE INDEX` are idempotent: the table uses
+/// `IF NOT EXISTS`, and the index is created only when the side table's schema
+/// does not already carry it (GlueSQL has no `CREATE INDEX IF NOT EXISTS` and
+/// errors on a duplicate index name).
 async fn ensure_multikey_side_table(
     state: &AppState,
     tenant: &str,
     side: &str,
 ) -> Result<(), AppError> {
-    let sql = format!(
+    let create_table = format!(
         "CREATE TABLE IF NOT EXISTS {side} (rid TEXT PRIMARY KEY, _id TEXT, val TEXT);"
     );
-    run_ddl(state, tenant, &sql).await
+    run_ddl(state, tenant, &create_table).await?;
+
+    // Create INDEX(val) once. Stable name: `{side}_val`.
+    let index_name = format!("{side}_val");
+    let storage = state.connection(tenant).await?;
+    let schema = Store::fetch_schema(&storage, side)
+        .await
+        .map_err(|e| AppError::internal(format!("fetch schema: {e}")))?;
+    let index_exists = schema.is_some_and(|s| s.indexes.iter().any(|i| i.name == index_name));
+    if !index_exists {
+        let create_idx = format!("CREATE INDEX {index_name} ON {side} (val);");
+        run_ddl(state, tenant, &create_idx).await?;
+    }
+    Ok(())
 }
 
 /// Return the list of multikey side-table field names for `coll`.
@@ -735,12 +762,12 @@ pub(crate) async fn find(
     // multikey side table, rewrite to:
     //   _id IN (SELECT _id FROM {side} WHERE val = $1)
     //
-    // NOTE (FIX I2): the `_id IN (SELECT ...)` shape is NOT recognized by the
-    // query guardrail as a PK-lookup. It therefore routes to the analytical engine
-    // (DataFusion over the Iceberg mirror). Results are correct and fresh (the
-    // side table reflects all writes), but this is a full scan of the side table
-    // + join — not an index-fast lookup on the transactional engine.
-    // Teaching the guardrail to recognise the PK-IN-subquery shape is a follow-up.
+    // The `_id IN (SELECT ... WHERE val = $1)` shape IS recognized by the query
+    // guardrail as index-served (PK membership + the side table's INDEX(val)), so
+    // it stays on the GlueSQL transactional fast path — a point lookup on the side
+    // table, not a DataFusion full scan. See `bluedb_sql::guardrail`
+    // (`in_subquery_hits_index`) and `ensure_multikey_side_table` (which creates
+    // the `val` index this relies on).
     //
     // Only a single-equality-on-a-multikey-field is rewritten here; other shapes
     // (e.g. `$in` on a multikey field, mixed predicates) fall through to the
@@ -968,11 +995,10 @@ pub(crate) async fn create_index(
         //
         // Element-membership find (field:"x" on an array field) is served via:
         //   SELECT doc FROM {coll} WHERE _id IN (SELECT _id FROM side WHERE val=$1)
-        // Results are correct and fresh — the side table is maintained on every
-        // write — but the `_id IN (SELECT ...)` shape is NOT recognized by the
-        // query guardrail as a PK-lookup, so this query routes through the
-        // analytical engine (DataFusion). Teaching the guardrail to recognise the
-        // PK-IN-subquery shape is deferred to v2.
+        // The side table carries INDEX(val) (created by ensure_multikey_side_table),
+        // and the guardrail recognises the `_id IN (SELECT ... WHERE val=$1)` shape
+        // as index-served, so this stays on the GlueSQL fast path (a point lookup
+        // on the side table) — not a DataFusion full scan.
         //
         // FIX I4: reject dotted (nested) paths in multikey indexes. The side-table
         // name `{coll}__mk_a_b` conflates `a.b` with a top-level field named `a_b`,
@@ -1738,11 +1764,11 @@ fn try_compound_match(
 /// field `tags:["x","y"]` correctly matches (the side table stores one row per
 /// element — or one row for a scalar value).
 ///
-/// **Freshness note (FIX I2):** the `_id IN (SELECT ...)` shape is NOT recognized
-/// by the query guardrail as a PK-lookup, so this query routes to the analytical
-/// engine (DataFusion). Results are correct (the side table is maintained on every
-/// write) but not on the GlueSQL transactional fast path. Teaching the guardrail
-/// to recognize PK-IN-subquery is a follow-up.
+/// **Fast path:** the side table carries `INDEX(val)` (see
+/// [`ensure_multikey_side_table`]), and the guardrail accepts the
+/// `_id IN (SELECT _id FROM {side} WHERE val = $N)` shape as index-served (PK
+/// membership + the indexed subquery scan), so this stays on the GlueSQL
+/// transactional fast path — read-your-writes, no DataFusion round-trip.
 ///
 /// Only the **single-equality-on-a-multikey-field** shape is handled here. Other
 /// shapes (multiple predicates, `$in`, `$ne`, etc. on a multikey field) fall

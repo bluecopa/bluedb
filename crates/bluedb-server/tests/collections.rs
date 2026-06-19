@@ -1676,8 +1676,16 @@ fn json_get_field(doc: &Value, field: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Basic multikey index: createIndex auto-detects array field, find by element
-/// membership returns the correct subset. All reads on the GlueSQL fast path
-/// (no seal needed — the side table is a plain indexed table, not a JSON accessor).
+/// membership returns the correct subset on FRESH, unsealed data.
+///
+/// The element-membership rewrite is `_id IN (SELECT _id FROM {side} WHERE
+/// val = $1)`. The side table carries `INDEX(val)`, and the guardrail accepts
+/// this PK-IN-(indexed subquery) shape as index-served, so the read stays on the
+/// GlueSQL transactional fast path — it never routes to DataFusion (which would
+/// require a prior seal). The correctness assertions here run on data that was
+/// just inserted and never sealed, so a pass means the fast path served them.
+/// (The formal "accepted, not rejected" proof is the `bluedb_sql::guardrail`
+/// unit test `pk_in_indexed_subquery_is_accepted`.)
 #[tokio::test]
 async fn multikey_find_matches_array_element() {
     let app = app().await;
