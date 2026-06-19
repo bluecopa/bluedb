@@ -203,22 +203,118 @@ fn lower_exists(ss: &SearchSchema, m: &serde_json::Map<String, Value>) -> Result
 }
 
 mod range {
-    use super::*;
+    use std::ops::Bound;
+
+    use serde_json::Value;
+    use tantivy::query::{Query, RangeQuery};
+    use tantivy::schema::Term;
+
+    use crate::error::{Result, SearchError};
+    use crate::mapping::{FieldKindInfo, SearchSchema};
+
+    fn bound_i64(m: &serde_json::Map<String, Value>, incl: &str, excl: &str, field: tantivy::schema::Field) -> Result<Bound<Term>> {
+        if let Some(v) = m.get(incl) {
+            let n = v.as_i64().ok_or_else(|| SearchError::BadRequest("range bound must be an integer".into()))?;
+            Ok(Bound::Included(Term::from_field_i64(field, n)))
+        } else if let Some(v) = m.get(excl) {
+            let n = v.as_i64().ok_or_else(|| SearchError::BadRequest("range bound must be an integer".into()))?;
+            Ok(Bound::Excluded(Term::from_field_i64(field, n)))
+        } else {
+            Ok(Bound::Unbounded)
+        }
+    }
+
+    fn bound_text(m: &serde_json::Map<String, Value>, incl: &str, excl: &str, field: tantivy::schema::Field) -> Result<Bound<Term>> {
+        if let Some(v) = m.get(incl) {
+            let s = v.as_str().ok_or_else(|| SearchError::BadRequest("range bound must be a string".into()))?;
+            Ok(Bound::Included(Term::from_field_text(field, s)))
+        } else if let Some(v) = m.get(excl) {
+            let s = v.as_str().ok_or_else(|| SearchError::BadRequest("range bound must be a string".into()))?;
+            Ok(Bound::Excluded(Term::from_field_text(field, s)))
+        } else {
+            Ok(Bound::Unbounded)
+        }
+    }
+
     pub fn lower_range(
-        _ss: &SearchSchema,
-        _m: &serde_json::Map<String, Value>,
+        ss: &SearchSchema,
+        m: &serde_json::Map<String, Value>,
     ) -> Result<Box<dyn Query>> {
-        Err(SearchError::UnsupportedQuery("range".into()))
+        let mut it = m.iter();
+        let (field_name, body) = it
+            .next()
+            .ok_or_else(|| SearchError::BadRequest("empty range".into()))?;
+        let body = body
+            .as_object()
+            .ok_or_else(|| SearchError::BadRequest("range body must be an object".into()))?;
+        let resolved = ss
+            .field(field_name)
+            .ok_or_else(|| SearchError::UnmappedField(field_name.clone()))?;
+        match resolved.kind {
+            FieldKindInfo::Integer => {
+                let lo = bound_i64(body, "gte", "gt", resolved.field)?;
+                let hi = bound_i64(body, "lte", "lt", resolved.field)?;
+                Ok(Box::new(RangeQuery::new(lo, hi)))
+            }
+            FieldKindInfo::Keyword => {
+                let lo = bound_text(body, "gte", "gt", resolved.field)?;
+                let hi = bound_text(body, "lte", "lt", resolved.field)?;
+                Ok(Box::new(RangeQuery::new(lo, hi)))
+            }
+            FieldKindInfo::Text(_) => Err(SearchError::BadRequest(format!(
+                "range is not supported on analyzed text field [{field_name}] (use keyword)"
+            ))),
+        }
     }
 }
 mod boolean {
-    use super::*;
+    use std::collections::HashMap;
+
+    use serde_json::Value;
+    use tantivy::query::{BooleanQuery, Occur, Query};
+
+    use crate::error::{Result, SearchError};
+    use crate::mapping::SearchSchema;
+
+    fn clauses_for(
+        ss: &SearchSchema,
+        body: &serde_json::Map<String, Value>,
+        key: &str,
+        occur: Occur,
+        terms: &mut HashMap<String, Vec<String>>,
+        out: &mut Vec<(Occur, Box<dyn Query>)>,
+    ) -> Result<()> {
+        let Some(v) = body.get(key) else { return Ok(()) };
+        let items: Vec<&Value> = match v {
+            Value::Array(a) => a.iter().collect(),
+            other => vec![other],
+        };
+        for item in items {
+            let q = if matches!(occur, Occur::MustNot) {
+                let mut scratch = HashMap::new();
+                super::lower(ss, item, &mut scratch)?
+            } else {
+                super::lower(ss, item, terms)?
+            };
+            out.push((occur, q));
+        }
+        Ok(())
+    }
+
     pub fn lower_bool(
-        _ss: &SearchSchema,
-        _m: &serde_json::Map<String, Value>,
-        _t: &mut std::collections::HashMap<String, Vec<String>>,
+        ss: &SearchSchema,
+        body: &serde_json::Map<String, Value>,
+        terms: &mut HashMap<String, Vec<String>>,
     ) -> Result<Box<dyn Query>> {
-        Err(SearchError::UnsupportedQuery("bool".into()))
+        let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+        clauses_for(ss, body, "must", Occur::Must, terms, &mut clauses)?;
+        clauses_for(ss, body, "filter", Occur::Must, terms, &mut clauses)?;
+        clauses_for(ss, body, "should", Occur::Should, terms, &mut clauses)?;
+        clauses_for(ss, body, "must_not", Occur::MustNot, terms, &mut clauses)?;
+        if clauses.is_empty() {
+            return Err(SearchError::BadRequest("empty bool query".into()));
+        }
+        Ok(Box::new(BooleanQuery::new(clauses)))
     }
 }
 
@@ -276,5 +372,35 @@ mod tests {
     fn match_all_builds() {
         let ss = schema();
         assert!(compile_query(&ss, &serde_json::json!({"match_all": {}})).is_ok());
+    }
+
+    #[test]
+    fn range_on_integer_builds() {
+        let ss = schema();
+        assert!(compile_query(&ss, &serde_json::json!({"range": {"year": {"gte": 2000, "lt": 2020}}})).is_ok());
+    }
+
+    #[test]
+    fn range_on_keyword_builds() {
+        let ss = schema();
+        assert!(compile_query(&ss, &serde_json::json!({"range": {"tag": {"gte": "a", "lte": "m"}}})).is_ok());
+    }
+
+    #[test]
+    fn bool_merges_clauses_and_terms() {
+        let ss = schema();
+        let c = compile_query(&ss, &serde_json::json!({"bool": {
+            "must": [{"match": {"title": "dog"}}],
+            "filter": [{"term": {"tag": "pets"}}],
+            "must_not": [{"term": {"tag": "draft"}}],
+            "should": [{"match": {"title": "park"}}]
+        }})).unwrap();
+        assert!(c.terms_by_field.get("title").is_some());
+    }
+
+    #[test]
+    fn range_on_text_field_errors() {
+        let ss = schema();
+        assert!(compile_query(&ss, &serde_json::json!({"range": {"title": {"gte": "a"}}})).is_err());
     }
 }
