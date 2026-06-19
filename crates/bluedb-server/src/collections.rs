@@ -427,15 +427,24 @@ async fn write_full_doc(
     );
     run_write(state, tenant, &sql, &params).await?;
 
-    // Maintain multikey side tables — one row per array element per field.
+    // Maintain multikey side tables — one row per array element (or scalar) per field.
     // Note: `field` here is the suffix after `{coll}__mk_`, dots replaced by
     // underscores. For top-level fields (no dots in path), `field` is the
     // exact key name in the document; for nested paths this would require extra
     // metadata. V1 supports top-level multikey fields only.
     let mk_sides = multikey_side_tables(state, tenant, coll).await?;
     for (side, field) in &mk_sides {
-        if let Some(Value::Array(arr)) = doc.get(field.as_str()) {
-            insert_multikey_elements(state, tenant, side, &id_str, arr).await?;
+        match doc.get(field.as_str()) {
+            Some(Value::Array(arr)) => {
+                insert_multikey_elements(state, tenant, side, &id_str, arr).await?;
+            }
+            // FIX M5: a scalar (non-array, non-null) value is also indexed as a
+            // single entry — matches MongoDB multikey semantics.
+            Some(v) if !v.is_null() => {
+                let singleton = [v.clone()];
+                insert_multikey_elements(state, tenant, side, &id_str, &singleton).await?;
+            }
+            _ => {}
         }
     }
 
@@ -497,9 +506,16 @@ async fn rewrite_doc_row(
         // Delete old elements for this document.
         let del_sql = format!("DELETE FROM {side} WHERE _id = $1;");
         run_write(state, tenant, &del_sql, &[bluedb_rest::Param::Str(id.to_string())]).await?;
-        // Re-insert new elements.
-        if let Some(Value::Array(arr)) = doc.get(field.as_str()) {
-            insert_multikey_elements(state, tenant, side, id, arr).await?;
+        // Re-insert new elements (array or scalar — FIX M5).
+        match doc.get(field.as_str()) {
+            Some(Value::Array(arr)) => {
+                insert_multikey_elements(state, tenant, side, id, arr).await?;
+            }
+            Some(v) if !v.is_null() => {
+                let singleton = [v.clone()];
+                insert_multikey_elements(state, tenant, side, id, &singleton).await?;
+            }
+            _ => {}
         }
     }
 
@@ -718,7 +734,14 @@ pub(crate) async fn find(
     // Multikey element-match: for a filter `{field: "x"}` where `field` has a
     // multikey side table, rewrite to:
     //   _id IN (SELECT _id FROM {side} WHERE val = $1)
-    // This is served on the GlueSQL fast path — no DataFusion required.
+    //
+    // NOTE (FIX I2): the `_id IN (SELECT ...)` shape is NOT recognized by the
+    // query guardrail as a PK-lookup. It therefore routes to the analytical engine
+    // (DataFusion over the Iceberg mirror). Results are correct and fresh (the
+    // side table reflects all writes), but this is a full scan of the side table
+    // + join — not an index-fast lookup on the transactional engine.
+    // Teaching the guardrail to recognise the PK-IN-subquery shape is a follow-up.
+    //
     // Only a single-equality-on-a-multikey-field is rewritten here; other shapes
     // (e.g. `$in` on a multikey field, mixed predicates) fall through to the
     // existing routing and are handled by the JSON accessor / DataFusion path.
@@ -837,6 +860,17 @@ pub(crate) async fn create_index(
                 .with_code("PARSE_ERROR")
                 .into());
             }
+            // FIX I4: reject dotted (nested) paths in compound indexes. The
+            // column-name round-trip `__cidxm_a__b` conflates `a.b` with a
+            // top-level field named `a_b`; nested-path support in compound
+            // indexes is deferred to v2.
+            if p.contains('.') {
+                return Err(AppError::bad_request(
+                    "nested (dotted) paths are not supported for compound indexes in v1"
+                )
+                .with_code("PARSE_ERROR")
+                .into());
+            }
         }
 
         let dcol = compound_col(&paths);
@@ -934,10 +968,24 @@ pub(crate) async fn create_index(
         //
         // Element-membership find (field:"x" on an array field) is served via:
         //   SELECT doc FROM {coll} WHERE _id IN (SELECT _id FROM side WHERE val=$1)
-        // This runs on the GlueSQL fast path (no seal needed) — the side table
-        // is a regular indexed table, not a JSON accessor, so the guardrail is
-        // never triggered.
+        // Results are correct and fresh — the side table is maintained on every
+        // write — but the `_id IN (SELECT ...)` shape is NOT recognized by the
+        // query guardrail as a PK-lookup, so this query routes through the
+        // analytical engine (DataFusion). Teaching the guardrail to recognise the
+        // PK-IN-subquery shape is deferred to v2.
+        //
+        // FIX I4: reject dotted (nested) paths in multikey indexes. The side-table
+        // name `{coll}__mk_a_b` conflates `a.b` with a top-level field named `a_b`,
+        // and `write_full_doc` uses `doc.get(field)` (literal key, not path nav).
+        // Nested multikey support is deferred to v2.
         // -----------------------------------------------------------------------
+        if path.contains('.') {
+            return Err(AppError::bad_request(
+                "nested (dotted) paths are not supported for multikey indexes in v1"
+            )
+            .with_code("PARSE_ERROR")
+            .into());
+        }
         let side = multikey_side_table(&coll, &path);
         let index_name = format!("mk_{coll}_{}", path.replace('.', "_"));
 
@@ -964,11 +1012,19 @@ pub(crate) async fn create_index(
                 }
             }
             if found {
-                if let Value::Array(arr) = cur {
-                    // Clear any prior entries first (idempotent backfill).
-                    let del_sql = format!("DELETE FROM {side} WHERE _id = $1;");
-                    run_write(&state, &tenant, &del_sql, &[bluedb_rest::Param::Str(id.clone())]).await?;
-                    insert_multikey_elements(&state, &tenant, &side, &id, arr).await?;
+                // Clear any prior entries first (idempotent backfill).
+                let del_sql = format!("DELETE FROM {side} WHERE _id = $1;");
+                run_write(&state, &tenant, &del_sql, &[bluedb_rest::Param::Str(id.clone())]).await?;
+                match cur {
+                    Value::Array(arr) => {
+                        insert_multikey_elements(&state, &tenant, &side, &id, arr).await?;
+                    }
+                    // FIX M5: a scalar value is indexed as a single entry.
+                    v if !v.is_null() => {
+                        let singleton = [v.clone()];
+                        insert_multikey_elements(&state, &tenant, &side, &id, &singleton).await?;
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1057,6 +1113,21 @@ pub(crate) async fn create_index(
         if secs < 0 {
             return Err(AppError::bad_request(
                 "expireAfterSeconds must be >= 0",
+            )
+            .with_code("PARSE_ERROR")
+            .into());
+        }
+        // FIX I3: the TTL background sweep only runs for the default tenant.
+        // Registering a TTL index for a non-default tenant would silently never
+        // expire any documents. Reject it clearly instead of silently failing.
+        //
+        // (The sweep loop in `AppState::promote` calls `sweep_all_ttl` with
+        // `DEFAULT_TENANT` only; there is no per-tenant enumeration available to
+        // the scheduler. Tenant-aware sweeps are a v2 item.)
+        if tenant != bluedb_sql::DEFAULT_TENANT {
+            return Err(AppError::bad_request(
+                "TTL indexes are supported only on the default tenant in v1 \
+                 (the sweep loop runs for the default tenant only)"
             )
             .with_code("PARSE_ERROR")
             .into());
@@ -1533,6 +1604,15 @@ pub(crate) async fn sweep_ttl(
 /// Read every TTL config from `__bluedb_ttl` for `tenant` and sweep each
 /// collection using the current wall-clock time.  Called by the background task.
 pub(crate) async fn sweep_all_ttl(state: &AppState, tenant: &str) -> Result<(), AppError> {
+    // FIX M6: Do not sweep on a node that is no longer the active writer.
+    // A node losing its lease must not issue DELETEs — this could race with the
+    // new writer and corrupt data. The scheduler loop is aborted on demote, but
+    // there is a window between the last tick and the abort where `is_writer()`
+    // may have already flipped. Guard defensively here.
+    if !state.is_writer() {
+        return Ok(());
+    }
+
     // If the TTL registry table doesn't exist yet, nothing to sweep.
     let sql = format!("SELECT collection, field, seconds FROM {TTL_TABLE} WHERE TRUE;");
     let rows = match run_read_routed(state, tenant, &sql, &[]).await {
@@ -1654,9 +1734,15 @@ fn try_compound_match(
 /// _id IN (SELECT _id FROM {side} WHERE val = $N)
 /// ```
 ///
-/// This is the element-membership fast path: `find {tags:"x"}` on an array
+/// This is the element-membership path: `find {tags:"x"}` on an array
 /// field `tags:["x","y"]` correctly matches (the side table stores one row per
-/// element).
+/// element — or one row for a scalar value).
+///
+/// **Freshness note (FIX I2):** the `_id IN (SELECT ...)` shape is NOT recognized
+/// by the query guardrail as a PK-lookup, so this query routes to the analytical
+/// engine (DataFusion). Results are correct (the side table is maintained on every
+/// write) but not on the GlueSQL transactional fast path. Teaching the guardrail
+/// to recognize PK-IN-subquery is a follow-up.
 ///
 /// Only the **single-equality-on-a-multikey-field** shape is handled here. Other
 /// shapes (multiple predicates, `$in`, `$ne`, etc. on a multikey field) fall

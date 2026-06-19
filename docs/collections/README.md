@@ -222,10 +222,10 @@ see [Freshness](#freshness) below.
 |---------|-----------|-------|
 | Single-field index | yes | `{"keys": {"field": 1}}` |
 | Unique index | yes | `{"options": {"unique": true}}` |
-| Compound index | yes | `{"keys": {"a": 1, "b": 1}}` — accelerates **full-key equality** lookups (`{a: x, b: y}`) on the fresh fast path. Prefix-only queries (`{a: x}`) or range queries on the last component are not accelerated by the compound index — they fall to single-field indexes or the analytical engine. |
-| Multikey index (array field) | **no** | |
+| Compound index | yes | `{"keys": {"a": 1, "b": 1}}` — accelerates **full-key equality** lookups (`{a: x, b: y}`). Top-level fields only; dotted (nested) paths are rejected. Prefix-only queries or range queries fall to single-field indexes or the analytical engine. |
+| Multikey index (array field or scalar) | yes (v1, with caveats) | `{"keys": {"tags": 1}}` — see note below |
+| TTL index | yes (default tenant only, v1) | `{"options": {"expireAfterSeconds": N}}` — see note below |
 | Geospatial index | **no** | |
-| TTL index | **no** | |
 | Text index | **no** | Use [SQL full-text search](../sql/full-text-search.md) instead |
 | Partial index | **no** | |
 | Sparse index | **no** | |
@@ -255,6 +255,34 @@ Indexes are **gateway-maintained**: the server adds a derived column
 
     `$exists` always uses the derived column regardless of type (it is a NULL
     check and is type-agnostic).
+
+!!! note "Multikey index: correct results, not yet index-accelerated (v1)"
+    A multikey index (`{"keys": {"tags": 1}}`) stores one side-table row per
+    array element (or one row for a scalar value), so `find {tags: "x"}` on an
+    array field `tags: ["x", "y"]` correctly returns the document.
+
+    **v1 routing caveat:** the `_id IN (SELECT _id FROM side WHERE val = $1)`
+    query shape is not yet recognized by the query guardrail as a PK-lookup, so
+    multikey `find` routes through the analytical engine (DataFusion over the
+    Iceberg mirror). Results are correct — the side table is maintained on every
+    write — but this is a full scan of the side table, not a GlueSQL index-fast
+    lookup. Teaching the guardrail to recognize the PK-IN-subquery shape is a
+    planned v2 improvement.
+
+    **Dotted (nested) paths** are **not** supported for multikey indexes in v1.
+    `createIndex` will reject `{"keys": {"a.b": 1}, "options": {"multikey": true}}`
+    with a `BadValue` error.
+
+!!! note "TTL index: epoch-seconds; default tenant only (v1)"
+    A TTL index expires documents whose TTL field value (plus `expireAfterSeconds`)
+    is in the past. The numeric TTL field is interpreted as **epoch seconds**
+    (Unix timestamp). A field storing epoch **milliseconds** (e.g.
+    `Date.now()` in JavaScript) will never expire as expected — convert to seconds
+    before storing, or use an ISO-8601 string field (e.g. `"2026-06-15T00:00:00Z"`).
+
+    In v1, TTL indexes are supported **on the default tenant only**. Creating a
+    TTL index on a non-default tenant returns a `BadValue` error. Tenant-aware TTL
+    sweeps are planned for v2.
 
 !!! note "Sort on nested/dotted paths not supported"
     The `sort` field in a `find` request supports **top-level** field names
@@ -307,9 +335,12 @@ The following MongoDB features are not implemented in this release:
 
 - **MongoDB wire protocol** — native `mongosh` / `MongoClient` drivers cannot connect.
 - **Server-side cursors** — all results are returned in a single response body.
-- **Multikey, geospatial, TTL, text, partial, sparse, and hashed indexes.**
+- **Geospatial, text, partial, sparse, and hashed indexes.**
+- **Compound index on nested (dotted) paths** — compound and multikey indexes accept top-level field names only; dotted paths (e.g. `"a.b"`) are rejected.
 - **Compound index prefix/range acceleration** — a compound index `{a,b}` accelerates full-key equality (`{a:x, b:y}`) but not prefix-only (`{a:x}`) or range queries on the last component; those fall to single-field indexes or the analytical engine.
 - **Fractional/float field fast-path** — queries on a field indexed as float are served by the analytical engine (seconds-fresh, not read-your-writes).
+- **Multikey index on the transactional fast path** — multikey `find` queries route to the analytical engine (correct results, seconds-fresh; not GlueSQL index-fast in v1).
+- **TTL indexes on non-default tenants** — the sweep loop runs for the default tenant only; non-default-tenant TTL creation is rejected.
 - **Aggregation stages:** `$facet`, `$graphLookup`, `$bucket`/`$bucketAuto`, `$setWindowFields`, `$merge`, `$out`, `$replaceRoot`, `$replaceWith`, `$unionWith`.
 - **`$lookup` nested-array fidelity** — the `as` field contains a flat JSON value per match, not Mongo's nested single-element array. This is a current serialization limitation (Arrow list columns are not yet rendered as JSON arrays in responses).
 - **`$lookup` on JSON sub-field paths** — the join key must be a plain top-level field name, not a dotted path like `"address.city"`.

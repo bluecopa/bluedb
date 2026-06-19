@@ -139,6 +139,21 @@ impl Filter {
                             _ => value_matches_type(value, idx_type),
                         };
                         if use_index {
+                            // FIX C1: For a Number-typed indexed column, a whole-valued
+                            // float like `6.0` must be rebound as its integer form before
+                            // reaching `cmp_sql_col`. The derived column is `INT`; binding
+                            // a raw float literal produces `Param::Float` which the INT
+                            // key encoder rejects with a 400. The STORED side already
+                            // canonicalizes whole floats to int via `json_value_to_param`;
+                            // the QUERY side must match.
+                            //
+                            // Only applies to the indexed-column path (this branch). The
+                            // non-indexed / analytical path (`cmp_sql`) keeps the original
+                            // value so fractional `3.14` comparisons still work there.
+                            if idx_type == IndexType::Number {
+                                let canonical = canonicalize_number_for_index(op, value);
+                                return cmp_sql_col(&col, op, &canonical, params);
+                            }
                             return cmp_sql_col(&col, op, value, params);
                         }
                     }
@@ -157,6 +172,33 @@ fn join(v: &[Filter], sep: &str, params: &mut Vec<Value>) -> String {
 fn join_indexed(v: &[Filter], sep: &str, params: &mut Vec<Value>, indexed: &HashMap<String, IndexType>) -> String {
     let parts: Vec<String> = v.iter().map(|f| format!("({})", f.to_sql_indexed(params, indexed))).collect();
     parts.join(sep)
+}
+
+/// For a Number-typed indexed column, rewrite any whole-valued float literal(s)
+/// in `value` to their integer equivalent so the bound parameter matches the INT
+/// column type.  Scalars are rewritten in-place; `$in`/`$nin` arrays have each
+/// element rewritten.  Other ops / non-float values pass through unchanged.
+fn canonicalize_number_for_index(op: &Cmp, value: &Value) -> Value {
+    fn as_int(v: &Value) -> Value {
+        if let Some(f) = v.as_f64() {
+            if !v.is_i64() && !v.is_u64() && f.fract() == 0.0
+                && f >= i64::MIN as f64 && f <= i64::MAX as f64
+            {
+                return serde_json::json!(f as i64);
+            }
+        }
+        v.clone()
+    }
+    match op {
+        Cmp::In | Cmp::Nin => {
+            if let Some(arr) = value.as_array() {
+                Value::Array(arr.iter().map(as_int).collect())
+            } else {
+                value.clone()
+            }
+        }
+        _ => as_int(value),
+    }
 }
 
 /// Return `true` when the JSON value's type matches the expected [`IndexType`].

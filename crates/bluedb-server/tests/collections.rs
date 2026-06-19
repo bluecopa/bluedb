@@ -1887,3 +1887,236 @@ async fn multikey_stays_consistent_on_update_and_delete() {
         "expected doc_a for tags:z"
     );
 }
+
+// ---------------------------------------------------------------------------
+// FIX C1: whole-float query literal on a numeric index (find {qty:6.0})
+// ---------------------------------------------------------------------------
+
+/// FIX C1: querying a numeric-indexed field with a whole-valued float literal
+/// (`6.0`) must not error with a 400; it must find the document stored with that
+/// value. Previously the float was passed raw to the INT index encoder, which
+/// rejected it with "FLOAT data type cannot be converted to Big-Endian bytes".
+#[tokio::test]
+async fn numeric_index_whole_float_query_does_not_error() {
+    let app = app().await;
+
+    // Create an explicit number index on "qty".
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/floatq/createIndex",
+        Some(json!({ "keys": { "qty": 1 }, "options": { "type": "number" } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "createIndex: {body}");
+
+    // Insert one doc with integer qty=5 and another stored with whole-float qty=6.0.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/floatq/insert",
+        Some(json!({ "documents": [
+            { "label": "int-five",   "qty": 5   },
+            { "label": "float-six",  "qty": 6.0 }
+        ]})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "insert: {body}");
+
+    // find {qty:6.0} (float literal) — must return the float-six doc (not 400).
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/floatq/find",
+        Some(json!({ "filter": { "qty": 6.0 } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "find qty=6.0 must not error: {body}");
+    let docs = body["documents"].as_array().expect("documents array");
+    assert_eq!(docs.len(), 1, "expected 1 doc for qty=6.0, got: {body}");
+    assert_eq!(docs[0]["label"].as_str().unwrap(), "float-six");
+
+    // find {qty:5} — must return the int-five doc.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/floatq/find",
+        Some(json!({ "filter": { "qty": 5 } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "find qty=5: {body}");
+    let docs = body["documents"].as_array().expect("documents array");
+    assert_eq!(docs.len(), 1, "expected 1 doc for qty=5, got: {body}");
+    assert_eq!(docs[0]["label"].as_str().unwrap(), "int-five");
+
+    // find {qty:{$gte:6.0}} (float range) — must return at least the float-six doc.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/floatq/find",
+        Some(json!({ "filter": { "qty": { "$gte": 6.0 } } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "find qty>=6.0 must not error: {body}");
+    let docs = body["documents"].as_array().expect("documents array");
+    assert!(
+        docs.len() >= 1,
+        "find qty>=6.0 must return at least the float-six doc, got: {body}"
+    );
+    let labels: Vec<&str> = docs.iter().filter_map(|d| d["label"].as_str()).collect();
+    assert!(
+        labels.contains(&"float-six"),
+        "float-six must be in qty>=6.0 results, got: {labels:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// FIX I3: TTL index on non-default tenant is rejected
+// ---------------------------------------------------------------------------
+
+/// FIX I3: createIndex with expireAfterSeconds on a non-default tenant must
+/// return a 4xx error (the TTL sweep only runs for the default tenant).
+#[tokio::test]
+async fn ttl_index_rejected_for_non_default_tenant() {
+    let app = app().await;
+
+    // Issue the createIndex on a non-default tenant.
+    let request = Request::builder()
+        .method("POST")
+        .uri("/collections/ndt_coll/createIndex")
+        .header("content-type", "application/json")
+        .header("X-Bluedb-Tenant", "other_tenant")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "keys": { "created": 1 },
+                "options": { "expireAfterSeconds": 60, "type": "number" }
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "TTL createIndex on non-default tenant must return 400, got: {body}"
+    );
+    let errmsg = body["errmsg"].as_str().unwrap_or("");
+    assert!(
+        errmsg.contains("default tenant") || errmsg.contains("TTL"),
+        "error message must mention TTL / default tenant, got: {errmsg}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// FIX I4: compound/multikey indexes reject dotted (nested) paths
+// ---------------------------------------------------------------------------
+
+/// FIX I4: createIndex on a compound key with a dotted component path must
+/// return 4xx — the column-name round-trip conflates "a.b" with "a_b".
+#[tokio::test]
+async fn compound_index_rejects_dotted_path() {
+    let app = app().await;
+
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/ci_dotted/createIndex",
+        Some(json!({ "keys": { "a.b": 1, "c": 1 } })),
+    )
+    .await;
+    assert!(
+        s.is_client_error(),
+        "compound index with dotted path must be rejected (4xx), got: {s} body: {body}"
+    );
+    let errmsg = body["errmsg"].as_str().unwrap_or("");
+    assert!(
+        errmsg.contains("dotted") || errmsg.contains("nested") || errmsg.contains("not supported"),
+        "error must mention dotted/nested paths, got: {errmsg}"
+    );
+}
+
+/// FIX I4: createIndex (multikey) on a dotted path must return 4xx.
+#[tokio::test]
+async fn multikey_index_rejects_dotted_path() {
+    let app = app().await;
+
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/mk_dotted/createIndex",
+        Some(json!({ "keys": { "a.b": 1 }, "options": { "multikey": true } })),
+    )
+    .await;
+    assert!(
+        s.is_client_error(),
+        "multikey index with dotted path must be rejected (4xx), got: {s} body: {body}"
+    );
+    let errmsg = body["errmsg"].as_str().unwrap_or("");
+    assert!(
+        errmsg.contains("dotted") || errmsg.contains("nested") || errmsg.contains("not supported"),
+        "error must mention dotted/nested paths, got: {errmsg}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// FIX M5: scalar value in a multikey field is indexed
+// ---------------------------------------------------------------------------
+
+/// FIX M5: when a multikey-indexed field holds a scalar (not an array), it
+/// must still be indexed as a single entry so `find {tags:"x"}` returns the doc.
+#[tokio::test]
+async fn multikey_scalar_field_is_indexed() {
+    let app = app().await;
+
+    // Create multikey index on `tags` (explicit opt-in — there are no existing
+    // docs to auto-detect from, and we want to force multikey even for a scalar).
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/scalartags/createIndex",
+        Some(json!({ "keys": { "tags": 1 }, "options": { "multikey": true } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "createIndex: {body}");
+
+    // Insert a doc with a scalar (non-array) tags field.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/scalartags/insert",
+        Some(json!({ "documents": [{ "_id": "doc1", "tags": "x" }] })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "insert scalar tags: {body}");
+
+    // find {tags:"x"} — must return the scalar-tags doc (not 0).
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/scalartags/find",
+        Some(json!({ "filter": { "tags": "x" } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "find tags=x: {body}");
+    let docs = body["documents"].as_array().expect("documents array");
+    assert_eq!(
+        docs.len(), 1,
+        "scalar 'tags:x' must be found by find {{tags:'x'}}, got: {body}"
+    );
+
+    // find {tags:"y"} — must return 0 (scalar "x" does not match "y").
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/scalartags/find",
+        Some(json!({ "filter": { "tags": "y" } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "find tags=y: {body}");
+    let docs = body["documents"].as_array().expect("documents array");
+    assert_eq!(docs.len(), 0, "tags:y must match 0 docs for scalar x, got: {body}");
+}
