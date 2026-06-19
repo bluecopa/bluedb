@@ -123,6 +123,37 @@ The mirror is **read-only from the warehouse side**: writes always go through
 bluedb's SQL/REST surface and flow to Iceberg automatically. Don't write to the
 Iceberg tables directly.
 
+### Attaching as a durable REST catalog
+
+Attach `/catalog/v1` as a standing Iceberg REST catalog — `ATTACH … (TYPE
+ICEBERG, ENDPOINT …)` — rather than a one-shot `iceberg_scan(metadata-location)`.
+This is the intended integration; point the catalog URI at
+`http://<bluedb-host>:<port>/catalog` (the Iceberg client appends `/v1/…`).
+
+**Auth is a bearer token plus the namespace in the request path — there is no
+`X-Bluedb-Tenant` header on the catalog plane** (that header is only for the data
+plane, `/tables` and `/sql`). Each route derives the tenant from the namespace
+(`namespace == tenant`) and checks the token's scope against it:
+
+- a `superuser` token attaches once and sees **every** tenant as a namespace;
+- a `tenant:<name>`-scoped token sees **only** its own namespace (others are
+  filtered from `listNamespaces` and `403` on direct access).
+
+So off-the-shelf Iceberg REST clients (BigQuery, Snowflake, Databricks, DuckDB)
+work unchanged: they send a standard `Authorization: Bearer …` and put the
+namespace in the path — no custom headers.
+
+!!! warning "The warehouse reads data files directly — bring your own object-store credentials"
+    `loadTable` returns **locations only** (its `config` is empty); bluedb does
+    **not** vend storage credentials. The warehouse reads the Parquet straight from
+    object storage, so it needs its **own** read access to the bucket — none for a
+    local `file://` mirror, but real bucket IAM for S3 / GCS / Azure. The bearer
+    token authorizes the catalog metadata, not the data-file reads.
+
+The catalog is served by the **active writer** (a passive node returns `503` —
+re-resolve after a failover) and reflects the most recently **sealed** snapshot.
+Creating or committing tables through the catalog is not supported (read-only).
+
 ## Multi-tenancy
 
 bluedb is **multi-tenant**: every request is scoped to a tenant via the
