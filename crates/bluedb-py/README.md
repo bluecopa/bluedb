@@ -47,11 +47,47 @@ with serve() as db:                       # authenticated with a superuser key
 
 `serve(...)` knobs: `authz` (`True` default superuser / `False` open / `dict` /
 raw string), `token`, `admin_sql`, `flush_interval_ms`, `db_path`,
-`evidence_signing`. Helpers: `db.base_url`, `db.token`, `db.url(path)`,
-`db.headers(token=..., tenant=...)`.
+`evidence_signing`, `mirror`. Helpers: `db.base_url`, `db.token`, `db.url(path)`,
+`db.headers(token=..., tenant=...)`, and (mirror mode) `db.seal()` /
+`db.warehouse_path`.
 
-pytest fixtures (auto-registered): `bluedb` (fresh per test) and
-`bluedb_session` (shared). Instances are isolated → safe under `pytest-xdist`.
+pytest fixtures (auto-registered): `bluedb` (fresh per test), `bluedb_session`
+(shared), and `bluedb_mirrored` (fresh, Iceberg mirror on). Instances are
+isolated → safe under `pytest-xdist`.
+
+## Mirror mode (Iceberg + DuckDB)
+
+`serve(mirror=True)` (or the `bluedb_mirrored` fixture) runs the **lakehouse
+mirror on**, backed by a **local temp dir** — no cloud creds. Mirroring defaults
+on for every tenant, so you just write, `db.seal()` (synchronous), then read the
+Iceberg mirror through `/sql` or the read-only Iceberg REST catalog at
+`/catalog/v1`. `loadTable`'s `metadata-location` is a `file://` path an external
+warehouse can open directly (the warehouse dir is `db.warehouse_path`, cleaned
+when the server stops).
+
+```python
+import duckdb, httpx
+from bluedb_testkit import serve
+
+with serve(mirror=True) as db:
+    h = db.headers()
+    httpx.post(db.url("/admin/sql"), headers=h,
+               json={"sql": "CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)"})
+    httpx.post(db.url("/tables/docs"), headers=h, json={"id": 1, "body": "hello"})
+    db.seal()                                   # rows are now in the Iceberg mirror
+
+    loc = httpx.get(db.url("/catalog/v1/namespaces/default/tables/docs"),
+                    headers=h).json()["metadata-location"]   # file:///…
+    con = duckdb.connect(); con.execute("INSTALL iceberg"); con.execute("LOAD iceberg")
+    print(con.execute("SELECT * FROM iceberg_scan(?)", [loc]).fetchall())
+```
+
+Notes: the Iceberg **namespace == tenant** (the default tenant maps to `default`;
+set `X-Bluedb-Tenant` via `db.headers(tenant=...)` for others), and a superuser
+token lists/loads any namespace. Column types round-trip into Iceberg —
+`DECIMAL` / `DATE` / `TIMESTAMP` / `UUID` included. Reads can carry
+`X-Bluedb-Min-Watermark` to demand freshness; write/read responses surface
+`X-Bluedb-Watermark`.
 
 ## Build from source
 
