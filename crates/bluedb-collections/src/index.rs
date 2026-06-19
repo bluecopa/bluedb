@@ -101,6 +101,36 @@ pub fn index_sql_type(t: IndexType) -> &'static str {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Compound-index helpers
+// ---------------------------------------------------------------------------
+
+/// Derived column name for a compound index over `paths`. Uses a distinct
+/// `__cidxm_` prefix (compound) so it never collides with single-field
+/// `__cidx_` columns. Components are dot→underscore normalized and joined by `__`.
+pub fn compound_col(paths: &[String]) -> String {
+    let parts: Vec<String> = paths.iter().map(|p| p.replace('.', "_")).collect();
+    format!("__cidxm_{}", parts.join("__"))
+}
+
+/// Encode component text values into one compound key. Uses NUL (`\u{0}`) as the
+/// separator (it effectively never appears in document field text), so distinct
+/// component tuples map to distinct keys.
+pub fn encode_compound(parts: &[String]) -> String {
+    parts.join("\u{0}")
+}
+
+/// The stored compound-key value for `doc` over `paths`: each component's text
+/// form (missing component → empty string), NUL-joined. Mirrors `derive_value`'s
+/// text rendering so a query built from the same values matches.
+pub fn compound_key(doc: &Value, paths: &[String]) -> String {
+    let parts: Vec<String> = paths
+        .iter()
+        .map(|p| derive_value(doc, p).unwrap_or_default())
+        .collect();
+    encode_compound(&parts)
+}
+
 /// Extract `path` from `doc` as a typed value for the derived column.
 ///
 /// For `Number`/`Bool`, returns `None` unless the field is exactly that JSON
@@ -368,5 +398,69 @@ mod tests {
         );
         assert_eq!(derive_typed_value(&doc, "missing", IndexType::Bool), None);
         assert_eq!(derive_typed_value(&doc, "missing", IndexType::Text), None);
+    }
+
+    // ---------------------------------------------------------------------------
+    // compound_col
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn compound_col_simple_paths() {
+        assert_eq!(
+            compound_col(&["a".into(), "b".into()]),
+            "__cidxm_a__b"
+        );
+    }
+
+    #[test]
+    fn compound_col_nested_path_dot_normalized() {
+        assert_eq!(
+            compound_col(&["x.y".into(), "z".into()]),
+            "__cidxm_x_y__z"
+        );
+    }
+
+    #[test]
+    fn compound_col_does_not_start_with_single_field_prefix() {
+        // Must NOT start with "__cidx_" so single-field introspection won't pick it up.
+        // It starts with "__cidxm_" which begins with "__cidx" but NOT "__cidx_".
+        let col = compound_col(&["a".into(), "b".into()]);
+        assert!(!col.starts_with("__cidx_"), "col was: {col}");
+    }
+
+    // ---------------------------------------------------------------------------
+    // encode_compound
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn encode_compound_nul_separator() {
+        assert_eq!(
+            encode_compound(&["x".into(), "y".into()]),
+            "x\u{0}y"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // compound_key
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn compound_key_string_and_number() {
+        let doc = json!({"a": "x", "b": 5});
+        // number → text "5"
+        assert_eq!(
+            compound_key(&doc, &["a".into(), "b".into()]),
+            "x\u{0}5"
+        );
+    }
+
+    #[test]
+    fn compound_key_missing_component_is_empty_part() {
+        let doc = json!({"a": "x"});
+        // "b" is absent → empty string component
+        assert_eq!(
+            compound_key(&doc, &["a".into(), "b".into()]),
+            "x\u{0}"
+        );
     }
 }
