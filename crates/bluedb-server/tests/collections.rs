@@ -367,6 +367,181 @@ async fn create_index_invalid_path_is_rejected_and_collection_intact() {
     assert_eq!(body["insertedCount"].as_i64().unwrap(), 1);
 }
 
+// ---------------------------------------------------------------------------
+// update / delete tests
+// ---------------------------------------------------------------------------
+
+/// Basic update + delete round-trip: insert, $set a field, find to confirm
+/// the field changed, delete, confirm gone.
+#[tokio::test]
+async fn update_set_then_find_reflects_change() {
+    let app = app().await;
+
+    // Insert.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/peeps/insert",
+        Some(json!({ "documents": [{ "name": "ada", "age": 36 }] })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "insert: {body}");
+    let id = body["insertedIds"][0].as_str().unwrap().to_string();
+
+    // Update age.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/peeps/update",
+        Some(json!({ "filter": { "_id": id }, "update": { "$set": { "age": 37 } } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "update: {body}");
+    assert_eq!(body["matchedCount"].as_i64().unwrap(), 1);
+    assert_eq!(body["modifiedCount"].as_i64().unwrap(), 1);
+    assert!(body["upsertedId"].is_null());
+
+    // Find — must see age 37.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/peeps/find",
+        Some(json!({ "filter": { "_id": id } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "find after update: {body}");
+    let docs = body["documents"].as_array().unwrap();
+    assert_eq!(docs.len(), 1);
+    assert_eq!(docs[0]["age"].as_i64().unwrap(), 37);
+
+    // Delete.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/peeps/delete",
+        Some(json!({ "filter": { "_id": id } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "delete: {body}");
+    assert_eq!(body["deletedCount"].as_i64().unwrap(), 1);
+
+    // Find again — must return 0 docs.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/peeps/find",
+        Some(json!({ "filter": { "_id": id } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "find after delete: {body}");
+    assert_eq!(body["documents"].as_array().unwrap().len(), 0);
+}
+
+/// upsert: update with no match + upsert:true inserts a new document and
+/// returns its id; a subsequent find by the upserted field returns it.
+#[tokio::test]
+async fn update_with_upsert_inserts_when_no_match() {
+    let app = app().await;
+
+    // Upsert into an empty collection.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/contacts/update",
+        Some(json!({
+            "filter": { "email": "x@y.z" },
+            "update": { "$set": { "name": "new", "email": "x@y.z" } },
+            "upsert": true
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "upsert: {body}");
+    assert_eq!(body["matchedCount"].as_i64().unwrap(), 0);
+    assert_eq!(body["modifiedCount"].as_i64().unwrap(), 0);
+    let upserted_id = body["upsertedId"].as_str().expect("upsertedId should be a string");
+    assert_eq!(upserted_id.len(), 24, "expected 24-char id, got '{upserted_id}'");
+
+    // find by the field set during upsert.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/contacts/find",
+        Some(json!({ "filter": { "_id": upserted_id } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "find after upsert: {body}");
+    let docs = body["documents"].as_array().unwrap();
+    assert_eq!(docs.len(), 1, "expected 1 upserted doc: {body}");
+    assert_eq!(docs[0]["name"].as_str().unwrap(), "new");
+}
+
+/// Index-consistency: createIndex, insert, update a field that has an index,
+/// then find by both old and new values to prove __cidx_* was rewritten.
+#[tokio::test]
+async fn update_keeps_index_consistent() {
+    let app = app().await;
+
+    // Create an index on "status" before any data.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/workers/createIndex",
+        Some(json!({ "keys": { "status": 1 } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "createIndex: {body}");
+
+    // Insert a doc.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/workers/insert",
+        Some(json!({ "documents": [{ "name": "ada", "status": "active" }] })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "insert: {body}");
+    let id = body["insertedIds"][0].as_str().unwrap().to_string();
+
+    // Update status from "active" to "idle".
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/workers/update",
+        Some(json!({
+            "filter": { "_id": id },
+            "update": { "$set": { "status": "idle" } }
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "update: {body}");
+    assert_eq!(body["modifiedCount"].as_i64().unwrap(), 1);
+
+    // find by new value "idle" — must return exactly 1 doc (proves __cidx_status updated).
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/workers/find",
+        Some(json!({ "filter": { "status": "idle" } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "find idle: {body}");
+    let docs = body["documents"].as_array().unwrap();
+    assert_eq!(docs.len(), 1, "expected 1 idle doc; got: {body}");
+    assert_eq!(docs[0]["name"].as_str().unwrap(), "ada");
+
+    // find by old value "active" — must return 0 docs (stale index would return 1).
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/workers/find",
+        Some(json!({ "filter": { "status": "active" } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "find active: {body}");
+    let docs = body["documents"].as_array().unwrap();
+    assert_eq!(docs.len(), 0, "expected 0 active docs; stale index? got: {body}");
+}
+
 /// createIndex is idempotent — calling it twice on the same field succeeds and
 /// the find still works.
 #[tokio::test]

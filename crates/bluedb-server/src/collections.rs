@@ -9,6 +9,8 @@
 //! - `POST /collections/{coll}/insert`              — bulk-insert documents
 //! - `POST /collections/{coll}/find`                — query documents (MQL filter / sort / limit)
 //! - `POST /collections/{coll}/createIndex`         — add a gateway-maintained JSON-path index
+//! - `POST /collections/{coll}/update`              — read-modify-write (+ upsert)
+//! - `POST /collections/{coll}/delete`              — delete by filter
 
 use std::collections::HashSet;
 
@@ -23,7 +25,9 @@ use bluedb_engine::rest_sql;
 use bluedb_collections::{
     filter::parse_filter,
     index::{derive_value, derived_col, valid_path},
+    model::ensure_id,
     project::apply_projection,
+    update::apply_update,
 };
 
 use crate::{authz::Scope, run_read_routed, schema::ident, AppError, AppState};
@@ -111,6 +115,87 @@ async fn indexed_col_names(
     Ok(cols)
 }
 
+/// INSERT a complete document into `coll`, setting `_id`, `doc`, and every
+/// `__cidx_*` column. Shared by `insert` (per doc) and `upsert` (single doc).
+///
+/// The caller must have already called `ensure_collection` and must pass `dcols`
+/// (from `indexed_col_names`) so the derived columns are populated atomically
+/// with the main row. `doc` must already contain `_id`.
+async fn write_full_doc(
+    state: &AppState,
+    tenant: &str,
+    coll: &str,
+    doc: &Value,
+    dcols: &HashSet<String>,
+) -> Result<(), AppError> {
+    let id = doc
+        .get("_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::internal("write_full_doc: doc missing _id"))?
+        .to_string();
+    let doc_text = doc.to_string();
+
+    let mut col_names = vec!["_id".to_string(), "doc".to_string()];
+    let mut params: Vec<bluedb_rest::Param> = vec![
+        bluedb_rest::Param::Str(id),
+        bluedb_rest::Param::Str(doc_text),
+    ];
+
+    for dcol in dcols {
+        let path = dcol.strip_prefix("__cidx_").unwrap_or(dcol);
+        col_names.push(dcol.clone());
+        match derive_value(doc, path) {
+            Some(v) => params.push(bluedb_rest::Param::Str(v)),
+            None => params.push(bluedb_rest::Param::Null),
+        }
+    }
+
+    let placeholders: Vec<String> = (1..=params.len()).map(|i| format!("${i}")).collect();
+    let sql = format!(
+        "INSERT INTO {coll} ({cols}) VALUES ({vals});",
+        cols = col_names.join(", "),
+        vals = placeholders.join(", "),
+    );
+    run_write(state, tenant, &sql, &params).await
+}
+
+/// UPDATE a row's `doc` and all `__cidx_*` columns for the given `_id`.
+/// Used by the `update` handler after applying an in-memory MQL update to
+/// the document so the secondary indexes stay consistent.
+async fn rewrite_doc_row(
+    state: &AppState,
+    tenant: &str,
+    coll: &str,
+    id: &str,
+    doc: &Value,
+    dcols: &HashSet<String>,
+) -> Result<(), AppError> {
+    let doc_text = doc.to_string();
+
+    // SET doc = $1, __cidx_a = $2, ... WHERE _id = $N
+    let mut set_clauses = vec!["doc = $1".to_string()];
+    let mut params: Vec<bluedb_rest::Param> = vec![bluedb_rest::Param::Str(doc_text)];
+
+    for dcol in dcols {
+        let path = dcol.strip_prefix("__cidx_").unwrap_or(dcol);
+        let idx = params.len() + 1;
+        set_clauses.push(format!("{dcol} = ${idx}"));
+        match derive_value(doc, path) {
+            Some(v) => params.push(bluedb_rest::Param::Str(v)),
+            None => params.push(bluedb_rest::Param::Null),
+        }
+    }
+
+    let id_idx = params.len() + 1;
+    params.push(bluedb_rest::Param::Str(id.to_string()));
+
+    let sql = format!(
+        "UPDATE {coll} SET {sets} WHERE _id = ${id_idx};",
+        sets = set_clauses.join(", "),
+    );
+    run_write(state, tenant, &sql, &params).await
+}
+
 // ---------------------------------------------------------------------------
 // Request types
 // ---------------------------------------------------------------------------
@@ -131,6 +216,33 @@ pub(crate) struct CreateIndexRequest {
 pub(crate) struct CreateIndexOptions {
     #[serde(default)]
     pub unique: bool,
+}
+
+/// Body for `POST /collections/{coll}/update`.
+///
+/// ```json
+/// {"filter": {"_id": "..."}, "update": {"$set": {"age": 37}}, "multi": false, "upsert": false}
+/// ```
+#[derive(Deserialize)]
+pub(crate) struct UpdateRequest {
+    pub filter: Value,
+    pub update: Value,
+    #[serde(default)]
+    pub multi: bool,
+    #[serde(default)]
+    pub upsert: bool,
+}
+
+/// Body for `POST /collections/{coll}/delete`.
+///
+/// ```json
+/// {"filter": {"status": "inactive"}, "multi": false}
+/// ```
+#[derive(Deserialize)]
+pub(crate) struct DeleteRequest {
+    pub filter: Value,
+    #[serde(default)]
+    pub multi: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -183,37 +295,8 @@ pub(crate) async fn insert(
         if !doc.is_object() {
             return Err(AppError::bad_request("each document must be a JSON object"));
         }
-        let id = bluedb_collections::model::ensure_id(&mut doc);
-
-        // Serialize the whole document (including _id) as the `doc` column value.
-        let doc_text = doc.to_string();
-
-        // Build INSERT with optional derived-column values for each index.
-        // Column order: _id, doc, [__cidx_<path>, ...]
-        let mut col_names = vec!["_id".to_string(), "doc".to_string()];
-        let mut params: Vec<bluedb_rest::Param> = vec![
-            bluedb_rest::Param::Str(id.clone()),
-            bluedb_rest::Param::Str(doc_text),
-        ];
-
-        for dcol in &dcols {
-            // Strip "__cidx_" to get the path (dots became underscores — we use the
-            // column name as the path key since we stored it that way).
-            let path = dcol.strip_prefix("__cidx_").unwrap_or(dcol);
-            col_names.push(dcol.clone());
-            match derive_value(&doc, path) {
-                Some(v) => params.push(bluedb_rest::Param::Str(v)),
-                None => params.push(bluedb_rest::Param::Null),
-            }
-        }
-
-        let placeholders: Vec<String> = (1..=params.len()).map(|i| format!("${i}")).collect();
-        let sql = format!(
-            "INSERT INTO {coll} ({cols}) VALUES ({vals});",
-            cols = col_names.join(", "),
-            vals = placeholders.join(", "),
-        );
-        run_write(&state, &tenant, &sql, &params).await?;
+        let id = ensure_id(&mut doc);
+        write_full_doc(&state, &tenant, &coll, &doc, &dcols).await?;
         inserted_ids.push(id);
     }
 
@@ -406,6 +489,153 @@ pub(crate) async fn create_index(
     }
 
     Ok(Json(json!({ "name": index_name })))
+}
+
+/// `POST /collections/{coll}/update` — read-modify-write with optional upsert.
+///
+/// Body: `{"filter": {...}, "update": {...}, "multi": bool, "upsert": bool}`.
+/// Applies the MQL update operator (or replacement) to each matched document,
+/// then rewrites the row (doc + all `__cidx_*` columns) so secondary indexes
+/// stay current. With `multi: false` (default) only the first match is updated.
+/// With `upsert: true`, inserts a new document when nothing matches.
+///
+/// Returns `{"matchedCount": N, "modifiedCount": N, "upsertedId": <str>|null}`.
+pub(crate) async fn update(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(coll): Path<String>,
+    Json(req): Json<UpdateRequest>,
+) -> Result<Json<Value>, AppError> {
+    state.authorize(&headers, Scope::DataWrite)?;
+    let tenant = state.tenant(&headers)?;
+    state.require_active()?;
+
+    let coll = ident(&coll)?.to_string();
+
+    let filter = parse_filter(&req.filter)
+        .map_err(|e| AppError::bad_request(e.to_string()).with_code("PARSE_ERROR"))?;
+
+    // Fetch index columns once — used for both the SELECT routing and the UPDATE.
+    let dcols = indexed_col_names(&state, &tenant, &coll).await.unwrap_or_default();
+
+    // Build the set of indexed paths for query routing.
+    let indexed: HashSet<String> = collect_filter_paths(&filter)
+        .into_iter()
+        .filter(|p| dcols.contains(&derived_col(p)))
+        .collect();
+
+    let mut params: Vec<Value> = Vec::new();
+    let where_sql = filter.to_sql_indexed(&mut params, &indexed);
+
+    let mut read_sql = format!("SELECT _id, doc FROM {coll} WHERE {where_sql}");
+    if !req.multi {
+        read_sql.push_str(" LIMIT 1");
+    }
+
+    let rows = run_read_routed(&state, &tenant, &read_sql, &params)
+        .await
+        .unwrap_or_default();
+
+    let matched = rows.len();
+    let mut modified: usize = 0;
+
+    for row in &rows {
+        let id = match row.get("_id") {
+            Some(Value::String(s)) => s.clone(),
+            _ => continue,
+        };
+        let mut doc: Value = match row.get("doc") {
+            Some(Value::String(s)) => serde_json::from_str(s).unwrap_or(Value::Null),
+            Some(v) => v.clone(),
+            None => continue,
+        };
+        let before = doc.clone();
+        apply_update(&mut doc, &req.update)
+            .map_err(|e| AppError::bad_request(e.to_string()).with_code("PARSE_ERROR"))?;
+        if doc != before {
+            rewrite_doc_row(&state, &tenant, &coll, &id, &doc, &dcols).await?;
+            modified += 1;
+        }
+    }
+
+    let mut upserted_id: Value = Value::Null;
+    if matched == 0 && req.upsert {
+        ensure_collection(&state, &tenant, &coll).await?;
+        let mut doc = json!({});
+        apply_update(&mut doc, &req.update)
+            .map_err(|e| AppError::bad_request(e.to_string()).with_code("PARSE_ERROR"))?;
+        let id = ensure_id(&mut doc);
+        write_full_doc(&state, &tenant, &coll, &doc, &dcols).await?;
+        upserted_id = json!(id);
+    }
+
+    Ok(Json(json!({
+        "matchedCount": matched,
+        "modifiedCount": modified,
+        "upsertedId": upserted_id,
+    })))
+}
+
+/// `POST /collections/{coll}/delete` — delete documents matching a filter.
+///
+/// Body: `{"filter": {...}, "multi": bool}`. With `multi: false` (default)
+/// deletes at most one document. Deleting a row automatically removes all
+/// `__cidx_*` column values — no extra maintenance needed.
+///
+/// Returns `{"deletedCount": N}`.
+pub(crate) async fn delete(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(coll): Path<String>,
+    Json(req): Json<DeleteRequest>,
+) -> Result<Json<Value>, AppError> {
+    state.authorize(&headers, Scope::DataWrite)?;
+    let tenant = state.tenant(&headers)?;
+    state.require_active()?;
+
+    let coll = ident(&coll)?.to_string();
+
+    let filter = parse_filter(&req.filter)
+        .map_err(|e| AppError::bad_request(e.to_string()).with_code("PARSE_ERROR"))?;
+
+    let dcols = indexed_col_names(&state, &tenant, &coll).await.unwrap_or_default();
+
+    let indexed: HashSet<String> = collect_filter_paths(&filter)
+        .into_iter()
+        .filter(|p| dcols.contains(&derived_col(p)))
+        .collect();
+
+    let mut params: Vec<Value> = Vec::new();
+    let where_sql = filter.to_sql_indexed(&mut params, &indexed);
+
+    // Read the matching _id values first so we know the count and can scope
+    // the DELETE precisely when multi=false. GlueSQL DELETE does not support
+    // LIMIT, so we delete by the specific _id set we collected.
+    let read_sql = format!("SELECT _id FROM {coll} WHERE {where_sql}");
+    let rows = run_read_routed(&state, &tenant, &read_sql, &params)
+        .await
+        .unwrap_or_default();
+
+    let to_delete: Vec<String> = rows
+        .iter()
+        .filter_map(|r| r.get("_id").and_then(Value::as_str).map(str::to_owned))
+        .take(if req.multi { usize::MAX } else { 1 })
+        .collect();
+
+    let deleted_count = to_delete.len();
+
+    for id in &to_delete {
+        let del_sql = format!("DELETE FROM {coll} WHERE _id = $1;");
+        run_write(
+            &state,
+            &tenant,
+            &del_sql,
+            &[bluedb_rest::Param::Str(id.clone())],
+        )
+        .await?;
+    }
+
+    Ok(Json(json!({ "deletedCount": deleted_count })))
 }
 
 /// Collect all leaf paths referenced by a `Filter` (for `Cmp` nodes only).

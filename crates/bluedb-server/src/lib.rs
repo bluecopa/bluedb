@@ -867,6 +867,8 @@ pub fn build_app(state: AppState) -> Router {
         .route("/collections/{coll}/insert", post(collections::insert))
         .route("/collections/{coll}/find", post(collections::find))
         .route("/collections/{coll}/createIndex", post(collections::create_index))
+        .route("/collections/{coll}/update", post(collections::update))
+        .route("/collections/{coll}/delete", post(collections::delete))
         .with_state(state)
 }
 
