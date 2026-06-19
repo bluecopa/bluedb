@@ -295,6 +295,65 @@ pub(crate) fn doc_to_tantivy(
     Some(td)
 }
 
+// ---------------------------------------------------------------------------
+// Write-path search-index maintenance
+// ---------------------------------------------------------------------------
+
+/// After an insert/update batch: (re)index the given documents if the collection
+/// has a search mapping. `docs` carry their `_id`. No-op if no mapping / not writer.
+pub(crate) async fn maintain_on_upsert(
+    state: &AppState,
+    tenant: &str,
+    coll: &str,
+    docs: &[Value],
+) -> Result<(), AppError> {
+    if docs.is_empty() {
+        return Ok(());
+    }
+    let Some(spec) = get_mapping(state, tenant, coll).await? else { return Ok(()) };
+    let ss = bluedb_search::mapping::compile(&spec).map_err(search_err)?;
+    let engine = state.search().await;
+    let idx = engine.index_for(tenant, coll, &ss).await?;
+
+    let mut ids = Vec::with_capacity(docs.len());
+    let mut tdocs = Vec::with_capacity(docs.len());
+    for doc in docs {
+        if let Some(td) = doc_to_tantivy(&ss, &spec, doc) {
+            if let Some(id) = doc.get(ID_FIELD).and_then(Value::as_str) {
+                ids.push(id.to_string());
+            }
+            tdocs.push(td);
+        }
+    }
+    if tdocs.is_empty() {
+        return Ok(());
+    }
+    idx.update(ids, tdocs)
+        .await
+        .map_err(|e| AppError::internal(format!("index upsert: {e}")))?;
+    Ok(())
+}
+
+/// After a delete: drop the given ids from the search index if a mapping exists.
+pub(crate) async fn maintain_on_delete(
+    state: &AppState,
+    tenant: &str,
+    coll: &str,
+    ids: &[String],
+) -> Result<(), AppError> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let Some(spec) = get_mapping(state, tenant, coll).await? else { return Ok(()) };
+    let ss = bluedb_search::mapping::compile(&spec).map_err(search_err)?;
+    let engine = state.search().await;
+    let idx = engine.index_for(tenant, coll, &ss).await?;
+    idx.delete(ids.iter().cloned())
+        .await
+        .map_err(|e| AppError::internal(format!("index delete: {e}")))?;
+    Ok(())
+}
+
 /// Read a `doc` cell as a JSON object, accepting both a JSON string (the
 /// pre-`run_read_routed` shape) and an already-parsed object. The `find`
 /// handler notes that `run_read_routed` re-inflates the `doc` column, so in

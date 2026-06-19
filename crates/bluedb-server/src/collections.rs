@@ -703,6 +703,7 @@ pub(crate) async fn insert(
     let cdefs = compound_col_defs(&state, &tenant, &coll).await?;
 
     let mut inserted_ids: Vec<String> = Vec::with_capacity(docs_arr.len());
+    let mut inserted_docs: Vec<serde_json::Value> = Vec::with_capacity(docs_arr.len());
 
     for raw_doc in docs_arr {
         let mut doc = raw_doc.clone();
@@ -712,8 +713,11 @@ pub(crate) async fn insert(
         }
         let id = ensure_id(&mut doc);
         write_full_doc(&state, &tenant, &coll, &doc, &dcols, &cdefs).await?;
+        inserted_docs.push(doc);
         inserted_ids.push(id);
     }
+
+    crate::search::maintain_on_upsert(&state, &tenant, &coll, &inserted_docs).await?;
 
     Ok(Json(json!({
         "insertedIds": inserted_ids,
@@ -1202,6 +1206,7 @@ pub(crate) async fn update(
 
     let matched = rows.len();
     let mut modified: usize = 0;
+    let mut updated_docs: Vec<serde_json::Value> = Vec::new();
 
     for row in &rows {
         let id = match row.get("_id") {
@@ -1218,6 +1223,7 @@ pub(crate) async fn update(
             .map_err(|e| AppError::bad_request(e.to_string()).with_code("PARSE_ERROR"))?;
         if doc != before {
             rewrite_doc_row(&state, &tenant, &coll, &id, &doc, &dcols, &cdefs).await?;
+            updated_docs.push(doc);
             modified += 1;
         }
     }
@@ -1230,8 +1236,11 @@ pub(crate) async fn update(
             .map_err(|e| AppError::bad_request(e.to_string()).with_code("PARSE_ERROR"))?;
         let id = ensure_id(&mut doc);
         write_full_doc(&state, &tenant, &coll, &doc, &dcols, &cdefs).await?;
+        updated_docs.push(doc);
         upserted_id = json!(id);
     }
+
+    crate::search::maintain_on_upsert(&state, &tenant, &coll, &updated_docs).await?;
 
     Ok(Json(json!({
         "matchedCount": matched,
@@ -1302,6 +1311,8 @@ pub(crate) async fn delete(
         )
         .await?;
     }
+
+    crate::search::maintain_on_delete(&state, &tenant, &coll, &to_delete).await?;
 
     Ok(Json(json!({ "deletedCount": deleted_count })))
 }
