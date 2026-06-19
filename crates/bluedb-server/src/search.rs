@@ -108,10 +108,6 @@ impl SearchEngine {
             .remove(&(tenant.to_string(), coll.to_string()));
     }
 
-    /// Snapshot of all cached (tenant, coll) keys (for the compaction sweep).
-    pub(crate) async fn cached_keys(&self) -> Vec<(String, String)> {
-        self.indexes.read().await.keys().cloned().collect()
-    }
 }
 
 /// Build an HTTP error from a `bluedb_search::SearchError` (ES-style: 400 for
@@ -275,7 +271,7 @@ pub(crate) fn doc_to_tantivy(
     let mut td = tantivy::TantivyDocument::default();
     let id_resolved = ss.field(ID_FIELD)?;
     td.add_text(id_resolved.field, id);
-    for (name, _fspec) in &spec.fields {
+    for name in spec.fields.keys() {
         let Some(resolved) = ss.field(name) else { continue };
         let Some(v) = doc.get(name) else { continue };
         match resolved.kind {
@@ -283,7 +279,7 @@ pub(crate) fn doc_to_tantivy(
                 if let Some(s) = v.as_str() {
                     td.add_text(resolved.field, s);
                 } else if !v.is_null() {
-                    td.add_text(resolved.field, &v.to_string());
+                    td.add_text(resolved.field, v.to_string());
                 }
             }
             FieldKindInfo::Integer => {
