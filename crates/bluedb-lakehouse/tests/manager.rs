@@ -179,3 +179,27 @@ async fn tenant_set_is_restored_on_a_fresh_manager() {
     assert!(eng.is_mirrored("docs"), "registry restored for the tenant");
     assert_eq!(read_docs(&eng).await.get(&1).map(String::as_str), Some("a"));
 }
+
+#[tokio::test]
+async fn default_mirror_on_makes_new_tenants_mirror() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Database::new(Arc::new(Db::open("bluedb", store.clone()).await.unwrap()));
+    let cdc = CdcConfig::default();
+    let mgr = LakehouseManager::open(
+        object_store_file_io(store.clone(), ""),
+        "lakehouse",
+        db.clone(),
+        cdc.clone(),
+        cfg(),
+    )
+    .await
+    .unwrap();
+    // Testkit mirror mode: every fresh tenant mirrors by default, including
+    // arbitrary underscore-named tenants with no persisted registry.
+    mgr.set_default_mirror(true);
+    let eng = mgr.engine_for("ws1_sol2_copa_collection_v2").await.unwrap();
+    assert!(
+        eng.is_mirrored("any_table"),
+        "a fresh tenant must mirror by default when default_mirror_on is set"
+    );
+}

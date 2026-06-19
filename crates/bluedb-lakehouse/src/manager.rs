@@ -14,6 +14,7 @@
 //! every tenant (an idle tenant's `seal()` is a cheap no-op).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -82,6 +83,9 @@ pub struct LakehouseManager {
     index_lock: tokio::sync::Mutex<()>,
     /// Background seal + compaction task handles (aborted on [`Self::shutdown`]).
     handles: Mutex<Vec<JoinHandle<()>>>,
+    /// Testkit mirror mode: when true, a freshly-opened tenant mirrors by
+    /// default (no per-tenant PRAGMA needed). Prod leaves it false.
+    default_mirror_on: AtomicBool,
 }
 
 impl LakehouseManager {
@@ -107,6 +111,7 @@ impl LakehouseManager {
             engines: RwLock::new(HashMap::new()),
             index_lock: tokio::sync::Mutex::new(()),
             handles: Mutex::new(Vec::new()),
+            default_mirror_on: AtomicBool::new(false),
         });
         mgr.reopen_all().await?;
         mgr.clone().spawn_loops();
@@ -147,8 +152,18 @@ impl LakehouseManager {
             map.insert(tenant.to_string(), engine.clone());
             engine
         };
+        // Testkit mirror mode: a freshly-created tenant mirrors by default.
+        if self.default_mirror_on.load(Ordering::Relaxed) {
+            engine.apply_pragma(LhPragma::GlobalDefault(true)).await?;
+        }
         self.register_tenant(tenant).await?;
         Ok(engine)
+    }
+
+    /// Make every subsequently-opened tenant mirror by default (testkit mirror
+    /// mode). Call right after [`open`], before any writes.
+    pub fn set_default_mirror(&self, on: bool) {
+        self.default_mirror_on.store(on, Ordering::Relaxed);
     }
 
     /// Apply a `PRAGMA lakehouse_mirror` for `tenant` (creating its engine).
