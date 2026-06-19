@@ -554,3 +554,30 @@ async fn fetch_sources(
     }
     Ok(map)
 }
+
+/// Periodic compaction across all mapped collections for all search tenants.
+/// Writer-only (guarded). Mirrors the TTL sweep fan-out.
+pub(crate) async fn sweep_all_tenants_compaction(state: &AppState) -> Result<(), AppError> {
+    if !state.is_writer() {
+        return Ok(());
+    }
+    let engine = state.search().await;
+    if engine.writer_blob().is_none() {
+        return Ok(());
+    }
+    for tenant in list_search_tenants(state).await? {
+        for coll in list_mapped_collections(state, &tenant).await? {
+            let Some(spec) = get_mapping(state, &tenant, &coll).await? else { continue };
+            let ss = match bluedb_search::mapping::compile(&spec) {
+                Ok(ss) => ss,
+                Err(_) => continue,
+            };
+            if let Ok(idx) = engine.index_for(&tenant, &coll, &ss).await {
+                if let Err(e) = idx.maybe_compact().await {
+                    eprintln!("bluedb-server: search compaction error ({tenant}/{coll}): {e:?}");
+                }
+            }
+        }
+    }
+    Ok(())
+}

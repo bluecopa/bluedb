@@ -251,6 +251,11 @@ struct Inner {
     /// tenants on the active writer. Aborted on demote / re-promote. `None` until
     /// the first promote. Interval = `BLUEDB_TTL_SWEEP_INTERVAL_SECS` (default 60).
     ttl_sweep_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Background search compaction sweep: periodically calls `FtsIndex::maybe_compact`
+    /// across all mapped collections for all search tenants. Writer-only. Aborted on
+    /// demote / re-promote. `None` until the first promote.
+    /// Interval = `BLUEDB_SEARCH_COMPACTION_INTERVAL_SECS` (default 120).
+    search_compaction_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Shared CDC control for the lakehouse mirror — installed on every write
     /// connection so mutations on mirror-enabled tables land in the CDC log, and
     /// mutated by `PRAGMA lakehouse_mirror`. Lives for the node's lifetime so the
@@ -312,6 +317,7 @@ impl AppState {
                 search: RwLock::new(search::SearchEngine::empty()),
                 seal_handle: Mutex::new(None),
                 ttl_sweep_handle: Mutex::new(None),
+                search_compaction_handle: Mutex::new(None),
                 cdc: CdcConfig::default(),
                 lakehouse_base: String::new(),
                 lakehouse_default_on: false,
@@ -595,6 +601,35 @@ impl AppState {
             *self.inner.ttl_sweep_handle.lock().unwrap() = Some(ttl_handle);
         }
 
+        // Start the search compaction sweep background task. On each tick, calls
+        // FtsIndex::maybe_compact across all mapped collections for all search tenants.
+        // Interval = `BLUEDB_SEARCH_COMPACTION_INTERVAL_SECS` (default 120 s).
+        // A demote aborts the task; re-promote replaces it.
+        {
+            let compaction_interval = {
+                let secs = std::env::var("BLUEDB_SEARCH_COMPACTION_INTERVAL_SECS")
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .unwrap_or(120);
+                Duration::from_secs(secs)
+            };
+            if let Some(h) = self.inner.search_compaction_handle.lock().unwrap().take() {
+                h.abort();
+            }
+            let compaction_state = self.clone();
+            let compaction_handle = tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(compaction_interval);
+                ticker.tick().await; // skip the immediate first tick
+                loop {
+                    ticker.tick().await;
+                    if let Err(e) = search::sweep_all_tenants_compaction(&compaction_state).await {
+                        eprintln!("bluedb-server: search compaction sweep error: {:?}", e);
+                    }
+                }
+            });
+            *self.inner.search_compaction_handle.lock().unwrap() = Some(compaction_handle);
+        }
+
         // Reopen the lakehouse mirror over the SAME object store + writer database
         // (the Iceberg tables live alongside the SQL data, in the same bucket the
         // warehouse reads). Restores the durable opt-out registry, then spawns the
@@ -652,6 +687,10 @@ impl AppState {
         }
         // Stop the TTL sweep background task — a passive node must not mutate data.
         if let Some(h) = self.inner.ttl_sweep_handle.lock().unwrap().take() {
+            h.abort();
+        }
+        // Stop the search compaction sweep — a passive node must not run compaction.
+        if let Some(h) = self.inner.search_compaction_handle.lock().unwrap().take() {
             h.abort();
         }
         *self.inner.fts.write().await = FtsEngine::new();
