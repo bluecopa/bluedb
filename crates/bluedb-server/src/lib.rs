@@ -870,6 +870,7 @@ pub fn build_app(state: AppState) -> Router {
         .route("/collections/{coll}/update", post(collections::update))
         .route("/collections/{coll}/delete", post(collections::delete))
         .route("/collections/{coll}/aggregate", post(collections::aggregate))
+        .route("/collections/{coll}/count", post(collections::count))
         .with_state(state)
 }
 

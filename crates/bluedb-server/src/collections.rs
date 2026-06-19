@@ -695,6 +695,64 @@ pub(crate) async fn aggregate(
     Ok(Json(json!({ "documents": rows })))
 }
 
+/// `POST /collections/{coll}/count` — count documents matching a filter.
+///
+/// Body: `{"filter": {...}}`. All fields are optional; an empty filter counts
+/// every document. For equality filters on indexed fields the derived column
+/// (`__cidx_<path>`) is used — same index-aware routing as `find`. Non-indexed
+/// fields go through `doc->>'field'` which may be guardrail-rejected and routed
+/// to DataFusion (requires a prior seal for freshly-written data).
+///
+/// Returns `{"count": N}`.
+pub(crate) async fn count(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(coll): Path<String>,
+    Json(req): Json<Value>,
+) -> Result<Json<Value>, AppError> {
+    state.authorize(&headers, Scope::DataRead)?;
+    let tenant = state.tenant(&headers)?;
+    // Reads are allowed anywhere — no `require_active()`.
+
+    let coll = ident(&coll)?.to_string();
+
+    let filter = parse_filter(req.get("filter").unwrap_or(&json!({})))
+        .map_err(|e| AppError::bad_request(e.to_string()).with_code("PARSE_ERROR"))?;
+
+    // Resolve indexed paths — same logic as `find`.
+    let dcol_names = indexed_col_names(&state, &tenant, &coll).await.unwrap_or_default();
+    let indexed: HashSet<String> = collect_filter_paths(&filter)
+        .into_iter()
+        .filter(|p| dcol_names.contains(&derived_col(p)))
+        .collect();
+
+    let mut params: Vec<Value> = Vec::new();
+    let where_sql = filter.to_sql_indexed(&mut params, &indexed);
+
+    let sql = format!("SELECT COUNT(*) AS n FROM {coll} WHERE {where_sql}");
+
+    let rows = run_read_routed(&state, &tenant, &sql, &params).await?;
+
+    // The alias "n" is how GlueSQL surfaces it; DataFusion may surface it
+    // differently. Extract robustly: try "n" first, then fall back to the
+    // first value in the row object.
+    let n: i64 = rows
+        .first()
+        .and_then(|r| {
+            // Try the alias directly.
+            if let Some(v) = r.get("n").and_then(|v| v.as_i64()) {
+                return Some(v);
+            }
+            // Try the first value in the row (DataFusion may use a generated name).
+            r.as_object()
+                .and_then(|m| m.values().next())
+                .and_then(|v| v.as_i64())
+        })
+        .unwrap_or(0);
+
+    Ok(Json(json!({ "count": n })))
+}
+
 /// Collect all leaf paths referenced by a `Filter` (for `Cmp` nodes only).
 /// Used to build the indexed-path set for `find`.
 fn collect_filter_paths(filter: &bluedb_collections::filter::Filter) -> Vec<String> {

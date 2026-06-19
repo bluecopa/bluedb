@@ -748,6 +748,57 @@ async fn aggregate_unknown_stage_is_400() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "unknown stage should be 400");
 }
 
+// ---------------------------------------------------------------------------
+// count tests
+// ---------------------------------------------------------------------------
+
+/// `POST /collections/{coll}/count` with a filter and with an empty filter.
+/// The `v >= 20` filter on a non-indexed field routes through DataFusion, so
+/// a seal is required after insert (same pattern as `find_by_id_and_by_field`).
+#[tokio::test]
+async fn count_with_filter() {
+    let (app, state) = app_with_state().await;
+
+    // Insert {v:10}, {v:20}, {v:30}.
+    for v in [10i64, 20, 30] {
+        let (s, body) = call(
+            &app,
+            "POST",
+            "/collections/c/insert",
+            Some(json!({ "documents": [{ "v": v }] })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "insert v={v}: {body}");
+    }
+
+    // Seal so the DataFusion/Iceberg path sees the data.
+    state.seal_now().await.expect("seal");
+
+    // count with filter v >= 20  → 2 (v=20 and v=30).
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/collections/c/count",
+        Some(json!({ "filter": { "v": { "$gte": 20 } } })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "count filtered: {body}");
+    let n = body["count"].as_i64().expect("count field missing");
+    assert_eq!(n, 2, "expected 2 docs with v>=20, got: {body}");
+
+    // count with empty filter {} → 3 (all docs).
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/collections/c/count",
+        Some(json!({ "filter": {} })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "count all: {body}");
+    let n_all = body["count"].as_i64().expect("count field missing");
+    assert_eq!(n_all, 3, "expected 3 total docs, got: {body}");
+}
+
 /// Helper: read a string field that may have arrived as a JSON object's member
 /// or directly. The aggregate result projects `_id` plus extracted columns; a
 /// `$match`+`$sort` pipeline with no `$project` returns the base table columns
