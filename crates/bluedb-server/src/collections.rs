@@ -108,7 +108,7 @@ async fn ensure_collection(state: &AppState, tenant: &str, coll: &str) -> Result
 /// Run a single parameterized write statement (`INSERT`, `UPDATE`) through the
 /// FTS commit-observer path so the live index is maintained. Mirrors the write
 /// branch of `exec_sql`.
-async fn run_write(
+pub(crate) async fn run_write(
     state: &AppState,
     tenant: &str,
     sql: &str,
@@ -122,7 +122,7 @@ async fn run_write(
 /// Run a DDL statement (ALTER TABLE, CREATE INDEX) with `allow_arbitrary = true`.
 /// DDL does not go through the FTS rewriter (which would reject it via the DML
 /// guard). Uses a serialized connection for write ordering.
-async fn run_ddl(
+pub(crate) async fn run_ddl(
     state: &AppState,
     tenant: &str,
     sql: &str,
@@ -140,7 +140,7 @@ async fn run_ddl(
 /// query (`table not found`), but that just means there are no rows to match —
 /// upsert should still proceed. Genuine I/O errors (storage failures, etc.) are
 /// still propagated via `?`.
-async fn run_read_routed_for_mutation(
+pub(crate) async fn run_read_routed_for_mutation(
     state: &AppState,
     tenant: &str,
     sql: &str,
@@ -703,6 +703,7 @@ pub(crate) async fn insert(
     let cdefs = compound_col_defs(&state, &tenant, &coll).await?;
 
     let mut inserted_ids: Vec<String> = Vec::with_capacity(docs_arr.len());
+    let mut inserted_docs: Vec<serde_json::Value> = Vec::with_capacity(docs_arr.len());
 
     for raw_doc in docs_arr {
         let mut doc = raw_doc.clone();
@@ -712,7 +713,15 @@ pub(crate) async fn insert(
         }
         let id = ensure_id(&mut doc);
         write_full_doc(&state, &tenant, &coll, &doc, &dcols, &cdefs).await?;
+        inserted_docs.push(doc);
         inserted_ids.push(id);
+    }
+
+    // Search-index maintenance runs AFTER the durable SQL write has committed.
+    // A failure here must NOT fail the already-committed write — log and swallow;
+    // the index self-heals on the next write or mapping re-declare (backfill).
+    if let Err(e) = crate::search::maintain_on_upsert(&state, &tenant, &coll, &inserted_docs).await {
+        eprintln!("bluedb-server: search index maintenance failed for collection {coll}: {e:?}");
     }
 
     Ok(Json(json!({
@@ -1202,6 +1211,7 @@ pub(crate) async fn update(
 
     let matched = rows.len();
     let mut modified: usize = 0;
+    let mut updated_docs: Vec<serde_json::Value> = Vec::new();
 
     for row in &rows {
         let id = match row.get("_id") {
@@ -1218,6 +1228,7 @@ pub(crate) async fn update(
             .map_err(|e| AppError::bad_request(e.to_string()).with_code("PARSE_ERROR"))?;
         if doc != before {
             rewrite_doc_row(&state, &tenant, &coll, &id, &doc, &dcols, &cdefs).await?;
+            updated_docs.push(doc);
             modified += 1;
         }
     }
@@ -1230,7 +1241,13 @@ pub(crate) async fn update(
             .map_err(|e| AppError::bad_request(e.to_string()).with_code("PARSE_ERROR"))?;
         let id = ensure_id(&mut doc);
         write_full_doc(&state, &tenant, &coll, &doc, &dcols, &cdefs).await?;
+        updated_docs.push(doc);
         upserted_id = json!(id);
+    }
+
+    // See `insert`: a post-commit index-maintenance failure must not fail the write.
+    if let Err(e) = crate::search::maintain_on_upsert(&state, &tenant, &coll, &updated_docs).await {
+        eprintln!("bluedb-server: search index maintenance failed for collection {coll}: {e:?}");
     }
 
     Ok(Json(json!({
@@ -1301,6 +1318,11 @@ pub(crate) async fn delete(
             &[bluedb_rest::Param::Str(id.clone())],
         )
         .await?;
+    }
+
+    // See `insert`: a post-commit index-maintenance failure must not fail the write.
+    if let Err(e) = crate::search::maintain_on_delete(&state, &tenant, &coll, &to_delete).await {
+        eprintln!("bluedb-server: search index maintenance failed for collection {coll}: {e:?}");
     }
 
     Ok(Json(json!({ "deletedCount": deleted_count })))

@@ -53,6 +53,7 @@ mod ledger_api;
 mod evidence_api;
 mod graph_api;
 mod signer;
+mod search;
 
 /// ES256-DER verification helper, re-exported for Rust consumers (and the e2e
 /// test) to verify Signed Tree Heads against a published SPKI-PEM public key.
@@ -239,6 +240,10 @@ struct Inner {
     /// Installed as a commit observer on every write connection (maintains the live
     /// index) and consulted by `/sql` to rewrite `@@`/`ts_rank` (read-your-writes).
     fts: RwLock<Arc<FtsEngine>>,
+    /// Per-(tenant,collection) tantivy search engine, swapped on promote/demote
+    /// exactly like `fts`. Writer-only on writes (blob = Some); empty on passive
+    /// nodes and before the first promote.
+    search: RwLock<Arc<search::SearchEngine>>,
     /// The background seal/compaction scheduler for the durable FTS engine, spawned
     /// on promote and aborted on demote / re-promote. `None` until the first promote.
     seal_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -246,6 +251,11 @@ struct Inner {
     /// tenants on the active writer. Aborted on demote / re-promote. `None` until
     /// the first promote. Interval = `BLUEDB_TTL_SWEEP_INTERVAL_SECS` (default 60).
     ttl_sweep_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Background search compaction sweep: periodically calls `FtsIndex::maybe_compact`
+    /// across all mapped collections for all search tenants. Writer-only. Aborted on
+    /// demote / re-promote. `None` until the first promote.
+    /// Interval = `BLUEDB_SEARCH_COMPACTION_INTERVAL_SECS` (default 120).
+    search_compaction_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Shared CDC control for the lakehouse mirror — installed on every write
     /// connection so mutations on mirror-enabled tables land in the CDC log, and
     /// mutated by `PRAGMA lakehouse_mirror`. Lives for the node's lifetime so the
@@ -304,8 +314,10 @@ impl AppState {
                 writer_bound: AtomicBool::new(false),
                 authz: OnceLock::new(),
                 fts: RwLock::new(FtsEngine::new()),
+                search: RwLock::new(search::SearchEngine::empty()),
                 seal_handle: Mutex::new(None),
                 ttl_sweep_handle: Mutex::new(None),
+                search_compaction_handle: Mutex::new(None),
                 cdc: CdcConfig::default(),
                 lakehouse_base: String::new(),
                 lakehouse_default_on: false,
@@ -558,6 +570,7 @@ impl AppState {
         let handle = fts.clone().spawn_seal_scheduler(fts_seal_interval());
         *self.inner.seal_handle.lock().unwrap() = Some(handle);
         *self.inner.fts.write().await = fts;
+        *self.inner.search.write().await = search::SearchEngine::new_durable(database.substrate());
 
         // Start the TTL sweep background task. On each tick, reads the global
         // tenant registry and sweeps every tenant that has a TTL index.
@@ -586,6 +599,35 @@ impl AppState {
                 }
             });
             *self.inner.ttl_sweep_handle.lock().unwrap() = Some(ttl_handle);
+        }
+
+        // Start the search compaction sweep background task. On each tick, calls
+        // FtsIndex::maybe_compact across all mapped collections for all search tenants.
+        // Interval = `BLUEDB_SEARCH_COMPACTION_INTERVAL_SECS` (default 120 s).
+        // A demote aborts the task; re-promote replaces it.
+        {
+            let compaction_interval = {
+                let secs = std::env::var("BLUEDB_SEARCH_COMPACTION_INTERVAL_SECS")
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .unwrap_or(120);
+                Duration::from_secs(secs)
+            };
+            if let Some(h) = self.inner.search_compaction_handle.lock().unwrap().take() {
+                h.abort();
+            }
+            let compaction_state = self.clone();
+            let compaction_handle = tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(compaction_interval);
+                ticker.tick().await; // skip the immediate first tick
+                loop {
+                    ticker.tick().await;
+                    if let Err(e) = search::sweep_all_tenants_compaction(&compaction_state).await {
+                        eprintln!("bluedb-server: search compaction sweep error: {:?}", e);
+                    }
+                }
+            });
+            *self.inner.search_compaction_handle.lock().unwrap() = Some(compaction_handle);
         }
 
         // Reopen the lakehouse mirror over the SAME object store + writer database
@@ -647,7 +689,12 @@ impl AppState {
         if let Some(h) = self.inner.ttl_sweep_handle.lock().unwrap().take() {
             h.abort();
         }
+        // Stop the search compaction sweep — a passive node must not run compaction.
+        if let Some(h) = self.inner.search_compaction_handle.lock().unwrap().take() {
+            h.abort();
+        }
         *self.inner.fts.write().await = FtsEngine::new();
+        *self.inner.search.write().await = search::SearchEngine::empty();
         // Stop the lakehouse seal/compaction loops and drop the manager — a
         // passive node mirrors nothing (the next promote reopens from the tenant
         // index + registries).
@@ -706,6 +753,20 @@ impl AppState {
     /// hold a snapshot of the engine that was active when they asked.
     pub(crate) async fn fts(&self) -> Arc<FtsEngine> {
         self.inner.fts.read().await.clone()
+    }
+
+    /// The currently-bound search engine (for the `/collections` ES-shaped search
+    /// handlers). Mirrors `fts()` — clones the `Arc` out of the role-swap `RwLock`.
+    pub(crate) async fn search(&self) -> Arc<search::SearchEngine> {
+        self.inner.search.read().await.clone()
+    }
+
+    /// A read guard over the currently-bound database option. Used by the search
+    /// read path which needs to build a blob store on any node (writer or replica).
+    pub(crate) async fn db_read(
+        &self,
+    ) -> tokio::sync::RwLockReadGuard<'_, Option<bluedb_sql::Database>> {
+        self.inner.db.read().await
     }
 
     /// A connection to the currently-bound database, or `503` if unbound. Carries
@@ -950,6 +1011,11 @@ pub fn build_app(state: AppState) -> Router {
         .route("/collections/{coll}/delete", post(collections::delete))
         .route("/collections/{coll}/aggregate", post(collections::aggregate))
         .route("/collections/{coll}/count", post(collections::count))
+        .route(
+            "/collections/{coll}/searchIndex",
+            post(search::create_search_index).get(search::get_search_index),
+        )
+        .route("/collections/{coll}/search", post(search::search))
         .with_state(state)
 }
 

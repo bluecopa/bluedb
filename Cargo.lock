@@ -880,6 +880,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "bluedb-search"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "bluedb-fts",
+ "serde",
+ "serde_json",
+ "tantivy",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "bluedb-server"
 version = "0.0.0"
 dependencies = [
@@ -893,12 +905,15 @@ dependencies = [
  "bluedb-collections",
  "bluedb-engine",
  "bluedb-evidence",
+ "bluedb-fts",
  "bluedb-ha",
  "bluedb-lakehouse",
  "bluedb-ledger",
  "bluedb-query",
  "bluedb-rest",
+ "bluedb-search",
  "bluedb-sql",
+ "bluedb-storage",
  "chrono",
  "gluesql-core",
  "http-body-util",
@@ -909,6 +924,7 @@ dependencies = [
  "serde",
  "serde_json",
  "slatedb",
+ "tantivy",
  "tempfile",
  "tokio",
  "tower",

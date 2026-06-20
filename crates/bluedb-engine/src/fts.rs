@@ -33,8 +33,11 @@ use bluedb_fts::merge::Compactor;
 use bluedb_fts::open::open_split_lazy;
 use bluedb_fts::policy::CompactionPolicy;
 use bluedb_fts::search::{
-    multi_split_search_filtered, multi_split_search_filtered_ids, MultiSplitHit, SplitHandle,
+    multi_split_count_query_filtered, multi_split_search_filtered,
+    multi_split_search_filtered_ids, multi_split_search_query_filtered_ids,
+    multi_split_search_query_sorted_ids, MultiSplitHit, SplitHandle,
 };
+use tantivy::query::Query;
 use bluedb_fts::tombstones::Tombstones;
 use bluedb_fts::writer::IndexWriter;
 use bluedb_fts::IdField;
@@ -247,6 +250,71 @@ impl FtsIndex {
             &handles,
             query,
             fields,
+            limit,
+            self.id_field,
+            &tombstones,
+        )?)
+    }
+
+    /// BM25 search with a pre-built tantivy [`Query`]; returns `(id, score)`.
+    pub async fn search_query_ids(
+        &self,
+        query: &dyn Query,
+        limit: usize,
+    ) -> Result<Vec<(String, f32)>> {
+        let manifest = self.load_manifest().await?;
+        let tombstones = self.load_tombstones().await?;
+        let opened = self.open_splits(manifest.splits.iter()).await?;
+        let handles: Vec<SplitHandle> = opened
+            .iter()
+            .map(|(id, generation, index)| SplitHandle::with_generation(id.clone(), *generation, index))
+            .collect();
+        Ok(multi_split_search_query_filtered_ids(
+            &handles,
+            query,
+            limit,
+            self.id_field,
+            &tombstones,
+        )?)
+    }
+
+    /// Total live matches for a pre-built tantivy [`Query`].
+    pub async fn count_query(&self, query: &dyn Query) -> Result<usize> {
+        let manifest = self.load_manifest().await?;
+        let tombstones = self.load_tombstones().await?;
+        let opened = self.open_splits(manifest.splits.iter()).await?;
+        let handles: Vec<SplitHandle> = opened
+            .iter()
+            .map(|(id, generation, index)| SplitHandle::with_generation(id.clone(), *generation, index))
+            .collect();
+        Ok(multi_split_count_query_filtered(
+            &handles,
+            query,
+            self.id_field,
+            &tombstones,
+        )?)
+    }
+
+    /// Search with a pre-built [`Query`] ordered by an `i64` fast field.
+    pub async fn search_query_sorted_ids(
+        &self,
+        query: &dyn Query,
+        sort_field_name: &str,
+        descending: bool,
+        limit: usize,
+    ) -> Result<Vec<(String, f32)>> {
+        let manifest = self.load_manifest().await?;
+        let tombstones = self.load_tombstones().await?;
+        let opened = self.open_splits(manifest.splits.iter()).await?;
+        let handles: Vec<SplitHandle> = opened
+            .iter()
+            .map(|(id, generation, index)| SplitHandle::with_generation(id.clone(), *generation, index))
+            .collect();
+        Ok(multi_split_search_query_sorted_ids(
+            &handles,
+            query,
+            sort_field_name,
+            descending,
             limit,
             self.id_field,
             &tombstones,

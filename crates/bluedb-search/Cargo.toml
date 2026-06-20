@@ -1,0 +1,16 @@
+[package]
+name = "bluedb-search"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+description = "Elasticsearch-shaped search DSL translated onto tantivy (bluedb-fts) for the /collections document API."
+
+[dependencies]
+bluedb-fts = { workspace = true }
+tantivy    = { workspace = true, features = ["stemmer"] }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+thiserror  = { workspace = true }
+anyhow     = { workspace = true }
+
+[dev-dependencies]

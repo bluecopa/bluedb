@@ -18,6 +18,11 @@ use tantivy::{DocAddress, Index, TantivyDocument};
 use crate::tombstones::Tombstones;
 use crate::{doc_id_string, IdField};
 
+/// Per-split match-collection cap for [`multi_split_count_query_filtered`]. A
+/// dedup'd total at or above this value is a lower bound, not an exact count
+/// (callers surface that as `"relation": "gte"`).
+pub const COUNT_CAP: usize = 100_000;
+
 /// Deterministic merged ordering for multi-split hits: descending score, then
 /// ascending `(split_ord, segment_ord, doc_id)` so results are stable across
 /// runs. Shared by every search variant.
@@ -441,6 +446,204 @@ pub fn multi_split_count_filtered(
         }
     }
     Ok(total)
+}
+
+// ============================================================================
+// Query-object variants: same logic as the string-based functions above, but
+// accept a pre-built `&dyn Query` instead of a query string + parser.
+// ============================================================================
+
+/// Like [`multi_split_search_filtered_ids`] but takes a pre-built tantivy
+/// [`Query`] (no `QueryParser`). Returns `(id, bm25_score)` newest-wins-deduped,
+/// tombstone-filtered, BM25-ordered, truncated to `limit`.
+pub fn multi_split_search_query_filtered_ids(
+    splits: &[SplitHandle<'_>],
+    query: &dyn Query,
+    limit: usize,
+    id_field: IdField,
+    tombstones: &Tombstones,
+) -> anyhow::Result<Vec<(String, f32)>> {
+    let per_split_limit = limit.saturating_add(tombstones.len()).max(limit);
+
+    struct Candidate {
+        hit: MultiSplitHit,
+        id: String,
+        generation: u64,
+    }
+
+    let mut all: Vec<Candidate> = Vec::new();
+    for (split_ord, handle) in splits.iter().enumerate() {
+        let reader = handle.index.reader()?;
+        let searcher = reader.searcher();
+        let hits = searcher.search(query, &TopDocs::with_limit(per_split_limit).order_by_score())?;
+        for (score, doc_address) in hits {
+            let stored: TantivyDocument = searcher.doc(doc_address)?;
+            let id = id_field.extract(&stored).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "split {} hit at {doc_address:?} has no stored id-field value",
+                    handle.split_id
+                )
+            })?;
+            if tombstones.is_deleted_at(&id, handle.generation) {
+                continue;
+            }
+            all.push(Candidate {
+                hit: MultiSplitHit { score, split_ord, doc_address },
+                id,
+                generation: handle.generation,
+            });
+        }
+    }
+
+    use std::collections::HashMap;
+    let mut best_by_id: HashMap<&str, usize> = HashMap::with_capacity(all.len());
+    for (i, cand) in all.iter().enumerate() {
+        match best_by_id.get(cand.id.as_str()) {
+            Some(&j) => {
+                let cur = &all[j];
+                let wins = cand.generation > cur.generation
+                    || (cand.generation == cur.generation
+                        && (cand.hit.split_ord > cur.hit.split_ord
+                            || (cand.hit.split_ord == cur.hit.split_ord
+                                && cand.hit.score > cur.hit.score)));
+                if wins {
+                    best_by_id.insert(cand.id.as_str(), i);
+                }
+            }
+            None => {
+                best_by_id.insert(cand.id.as_str(), i);
+            }
+        }
+    }
+    let keep: std::collections::BTreeSet<usize> = best_by_id.values().copied().collect();
+    let mut kept: Vec<&Candidate> = all
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| keep.contains(i))
+        .map(|(_, c)| c)
+        .collect();
+    kept.sort_by(|a, b| cmp_hits(&a.hit, &b.hit));
+    let mut out: Vec<(String, f32)> = kept.into_iter().map(|c| (c.id.clone(), c.hit.score)).collect();
+    out.truncate(limit);
+    Ok(out)
+}
+
+/// Total live matches for a pre-built [`Query`] (tombstone-filtered, deduped).
+///
+/// Like [`multi_split_count_filtered`] but accepts a pre-built `&dyn Query`
+/// instead of a query string. Counts distinct live document ids across all
+/// splits, applying generation-scoped tombstone filtering and last-write-wins
+/// dedup so each logical document is counted at most once.
+pub fn multi_split_count_query_filtered(
+    splits: &[SplitHandle<'_>],
+    query: &dyn Query,
+    id_field: IdField,
+    tombstones: &Tombstones,
+) -> anyhow::Result<usize> {
+    let mut live: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    for handle in splits.iter() {
+        let reader = handle.index.reader()?;
+        let searcher = reader.searcher();
+        let hits = searcher.search(query, &TopDocs::with_limit(COUNT_CAP).order_by_score())?;
+        for (_score, doc_address) in hits {
+            let stored: TantivyDocument = searcher.doc(doc_address)?;
+            if let Some(id) = id_field.extract(&stored) {
+                if tombstones.is_deleted_at(&id, handle.generation) {
+                    continue;
+                }
+                let e = live.entry(id).or_insert(handle.generation);
+                if handle.generation > *e {
+                    *e = handle.generation;
+                }
+            }
+        }
+    }
+    Ok(live.len())
+}
+
+/// Like [`multi_split_search_query_filtered_ids`] but ordered by an `i64`
+/// fast field instead of BM25 score. Returns `(id, 0.0)` pairs in the
+/// requested order; docs missing the field sort last.
+///
+/// `sort_field_name` must be registered as a fast `i64` field in every split's
+/// schema. Results are tombstone-filtered and last-write-wins deduped before
+/// sorting and truncation.
+pub fn multi_split_search_query_sorted_ids(
+    splits: &[SplitHandle<'_>],
+    query: &dyn Query,
+    sort_field_name: &str,
+    descending: bool,
+    limit: usize,
+    id_field: IdField,
+    tombstones: &Tombstones,
+) -> anyhow::Result<Vec<(String, f32)>> {
+    use tantivy::Order;
+
+    let per_split_limit = limit.saturating_add(tombstones.len()).max(limit);
+
+    struct Cand {
+        id: String,
+        sort: Option<i64>,
+        generation: u64,
+    }
+
+    let mut all: Vec<Cand> = Vec::new();
+    for handle in splits.iter() {
+        let reader = handle.index.reader()?;
+        let searcher = reader.searcher();
+        // `Order` is `Copy`, so we can construct it inside the loop without
+        // needing to clone.
+        let order = if descending { Order::Desc } else { Order::Asc };
+        let collector = TopDocs::with_limit(per_split_limit)
+            .order_by_fast_field::<i64>(sort_field_name, order);
+        // `order_by_fast_field::<i64>` returns `Vec<(Option<i64>, DocAddress)>`
+        // in this tantivy fork (rev 6270552).
+        let hits = searcher.search(query, &collector)?;
+        for (sort_val, doc_address) in hits {
+            let stored: TantivyDocument = searcher.doc(doc_address)?;
+            if let Some(id) = id_field.extract(&stored) {
+                if tombstones.is_deleted_at(&id, handle.generation) {
+                    continue;
+                }
+                all.push(Cand { id, sort: sort_val, generation: handle.generation });
+            }
+        }
+    }
+
+    use std::collections::HashMap;
+    let mut best: HashMap<String, usize> = HashMap::new();
+    for (i, c) in all.iter().enumerate() {
+        match best.get(&c.id) {
+            Some(&j) if all[j].generation >= c.generation => {}
+            _ => {
+                best.insert(c.id.clone(), i);
+            }
+        }
+    }
+    let keep: std::collections::BTreeSet<usize> = best.values().copied().collect();
+    let mut kept: Vec<&Cand> = all
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| keep.contains(i))
+        .map(|(_, c)| c)
+        .collect();
+    // Present-before-missing holds in BOTH directions: only the present/present
+    // comparison is reversed for descending, so docs missing the sort field
+    // always sort last regardless of direction (ES `missing: _last` default).
+    kept.sort_by(|a, b| {
+        match (a.sort, b.sort) {
+            (Some(x), Some(y)) => {
+                let c = x.cmp(&y);
+                if descending { c.reverse() } else { c }
+            }
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+    });
+    let mut out: Vec<(String, f32)> = kept.into_iter().map(|c| (c.id.clone(), 0.0f32)).collect();
+    out.truncate(limit);
+    Ok(out)
 }
 
 /// Extract the stored id value of `field` from `doc` as a string, matching the

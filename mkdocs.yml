@@ -68,6 +68,7 @@ nav:
       - Limitations & differences: sql/limitations.md
   - Collections:
       - MongoDB-style API: collections/README.md
+      - Search: collections/search.md
   - Lakehouse:
       - Iceberg mirror: lakehouse/iceberg-mirror.md
   - Ledger:

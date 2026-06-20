@@ -378,6 +378,18 @@ bluedb exposes a MongoDB-style document API at `/collections/{collection}/{verb}
 
 Tenant selection and bearer scopes are the same as the rest of the API: pass `X-Bluedb-Tenant` to target a tenant (default `_`), and use `data:read` / `data:write` / `schema:admin` scopes as appropriate. See the full reference at [Collections](../collections/README.md).
 
+### Collections — search endpoints
+
+An Elasticsearch-shaped search surface is available on the same path prefix:
+
+| Method | Path | Scope | Description |
+|--------|------|-------|-------------|
+| `POST` | `/collections/{c}/searchIndex` | `schema:admin` | Declare or replace a search mapping; backfills existing documents |
+| `GET` | `/collections/{c}/searchIndex` | `data:read` | Describe the current search mapping for a collection |
+| `POST` | `/collections/{c}/search` | `data:read` | Run a BM25 search with the Elasticsearch query DSL; returns the ES hits envelope |
+
+See the full reference at [Collections search](../collections/search.md).
+
 ## Ledger
 
 `/ledger/accounts` and `/ledger/transfers` (batched create + lookup) expose the

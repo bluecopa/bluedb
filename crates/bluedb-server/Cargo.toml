@@ -25,6 +25,10 @@ bluedb-evidence     = { workspace = true }
 bluedb-query        = { path = "../bluedb-query" }
 bluedb-cache        = { path = "../bluedb-cache" }
 bluedb-collections  = { path = "../bluedb-collections" }
+bluedb-storage  = { workspace = true }
+bluedb-search   = { workspace = true }
+bluedb-fts      = { workspace = true }
+tantivy         = { workspace = true, features = ["stemmer"] }
 arrow-json       = "57"
 arrow-array      = "57"
 arrow-schema     = "57"
