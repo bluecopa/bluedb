@@ -702,6 +702,30 @@ impl SlateDbStorage {
         self.write_key(key, encode(names)?).await
     }
 
+    /// Read this tenant's view registry (`view name → body SQL`), honoring the
+    /// txn overlay. Empty when no view has been created. GlueSQL has no views,
+    /// so bluedb-sql stores definitions here and inlines them on read. Public so
+    /// the server's analytical (`/sql`) read path can inline views itself, since
+    /// it bypasses the composite-PK pre-parse where views are otherwise expanded.
+    pub async fn read_views(
+        &self,
+    ) -> Result<std::collections::HashMap<String, String>, SqlError> {
+        let key = self.keyspace.views_key();
+        Ok(match self.read_key(&key).await? {
+            Some(bytes) => decode(&bytes)?,
+            None => std::collections::HashMap::new(),
+        })
+    }
+
+    /// Persist this tenant's view registry (the full map; overwrites).
+    pub(crate) async fn write_views(
+        &mut self,
+        views: &std::collections::HashMap<String, String>,
+    ) -> Result<(), SqlError> {
+        let key = self.keyspace.views_key();
+        self.write_key(key, encode(views)?).await
+    }
+
     /// The user primary-key column names of a composite-key table (in key
     /// order), or `None` for a single-column-PK table. Public so the lakehouse
     /// mirror can declare an Iceberg sort order on the component columns.

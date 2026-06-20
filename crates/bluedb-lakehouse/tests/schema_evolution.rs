@@ -220,3 +220,65 @@ async fn rename_column_uses_new_name_in_mirror() {
     assert_eq!(by_id.get(&1).map(String::as_str), Some("x"));
     assert_eq!(by_id.get(&2).map(String::as_str), Some("y"));
 }
+
+/// Regression for UAT-SQL-009: a composite-PK table read through the
+/// lakehouse front door after ADD + DROP COLUMN. bluedb derives Iceberg
+/// field-ids from the column-catalog slots (`slot + 1`); DROP frees a slot,
+/// and the composite-PK surrogate's slot-derived id can then match a
+/// *different* persisted field when `reconcile_schema` looked fields up by id.
+/// That mistyped the non-nullable `__bluedb_pk` (Binary) as String, so the
+/// reloaded schema declared a non-nullable column that decoded to null, and
+/// `current_record_batch` errored "Column '__bluedb_pk' is declared as
+/// non-nullable but contains null values". The fix matches persisted fields by
+/// NAME (the stable identity), not id.
+///
+/// This test does NOT mirror/seal the table: the bug fires on the row-store
+/// read path (`current_record_batch`), the first call of which persists
+/// `v0.metadata.json`, and the second of which reloads + evolves it (where the
+/// mis-typing happened). So we call it twice.
+#[tokio::test]
+async fn composite_pk_after_drop_column_reads_via_lakehouse() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    let db = make_db("schemaevo-cpk-drop").await;
+    let cdc = CdcConfig::default();
+    let eng = engine(root, db.clone(), cdc).await;
+
+    {
+        let mut g = Glue::new(db.connection_serialized());
+        // Composite PK (org_id, user_id) → hidden __bluedb_pk surrogate.
+        exec(&mut g, "CREATE TABLE m (org_id INTEGER, user_id INTEGER, role TEXT, age INTEGER, PRIMARY KEY (org_id, user_id))").await;
+        exec(&mut g, "INSERT INTO m (org_id, user_id, role, age) VALUES (1, 7, 'owner', 40)").await;
+        // ADD then DROP frees a slot, exercising the id-collision path.
+        exec(&mut g, "ALTER TABLE m ADD COLUMN nickname TEXT").await;
+        exec(&mut g, "ALTER TABLE m RENAME COLUMN nickname TO handle").await;
+        exec(&mut g, "ALTER TABLE m DROP COLUMN age").await;
+    }
+
+    // First read persists v0.metadata.json; second read reloads + evolves it.
+    // Before the fix, the second (and every later) read errored.
+    for label in ["first", "second"] {
+        let batch = eng
+            .current_record_batch("m")
+            .await
+            .unwrap_or_else(|e| panic!("current_record_batch ({label}): {e}"))
+            .expect("table exists");
+        assert_eq!(batch.num_rows(), 1, "one row ({label})");
+        // The bug errored before the row could be materialized at all; reaching
+        // here with the role column present is the regression assertion.
+        assert!(batch.column_by_name("role").is_some(), "role column ({label})");
+    }
+
+    // The surrogate stays Binary (LargeBinary in Arrow) across the evolve.
+    let schema = eng.fetch_schema("m").await.unwrap();
+    let arrow = eng.writer_for("m", &schema, &[]).await.unwrap().arrow_schema().unwrap();
+    let pk_field = arrow
+        .field_with_name("__bluedb_pk")
+        .expect("surrogate column present");
+    use arrow_schema::DataType;
+    assert!(
+        matches!(pk_field.data_type(), DataType::LargeBinary | DataType::Binary),
+        "surrogate stays binary, got {:?}",
+        pk_field.data_type()
+    );
+}

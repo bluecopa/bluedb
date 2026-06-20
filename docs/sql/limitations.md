@@ -16,7 +16,6 @@ window functions, subqueries, CTEs, set operations, and arbitrary `WHERE` /
 | Feature | Notes |
 |---------|-------|
 | **Schemaless / PK-less tables** | Every table needs a typed column list **and** a `PRIMARY KEY`; a column-less or key-less `CREATE TABLE` is rejected. |
-| **`WITH RECURSIVE`** | Recursive CTEs need iterative evaluation. (Non-recursive `WITH` is supported.) |
 | **Composite (multi-column) indexes** | Secondary indexes are single-column. (A composite **`PRIMARY KEY`** is supported.) |
 | **`UPDATE` of a primary-key column** | Changes a row's identity; delete and re-insert instead. |
 | **User-defined functions** | `CREATE FUNCTION` and custom aggregates. |

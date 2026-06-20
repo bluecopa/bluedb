@@ -139,6 +139,11 @@ const TAG_JSONCAT: u8 = 0x09;
 /// registry. Absent for tables with no unique index. Looked up by exact key per
 /// table, never prefix-scanned.
 const TAG_UNIQUEIDX: u8 = 0x0A;
+/// Tag byte for the per-tenant **view registry**: a single key holding the
+/// `view name → body SQL` map. GlueSQL has no views, so bluedb-sql intercepts
+/// `CREATE VIEW`/`DROP VIEW`, stores the definitions here, and inlines them on
+/// read (see `crate::cte`).
+const TAG_VIEWS: u8 = 0x0B;
 
 /// Tag floor for namespaces owned by layers *above* bluedb-sql (e.g.
 /// `bluedb-ledger`). bluedb-sql's own tags (`TAG_SCHEMA`/`TAG_DATA`/`TAG_INDEX`)
@@ -278,6 +283,12 @@ impl Keyspace {
         let mut key = self.tagged(TAG_UNIQUEIDX, name.len());
         key.extend_from_slice(name);
         key
+    }
+
+    /// Encode the storage key for the per-tenant view registry (a single key
+    /// holding the `view name → body SQL` map for this tenant).
+    pub fn views_key(&self) -> Vec<u8> {
+        self.tagged(TAG_VIEWS, 0)
     }
 
     /// Encode the storage key for a table's name → stable-id mapping.

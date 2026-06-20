@@ -152,9 +152,26 @@ DROP INDEX users_email ON users;
 
 !!! note
     An index is a **performance** feature: it turns an equality or range filter
-    (or an `ORDER BY`) on that column into a fast index-served lookup. Queries on
+    (or `ORDER BY`) on that column into a fast index-served lookup. Queries on
     non-indexed columns still run; they're served as analytical scans (see
     [Reads and indexes](query-guardrail.md)).
+
+### Unique indexes
+
+`CREATE UNIQUE INDEX` rejects any insert or update that would put a duplicate
+value in the indexed column. Two rows may share `NULL` (SQL NULLs-are-distinct
+semantics, the Postgres default).
+
+```sql
+CREATE UNIQUE INDEX users_email ON users (email);
+INSERT INTO users VALUES (2, 'a@x');   -- ok
+INSERT INTO users VALUES (3, 'a@x');   -- rejected: UNIQUE_VIOLATION (409)
+```
+
+A duplicate surfaces as `UNIQUE_VIOLATION` (HTTP 409), the same code a duplicate
+primary key returns. Dropping the index removes the constraint. Uniqueness is
+checked at commit and re-checked against live state, so two concurrent inserts
+of the same value cannot both succeed.
 
 !!! warning
     Indexes are **single-column** only. Composite (multi-column)

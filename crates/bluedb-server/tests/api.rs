@@ -823,3 +823,39 @@ async fn glue_meta_tables_accept_predicates_and_order() {
         .collect();
     assert_eq!(names, vec!["meta8_email".to_string()], "only declared index: {names:?}");
 }
+
+/// Views: CREATE VIEW stores the definition; a SELECT through the view inlines
+/// it (one level). DROP VIEW removes it. bluedb has no native view support in
+/// GlueSQL, so views are intercepted in the pre-parse, stored in a per-tenant
+/// registry, and inlined on read.
+#[tokio::test]
+async fn create_view_select_through_it_and_drop() {
+    let app = app().await;
+    let (s, _) = sql_admin(&app, "CREATE TABLE vusers (id INTEGER PRIMARY KEY, name TEXT, active BOOLEAN)").await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _) = sql_admin(&app, "INSERT INTO vusers VALUES (1, 'ada', true), (2, 'lin', false)").await;
+    assert_eq!(s, StatusCode::OK);
+
+    // CREATE VIEW via /admin/sql.
+    let (s, body) = sql_admin(&app, "CREATE VIEW active_users AS SELECT id, name FROM vusers WHERE active = true").await;
+    assert_eq!(s, StatusCode::OK, "CREATE VIEW: {body}");
+
+    // Read through the view via the /sql data plane (DataFusion path).
+    let (s, body) = call(&app, "POST", "/sql", Some(json!({
+        "sql": "SELECT name FROM active_users ORDER BY id"
+    }))).await;
+    assert_eq!(s, StatusCode::OK, "select through view: {body}");
+    let names: Vec<String> = body.as_array().expect("rows")
+        .iter().map(|r| r["name"].as_str().unwrap().to_string()).collect();
+    assert_eq!(names, vec!["ada".to_string()], "view filter: {body}");
+
+    // Read through the view via /admin/sql (GlueSQL path) too.
+    let (s, body) = sql_admin(&app, "SELECT name FROM active_users ORDER BY id").await;
+    assert_eq!(s, StatusCode::OK, "select through view (admin): {body}");
+
+    // DROP VIEW, then the view is gone.
+    let (s, body) = sql_admin(&app, "DROP VIEW active_users").await;
+    assert_eq!(s, StatusCode::OK, "DROP VIEW: {body}");
+    let (s, _) = call(&app, "POST", "/sql", Some(json!({"sql": "SELECT name FROM active_users"}))).await;
+    assert!(s.as_u16() >= 400, "view gone after drop: status {s}");
+}
