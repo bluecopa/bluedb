@@ -7,11 +7,19 @@ where the behavior matches PostgreSQL/DuckDB, and where it differs.
 ## What powers it
 
 bluedb speaks SQL directly over its object-storage substrate, with no separate
-database server. Point and range access by primary key or secondary index is
-served from the transactional store. Analytical reads (joins, `GROUP BY`,
-aggregates, window functions, subqueries, CTEs, set operations, and arbitrary
-filters and sorts) are served by a columnar engine over the same data. You
-write one SQL surface, and bluedb routes each query to the right path.
+database server. There are **two SQL surfaces**, split by performance contract:
+
+- **`POST /sql`** — the transactional, read-your-writes surface. Point and range
+  access by primary key or secondary index is served from the transactional store
+  at lookup latency, fresh from your last write. It also runs writes, optionally
+  with `RETURNING`. A read that would need a scan is rejected with `400 NO_INDEX`.
+- **`POST /query`** — the analytical surface. Joins, `GROUP BY`, aggregates,
+  window functions, subqueries, CTEs, set operations, and arbitrary filters and
+  sorts are served columnar over the same data, at scan latency. No index
+  required to read.
+
+Both speak the same dialect. See [Reads and indexes](query-guardrail.md) for the
+full cost model and which endpoint to use when.
 
 ## Dialect at a glance
 

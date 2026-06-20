@@ -7,7 +7,7 @@
 //! (b) A read (`GET /tables`) with `X-Bluedb-Min-Watermark` is served from
 //!     SlateDB regardless — SlateDB is always at least as fresh as the seal, so
 //!     the freshness gate does NOT apply here.
-//! (c) An analytical query (`POST /sql` routed to Iceberg) with
+//! (c) An analytical query (`POST /query` over the Iceberg mirror) with
 //!     `X-Bluedb-Min-Watermark > sealed` returns 503 + the current sealed
 //!     watermark in `X-Bluedb-Watermark`.
 
@@ -361,14 +361,14 @@ async fn guardrail_rejected_select_routed_to_analytical_path_returns_correct_row
     setup_analytical_table(&state, &app).await;
 
     // Query: filter on `score` (non-indexed) + ORDER BY `score` (non-indexed).
-    // The guardrail rejects this on the SlateDB path.
+    // `/sql` rejects this (index-only RYW surface); `/query` serves it analytically.
     let r = call_full(
-        &app, "POST", "/sql", None, None,
+        &app, "POST", "/query", None, None,
         Some(json!({"sql": "SELECT id, name FROM products WHERE score > 50 ORDER BY score DESC"})),
     ).await;
     assert!(
         r.status.is_success(),
-        "guardrail-rejected query should be routed to Iceberg and succeed: {} {:?}",
+        "analytical query on /query must succeed: {} {:?}",
         r.status, r.body
     );
 
@@ -398,7 +398,7 @@ async fn analytical_path_honors_min_watermark() {
 
     // (a) min <= sealed: served from the sealed Iceberg snapshot.
     let r_ok = call_full(
-        &app, "POST", "/sql", None, Some("0"),
+        &app, "POST", "/query", None, Some("0"),
         Some(json!({"sql": "SELECT id, name FROM products WHERE score > 50 ORDER BY score DESC"})),
     ).await;
     assert!(
@@ -413,7 +413,7 @@ async fn analytical_path_honors_min_watermark() {
     // (b) min > sealed on the active writer: P4 serves FRESH (not 503).
     let future_seq = sealed + 1_000_000;
     let r_fresh = call_full(
-        &app, "POST", "/sql", None, Some(&future_seq.to_string()),
+        &app, "POST", "/query", None, Some(&future_seq.to_string()),
         Some(json!({"sql": "SELECT id, name FROM products WHERE score > 50 ORDER BY score DESC"})),
     ).await;
     assert!(
@@ -464,10 +464,10 @@ async fn writer_serves_unsealed_fresh_row_on_analytical_path() {
     assert!(write_seq > 0, "writes should have produced a CDC watermark");
 
     // Demand a min-watermark at the last write (strictly greater than the sealed
-    // watermark, which is still 0). The guardrail-rejected filter on `score`
-    // routes to the analytical path; P4 must serve the UNSEALED rows fresh.
+    // watermark, which is still 0). The non-indexed filter on `score` runs on the
+    // analytical path (`/query`); P4 must serve the UNSEALED rows fresh.
     let r = call_full(
-        &app, "POST", "/sql", None, Some(&write_seq.to_string()),
+        &app, "POST", "/query", None, Some(&write_seq.to_string()),
         Some(json!({"sql": "SELECT id, name FROM fresh_items WHERE score > 50 ORDER BY score DESC"})),
     ).await;
     assert!(
@@ -518,7 +518,7 @@ async fn read_wait_seal_n_pragma_is_accepted_and_affects_decision() {
     let _ = call_full(&app, "POST", "/sql", None, None,
         Some(json!({"sql": "INSERT INTO wpragma VALUES (1, 99)"}))).await;
     let r = call_full(
-        &app, "POST", "/sql", None, Some("1000000"),
+        &app, "POST", "/query", None, Some("1000000"),
         Some(json!({"sql": "SELECT id FROM wpragma WHERE score > 0"})),
     ).await;
     assert!(
@@ -529,21 +529,22 @@ async fn read_wait_seal_n_pragma_is_accepted_and_affects_decision() {
 
 // ----- P4 test: writer unavailable → fail-fast 503 (never hang) ---------------
 //
-// A node with no writer `Db` bound (never promoted) must 503 immediately on
-// `/sql` rather than block. This is the writer-unavailable outcome.
+// A node with no writer `Db` bound (never promoted) must 503 immediately on a
+// `/sql` write rather than block. `/sql` gates on the active writer
+// (`require_active`); a passive node fails fast instead of hanging.
 
 #[tokio::test]
 async fn unpromoted_node_fails_fast_503_on_sql() {
     let state = make_unpromoted_state();
     let app = build_app(state.clone());
 
-    // No promote() — the node is passive. A guardrail-routable analytical query
-    // with a freshness demand must 503 fast (require_active gate), not hang.
+    // No promote() — the node is passive. A write must 503 fast
+    // (require_active gate), not hang.
     let r = tokio::time::timeout(
         Duration::from_secs(5),
         call_full(
-            &app, "POST", "/sql", None, Some("1000000"),
-            Some(json!({"sql": "SELECT id, name FROM whatever WHERE score > 50 ORDER BY score DESC"})),
+            &app, "POST", "/sql", None, None,
+            Some(json!({"sql": "INSERT INTO whatever VALUES (1)"})),
         ),
     )
     .await
@@ -623,9 +624,9 @@ async fn decimal_date_timestamp_time_render_identically_on_both_paths() {
     assert_eq!(oltp_rows.len(), 1, "expected 1 row from OLTP path");
     let oltp = &oltp_rows[0];
 
-    // --- Analytical path: guardrail-rejected WHERE score > 0 → DataFusion ---
+    // --- Analytical path (`/query`): non-indexed WHERE score > 0 → DataFusion ---
     let r_analytical = call_full(
-        &app, "POST", "/sql", None, None,
+        &app, "POST", "/query", None, None,
         Some(json!({"sql": "SELECT * FROM typed_row WHERE score > 0 ORDER BY id"})),
     ).await;
     assert!(
@@ -713,10 +714,11 @@ async fn json_accessors_work_on_the_analytical_path() {
         }
     }
 
-    // Project + filter on a JSON subfield via `->>` (text accessor). `/sql` always
-    // runs on the analytical path; min-watermark forces a fresh (unsealed) read.
+    // Project + filter on a JSON subfield via `->>` (text accessor). JSON paths
+    // run on the analytical surface (`/query`); min-watermark forces a fresh
+    // (unsealed) read on the writer.
     let r = call_full(
-        &app, "POST", "/sql", None, Some(&write_seq.to_string()),
+        &app, "POST", "/query", None, Some(&write_seq.to_string()),
         Some(json!({
             "sql": "SELECT id, data->>'status' AS status, data->>'n' AS n \
                     FROM docs WHERE (data->>'status') = 'active'"

@@ -1,12 +1,19 @@
 # REST API
 
-`bluedb-server` exposes a **PostgREST-style** HTTP API over four capability
-surfaces: a data plane (`/tables/{table}`), one parameterized SQL statement
-(`/sql`), structured DDL (`/schema/*`), and an off-by-default arbitrary-SQL
+`bluedb-server` exposes a **PostgREST-style** HTTP API over five capability
+surfaces: a data plane (`/tables/{table}`), a transactional SQL surface for
+reads and writes (`/sql`), an analytical SQL surface for scans and joins
+(`/query`), structured DDL (`/schema/*`), and an off-by-default arbitrary-SQL
 admin escape hatch (`/admin/sql`). A [double-entry ledger](ledger.md) is
 mounted at `/ledger/*`. The listener speaks HTTP/1.1 and HTTP/2 (h2c,
 prior-knowledge), so an h2 client can multiplex many concurrent in-flight
 writes over one connection.
+
+The two SQL surfaces split by performance contract: **`/sql`** is your
+read-your-writes OLTP surface (index-only reads at lookup latency, plus writes),
+and **`/query`** is your analytical/HTAP surface (joins, aggregates, scans — no
+index required, at scan latency). See
+[Reads and indexes](../sql/query-guardrail.md).
 
 All write methods (`POST`/`PATCH`/`DELETE`, `POST /sql`, every `/schema/*`
 endpoint, and the ledger create endpoints) are accepted only by the
@@ -34,6 +41,7 @@ Per-route scopes:
 | `GET /tables/{table}` | `data:read` |
 | `POST` / `PATCH` / `DELETE /tables/{table}` | `data:write` |
 | `POST /sql` | `data:query` |
+| `POST /query` | `data:query` |
 | `POST /admin/sql` | `superuser` |
 | `POST` / `DELETE /schema/*` | `schema:admin` |
 | `GET /catalog/v1/*` | `data:read` |
@@ -54,31 +62,102 @@ be bound to specific tenants with a `tenant:<name>` scope; it can then act only
 on those tenants (a `superuser` reaches any, an unbound token only the default
 tenant). See [Multi-tenancy](../deployment/configuration.md#multi-tenancy).
 
-## `POST /sql`: run one parameterized statement
+## `POST /sql`: transactional reads & writes (read-your-writes)
 
-`/sql` runs a **single, parameterized, non-DDL** statement: one
-`SELECT`/`INSERT`/`UPDATE`/`DELETE`. Bind values with `$N` placeholders and a
-`params` array (injection-proof by construction); never interpolate values into
-the SQL string.
+`/sql` is the **transactional, read-your-writes** surface. It runs a single,
+parameterized, non-DDL statement — one `SELECT`/`INSERT`/`UPDATE`/`DELETE`,
+optionally with `RETURNING`. Reads are served from the live row store at
+**lookup latency**, and writes are acknowledged when durable. Bind values with
+`$N` placeholders and a `params` array (injection-proof by construction); never
+interpolate values into the SQL string.
 
 ```bash
 curl -s localhost:8081/sql -H 'content-type: application/json' \
-  -d '{"sql": "SELECT name FROM users WHERE age > $1 ORDER BY name", "params": [21]}'
+  -d '{"sql": "SELECT name FROM users WHERE id = $1", "params": [42]}'
 ```
 
-It returns a JSON object with the result rows. See the
-[SQL reference](../sql/README.md).
+!!! important "Reads are index-only"
+    A `/sql` `SELECT` must be served by the primary key or a secondary index
+    (point, range, prefix, keyset, or an indexed equality). Anything that would
+    require a scan — a non-indexed `WHERE`/`ORDER BY`, a join, an aggregate, a
+    window function, a JSON path — is **rejected with `400 NO_INDEX`**, and the
+    error names the exact index to create. For those reads use
+    [`POST /query`](#post-query-analytical-reads-htap). See
+    [Reads and indexes](../sql/query-guardrail.md).
+
+A read served on the writer reflects every write it has acknowledged, so a
+`SELECT … WHERE pk = …` immediately after the write is read-your-writes at
+lookup latency — no seal cycle, no mirror lag. A write response carries the
+sequence it reached in `X-Bluedb-Watermark`; echo it on a subsequent read as
+`X-Bluedb-Min-Watermark` to enforce freshness (see
+[Read-your-writes & freshness](#read-your-writes-freshness)).
+
+### `RETURNING`: get the affected rows back
+
+Add `RETURNING <cols>` (or `RETURNING *`) to an `INSERT`/`UPDATE`/`DELETE` to
+receive the affected rows instead of a count — one round trip:
+
+```bash
+curl -s localhost:8081/sql -H 'content-type: application/json' \
+  -d '{"sql": "INSERT INTO users (id, name) VALUES (1, '\''ada'\'') RETURNING id, name"}'
+# [{"id":1,"name":"ada"}]
+
+curl -s localhost:8081/sql -H 'content-type: application/json' \
+  -d '{"sql": "DELETE FROM users WHERE id = 1 RETURNING name"}'
+# [{"name":"ada"}]   — the row, captured before deletion
+```
+
+`DELETE … RETURNING` reads the matching rows **before** they are removed.
+`UPDATE … RETURNING` re-selects by the statement's `WHERE`, so if the `UPDATE`
+changed a column the filter tests, the returned set reflects the post-update
+matches. A write that matched no rows returns `[]`.
 
 !!! note "Full-text search"
     `/sql` also accepts the PostgreSQL full-text surface (`to_tsvector(cfg, col)
     @@ plainto_tsquery($1)`, `ts_rank(...)`, and trigram-accelerated
-    `col LIKE '%lit%'`), which is rewritten transparently against the live index.
+    `col LIKE '%lit%'`), which is rewritten transparently against the live index
+    (to a `pk IN (...)` predicate, which the read path serves as a point lookup).
     See [Full-text search](../sql/full-text-search.md).
 
 !!! warning "DDL goes elsewhere"
     `CREATE`/`DROP`/`ALTER`, transactions, and multi-statement scripts are **not**
     accepted here. Use the structured [`/schema/*`](#schema-ddl-endpoints)
     endpoints, or `/admin/sql` for the raw escape hatch.
+
+## `POST /query`: analytical reads (HTAP)
+
+`/query` is the **analytical** surface and the counterpart to `/sql`. It runs a
+single `SELECT` through the DataFusion front door over the tenant's Iceberg
+mirror ∪ the unsealed CDC tail: joins, `GROUP BY`/aggregates, window functions,
+recursive CTEs, set operations, JSON paths, and arbitrary non-indexed
+filters/sorts all belong here. It never rejects a read on indexing grounds.
+
+```bash
+curl -s localhost:8081/query -H 'content-type: application/json' \
+  -d '{"sql": "SELECT category, COUNT(*) FROM products GROUP BY category"}'
+```
+
+It accepts the same `$N` parameters and JSON body as `/sql`, and the same
+[`X-Bluedb-Min-Watermark`](#read-your-writes-freshness) freshness gate applies.
+On the active writer it is read-your-writes (the unsealed tail union); on a
+replica it is bounded-stale at the sealed snapshot. Reads here run at **scan
+latency** (columnar Parquet + CDC-tail merge), not the lookup latency of `/sql` —
+that is the trade: full analytical flexibility, no index required.
+
+| Read shape | `/sql` | `/query` |
+|------------|:------:|:--------:|
+| `WHERE pk = …` / `WHERE pk > … ORDER BY pk` | ✅ lookup | ✅ scan |
+| `WHERE <indexed-col> = …` | ✅ lookup | ✅ scan |
+| `WHERE <non-indexed> = …` | ❌ `400 NO_INDEX` | ✅ scan |
+| Join / aggregate / window / CTE | ❌ | ✅ |
+| JSON path (`data->>'status'`) | ❌ | ✅ |
+| Full-text `@@` (single-table) | ✅ lookup | ✅ scan |
+
+`GLUE_*` catalog introspection views are transactional synthetics only `/sql`
+can resolve; a `/query` that references one returns `400 UNSUPPORTED_STATEMENT`.
+Writes and DDL are not accepted on `/query` (use `/sql` and `/schema`).
+
+
 
 ## `POST /admin/sql`: arbitrary SQL (off by default)
 
@@ -134,7 +213,7 @@ curl -s 'localhost:8081/tables/events?select=id,attrs->>status&order=id.asc'
 ```
 
 A JSON-path read is served by the analytical engine. Containment (`@>`) and
-`jsonb_path_query` are available over [`POST /sql`](#post-sql-run-one-parameterized-statement).
+`jsonb_path_query` are available over [`POST /query`](#post-query-analytical-reads-htap).
 
 ### Pagination total: `Prefer: count=exact`
 
@@ -341,7 +420,7 @@ If the node can't satisfy that freshness (its sealed analytical snapshot is
 behind the requested sequence and it is not the active writer), it returns
 **`503`** rather than serve stale data. Retry against the writer or after the
 next seal. How much staleness a read tolerates before that gate trips is set per
-tenant, in **seal cycles**, with a PRAGMA over [`/sql`](#post-sql-run-one-parameterized-statement)
+tenant, in **seal cycles**, with a PRAGMA over [`/sql`](#post-sql-transactional-reads-writes-read-your-writes)
 (default `1`):
 
 ```bash
@@ -369,7 +448,8 @@ prose:
 | `UNIQUE_VIOLATION` | 409 | Duplicate primary key / unique value |
 | `PARSE_ERROR` | 400 | SQL did not parse / translate |
 | `TYPE_MISMATCH` | 400 | A value didn't match the column type |
-| `NO_INDEX` | 400 | A query the guardrail won't serve without an index |
+| `NO_INDEX` | 400 | A `/sql` read needs a scan; add an index or run it on `/query` |
+| `UNSUPPORTED_STATEMENT` | 400 | A statement the endpoint doesn't accept (e.g. a non-`SELECT` on `/query`) |
 
 A write sent to a passive (non-writer) node returns `503`; re-resolve the active
 writer (see [Administration](../operations/admin.md)).
@@ -412,7 +492,7 @@ warehouses use to discover and load the mirrored tables:
 Requires `data:read` when authorization is enabled. Each **tenant** publishes its
 own namespace (`namespace == tenant`; the default tenant maps to `default`), and a
 token only sees the namespaces for tenants it is bound to. Control which tables are
-mirrored with `PRAGMA lakehouse_mirror` over [`POST /sql`](#post-sql-run-one-parameterized-statement)
+mirrored with `PRAGMA lakehouse_mirror` over [`POST /sql`](#post-sql-transactional-reads-writes-read-your-writes)
 (per tenant, selected by the `X-Bluedb-Tenant` header).
 
 ## Health & admin

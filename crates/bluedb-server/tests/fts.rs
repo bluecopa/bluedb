@@ -281,10 +281,11 @@ async fn trigram_like_over_http_read_your_writes() {
     assert!(s.is_success(), "LIKE select: {s} {body}");
     assert_eq!(body, json!([{ "id": 1 }, { "id": 3 }]), "matching rows 1 and 3");
 
-    // 5. a column with NO trigram index: the engine passes the LIKE through
-    //    unchanged, and the analytical engine serves the (un-indexed) scan
-    //    directly. A trigram index only *accelerates* the LIKE — it is no longer
-    //    required to read (the scan/sort guardrail no longer gates `/sql` reads).
+    // 5. a column with NO trigram index: `/sql` (the RYW transactional surface)
+    //    rejects the un-indexed scan with `400 NO_INDEX`; the same read on
+    //    `/query` (the analytical surface) serves it. A trigram index only
+    //    *accelerates* the LIKE on `/sql` — without one the read belongs on
+    //    `/query`.
     let (s, _) = call(
         &app,
         "POST",
@@ -307,10 +308,21 @@ async fn trigram_like_over_http_read_your_writes() {
     )
     .await;
     assert!(s.is_success(), "insert notes: {s}");
+    // `/sql` rejects the un-indexed LIKE (the RYW surface is index-only).
     let (s, body) = call(
         &app,
         "POST",
         "/sql",
+        Some(json!({"sql": "SELECT id FROM notes WHERE memo LIKE '%overdue%'"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "un-indexed LIKE on /sql is rejected: {body}");
+    assert_eq!(body["code"], json!("NO_INDEX"), "guardrail reject code: {body}");
+    // `/query` (analytical) serves the same scan.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/query",
         Some(json!({"sql": "SELECT id FROM notes WHERE memo LIKE '%overdue%'"})),
     )
     .await;

@@ -78,8 +78,8 @@ sorted by its primary key.)
 ## Enabling the mirror
 
 The mirror is controlled by `PRAGMA lakehouse_mirror` over
-[`POST /sql`](../api/rest.md#post-sql-run-one-parameterized-statement). It is
-**off by default** (opt-in).
+[`POST /sql`](../api/rest.md#post-sql-transactional-reads-writes-read-your-writes).
+It is **off by default** (opt-in).
 
 Mirror **one** table:
 

@@ -9,11 +9,13 @@ the [`/tables`](../api/rest.md) data plane, not as quoted strings.
 
 !!! note "Where JSON runs"
     The JSON **operators and functions** are evaluated by bluedb's analytical
-    engine. You reach them two ways: through [`POST /sql`](../api/rest.md#post-sql-run-one-parameterized-statement),
-    and through a [`/tables`](../api/rest.md#get-tablestable-select) read whose
-    filter uses a JSON path (`col->>key`); that read is routed to the analytical
-    engine automatically. Storing and retrieving whole JSON values works on every
-    path; only the field-level operators are analytical-engine-only.
+    engine. You reach them through [`POST /query`](../api/rest.md#post-query-analytical-reads-htap),
+    or through a [`/tables`](../api/rest.md#get-tablestable-select) read whose
+    filter uses a JSON path (`col->>key`) — that read is routed to the analytical
+    engine automatically. A JSON-path read on `/sql` is rejected (`NO_INDEX`),
+    since `/sql` is the index-only transactional surface. Storing and retrieving
+    whole JSON values works on every path; only the field-level operators are
+    analytical-engine-only.
 
 ## The `JSON` / `JSONB` column type
 

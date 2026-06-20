@@ -131,10 +131,14 @@ database). Writes are accepted only by the **active writer**; a replica returns
 - **Index-organized storage.** Every table is clustered by its primary key (no
   heap, no `ROWID`): PK reads are contiguous range scans, and that same ordering
   seals to Parquet with no re-sort. See [Storage model](#storage-model-index-organized-tables).
-- **Two read tiers, one SQL surface.** Point and range lookups by primary key or
-  index are served from the row store; analytical reads (joins, aggregates,
-  window functions, arbitrary filters/sorts) are served columnar from the
-  [Iceberg mirror](../lakehouse/iceberg-mirror.md), off the OLTP hot path.
+- **Two read tiers, two SQL surfaces.** Point and range lookups by primary key
+  or index are served from the row store at lookup latency on [`POST /sql`](../api/rest.md#post-sql-transactional-reads-writes-read-your-writes)
+  (the read-your-writes OLTP surface, which rejects scans); analytical reads
+  (joins, aggregates, window functions, arbitrary filters/sorts) are served
+  columnar from the [Iceberg mirror](../lakehouse/iceberg-mirror.md) on
+  [`POST /query`](../api/rest.md#post-query-analytical-reads-htap), off the OLTP
+  hot path. The two surfaces speak the same dialect but carry different latency
+  contracts — see [Reads and indexes](../sql/query-guardrail.md).
 - **Portable.** The substrate targets any S3-compatible store, GCS, or Azure
   Blob, all three verified end-to-end with a real SlateDB round-trip (S3/Azure
   via emulators, GCS against real GCS). See

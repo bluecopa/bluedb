@@ -9,7 +9,7 @@ durable-before-ack guarantees of the rest of the engine).
 Canonical state lives as native records, but a **crash-consistent SQL
 projection** dual-writes accounts and transfers into the `ledger_accounts` and
 `ledger_transfers` tables, so balances are queryable through ordinary
-[`/sql`](rest.md#post-sql-run-one-parameterized-statement) and
+[`/sql`](rest.md#post-sql-transactional-reads-writes-read-your-writes) and
 [`/tables`](rest.md) reads alongside everything else.
 
 !!! note "Large integers cross the wire as strings"
@@ -160,7 +160,8 @@ curl -s localhost:8081/ledger/transfers/10
 
 Because the canonical records are projected into `ledger_accounts` and
 `ledger_transfers`, you can aggregate and join them like any other table through
-[`/sql`](rest.md#post-sql-run-one-parameterized-statement):
+[`/query`](rest.md#post-query-analytical-reads-htap) (aggregates and joins run on
+the analytical surface):
 
 ```sql
 -- A single account's posted balance
