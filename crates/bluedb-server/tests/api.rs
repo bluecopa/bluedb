@@ -724,3 +724,102 @@ async fn ledger_writes_refused_on_passive_node() {
     .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 }
+
+/// Regression for UAT-SQL-008: `GLUE_*` catalog tables must accept predicates
+/// and ORDER BY. They are GlueSQL synthetic views, not real tables the
+/// analytical (DataFusion) engine can resolve, so the server routes any query
+/// that references one back to GlueSQL. Before the fix, even a simple
+/// `WHERE OBJECT_NAME = 't'` returned HTTP 400 "planning SQL".
+#[tokio::test]
+async fn glue_meta_tables_accept_predicates_and_order() {
+    let app = app().await;
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/schema/tables",
+        Some(json!({ "name": "meta8", "columns": [
+            { "name": "id", "type": "INTEGER", "primaryKey": true },
+            { "name": "email", "type": "TEXT" }
+        ]})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "create: {body}");
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/schema/tables/meta8/indexes",
+        Some(json!({ "name": "meta8_email", "columns": ["email"] })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "index: {body}");
+
+    // WHERE ... IN (...) + ORDER BY on GLUE_OBJECTS.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({ "sql": "SELECT OBJECT_NAME, OBJECT_TYPE FROM GLUE_OBJECTS \
+            WHERE OBJECT_NAME IN ('meta8', 'meta8_email') ORDER BY OBJECT_NAME" })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "GLUE_OBJECTS IN+ORDER: {body}");
+    let types: std::collections::HashMap<String, String> = body
+        .as_array()
+        .expect("rows array")
+        .iter()
+        .map(|r| (
+            r["OBJECT_NAME"].as_str().unwrap().to_string(),
+            r["OBJECT_TYPE"].as_str().unwrap().to_string(),
+        ))
+        .collect();
+    assert_eq!(types.get("meta8"), Some(&"TABLE".to_string()), "table row: {body}");
+    assert_eq!(types.get("meta8_email"), Some(&"INDEX".to_string()), "index row: {body}");
+
+    // A plain equality predicate and a different GLUE_* table.
+    let (s, _body) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({ "sql": "SELECT COLUMN_NAME FROM GLUE_TABLE_COLUMNS \
+            WHERE TABLE_NAME = 'meta8' ORDER BY COLUMN_ID" })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "GLUE_TABLE_COLUMNS eq+ORDER: {_body}");
+
+    // GLUE_INDEXES lists a `PRIMARY` row for the clustered primary-key index,
+    // plus one row per declared secondary index (documented in metadata.md).
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({ "sql": "SELECT INDEX_NAME FROM GLUE_INDEXES WHERE TABLE_NAME = 'meta8'" })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "GLUE_INDEXES: {body}");
+    let names: Vec<String> = body
+        .as_array()
+        .expect("rows array")
+        .iter()
+        .map(|r| r["INDEX_NAME"].as_str().unwrap().to_string())
+        .collect();
+    assert!(names.contains(&"PRIMARY".to_string()), "PRIMARY row present: {names:?}");
+    assert!(names.contains(&"meta8_email".to_string()), "declared index present: {names:?}");
+
+    // The documented filter excludes PRIMARY to leave only user-declared indexes.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({ "sql": "SELECT INDEX_NAME FROM GLUE_INDEXES \
+            WHERE TABLE_NAME = 'meta8' AND INDEX_NAME <> 'PRIMARY'" })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "GLUE_INDEXES filtered: {body}");
+    let names: Vec<String> = body
+        .as_array()
+        .expect("rows array")
+        .iter()
+        .map(|r| r["INDEX_NAME"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(names, vec!["meta8_email".to_string()], "only declared index: {names:?}");
+}

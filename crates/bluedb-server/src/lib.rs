@@ -1378,8 +1378,10 @@ async fn exec_sql(
         }
     }
     // Reads are served by the analytical engine (the DataFusion front door);
-    // writes and DDL stay on the transactional engine.
-    if is_read_query(&req.sql) {
+    // writes and DDL stay on the transactional engine. The `GLUE_*` catalog
+    // tables are GlueSQL synthetic views (OBJECTS/TABLES/TABLE_COLUMNS/INDEXES),
+    // not real tables DataFusion can resolve, so they stay on the GlueSQL path.
+    if is_read_query(&req.sql) && !references_glue_meta_table(&req.sql) {
         return exec_sql_read(&state, &headers, &tenant, &req).await;
     }
 
@@ -1402,6 +1404,27 @@ fn is_read_query(sql: &str) -> bool {
         Ok(stmts) if stmts.len() == 1 => matches!(stmts[0], Statement::Query(_)),
         _ => false,
     }
+}
+
+/// True if `sql` references a `GLUE_*` catalog table (the read-only
+/// introspection views). These are GlueSQL synthetic tables, not real tables
+/// the analytical (DataFusion) engine can resolve, so a query that touches one
+/// must stay on the GlueSQL path. Match is a word-boundary, case-insensitive
+/// scan of the SQL text so it catches any reference (FROM, JOIN, subquery).
+fn references_glue_meta_table(sql: &str) -> bool {
+    let upper = sql.to_ascii_uppercase();
+    ["GLUE_OBJECTS", "GLUE_TABLES", "GLUE_TABLE_COLUMNS", "GLUE_INDEXES"]
+        .into_iter()
+        .any(|t| {
+            let i = match upper.find(t) {
+                Some(i) => i,
+                None => return false,
+            };
+            let before = upper[..i].chars().next_back();
+            let after = upper[i + t.len()..].chars().next();
+            !matches!(before, Some(c) if c.is_alphanumeric() || c == '_')
+                && !matches!(after, Some(c) if c.is_alphanumeric() || c == '_')
+        })
 }
 
 /// Serve a `POST /sql` read through the DataFusion front door: the per-tenant
