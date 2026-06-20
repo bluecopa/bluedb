@@ -988,6 +988,50 @@ async fn query_rejects_non_select() {
     assert_eq!(body["code"], json!("UNSUPPORTED_STATEMENT"), "code: {body}");
 }
 
+/// `/sql` rejects a JSON-path read (`->>` / `->`) with `NO_INDEX` pointing at
+/// `/query`, not a confusing `PARSE_ERROR` from GlueSQL (which can't parse the
+/// operator). JSON paths are an analytical-surface feature. UAT-SQL-004 shape.
+#[tokio::test]
+async fn sql_rejects_json_path_with_no_index() {
+    let app = app().await;
+    let (s, _) = sql_admin(
+        &app,
+        "CREATE TABLE jrow (id INTEGER PRIMARY KEY, data JSON);",
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "INSERT INTO jrow VALUES (1, '{\"status\":\"active\"}')"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    // `data->>'status'` on /sql → NO_INDEX (not PARSE_ERROR), pointing at /query.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "SELECT id FROM jrow WHERE (data->>'status') = 'active'"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "json-path on /sql must 400: {body}");
+    assert_eq!(body["code"], json!("NO_INDEX"), "stable code: {body}");
+
+    // The same read on /query succeeds.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/query",
+        Some(json!({"sql": "SELECT id FROM jrow WHERE (data->>'status') = 'active'"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "json-path on /query: {body}");
+    assert_eq!(body, json!([{ "id": 1 }]), "matching row: {body}");
+}
+
 /// `/sql` read-your-writes: a row written via `/sql` is immediately visible to a
 /// `/sql` read of the same row (fresh SlateDB state, no seal needed).
 #[tokio::test]

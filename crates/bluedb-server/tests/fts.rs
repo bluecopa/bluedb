@@ -141,6 +141,74 @@ async fn fts_over_http_read_your_writes() {
     assert_eq!(body2, json!([]), "deleted row no longer matches");
 }
 
+/// A **parameterized** `@@ plainto_tsquery($1)` read on `/sql` resolves the
+/// bound query string against the live index. This is the UAT-SEARCH-001 shape:
+/// after the `/sql` read-tier flip, `/sql` reads run through `execute_fts`, which
+/// must thread the bound `$N` params into the FTS rewrite (not pass them empty),
+/// or a parameterized tsquery can't be searched.
+#[tokio::test]
+async fn parameterized_fts_query_works_on_sql() {
+    let app = make_app(true).await;
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/schema/tables",
+        Some(json!({
+            "name": "pdocs",
+            "columns": [
+                {"name": "id", "type": "INTEGER", "primary_key": true},
+                {"name": "body", "type": "TEXT"}
+            ]
+        })),
+    )
+    .await;
+    assert!(s.is_success(), "create pdocs: {s}");
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/schema/tables/pdocs/fulltext-indexes",
+        Some(json!({"column": "body", "analyzer": "english"})),
+    )
+    .await;
+    assert!(s.is_success(), "create fulltext index: {s}");
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "INSERT INTO pdocs (id, body) VALUES (1, 'quarterly invoice overdue'), (2, 'weather sunny')"})),
+    )
+    .await;
+    assert!(s.is_success(), "insert pdocs: {s}");
+
+    // Parameterized plainto_tsquery($1) — the query string arrives as a bound param.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({
+            "sql": "SELECT id FROM pdocs WHERE to_tsvector('english', body) @@ plainto_tsquery($1)",
+            "params": ["invoice overdue"]
+        })),
+    )
+    .await;
+    assert!(s.is_success(), "parameterized @@ on /sql: {s} {body}");
+    assert_eq!(body, json!([{ "id": 1 }]), "only the matching row id=1: {body}");
+
+    // to_tsquery($1) with a boolean query string also resolves its param.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({
+            "sql": "SELECT id FROM pdocs WHERE to_tsvector('english', body) @@ to_tsquery($1)",
+            "params": ["invoice & !paid"]
+        })),
+    )
+    .await;
+    assert!(s.is_success(), "parameterized to_tsquery on /sql: {s} {body}");
+    assert_eq!(body, json!([{ "id": 1 }]), "boolean query matches id=1: {body}");
+}
+
 #[tokio::test]
 async fn durable_engine_serves_a_second_fulltext_index() {
     // After B4-4, `promote` binds a durable, reopened `FtsEngine` over the writer's
