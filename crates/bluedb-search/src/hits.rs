@@ -25,25 +25,38 @@ fn trim_source(doc: &Value, spec: &SourceSpec) -> Option<Value> {
     }
 }
 
-/// Wrap whole-token, case-insensitive occurrences of any `terms` in `<em>...</em>`.
+/// Wrap whole-token occurrences of any query `terms` in `<em>...</em>`,
+/// case-insensitively. `terms` are the *analyzed* (stemmed, lowercased) query
+/// terms — e.g. the english analyzer turns "storage" into "storag" — while the
+/// source text is raw, so a token matches when an analyzed term is a **prefix**
+/// of it (best-effort: ES re-analyzes per token for highlighting; we approximate
+/// with the stem, which is a prefix of its inflected forms). Exact match is the
+/// `term == word` special case of the prefix test.
 fn highlight_text(text: &str, terms: &[String]) -> Option<String> {
-    if terms.is_empty() {
+    let stems: Vec<String> = terms
+        .iter()
+        .map(|t| t.to_lowercase())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if stems.is_empty() {
         return None;
     }
-    let lset: std::collections::HashSet<String> =
-        terms.iter().map(|t| t.to_lowercase()).collect();
+    let is_match = |word: &str| {
+        let wl = word.to_lowercase();
+        stems.iter().any(|t| wl.starts_with(t.as_str()))
+    };
     let mut out = String::with_capacity(text.len() + 16);
     let mut hit = false;
     let mut word = String::new();
-    let flush = |word: &mut String, out: &mut String, hit: &mut bool, lset: &std::collections::HashSet<String>| {
+    let mut flush = |word: &mut String, out: &mut String| {
         if word.is_empty() {
             return;
         }
-        if lset.contains(&word.to_lowercase()) {
+        if is_match(word) {
             out.push_str("<em>");
             out.push_str(word);
             out.push_str("</em>");
-            *hit = true;
+            hit = true;
         } else {
             out.push_str(word);
         }
@@ -53,11 +66,11 @@ fn highlight_text(text: &str, terms: &[String]) -> Option<String> {
         if ch.is_alphanumeric() {
             word.push(ch);
         } else {
-            flush(&mut word, &mut out, &mut hit, &lset);
+            flush(&mut word, &mut out);
             out.push(ch);
         }
     }
-    flush(&mut word, &mut out, &mut hit, &lset);
+    flush(&mut word, &mut out);
     if hit {
         Some(out)
     } else {
@@ -186,5 +199,28 @@ mod tests {
         );
         let hl = out.hits[0].highlight.as_ref().unwrap();
         assert!(hl.get("body").unwrap()[0].contains("<em>dogs</em>"));
+    }
+
+    /// The english analyzer stems query terms ("storage" -> "storag"), but the
+    /// source text is raw. A stem must still highlight its inflected word via a
+    /// best-effort prefix match — otherwise highlight is silently empty even
+    /// though the search matched.
+    #[test]
+    fn highlights_stemmed_terms_via_prefix() {
+        let ranked = vec![("a".to_string(), 1.0f32)];
+        let mut sources = HashMap::new();
+        sources.insert(
+            "a".to_string(),
+            src("a", "x", "A database built directly on object storage"),
+        );
+        let mut terms = HashMap::new();
+        terms.insert("body".to_string(), vec!["databas".to_string(), "storag".to_string()]);
+        let out = assemble(
+            "c", &ranked, 1, "eq", sources, &SourceSpec::Bool(true),
+            &["body".to_string()], &terms,
+        );
+        let body_hl = &out.hits[0].highlight.as_ref().unwrap().get("body").unwrap()[0];
+        assert!(body_hl.contains("<em>database</em>"), "got: {body_hl}");
+        assert!(body_hl.contains("<em>storage</em>"), "got: {body_hl}");
     }
 }
