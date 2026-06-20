@@ -877,13 +877,30 @@ fn reconcile_schema(
 ) -> Result<Option<IcebergSchema>> {
     use iceberg::spec::NestedField;
 
+    // Index the persisted schema by NAME, not id. bluedb derives Iceberg
+    // field-ids from the column-catalog slots (`slot + 1`), and a DROP COLUMN
+    // frees a slot that a later ADD/surrogate may reuse, so the same logical
+    // column can get a different slot-derived id across ALTERs. The column
+    // NAME is its stable identity, so matching by name keeps each surviving
+    // column on its persisted id + type (and nested ids). Matching by id would
+    // pair a column with whichever persisted field happened to hold that id,
+    // e.g. a composite-PK surrogate (Binary) picking up a dropped/reused slot
+    // owned by a TEXT column, which then mistypes the non-nullable PK and
+    // breaks reads after RENAME TABLE.
+    let by_name: std::collections::HashMap<&str, &iceberg::spec::NestedField> = current
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|f| (f.name.as_str(), f.as_ref()))
+        .collect();
+
     let evolved: Vec<_> = desired
         .as_struct()
         .fields()
         .iter()
-        .map(|d| match current.field_by_id(d.id) {
-            // Reuse the persisted field (its type, incl. nested ids); rename if
-            // the name changed, and honor the desired requiredness.
+        .map(|d| match by_name.get(d.name.as_str()) {
+            // Reuse the persisted field (its id, type, incl. nested ids); honor
+            // the desired requiredness (NOT NULL can change via ALTER).
             Some(existing) => {
                 let mut f = NestedField::new(
                     existing.id,
@@ -901,9 +918,23 @@ fn reconcile_schema(
         })
         .collect();
 
+    // The identifier (PK) field id must be the PERSISTED id for the PK column
+    // (matched by name above), not the desired slot-derived id, or the rebuilt
+    // schema would point its identifier at the wrong field.
+    let desired_pk_names: std::collections::HashSet<&str> = desired
+        .identifier_field_ids()
+        .filter_map(|id| desired.field_by_id(id))
+        .map(|f| f.name.as_str())
+        .collect();
+    let identifier_ids: Vec<i32> = evolved
+        .iter()
+        .filter(|f| desired_pk_names.contains(f.name.as_str()))
+        .map(|f| f.id)
+        .collect();
+
     let rebuilt = IcebergSchema::builder()
         .with_schema_id(current.schema_id())
-        .with_identifier_field_ids(desired.identifier_field_ids().collect::<Vec<_>>())
+        .with_identifier_field_ids(identifier_ids)
         .with_fields(evolved)
         .build()
         .map_err(|e| LakehouseError::Schema(format!("reconciling schema: {e}")))?;
