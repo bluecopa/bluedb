@@ -157,7 +157,11 @@ fn stage_sort(df: DataFrame, body: &Value, ctx: &Ctx<'_>) -> Result<DataFrame, M
 }
 
 /// `$group: {_id: "$field"|null, <out>: {<acc>: "$f"|1}}`.
-fn stage_group(df: DataFrame, body: &Value, ctx: &Ctx<'_>) -> Result<DataFrame, MqlError> {
+fn stage_group(
+    df: DataFrame,
+    body: &Value,
+    ctx: &mut Ctx<'_>,
+) -> Result<DataFrame, MqlError> {
     let obj = body
         .as_object()
         .ok_or_else(|| MqlError::Malformed("$group takes an object".into()))?;
@@ -179,7 +183,11 @@ fn stage_group(df: DataFrame, body: &Value, ctx: &Ctx<'_>) -> Result<DataFrame, 
         }
     };
 
-    // Aggregates: every key other than `_id`.
+    // Aggregates: every key other than `_id`. Each output becomes a real column
+    // in the post-group DataFrame, so register it as materialized — a later
+    // `$sort`/`$project`/`$addFields` on that field must read the column, not
+    // the (now-absent) `doc` JSON accessor (otherwise DataFusion errors with
+    // "No field named <coll>.doc").
     let mut aggr_expr: Vec<Expr> = Vec::new();
     for (out, spec) in obj {
         if out == "_id" {
@@ -196,6 +204,7 @@ fn stage_group(df: DataFrame, body: &Value, ctx: &Ctx<'_>) -> Result<DataFrame, 
         let (acc, arg) = spec_obj.iter().next().unwrap();
         let expr = group_accumulator(acc, arg, ctx)?.alias(out);
         aggr_expr.push(expr);
+        ctx.materialized.insert(out.clone());
     }
 
     df.aggregate(group_expr, aggr_expr).map_err(df_err)
@@ -224,11 +233,15 @@ fn group_accumulator(acc: &str, arg: &Value, ctx: &Ctx<'_>) -> Result<Expr, MqlE
 /// `$project` / `$addFields` / `$set` — best-effort. Inclusion (`{field: 1}`) and
 /// computed (`{newField: "$f"}`) both project the field aliased to the output
 /// name. `$project` replaces the projection; `$addFields`/`$set` append.
+///
+/// Each output becomes a real column in the resulting DataFrame, so it is
+/// registered as materialized — a later stage that references it reads the
+/// column, not the (possibly absent) `doc` JSON accessor.
 fn stage_project(
     df: DataFrame,
     name: &str,
     body: &Value,
-    ctx: &Ctx<'_>,
+    ctx: &mut Ctx<'_>,
 ) -> Result<DataFrame, MqlError> {
     let obj = body
         .as_object()
@@ -244,6 +257,7 @@ fn stage_project(
                 continue;
             }
             exprs.push(project_value(out, spec, ctx)?);
+            ctx.materialized.insert(out.clone());
         }
         return df.select(exprs).map_err(df_err);
     }
@@ -253,6 +267,7 @@ fn stage_project(
     for (out, spec) in obj {
         let expr = project_value(out, spec, ctx)?;
         out_df = out_df.with_column(out, expr).map_err(df_err)?;
+        ctx.materialized.insert(out.clone());
     }
     Ok(out_df)
 }

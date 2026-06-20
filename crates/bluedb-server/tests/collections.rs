@@ -633,6 +633,67 @@ async fn aggregate_group_sum_sorted_by_id() {
     assert_eq!(docs[1]["total"].as_f64().unwrap(), 7.0, "US total: {body}");
 }
 
+/// Regression for UAT-COLL-007: a `$group` output referenced by a later
+/// `$sort` (and a `$project` output by a later `$addFields`) must read the
+/// computed column, not the now-absent `doc` JSON accessor. Before the fix,
+/// `$sort {total: -1}` after `$group` errored "No field named <coll>.doc".
+#[tokio::test]
+async fn aggregate_sort_on_group_output_and_chained_project() {
+    let (app, state) = app_with_state().await;
+
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/agg7/insert",
+        Some(json!({ "documents": [
+            { "_id": "a1", "region": "EU", "amount": 10, "kind": "retail" },
+            { "_id": "a2", "region": "EU", "amount": 30, "kind": "retail" },
+            { "_id": "a3", "region": "US", "amount": 20, "kind": "enterprise" },
+            { "_id": "a4", "region": "US", "amount": 40, "kind": "retail" }
+        ]})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "insert: {body}");
+    state.seal_now().await.expect("seal");
+
+    // $group then $sort on the `total` accumulator output (desc), $limit 2.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/agg7/aggregate",
+        Some(json!({ "pipeline": [
+            { "$match": { "kind": "retail" } },
+            { "$group": { "_id": "$region", "total": { "$sum": "$amount" }, "count": { "$count": {} } } },
+            { "$sort": { "total": -1 } },
+            { "$limit": 2 }
+        ]})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "group+sort+limit: {body}");
+    let docs = body["documents"].as_array().expect("documents array");
+    assert_eq!(docs.len(), 2, "expected 2 groups, got: {body}");
+    // Both groups sum to 40; sort is stable enough that EU (first inserted) leads.
+    assert_eq!(docs[0]["total"].as_f64().unwrap(), 40.0, "first total: {body}");
+
+    // $project then $addFields referencing the projected field `who`.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/agg7/aggregate",
+        Some(json!({ "pipeline": [
+            { "$match": { "region": "EU" } },
+            { "$project": { "who": "$region", "amount": 1 } },
+            { "$addFields": { "tag": "$who" } }
+        ]})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "project+addFields: {body}");
+    for doc in body["documents"].as_array().expect("documents array") {
+        assert_eq!(doc["who"].as_str().unwrap(), "EU", "who: {body}");
+        assert_eq!(doc["tag"].as_str().unwrap(), "EU", "tag mirrors who: {body}");
+    }
+}
+
 /// `$match` (string field) + `$sort` + `$limit`: filter to one region, sort by a
 /// string field ascending, cap the count.
 #[tokio::test]

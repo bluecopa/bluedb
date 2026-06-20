@@ -56,6 +56,15 @@ One row per index.
 SELECT TABLE_NAME, INDEX_NAME FROM GLUE_INDEXES;
 ```
 
+Every table with a primary key also has a `PRIMARY` row for the clustered
+primary-key index (the index-organized store itself). Filter it out to list
+only the secondary indexes you declared:
+
+```sql
+SELECT INDEX_NAME FROM GLUE_INDEXES
+WHERE TABLE_NAME = 'users' AND INDEX_NAME <> 'PRIMARY';
+```
+
 !!! note
     These tables are read-only and reflect the live catalog. They are
     the supported way to introspect schema; there is no `information_schema`.
