@@ -24,8 +24,8 @@ use gluesql_core::data::{Key, Value};
 use gluesql_core::store::Store;
 use serde::{Deserialize, Serialize};
 use sqlparser::ast::{
-    ColumnDef, ColumnOption, ColumnOptionDef, DataType, Expr, Ident, ObjectName, SetExpr,
-    Statement, TableConstraint, UnaryOperator, Value as SqlValue,
+    ColumnDef, ColumnOption, ColumnOptionDef, DataType, Expr, Ident, ObjectName, ObjectType,
+    SetExpr, Statement, TableConstraint, UnaryOperator, Value as SqlValue,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -67,23 +67,119 @@ pub async fn prepare(
     params: &[Value],
 ) -> Result<String, SqlError> {
     let dialect = GenericDialect {};
-    let Ok(mut statements) = Parser::parse_sql(&dialect, sql) else {
-        return Ok(sql.to_string()); // not parseable here → let gluesql handle it
+
+    // First, apply any `CREATE VIEW`/`DROP VIEW` to the per-tenant view
+    // registry (GlueSQL has no views) and inline view references in queries.
+    // Returns Some(rewritten) when a statement touched views, else None.
+    let view_rewritten = view_rewrite(storage, sql).await?;
+    let views_changed = view_rewritten.is_some();
+    let sql: String = match view_rewritten {
+        Some(s) => s,
+        None => sql.to_string(),
     };
-    let mut changed = false;
+
+    let Ok(mut statements) = Parser::parse_sql(&dialect, &sql) else {
+        return Ok(sql); // not parseable here → let gluesql handle it
+    };
+    let mut changed = views_changed;
     for stmt in &mut statements {
         changed |= apply(storage, stmt, params).await?;
     }
-    // Re-serialize only when we actually rewrote a composite-PK statement; every
-    // other statement returns the original string untouched.
+    // Re-serialize only when we actually rewrote something; otherwise return the
+    // original string untouched.
     if !changed {
-        return Ok(sql.to_string());
+        return Ok(sql);
     }
     Ok(statements
         .iter()
         .map(|s| s.to_string())
         .collect::<Vec<_>>()
         .join("; "))
+}
+
+/// Apply `CREATE VIEW` / `DROP VIEW` to the per-tenant view registry and inline
+/// view references in queries. GlueSQL has no views, so bluedb-sql stores view
+/// definitions itself and substitutes the body (as a derived table) wherever the
+/// view name is referenced.
+///
+/// Returns `Some(rewritten_sql)` when any statement touched views (so the caller
+/// re-parses the result), or `None` to pass the original SQL through unchanged.
+/// A `CREATE VIEW`/`DROP VIEW` statement is replaced by a benign `SELECT 0`
+/// (GlueSQL accepts it and returns a row, which the caller surfaces as success).
+async fn view_rewrite(
+    storage: &mut SlateDbStorage,
+    sql: &str,
+) -> Result<Option<String>, SqlError> {
+    let dialect = GenericDialect {};
+    let Ok(mut statements) = Parser::parse_sql(&dialect, sql) else {
+        return Ok(None); // unparseable here → let the caller handle it
+    };
+
+    let mut touched = false;
+    let mut views = storage.read_views().await?;
+
+    // A benign no-op the executor accepts and returns success for. Used to
+    // replace a CREATE/DROP VIEW (which GlueSQL would reject) after we have
+    // recorded the change in the registry. Parsed from a string so we don't
+    // hand-build the (version-skew-prone) AST.
+    let noop = Parser::parse_sql(&dialect, "SELECT 0")
+        .ok()
+        .and_then(|mut s| s.pop());
+
+    for stmt in &mut statements {
+        match stmt {
+            Statement::CreateView { name, query, .. } => {
+                let view_name = object_table_name(name);
+                views.insert(view_name, query.to_string());
+                if let Some(n) = noop.clone() {
+                    *stmt = n;
+                }
+                touched = true;
+            }
+            Statement::Drop {
+                object_type: ObjectType::View,
+                names,
+                if_exists,
+                ..
+            } => {
+                for n in names {
+                    views.remove(&object_table_name(n));
+                }
+                // Strict drop-missing validation (error when a named view was
+                // absent and IF EXISTS was not set) is a v2 concern; for now the
+                // no-op succeeds regardless.
+                let _ = if_exists;
+                if let Some(n) = noop.clone() {
+                    *stmt = n;
+                }
+                touched = true;
+            }
+            Statement::Query(_) if !views.is_empty() => {
+                // Inline view references in this query, then re-parse the
+                // rewritten statement back in.
+                let inlined = crate::cte::inline_views(&stmt.to_string(), &views);
+                if let Ok(parsed) = Parser::parse_sql(&dialect, &inlined) {
+                    if let Some(Statement::Query(q)) = parsed.into_iter().next() {
+                        *stmt = Statement::Query(q);
+                        touched = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !touched {
+        return Ok(None);
+    }
+    storage.write_views(&views).await?;
+    Ok(Some(
+        statements
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+            .join("; "),
+    ))
 }
 
 /// Rewrite `stmt` in place for composite-PK support and data-type normalisation.

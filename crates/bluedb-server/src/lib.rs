@@ -1449,7 +1449,20 @@ async fn exec_sql_read(
     // Rewrite FTS (`@@` / `ts_rank` / trigram-`LIKE`) to plain SQL the analytical
     // engine runs; non-FTS SQL passes through unchanged.
     let rewritten = state.fts().await.rewrite_for(&req.sql, &req.params).await?;
-    let sql = rewritten.unwrap_or_else(|| req.sql.clone());
+    let mut sql = rewritten.unwrap_or_else(|| req.sql.clone());
+
+    // Inline stored views (GlueSQL has no views; bluedb-sql keeps a per-tenant
+    // view registry and substitutes the body as a derived table on read). The
+    // analytical path bypasses the composite-PK pre-parse, so do it here.
+    let views = state
+        .connection(tenant)
+        .await?
+        .read_views()
+        .await
+        .map_err(|e| AppError::internal(format!("read view registry: {e}")))?;
+    if !views.is_empty() {
+        sql = bluedb_sql::inline_views(&sql, &views);
+    }
 
     // Freshness gate: a non-writer node holds no fresh unsealed tail, so it cannot
     // satisfy a read demanding a watermark beyond the sealed snapshot.
