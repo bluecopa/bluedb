@@ -495,8 +495,12 @@ impl FtsEngine {
     /// first (BM25 fulltext); if the SQL has no `@@`, tries the trigram-accelerated
     /// `LIKE '%lit%'` path. `Ok(None)` when neither applies (the SQL runs unchanged
     /// on gluesql's exact scan).
-    pub async fn rewrite_for(&self, sql: &str) -> Result<Option<String>> {
-        if let Some(rewritten) = self.rewrite_at_at(sql).await? {
+    pub async fn rewrite_for(
+        &self,
+        sql: &str,
+        params: &[serde_json::Value],
+    ) -> Result<Option<String>> {
+        if let Some(rewritten) = self.rewrite_at_at(sql, params).await? {
             return Ok(Some(rewritten));
         }
         self.rewrite_like(sql).await
@@ -505,8 +509,12 @@ impl FtsEngine {
     /// The `@@`/`ts_rank` rewrite (Spec B §4.2/§4.3): union the matching FULLTEXT
     /// index's live segment and (if durable) its durable splits, live authoritative
     /// for any pk it covers. `Ok(None)` when the SQL has no `@@`.
-    async fn rewrite_at_at(&self, sql: &str) -> Result<Option<String>> {
-        let Some(pred) = extract_fts_predicate(sql)? else {
+    async fn rewrite_at_at(
+        &self,
+        sql: &str,
+        params: &[serde_json::Value],
+    ) -> Result<Option<String>> {
+        let Some(pred) = extract_fts_predicate(sql, params)? else {
             return Ok(None);
         };
         // Snapshot the def's handles out of the read guard and drop the guard
@@ -536,7 +544,7 @@ impl FtsEngine {
         };
 
         let merged = union_hits(&segment, durable.as_deref(), durable_body_field, &pred).await?;
-        rewrite_fts_query(sql, &pk_column, &PrecomputedSearcher { hits: merged }).await
+        rewrite_fts_query(sql, &pk_column, &PrecomputedSearcher { hits: merged }, params).await
     }
 
     /// The trigram-accelerated `LIKE '%lit%'` rewrite (Spec B §4.6). When `sql` is
@@ -590,7 +598,10 @@ impl FtsEngine {
         sql: &str,
         params: &[Param],
     ) -> Result<Vec<Payload>> {
-        let rewritten = self.rewrite_for(sql).await?;
+        // Writes never contain `@@`, so the FTS rewrite is a no-op here; the
+        // parameterized-tsquery path is read-only (`exec_sql_read`), so `&[]` is
+        // correct (and avoids converting gluesql Params to JSON).
+        let rewritten = self.rewrite_for(sql, &[]).await?;
         let final_sql = rewritten.as_deref().unwrap_or(sql);
         rest_sql::execute_sql(glue, final_sql, params, false).await
     }

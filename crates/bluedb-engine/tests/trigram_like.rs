@@ -85,7 +85,7 @@ async fn like_infix_is_accelerated_and_matches_scan() {
     let (fts, database) = seed("trgm-like-core").await;
     let sql = "SELECT id FROM docs WHERE body LIKE '%overdue%'";
 
-    let rewritten = fts.rewrite_for(sql).await.unwrap().expect("LIKE rewritten");
+    let rewritten = fts.rewrite_for(sql, &[]).await.unwrap().expect("LIKE rewritten");
     assert!(
         rewritten.contains("id IN ("),
         "expected a pk prefilter, got: {rewritten}"
@@ -122,7 +122,7 @@ async fn like_short_literal_passes_through() {
     let sql = "SELECT id FROM docs WHERE body LIKE '%ab%'";
     // No prefilter added (pass-through to gluesql's exact scan).
     assert!(
-        fts.rewrite_for(sql).await.unwrap().is_none(),
+        fts.rewrite_for(sql, &[]).await.unwrap().is_none(),
         "a <3-char LIKE literal must pass through unchanged"
     );
     assert_eq!(engine_ids(&fts, &database, sql).await, scan_ids(&database, sql).await);
@@ -130,7 +130,7 @@ async fn like_short_literal_passes_through() {
     // And a <3-char literal that DOES match ('er' is in quarterly/overdue/weather)
     // still matches via the scan — proving pass-through is correct, not lossy.
     let sql2 = "SELECT id FROM docs WHERE body LIKE '%er%'";
-    assert!(fts.rewrite_for(sql2).await.unwrap().is_none());
+    assert!(fts.rewrite_for(sql2, &[]).await.unwrap().is_none());
     assert_eq!(engine_ids(&fts, &database, sql2).await, scan_ids(&database, sql2).await);
     assert_eq!(
         scan_ids(&database, sql2).await,
@@ -156,7 +156,7 @@ async fn like_without_trigram_index_passes_through() {
     }
     let sql = "SELECT id FROM docs WHERE body LIKE '%overdue%'";
     assert!(
-        fts.rewrite_for(sql).await.unwrap().is_none(),
+        fts.rewrite_for(sql, &[]).await.unwrap().is_none(),
         "no trigram index on the column → pass-through"
     );
     assert_eq!(engine_ids(&fts, &database, sql).await, scan_ids(&database, sql).await);
@@ -187,7 +187,7 @@ async fn like_negated_passes_through() {
     let (fts, database) = seed("trgm-like-neg").await;
     let sql = "SELECT id FROM docs WHERE body NOT LIKE '%overdue%'";
     assert!(
-        fts.rewrite_for(sql).await.unwrap().is_none(),
+        fts.rewrite_for(sql, &[]).await.unwrap().is_none(),
         "NOT LIKE must pass through (no prefilter)"
     );
     assert_eq!(engine_ids(&fts, &database, sql).await, scan_ids(&database, sql).await);
@@ -201,7 +201,7 @@ async fn like_internal_wildcard_passes_through() {
     let (fts, database) = seed("trgm-like-wild").await;
     let sql = "SELECT id FROM docs WHERE body LIKE '%ov_rdue%'";
     assert!(
-        fts.rewrite_for(sql).await.unwrap().is_none(),
+        fts.rewrite_for(sql, &[]).await.unwrap().is_none(),
         "a literal with an internal wildcard must pass through"
     );
     assert_eq!(engine_ids(&fts, &database, sql).await, scan_ids(&database, sql).await);

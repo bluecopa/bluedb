@@ -270,7 +270,19 @@ fn bind(params: &mut Vec<Value>, v: &Value) -> String {
 }
 
 fn cmp_sql(path: &str, op: &Cmp, value: &Value, params: &mut Vec<Value>) -> String {
-    let col = col_ref(path);
+    // The JSON accessor `doc->>'field'` returns text, so a comparison against a
+    // numeric value would be lexical (e.g. "85" >= "100" is true). When the value
+    // is numeric, cast the accessor to a 64-bit float so the comparison is numeric
+    // — mirroring the DataFusion path's `path_expr_for`. `_id` (the PK column) and
+    // string/bool comparisons are never cast.
+    let col = {
+        let base = col_ref(path);
+        if path != "_id" && is_numeric(value) {
+            format!("CAST({base} AS DOUBLE)")
+        } else {
+            base
+        }
+    };
     match op {
         Cmp::Eq  => format!("{col} = {}", bind(params, value)),
         // MongoDB $ne/$nin match documents where the field is missing/null in
@@ -691,6 +703,36 @@ mod tests {
             sql.contains("IS NULL"),
             "$ne must include IS NULL for missing-field semantics, got: {sql}"
         );
+    }
+
+    /// A numeric comparison must be numeric, not lexical: the JSON accessor is
+    /// text, so without a cast "85" >= "100" is lexically true. The SQL path must
+    /// CAST the accessor to a float, matching the DataFusion path's `path_expr_for`.
+    #[test]
+    fn cmp_sql_casts_numeric_comparison() {
+        let f = parse_filter(&json!({"amount": {"$gte": 100}})).unwrap();
+        let mut params = Vec::new();
+        let sql = f.to_sql(&mut params);
+        assert_eq!(sql, "CAST((doc->>'amount') AS DOUBLE) >= $1");
+        assert_eq!(params, vec![json!(100)]);
+    }
+
+    /// A string comparison is NOT cast — text ordering is correct for strings.
+    #[test]
+    fn cmp_sql_does_not_cast_string_comparison() {
+        let f = parse_filter(&json!({"name": {"$gte": "b"}})).unwrap();
+        let mut params = Vec::new();
+        let sql = f.to_sql(&mut params);
+        assert_eq!(sql, "(doc->>'name') >= $1");
+    }
+
+    /// `_id` is the PK column and is never cast, even against a numeric value.
+    #[test]
+    fn cmp_sql_does_not_cast_id() {
+        let f = parse_filter(&json!({"_id": {"$gte": 100}})).unwrap();
+        let mut params = Vec::new();
+        let sql = f.to_sql(&mut params);
+        assert_eq!(sql, "_id >= $1");
     }
 
     /// FIX 3: $nin SQL contains IS NULL (Mongo semantics: match missing/null too).

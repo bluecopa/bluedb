@@ -70,6 +70,23 @@ fn as_string_literal(expr: &Expr) -> Option<&str> {
     }
 }
 
+/// The query text from a `*_tsquery(..)` argument: a single-quoted string
+/// literal, or a `$N` placeholder resolved against `params` — so a parameterized
+/// `plainto_tsquery($1)` works (the docs advertise this form). The resolved text
+/// only feeds the index searcher; it is never re-injected into SQL, so there is
+/// no injection surface. A non-string param, an out-of-range index, or a `?` /
+/// named placeholder yields `None`.
+fn as_query_text(expr: &Expr, params: &[serde_json::Value]) -> Option<String> {
+    match expr {
+        Expr::Value(Value::SingleQuotedString(s)) => Some(s.clone()),
+        Expr::Value(Value::Placeholder(p)) => {
+            let n: usize = p.strip_prefix('$')?.parse().ok()?;
+            params.get(n.checked_sub(1)?)?.as_str().map(str::to_string)
+        }
+        _ => None,
+    }
+}
+
 /// Extract an identifier value from `Expr::Identifier` or the last segment of
 /// `Expr::CompoundIdentifier`.
 fn as_identifier(expr: &Expr) -> Option<&str> {
@@ -113,7 +130,7 @@ fn parse_tsvector(expr: &Expr) -> Option<(String, String)> {
 
 /// Try to parse `*_tsquery(query)` from an `Expr::Function`.
 /// Returns `(kind, query_str)` on success.
-fn parse_tsquery(expr: &Expr) -> Option<(TsQueryKind, String)> {
+fn parse_tsquery(expr: &Expr, params: &[serde_json::Value]) -> Option<(TsQueryKind, String)> {
     if let Expr::Function(func) = expr {
         let kind = match fn_last_name(&func.name).as_str() {
             "to_tsquery" => TsQueryKind::ToTsQuery,
@@ -123,7 +140,7 @@ fn parse_tsquery(expr: &Expr) -> Option<(TsQueryKind, String)> {
         };
         let args = fn_args(&func.args);
         if args.len() == 1 {
-            let query = as_string_literal(args[0])?.to_owned();
+            let query = as_query_text(args[0], params)?;
             return Some((kind, query));
         }
     }
@@ -157,7 +174,10 @@ fn find_at_at(expr: &Expr) -> Option<(&Expr, &Expr)> {
 /// Returns `Ok(None)` if no `@@` is present, `Ok(Some(...))` when a valid FTS
 /// predicate is found, or `Err` for an unsupported shape (multi-table FROM,
 /// wrong argument types, etc.).
-pub(crate) fn extract_fts_predicate(sql: &str) -> Result<Option<FtsPredicate>> {
+pub(crate) fn extract_fts_predicate(
+    sql: &str,
+    params: &[serde_json::Value],
+) -> Result<Option<FtsPredicate>> {
     let mut stmts =
         parse(sql).map_err(|e| EngineError::Rejected(format!("parse error: {e}")))?;
     if stmts.len() != 1 {
@@ -226,7 +246,7 @@ pub(crate) fn extract_fts_predicate(sql: &str) -> Result<Option<FtsPredicate>> {
         )
     })?;
 
-    let (kind, query_str) = parse_tsquery(rhs).ok_or_else(|| {
+    let (kind, query_str) = parse_tsquery(rhs, params).ok_or_else(|| {
         EngineError::Rejected(
             "unsupported FTS query shape: @@ RHS must be to_tsquery/plainto_tsquery/websearch_to_tsquery(q)".into(),
         )
@@ -459,9 +479,10 @@ pub async fn rewrite_fts_query(
     sql: &str,
     pk_column: &str,
     searcher: &impl FtsSearcher,
+    params: &[serde_json::Value],
 ) -> Result<Option<String>> {
     // Fast path: no @@ present.
-    let predicate = match extract_fts_predicate(sql)? {
+    let predicate = match extract_fts_predicate(sql, params)? {
         None => return Ok(None),
         Some(p) => p,
     };
@@ -630,7 +651,7 @@ mod tests {
     #[test]
     fn extract_plain_tsquery() {
         let sql = "SELECT id, title FROM docs WHERE to_tsvector('english', body) @@ plainto_tsquery('invoice overdue')";
-        let pred = extract_fts_predicate(sql).unwrap().unwrap();
+        let pred = extract_fts_predicate(sql, &[]).unwrap().unwrap();
         assert_eq!(pred.table, "docs");
         assert_eq!(pred.column, "body");
         assert_eq!(pred.config, "english");
@@ -639,9 +660,30 @@ mod tests {
     }
 
     #[test]
+    fn extract_plain_tsquery_with_param_placeholder() {
+        // Parameterized RHS: `plainto_tsquery($1)` resolves the query text from
+        // params (the documented form) instead of requiring a string literal.
+        let sql =
+            "SELECT id FROM docs WHERE to_tsvector('english', body) @@ plainto_tsquery($1)";
+        let params = vec![serde_json::json!("invoice overdue")];
+        let pred = extract_fts_predicate(sql, &params).unwrap().unwrap();
+        assert_eq!(pred.query, "invoice overdue");
+        assert_eq!(pred.kind, TsQueryKind::Plain);
+    }
+
+    #[test]
+    fn param_placeholder_without_params_is_rejected() {
+        // No bound params → the placeholder can't resolve → unsupported shape
+        // (rather than silently searching for the literal "$1").
+        let sql =
+            "SELECT id FROM docs WHERE to_tsvector('english', body) @@ plainto_tsquery($1)";
+        assert!(extract_fts_predicate(sql, &[]).is_err());
+    }
+
+    #[test]
     fn extract_to_tsquery() {
         let sql = "SELECT id FROM docs WHERE to_tsvector('english', body) @@ to_tsquery('a & b')";
-        let pred = extract_fts_predicate(sql).unwrap().unwrap();
+        let pred = extract_fts_predicate(sql, &[]).unwrap().unwrap();
         assert_eq!(pred.kind, TsQueryKind::ToTsQuery);
         assert_eq!(pred.query, "a & b");
     }
@@ -649,7 +691,7 @@ mod tests {
     #[test]
     fn extract_websearch_tsquery() {
         let sql = "SELECT id FROM docs WHERE to_tsvector('english', body) @@ websearch_to_tsquery('x')";
-        let pred = extract_fts_predicate(sql).unwrap().unwrap();
+        let pred = extract_fts_predicate(sql, &[]).unwrap().unwrap();
         assert_eq!(pred.kind, TsQueryKind::Websearch);
         assert_eq!(pred.query, "x");
     }
@@ -657,13 +699,13 @@ mod tests {
     #[test]
     fn no_at_at_returns_none() {
         let sql = "SELECT * FROM docs WHERE status = 'open'";
-        assert!(extract_fts_predicate(sql).unwrap().is_none());
+        assert!(extract_fts_predicate(sql, &[]).unwrap().is_none());
     }
 
     #[test]
     fn multi_table_with_at_at_errors() {
         let sql = "SELECT * FROM a, b WHERE to_tsvector('english', x) @@ plainto_tsquery('q')";
-        assert!(extract_fts_predicate(sql).is_err());
+        assert!(extract_fts_predicate(sql, &[]).is_err());
     }
 
     // --- Task 3: rewrite_fts_query ---
@@ -692,7 +734,7 @@ mod tests {
     #[tokio::test]
     async fn rewrite_basic_at_at() {
         let sql = "SELECT id FROM docs WHERE to_tsvector('english', body) @@ plainto_tsquery('q')";
-        let out = rewrite_fts_query(sql, "id", &FakeSearcher).await.unwrap().unwrap();
+        let out = rewrite_fts_query(sql, "id", &FakeSearcher, &[]).await.unwrap().unwrap();
         assert!(out.contains("id IN (2, 5)"), "expected IN clause, got: {out}");
         assert!(!out.contains("@@"), "@@  should be gone: {out}");
         assert!(!out.contains("to_tsvector"), "to_tsvector should be gone: {out}");
@@ -701,7 +743,7 @@ mod tests {
     #[tokio::test]
     async fn rewrite_at_at_with_extra_condition() {
         let sql = "SELECT id FROM docs WHERE to_tsvector('english', body) @@ plainto_tsquery('q') AND status = 'open'";
-        let out = rewrite_fts_query(sql, "id", &FakeSearcher).await.unwrap().unwrap();
+        let out = rewrite_fts_query(sql, "id", &FakeSearcher, &[]).await.unwrap().unwrap();
         assert!(out.contains("id IN (2, 5)"), "expected IN clause, got: {out}");
         assert!(out.contains("status"), "status condition should be kept: {out}");
         assert!(!out.contains("@@"), "@@ should be gone: {out}");
@@ -710,7 +752,7 @@ mod tests {
     #[tokio::test]
     async fn rewrite_empty_hits_never_match() {
         let sql = "SELECT id FROM docs WHERE to_tsvector('english', body) @@ plainto_tsquery('q')";
-        let out = rewrite_fts_query(sql, "id", &EmptySearcher).await.unwrap().unwrap();
+        let out = rewrite_fts_query(sql, "id", &EmptySearcher, &[]).await.unwrap().unwrap();
         let low = out.to_lowercase();
         // Must be an index-served never-match (`pk IN (NULL)`), so the empty case
         // still satisfies the scan guardrail.
@@ -724,7 +766,7 @@ mod tests {
     #[tokio::test]
     async fn rewrite_ts_rank_replaced_by_case() {
         let sql = "SELECT id FROM docs WHERE to_tsvector('english', body) @@ plainto_tsquery('q') ORDER BY ts_rank(to_tsvector('english', body), plainto_tsquery('q')) DESC";
-        let out = rewrite_fts_query(sql, "id", &FakeSearcher).await.unwrap().unwrap();
+        let out = rewrite_fts_query(sql, "id", &FakeSearcher, &[]).await.unwrap().unwrap();
         let low = out.to_lowercase();
         assert!(!low.contains("ts_rank"), "ts_rank should be gone: {out}");
         assert!(out.contains("CASE") || out.contains("case"), "CASE ordering should be present: {out}");
@@ -733,7 +775,7 @@ mod tests {
     #[tokio::test]
     async fn rewrite_no_at_at_returns_none() {
         let sql = "SELECT * FROM docs WHERE status = 'open'";
-        let out = rewrite_fts_query(sql, "id", &FakeSearcher).await.unwrap();
+        let out = rewrite_fts_query(sql, "id", &FakeSearcher, &[]).await.unwrap();
         assert!(out.is_none());
     }
 }

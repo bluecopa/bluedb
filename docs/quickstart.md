@@ -33,22 +33,35 @@ curl -s localhost:8081/admin/status
 The active writer reports it is active; replicas report passive. Writes must go
 to the active writer (see [Administration](operations/admin.md)).
 
-## 3. Run SQL
+## 3. Create a table and run SQL
 
-Send SQL to the writer's `/sql` endpoint:
+DDL is **typed JSON** on the structured `/schema/*` endpoints; `/sql` runs one
+non-DDL statement. Create the table on the writer, then read and write it through
+`/sql`:
 
 ```bash
+# Create the table (structured DDL)
+curl -s localhost:8081/schema/tables -H 'content-type: application/json' \
+  -d '{"name": "users", "columns": [
+        {"name": "id",   "type": "INTEGER", "primaryKey": true},
+        {"name": "name", "type": "TEXT"}
+      ]}'
+
+# Insert two rows, then read them back (one statement per /sql request)
 curl -s localhost:8081/sql -H 'content-type: application/json' \
-  -d '{"sql": "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)"}'
+  -d '{"sql": "INSERT INTO users VALUES (1, '"'"'ada'"'"')"}'
 
 curl -s localhost:8081/sql -H 'content-type: application/json' \
-  -d '{"sql": "INSERT INTO users VALUES (1, '"'"'ada'"'"'), (2, '"'"'lin'"'"')"}'
+  -d '{"sql": "INSERT INTO users VALUES (2, '"'"'lin'"'"')"}'
 
 curl -s localhost:8081/sql -H 'content-type: application/json' \
   -d '{"sql": "SELECT name FROM users ORDER BY id"}'
 ```
 
-You can also use the PostgREST-style REST surface at `/tables/{table}`. See
+`/sql` runs a single non-DDL statement (`SELECT`/`INSERT`/`UPDATE`/`DELETE`); DDL
+(`CREATE`/`DROP`/`ALTER`) goes to the structured
+[`/schema/*`](api/rest.md#schema-ddl-endpoints) endpoints (or `/admin/sql` if
+enabled). You can also use the PostgREST-style surface at `/tables/{table}`. See
 [REST API](api/rest.md).
 
 ## 4. Try a failover
