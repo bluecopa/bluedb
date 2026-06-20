@@ -94,3 +94,55 @@ async fn uniqueness_is_consistent_within_a_transaction() {
     };
     assert_eq!(n, 2, "only the committed rows (1 and the post-rollback 2) remain");
 }
+
+/// Run `sql` through the composite-PK pre-parse rewrite (the same chokepoint
+/// every user-facing SQL path uses) and execute the result. This is what makes
+/// `CREATE UNIQUE INDEX` reach the bluedb-sql unique-index registry — GlueSQL's
+/// own translator silently drops the UNIQUE keyword.
+async fn exec_rewritten(glue: &mut Glue<SlateDbStorage>, sql: &str) {
+    let rewritten = bluedb_sql::prepare_composite_pk(&mut glue.storage, sql, &[])
+        .await
+        .expect("rewrite");
+    glue.execute(&rewritten).await.expect("execute");
+}
+
+/// `CREATE UNIQUE INDEX` must enforce uniqueness at the engine level. GlueSQL
+/// drops the UNIQUE keyword from its `IndexMut::create_index` trait, so without
+/// the bluedb-sql registry + `apply_index_entries` enforcement a unique
+/// secondary index is silently non-unique. This runs through the production
+/// pre-parse rewrite (where UNIQUE is detected), then exercises insert/update/
+/// NULL-distinct/drop-index semantics.
+#[tokio::test]
+async fn unique_secondary_index_is_enforced_via_rewrite() {
+    let mut glue = new_glue().await;
+    exec_rewritten(&mut glue, "CREATE TABLE u (id INTEGER PRIMARY KEY, email TEXT);").await;
+    exec_rewritten(&mut glue, "CREATE UNIQUE INDEX u_email ON u (email);").await;
+    exec_rewritten(&mut glue, "INSERT INTO u VALUES (1, 'a@x');").await;
+
+    // Duplicate indexed value, different PK → rejected.
+    let err = glue
+        .execute("INSERT INTO u VALUES (2, 'a@x');")
+        .await
+        .expect_err("duplicate unique-index value must be rejected");
+    let msg = format!("{err}");
+    assert!(msg.contains("u_email"), "error names the index: {msg}");
+
+    // Distinct value inserts cleanly; UPDATE to a colliding value is rejected.
+    exec_rewritten(&mut glue, "INSERT INTO u VALUES (2, 'b@x');").await;
+    assert!(
+        glue.execute("UPDATE u SET email = 'a@x' WHERE id = 2;")
+            .await
+            .is_err(),
+        "update to a colliding unique-index value must be rejected"
+    );
+
+    // NULLs are distinct: two rows may both have NULL under a unique index.
+    exec_rewritten(&mut glue, "CREATE TABLE n (id INTEGER PRIMARY KEY, v TEXT);").await;
+    exec_rewritten(&mut glue, "CREATE UNIQUE INDEX n_v ON n (v);").await;
+    exec_rewritten(&mut glue, "INSERT INTO n (id, v) VALUES (1, NULL);").await;
+    exec_rewritten(&mut glue, "INSERT INTO n (id, v) VALUES (2, NULL);").await;
+
+    // DROP INDEX removes enforcement, so a duplicate value inserts afterwards.
+    exec_rewritten(&mut glue, "DROP INDEX u.u_email;").await;
+    exec_rewritten(&mut glue, "INSERT INTO u VALUES (3, 'a@x');").await;
+}

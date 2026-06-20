@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 use tantivy::query::{
-    AllQuery, BooleanQuery, ExistsQuery, Occur, PhraseQuery, Query, TermQuery,
+    AllQuery, BooleanQuery, ExistsQuery, Occur, PhraseQuery, Query, RegexQuery, TermQuery,
 };
 use tantivy::schema::{IndexRecordOption, Term};
 
@@ -197,9 +197,22 @@ fn lower_exists(ss: &SearchSchema, m: &serde_json::Map<String, Value>) -> Result
     let name = m
         .get("field")
         .and_then(Value::as_str)
-        .ok_or_else(|| SearchError::BadRequest("exists needs a `field`".into()))?;
-    let _ = resolve_field(ss, name)?;
-    Ok(Box::new(ExistsQuery::new(name.to_string(), false)))
+        .ok_or_else(|| SearchError::BadRequest("exists needs a `field`".to_string()))?;
+    let resolved = resolve_field(ss, name)?;
+    // tantivy's `ExistsQuery` only operates on *fast* fields (it reads the
+    // fast-field column to test presence). Our `text`/`keyword` fields are
+    // inverted-index only, so `ExistsQuery` throws
+    // "Schema error: 'Field <f> is not a fast field.'" at search time (a 500).
+    // For those, "exists" = "the doc has at least one indexed term in the
+    // field", which a `.*` regex over the field's postings matches exactly —
+    // the same semantics Elasticsearch gives `exists` on a text/keyword field.
+    // Integer fields are fast, so they take the native `ExistsQuery` path.
+    Ok(match resolved.kind {
+        FieldKindInfo::Integer => Box::new(ExistsQuery::new(name.to_string(), false)),
+        FieldKindInfo::Text(_) | FieldKindInfo::Keyword => {
+            Box::new(RegexQuery::from_pattern(".*", resolved.field).map_err(anyhow::Error::from)?)
+        }
+    })
 }
 
 mod range {
@@ -359,6 +372,22 @@ mod tests {
     fn exists_builds() {
         let ss = schema();
         assert!(compile_query(&ss, &serde_json::json!({"exists": {"field": "title"}})).is_ok());
+    }
+
+    #[test]
+    fn exists_compiles_for_every_field_kind() {
+        // Regression for UAT-COLL-SEARCH-002: tantivy's `ExistsQuery` only
+        // works on fast fields, so `exists` on a text/keyword field used to
+        // compile fine but throw "Field X is not a fast field." at search time
+        // (HTTP 500). It must compile for text, keyword, AND integer — the
+        // text/keyword path lowers to a `RegexQuery` over the postings.
+        let ss = schema();
+        for field in ["title", "tag", "year"] {
+            assert!(
+                compile_query(&ss, &serde_json::json!({"exists": {"field": field}})).is_ok(),
+                "exists on {field} should compile"
+            );
+        }
     }
 
     #[test]

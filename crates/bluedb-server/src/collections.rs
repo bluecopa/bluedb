@@ -880,8 +880,6 @@ pub(crate) async fn create_index(
     // Ensure the collection table exists first (createIndex before any insert).
     ensure_collection(&state, &tenant, &coll).await?;
 
-    let unique_kw = if req.options.unique { "UNIQUE " } else { "" };
-
     // -----------------------------------------------------------------------
     // Compound index: keys.len() > 1
     // -----------------------------------------------------------------------
@@ -915,11 +913,17 @@ pub(crate) async fn create_index(
             paths.iter().map(|p| p.replace('.', "_")).collect::<Vec<_>>().join("_")
         );
 
-        // Step 1: Add the TEXT column if not present.
+        // Step 1: Add the TEXT column if not present. A unique compound index is
+        // enforced as a column-level UNIQUE constraint on the surrogate column
+        // (GlueSQL silently drops UNIQUE from `CREATE UNIQUE INDEX`; see the
+        // single-field branch for the rationale).
         let existing_cdefs = compound_col_defs(&state, &tenant, &coll).await?;
         let already_exists = existing_cdefs.iter().any(|(c, _)| c == &dcol);
         if !already_exists {
-            let alter_sql = format!("ALTER TABLE {coll} ADD COLUMN {dcol} TEXT;");
+            let unique_constraint = if req.options.unique { " UNIQUE" } else { "" };
+            let alter_sql = format!(
+                "ALTER TABLE {coll} ADD COLUMN {dcol} TEXT{unique_constraint};"
+            );
             run_ddl(&state, &tenant, &alter_sql).await?;
         }
 
@@ -945,7 +949,8 @@ pub(crate) async fn create_index(
             run_write(&state, &tenant, &update_sql, &params).await?;
         }
 
-        // Step 3: Create the index.
+        // Step 3: Create the (non-unique) index for fast equality/range lookups.
+        // Uniqueness is enforced by the column-level UNIQUE constraint in step 1.
         let storage = state.connection(&tenant).await?;
         let schema = Store::fetch_schema(&storage, &coll)
             .await
@@ -953,7 +958,7 @@ pub(crate) async fn create_index(
         let index_exists = schema.is_some_and(|s| s.indexes.iter().any(|i| i.name == index_name));
         if !index_exists {
             let create_idx_sql = format!(
-                "CREATE {unique_kw}INDEX {index_name} ON {coll} ({dcol});"
+                "CREATE INDEX {index_name} ON {coll} ({dcol});"
             );
             run_ddl(&state, &tenant, &create_idx_sql).await?;
         }
@@ -1099,7 +1104,17 @@ pub(crate) async fn create_index(
         };
 
         let sql_type = index_sql_type(idx_type);
-        let alter_sql = format!("ALTER TABLE {coll} ADD COLUMN {dcol} {sql_type};");
+        // A unique index is enforced as a column-level UNIQUE constraint on the
+        // derived column. GlueSQL drops the `UNIQUE` keyword from
+        // `CREATE UNIQUE INDEX` (its `IndexMut::create_index` trait carries no
+        // uniqueness flag), so a unique *secondary index* is silently
+        // non-unique. A column-level `UNIQUE` constraint IS validated on INSERT
+        // and UPDATE (see `bluedb_sql::SlateDbStorage` → `UNIQUE_VIOLATION`),
+        // so we get real enforcement by adding it to the column instead.
+        let unique_constraint = if req.options.unique { " UNIQUE" } else { "" };
+        let alter_sql = format!(
+            "ALTER TABLE {coll} ADD COLUMN {dcol} {sql_type}{unique_constraint};"
+        );
         run_ddl(&state, &tenant, &alter_sql).await?;
     }
 
@@ -1129,17 +1144,18 @@ pub(crate) async fn create_index(
         }
     }
 
-    // Step 3: Create the secondary index on the derived column — skip if an
-    // index with this exact name already exists (idempotent createIndex).
+    // Step 3: Create the (non-unique) secondary index on the derived column for
+    // fast equality/range lookups — skip if one with this exact name already
+    // exists (idempotent createIndex). Uniqueness is enforced by the
+    // column-level UNIQUE constraint added in step 1, NOT by this index: GlueSQL
+    // silently drops the UNIQUE keyword from `CREATE UNIQUE INDEX`.
     let storage = state.connection(&tenant).await?;
     let schema = Store::fetch_schema(&storage, &coll)
         .await
         .map_err(|e| AppError::internal(format!("fetch schema: {e}")))?;
     let index_exists = schema.is_some_and(|s| s.indexes.iter().any(|i| i.name == index_name));
     if !index_exists {
-        let create_idx_sql = format!(
-            "CREATE {unique_kw}INDEX {index_name} ON {coll} ({dcol});"
-        );
+        let create_idx_sql = format!("CREATE INDEX {index_name} ON {coll} ({dcol});");
         run_ddl(&state, &tenant, &create_idx_sql).await?;
     }
 

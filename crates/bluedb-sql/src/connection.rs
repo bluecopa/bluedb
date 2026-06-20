@@ -57,6 +57,14 @@ use crate::error::SqlError;
 use crate::keyspace::{prefix_upper_bound, Keyspace, DEFAULT_TENANT, TAG_CDC};
 use crate::storage::{SeqAllocator, SlateDbStorage, WriteLease};
 
+/// A per-tenant commit-sequence counter shared by every connection vended from a
+/// [`Database`]. Advanced once per durable committed mutation regardless of
+/// whether the lakehouse CDC mirror is on, so the write watermark
+/// (`X-Bluedb-Watermark`) reflects the writer's latest acknowledged write even
+/// when CDC is disabled (the default). Distinct from [`CdcSeq`], which only
+/// advances for mirror-enabled tables and is what the seal loop orders on.
+pub(crate) type CommitSeq = Arc<Mutex<HashMap<String, i64>>>;
+
 /// A handle to one SlateDB database that vends isolated [`SlateDbStorage`]
 /// connections — either a **writer** handle (connections can read + write,
 /// write transactions serialized by a shared lease) or a **read-replica**
@@ -71,6 +79,11 @@ pub struct Database {
     /// connection vended from this handle so each tenant's lakehouse CDC log
     /// stays totally ordered across them (see [`crate::cdc`]).
     cdc_seq: CdcSeq,
+    /// Per-tenant commit-sequence counters, shared by every connection vended
+    /// from this handle. Advanced once per durable committed mutation
+    /// regardless of CDC, so the write watermark stays meaningful when the
+    /// lakehouse mirror is off. See [`Self::last_commit_seq`].
+    commit_seq: CommitSeq,
 }
 
 impl Database {
@@ -95,6 +108,7 @@ impl Database {
             insert_lock: Arc::new(Mutex::new(())),
             seq: Arc::new(Mutex::new(HashMap::new())),
             cdc_seq: Arc::new(Mutex::new(HashMap::new())),
+            commit_seq: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -110,13 +124,24 @@ impl Database {
     /// the counter. Returns 0 when no CDC write has yet been stamped for this
     /// tenant in this writer session (i.e. the counter was never seeded). This is
     /// the CDC watermark the in-memory commit path has advanced to — the sequence
-    /// of the most recent durable write on this writer — usable as the value of
-    /// `X-Bluedb-Watermark` in write-response headers.
+    /// of the most recent durable CDC write on this writer.
     ///
     /// Note: returns 0 (not `Option`) so callers can embed it unconditionally in
     /// headers; a 0 watermark signals "no CDC writes yet this session".
     pub async fn last_cdc_seq(&self, tenant: &str) -> i64 {
         self.cdc_seq.lock().await.get(tenant).copied().unwrap_or(0)
+    }
+
+    /// Peek the last commit sequence allocated for `tenant` without incrementing
+    /// it. This advances on **every** durable committed mutation (CDC mirror on
+    /// or off), so it is the value the write-response `X-Bluedb-Watermark` should
+    /// reflect: the sequence of the writer's most recent acknowledged write. The
+    /// CDC seq ([`Self::last_cdc_seq`]) only advances for mirror-enabled tables,
+    /// so it stays 0 when the lakehouse mirror is off; this counter never does.
+    ///
+    /// Returns 0 before any mutation has committed for `tenant` this session.
+    pub async fn last_commit_seq(&self, tenant: &str) -> i64 {
+        self.commit_seq.lock().await.get(tenant).copied().unwrap_or(0)
     }
 
     /// Is this a writer handle (vs. a read replica)?
@@ -207,6 +232,7 @@ impl Database {
             self.insert_lock.clone(),
             self.seq.clone(),
             self.cdc_seq.clone(),
+            self.commit_seq.clone(),
         )
     }
 

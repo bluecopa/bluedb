@@ -128,6 +128,27 @@ async fn apply(
         return Ok(true);
     }
 
+    // `CREATE UNIQUE INDEX`: GlueSQL's translator drops the UNIQUE keyword (its
+    // `IndexMut::create_index` trait carries no uniqueness flag), so bluedb-sql
+    // enforces it itself. Record the index in the table's unique-index registry
+    // and strip UNIQUE from the statement so GlueSQL creates a plain index. The
+    // name must be present (gluesql rejects unnamed indexes) and there must be
+    // exactly one column (gluesql rejects composite indexes) — we only touch
+    // `unique` and let gluesql surface those errors otherwise.
+    if let Statement::CreateIndex(ci) = stmt {
+        if ci.unique {
+            if let Some(name) = ci.name.as_ref() {
+                let table = object_table_name(&ci.table_name);
+                let index_name = object_table_name(name);
+                let mut unique = storage.read_unique_indexes(&table).await?;
+                unique.insert(index_name);
+                storage.write_unique_indexes(&table, &unique).await?;
+            }
+            ci.unique = false;
+            return Ok(true);
+        }
+    }
+
     // DML: act only on a table that has a composite-PK catalog.
     let Some(table) = statement_table(stmt) else {
         return Ok(false);
