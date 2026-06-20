@@ -1402,6 +1402,19 @@ async fn exec_sql(
         return Ok((watermark_headers(&tenant, wm), Json(Value::Array(rows))));
     }
 
+    // A JSON-path operator (`->>`, `->`) is an analytical-engine feature GlueSQL
+    // can't parse (it surfaces as a confusing `PARSE_ERROR`). Intercept it here
+    // and reject with `NO_INDEX` pointing at `/query`, matching the documented
+    // contract: JSON paths are served on the analytical surface, not `/sql`.
+    if has_json_path_op(&req.sql) && is_read_query(&req.sql) {
+        return Err(AppError::bad_request(
+            "JSON path operators (`->>`, `->`) run on the analytical surface; \
+             run this read on `POST /query`, or filter on the primary key / an \
+             indexed column on `/sql`",
+        )
+        .with_code("NO_INDEX"));
+    }
+
     let mut glue = Glue::new(state.connection_serialized(&tenant).await?);
     // Writes flow through the FTS engine so its commit observer indexes them; a
     // non-`@@` statement (including a guarded `SELECT`) runs unchanged. A
@@ -1470,6 +1483,16 @@ fn references_glue_meta_table(sql: &str) -> bool {
             !matches!(before, Some(c) if c.is_alphanumeric() || c == '_')
                 && !matches!(after, Some(c) if c.is_alphanumeric() || c == '_')
         })
+}
+
+/// True if `sql` contains a JSON-path operator (`->>` or `->`). These are
+/// analytical-engine features GlueSQL cannot parse, so `/sql` rejects them up
+/// front with `NO_INDEX` (pointing at `/query`) rather than letting GlueSQL
+/// surface a confusing `PARSE_ERROR`. The tokens are unambiguous in SQL text:
+/// they only appear as JSON accessors (`col->>'key'`, `col->'key'`), never as
+/// identifiers or punctuation.
+fn has_json_path_op(sql: &str) -> bool {
+    sql.contains("->>") || sql.contains("->")
 }
 
 /// The body of [`exec_query`]: run one `SELECT` through the DataFusion front
