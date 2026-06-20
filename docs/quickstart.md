@@ -58,11 +58,15 @@ curl -s localhost:8081/sql -H 'content-type: application/json' \
   -d '{"sql": "SELECT name FROM users ORDER BY id"}'
 ```
 
-`/sql` runs a single non-DDL statement (`SELECT`/`INSERT`/`UPDATE`/`DELETE`); DDL
-(`CREATE`/`DROP`/`ALTER`) goes to the structured
+`/sql` runs a single non-DDL statement (`SELECT`/`INSERT`/`UPDATE`/`DELETE`) and
+is the **transactional, read-your-writes** surface: a `SELECT` filtered by the
+primary key or an index is served at lookup latency, fresh from your last write.
+A read that would scan (a non-indexed filter, a join, an aggregate) is rejected
+with `400 NO_INDEX` — run it on the **analytical** surface, `/query`, instead.
+DDL (`CREATE`/`DROP`/`ALTER`) goes to the structured
 [`/schema/*`](api/rest.md#schema-ddl-endpoints) endpoints (or `/admin/sql` if
 enabled). You can also use the PostgREST-style surface at `/tables/{table}`. See
-[REST API](api/rest.md).
+[REST API](api/rest.md) and [Reads and indexes](sql/query-guardrail.md).
 
 ## 4. Try a failover
 

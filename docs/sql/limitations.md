@@ -7,9 +7,12 @@ where it **runs but behaves differently** from PostgreSQL/DuckDB. If a feature
 isn't listed as unsupported here or omitted from the other pages, assume it
 works as in standard SQL.
 
-`SELECT` runs the full analytical surface: joins, `GROUP BY` / aggregates,
-window functions, subqueries, CTEs, set operations, and arbitrary `WHERE` /
-`ORDER BY` on any column. See [Reads and indexes](query-guardrail.md).
+`SELECT` runs the full analytical surface on [`/query`](../api/rest.md#post-query-analytical-reads-htap):
+joins, `GROUP BY` / aggregates, window functions, subqueries, CTEs, set
+operations, and arbitrary `WHERE` / `ORDER BY` on any column. On
+[`/sql`](../api/rest.md#post-sql-transactional-reads-writes-read-your-writes) a
+`SELECT` must be index-served (a scan is rejected with `400 NO_INDEX`). See
+[Reads and indexes](query-guardrail.md).
 
 ## Not supported (these error, safe to detect)
 
