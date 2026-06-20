@@ -859,3 +859,208 @@ async fn create_view_select_through_it_and_drop() {
     let (s, _) = call(&app, "POST", "/sql", Some(json!({"sql": "SELECT name FROM active_users"}))).await;
     assert!(s.as_u16() >= 400, "view gone after drop: status {s}");
 }
+
+// =============================================================================
+// Two-tier read split: `/sql` (Ryw/transactional, index-only) vs
+// `/query` (HTAP/analytical, scans/joins/aggregates/JSON paths).
+// =============================================================================
+
+/// Set up a table with a PK (`id`) and a non-indexed column (`score`), plus a
+/// secondary index on `email`. Used by the two-tier split tests below.
+async fn setup_two_tier_table(app: &Router) {
+    let (s, body) = sql_admin(
+        app,
+        "CREATE TABLE tier (id INTEGER PRIMARY KEY, name TEXT, email TEXT, score INTEGER);",
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "create tier: {body}");
+    let (s, body) = sql_admin(app, "CREATE INDEX tier_email ON tier (email);").await;
+    assert_eq!(s, StatusCode::OK, "create index: {body}");
+    let (s, body) = call(
+        app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "INSERT INTO tier VALUES (1, 'alpha', 'a@x.io', 90), (2, 'beta', 'b@x.io', 40), (3, 'gamma', 'c@x.io', 75)"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "insert tier: {body}");
+}
+
+/// `/sql` serves a PK point read fresh from SlateDB at lookup latency.
+#[tokio::test]
+async fn sql_serves_pk_point_read() {
+    let app = app().await;
+    setup_two_tier_table(&app).await;
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "SELECT id, name FROM tier WHERE id = 2"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "pk point read: {body}");
+    assert_eq!(body, json!([{ "id": 2, "name": "beta" }]), "fresh PK read: {body}");
+}
+
+/// `/sql` serves a secondary-index equality read.
+#[tokio::test]
+async fn sql_serves_secondary_index_read() {
+    let app = app().await;
+    setup_two_tier_table(&app).await;
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "SELECT id FROM tier WHERE email = 'b@x.io'"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "index read: {body}");
+    assert_eq!(body, json!([{ "id": 2 }]), "secondary-index read: {body}");
+}
+
+/// `/sql` **rejects** a non-indexed filter with `400 NO_INDEX` (the flip), and
+/// the error points the client at the index to create.
+#[tokio::test]
+async fn sql_rejects_non_indexed_scan_with_no_index_code() {
+    let app = app().await;
+    setup_two_tier_table(&app).await;
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "SELECT id FROM tier WHERE score > 50"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "non-indexed filter on /sql must 400: {body}");
+    assert_eq!(body["code"], json!("NO_INDEX"), "stable code: {body}");
+    let msg = body["error"].as_str().unwrap_or("");
+    assert!(msg.contains("`score`"), "error names the column: {msg}");
+    assert!(
+        msg.contains("CREATE INDEX tier_score ON tier (score);"),
+        "error suggests the index DDL: {msg}"
+    );
+}
+
+/// `/query` serves the same non-indexed scan that `/sql` rejects — aggregates,
+/// arbitrary filters/sorts, and (below) joins all belong there.
+#[tokio::test]
+async fn query_serves_non_indexed_scan_and_aggregate() {
+    let app = app().await;
+    setup_two_tier_table(&app).await;
+    // Non-indexed filter + ORDER BY (a shape /sql rejects).
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/query",
+        Some(json!({"sql": "SELECT id, name FROM tier WHERE score > 50 ORDER BY score DESC"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "/query scan: {body}");
+    let names: Vec<&str> = body.as_array().unwrap().iter()
+        .map(|r| r["name"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["alpha", "gamma"], "score DESC: {body}");
+
+    // An aggregate (GROUP BY) — only the analytical surface serves it.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/query",
+        Some(json!({"sql": "SELECT COUNT(*) AS n FROM tier WHERE score > 50"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "/query aggregate: {body}");
+    assert_eq!(body[0]["n"], json!(2), "two rows over 50: {body}");
+}
+
+/// `/query` rejects a non-SELECT statement with a clear code (writes → `/sql`).
+#[tokio::test]
+async fn query_rejects_non_select() {
+    let app = app().await;
+    setup_two_tier_table(&app).await;
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/query",
+        Some(json!({"sql": "INSERT INTO tier VALUES (9, 'x', 'x@x.io', 1)"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "/query write must 400: {body}");
+    assert_eq!(body["code"], json!("UNSUPPORTED_STATEMENT"), "code: {body}");
+}
+
+/// `/sql` read-your-writes: a row written via `/sql` is immediately visible to a
+/// `/sql` read of the same row (fresh SlateDB state, no seal needed).
+#[tokio::test]
+async fn sql_read_your_writes() {
+    let app = app().await;
+    setup_two_tier_table(&app).await;
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "INSERT INTO tier VALUES (7, 'new', 'n@x.io', 1)"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "insert: {body}");
+    // Read it back immediately via the RYW transactional surface.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "SELECT name FROM tier WHERE id = 7"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "ryw read: {body}");
+    assert_eq!(body, json!([{ "name": "new" }]), "freshly-written row is visible: {body}");
+}
+
+/// `RETURNING` on `/sql`: INSERT/UPDATE/DELETE return the affected rows, not a count.
+#[tokio::test]
+async fn sql_returning_writes() {
+    let app = app().await;
+    setup_two_tier_table(&app).await;
+
+    // INSERT … RETURNING * → the inserted row.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "INSERT INTO tier VALUES (10, 'ten', 't@x.io', 10) RETURNING id, name"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "insert returning: {body}");
+    assert_eq!(body, json!([{ "id": 10, "name": "ten" }]), "RETURNING id,name: {body}");
+
+    // UPDATE … RETURNING → the updated row (re-selected by the WHERE).
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "UPDATE tier SET score = 99 WHERE id = 10 RETURNING id, score"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "update returning: {body}");
+    assert_eq!(body, json!([{ "id": 10, "score": 99 }]), "post-update row: {body}");
+
+    // DELETE … RETURNING → the row captured before deletion.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "DELETE FROM tier WHERE id = 10 RETURNING name"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "delete returning: {body}");
+    assert_eq!(body, json!([{ "name": "ten" }]), "pre-delete row: {body}");
+
+    // It's gone afterwards.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "SELECT id FROM tier WHERE id = 10"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "re-read: {body}");
+    assert_eq!(body, json!([]), "deleted row is gone: {body}");
+}

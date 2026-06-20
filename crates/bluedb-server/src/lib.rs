@@ -946,6 +946,7 @@ pub fn build_app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/sql", post(exec_sql))
+        .route("/query", post(exec_query))
         .route(
             "/tables/{table}",
             get(select).post(insert).patch(update).delete(delete_rows),
@@ -1377,27 +1378,71 @@ async fn exec_sql(
             None => return Err(AppError::internal("lakehouse manager not bound")),
         }
     }
-    // Reads are served by the analytical engine (the DataFusion front door);
-    // writes and DDL stay on the transactional engine. The `GLUE_*` catalog
-    // tables are GlueSQL synthetic views (OBJECTS/TABLES/TABLE_COLUMNS/INDEXES),
-    // not real tables DataFusion can resolve, so they stay on the GlueSQL path.
-    if is_read_query(&req.sql) && !references_glue_meta_table(&req.sql) {
-        return exec_sql_read(&state, &headers, &tenant, &req).await;
+    // `/sql` is the **read-your-writes transactional** surface. Reads run on the
+    // guarded GlueSQL connection (the scan/sort guardrail is enforced), so a
+    // point/range lookup by the primary key or a secondary index is served direct
+    // from fresh SlateDB state at lookup latency, and **any** read that would need
+    // an analytical scan is rejected with `400 NO_INDEX` (the error names the
+    // exact index to create, or points the client at `/query`). Analytical reads
+    // (joins, aggregates, windows, JSON paths, non-indexed filters/sorts) belong
+    // on [`exec_query`] (`POST /query`). FTS `@@` reads stay here: the FTS engine
+    // rewrites them to `pk IN (...)` first, which the guardrail accepts.
+    let params = req.params.iter().map(json_to_param).collect::<Result<Vec<_>, _>>()?;
+
+    // RETURNING: a write that asks for the affected rows back. GlueSQL rejects
+    // `RETURNING` at translate time, so we implement it ourselves: strip the
+    // clause, run the write, then read the affected rows back on an unguarded
+    // connection (the read is bounded by the statement's own predicate, never a
+    // client scan). DELETE captures its rows *before* the write (they're gone
+    // afterwards). Falls through to the normal count path when there's no
+    // RETURNING clause.
+    if let Some(ret) = parse_returning(&req.sql)? {
+        let rows = run_write_returning(&state, &tenant, &ret, &req.sql, &params).await?;
+        let wm = state.write_watermark(&tenant).await;
+        return Ok((watermark_headers(&tenant, wm), Json(Value::Array(rows))));
     }
 
-    let params = req.params.iter().map(json_to_param).collect::<Result<Vec<_>, _>>()?;
     let mut glue = Glue::new(state.connection_serialized(&tenant).await?);
-    // Writes flow through the FTS engine so its commit observer indexes them;
-    // a non-`@@` statement runs unchanged.
+    // Writes flow through the FTS engine so its commit observer indexes them; a
+    // non-`@@` statement (including a guarded `SELECT`) runs unchanged. A
+    // guardrail reject surfaces here as `400 NO_INDEX` via `From<EngineError>`.
     let payloads = state.fts().await.execute_fts(&mut glue, &req.sql, &params).await?;
     let wm = state.write_watermark(&tenant).await;
     Ok((watermark_headers(&tenant, wm), Json(payloads_to_json(payloads))))
 }
 
-/// True if `sql` is a single read query (`SELECT` / `VALUES` / CTE) — routed to
-/// the analytical engine. Writes and DDL return false (the transactional engine
-/// serves them). A parse failure is treated as not-a-read, so the transactional
-/// engine surfaces the error.
+/// `POST /query` — the **HTAP analytical** read surface. Runs a single `SELECT`
+/// through the DataFusion front door over the tenant's Iceberg mirror ∪ unsealed
+/// CDC tail: joins, aggregates, window functions, recursive CTEs, JSON paths,
+/// and arbitrary non-indexed filters/sorts all belong here. It is the counterpart
+/// to [`exec_sql`]: `/sql` serves index-only point/range reads at lookup latency
+/// and rejects scans; `/query` serves the full analytical surface at scan latency
+/// (read-your-writes on the active writer via the unsealed tail; bounded-stale on
+/// a replica). The `X-Bluedb-Min-Watermark` freshness gate and
+/// `bluedb_read_wait_seal_n` tolerance apply unchanged.
+async fn exec_query(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<SqlRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    state.authorize(&headers, authz::Scope::DataQuery)?;
+    let tenant = state.tenant(&headers)?;
+    // A read can be served by a replica at its sealed watermark (the freshness
+    // gate below decides); only `require_active`-style writer routing would need
+    // this, and `/query` deliberately does not gate on it.
+    if !is_read_query(&req.sql) {
+        return Err(AppError::bad_request(
+            "`/query` accepts a single SELECT/VALUES/CTE; writes go to `/sql` and DDL to `/schema`",
+        )
+        .with_code("UNSUPPORTED_STATEMENT"));
+    }
+    exec_query_inner(&state, &headers, &tenant, &req).await
+}
+
+/// True if `sql` is a single read query (`SELECT` / `VALUES` / CTE) — the shape
+/// [`exec_query`] accepts on `POST /query`. Writes and DDL return false. A parse
+/// failure is treated as not-a-read, so a syntax error surfaces from whichever
+/// handler runs it.
 fn is_read_query(sql: &str) -> bool {
     use gluesql_core::sqlparser::ast::Statement;
     match gluesql_core::parse_sql::parse(sql) {
@@ -1427,17 +1472,28 @@ fn references_glue_meta_table(sql: &str) -> bool {
         })
 }
 
-/// Serve a `POST /sql` read through the DataFusion front door: the per-tenant
-/// analytical engine, with every referenced table resolved via the bluedb schema
-/// provider (joins / windows / aggregates / multi-table / CTEs). FTS predicates
-/// are rewritten to plain SQL first; the freshness gate 503s on a non-writer node
-/// that cannot satisfy a fresher-than-sealed read.
-async fn exec_sql_read(
+/// The body of [`exec_query`]: run one `SELECT` through the DataFusion front
+/// door over the per-tenant analytical engine, with every referenced table
+/// resolved via the bluedb schema provider (joins / windows / aggregates /
+/// multi-table / CTEs). FTS predicates are rewritten to plain SQL first; the
+/// freshness gate 503s on a non-writer node that cannot satisfy a
+/// fresher-than-sealed read.
+///
+/// `GLUE_*` catalog introspection tables are GlueSQL synthetics the analytical
+/// engine cannot resolve, so they are rejected here with a pointer to `/sql`.
+async fn exec_query_inner(
     state: &AppState,
     headers: &axum::http::HeaderMap,
     tenant: &str,
     req: &SqlRequest,
 ) -> Result<(axum::http::HeaderMap, Json<Value>), AppError> {
+    if references_glue_meta_table(&req.sql) {
+        return Err(AppError::bad_request(
+            "the `GLUE_*` catalog views are a transactional-introspection surface; \
+             query them through `POST /sql`, not the analytical `/query` endpoint",
+        )
+        .with_code("UNSUPPORTED_STATEMENT"));
+    }
     let manager = state.lakehouse().await.ok_or_else(|| {
         AppError::internal("analytical path unavailable: lakehouse manager not bound")
     })?;
@@ -2132,6 +2188,300 @@ async fn read_affected_json(
     };
     let payloads = rest_sql::execute_query(&mut glue, &q).await?;
     Ok(select_to_json(payloads, &json_cols))
+}
+
+/// What [`exec_sql`] needs to serve an `INSERT`/`UPDATE`/`DELETE … RETURNING`
+/// request. GlueSQL rejects `RETURNING` at translate time, so bluedb implements
+/// it in the server: strip the clause, run the write, then read the affected rows
+/// back. `cols` holds the projected column names (`RETURNING *` → all columns);
+/// `write_sql` is the statement re-rendered with `RETURNING` removed; `pred` is
+/// the predicate to re-select the affected rows (the `WHERE` of an UPDATE/DELETE,
+/// or the PK-equality of an INSERT, as a SQL fragment).
+struct ReturningSpec {
+    /// `INSERT` (read the inserted rows back by PK), `UPDATE`, or `DELETE`.
+    kind: WriteKind,
+    /// The table the write targets.
+    table: String,
+    /// The write SQL with `RETURNING` stripped, ready to hand to gluesql.
+    write_sql: String,
+    /// The predicate to re-select the affected rows, as a `WHERE <...>` fragment.
+    /// `None` for a no-WHERE UPDATE/DELETE (matches every row) and for an INSERT
+    /// (whose predicate is derived from the inserted PK values — see
+    /// [`ReturningSpec::insert_value_rows`]).
+    pred: Option<String>,
+    /// `RETURNING *` → empty (project all columns); else the named columns.
+    cols: Vec<String>,
+    /// For an INSERT, the column list (empty = table-declared order) and the
+    /// VALUES rows (each a vector of rendered SQL fragments), used to build a
+    /// `WHERE pk IN (...)` read-back predicate. `None` for UPDATE/DELETE.
+    insert_value_rows: Option<(Vec<String>, Vec<Vec<String>>)>,
+}
+
+#[derive(PartialEq)]
+enum WriteKind {
+    Insert,
+    Update,
+    Delete,
+}
+
+/// Parse `sql` and, if it is a single `INSERT`/`UPDATE`/`DELETE` carrying a
+/// `RETURNING` clause, return the spec the server uses to run the write and read
+/// the affected rows back. Returns `Ok(None)` for anything else (no RETURNING, a
+/// SELECT, multi-statement, a parse error) so the normal `/sql` path runs. A
+/// parse error is deliberately swallowed to `None` so the write path surfaces it
+/// with the usual `PARSE_ERROR` code rather than a confusing RETURNING error.
+fn parse_returning(sql: &str) -> Result<Option<ReturningSpec>, AppError> {
+    use gluesql_core::sqlparser::ast::{Expr, SelectItem, Statement};
+    let stmts = match gluesql_core::parse_sql::parse(sql) {
+        Ok(s) => s,
+        Err(_) => return Ok(None),
+    };
+    if stmts.len() != 1 {
+        return Ok(None);
+    }
+    let mut stmt = stmts.into_iter().next().unwrap();
+    let (kind, table, returning, pred, insert_value_rows) = match &mut stmt {
+        Statement::Insert(i) => {
+            let returning = i.returning.take();
+            let table = table_name_of(&i.table_name);
+            let columns: Vec<String> = i.columns.iter().map(|c| c.value.clone()).collect();
+            // Render each VALUES row to SQL fragments, if the source is a VALUES.
+            let rows = i
+                .source
+                .as_ref()
+                .and_then(|q| match &*q.body {
+                    gluesql_core::sqlparser::ast::SetExpr::Values(v) => Some(v.clone()),
+                    _ => None,
+                })
+                .map(|v| {
+                    v.rows
+                        .iter()
+                        .map(|row| row.iter().map(|e| e.to_string()).collect::<Vec<_>>())
+                        .collect::<Vec<_>>()
+                });
+            let insert_value_rows = rows.map(|r| (columns, r));
+            (WriteKind::Insert, table, returning, None, insert_value_rows)
+        }
+        Statement::Update { table, selection, returning, .. } => {
+            let returning = returning.take();
+            let pred = selection.as_ref().map(|e| e.to_string());
+            let table = table_name_of_relation(&table.relation);
+            (WriteKind::Update, table, returning, pred, None)
+        }
+        Statement::Delete(d) => {
+            let returning = d.returning.take();
+            let pred = d.selection.as_ref().map(|e| e.to_string());
+            let table = match &d.from {
+                gluesql_core::sqlparser::ast::FromTable::WithFromKeyword(t)
+                | gluesql_core::sqlparser::ast::FromTable::WithoutKeyword(t) => {
+                    t.first().map(|tj| table_name_of_relation(&tj.relation))
+                }
+            }
+            .unwrap_or_default();
+            (WriteKind::Delete, table, returning, pred, None)
+        }
+        _ => return Ok(None),
+    };
+    let Some(returning) = returning else { return Ok(None) };
+    // Resolve the projected columns: `*` → all (empty), else each named column.
+    let mut cols = Vec::new();
+    let mut star = false;
+    for item in &returning {
+        match item {
+            SelectItem::Wildcard(_) => star = true,
+            SelectItem::UnnamedExpr(Expr::Identifier(id))
+            | SelectItem::ExprWithAlias { expr: Expr::Identifier(id), .. } => cols.push(id.value.clone()),
+            other => {
+                return Err(AppError::bad_request(format!(
+                    "RETURNING only supports `*` or bare column names; got `{other}`"
+                )));
+            }
+        }
+    }
+    if star {
+        cols.clear();
+    }
+    Ok(Some(ReturningSpec {
+        kind,
+        table,
+        write_sql: format!("{}", stmt),
+        pred,
+        cols,
+        insert_value_rows,
+    }))
+}
+
+/// The unqualified last segment of a sqlparser [`ObjectName`] (the table name).
+fn table_name_of(name: &gluesql_core::sqlparser::ast::ObjectName) -> String {
+    name.0
+        .last()
+        .map(|i| i.value.clone())
+        .unwrap_or_default()
+}
+
+/// The table name a `FROM` relation names, whatever its shape.
+fn table_name_of_relation(rel: &gluesql_core::sqlparser::ast::TableFactor) -> String {
+    use gluesql_core::sqlparser::ast::TableFactor;
+    match rel {
+        TableFactor::Table { name, .. } => table_name_of(name),
+        _ => String::new(),
+    }
+}
+
+/// Run a `… RETURNING` write and read the affected rows back on an **unguarded**
+/// connection (the read is bounded by the statement's own predicate, so the scan
+/// guardrail does not apply — same rationale as `Prefer: return=representation`).
+///
+/// `DELETE` captures its rows **before** the write (they're gone afterwards);
+/// `UPDATE` re-selects by the (post-write) `WHERE`; `INSERT` re-reads the whole
+/// row for each inserted PK. The rows are projected to the `RETURNING` columns.
+async fn run_write_returning(
+    state: &AppState,
+    tenant: &str,
+    spec: &ReturningSpec,
+    _original_sql: &str,
+    params: &[bluedb_rest::Param],
+) -> Result<Vec<Value>, AppError> {
+    // DELETE: read the to-be-deleted rows *before* the write runs.
+    let pre_delete_rows = if spec.kind == WriteKind::Delete {
+        Some(read_returning_rows(state, tenant, spec, params).await?)
+    } else {
+        None
+    };
+
+    // Run the stripped write on the serialized guarded connection (FTS indexes it).
+    let mut glue = Glue::new(state.connection_serialized(tenant).await?);
+    state
+        .fts()
+        .await
+        .execute_fts(&mut glue, &spec.write_sql, params)
+        .await?;
+
+    if let Some(rows) = pre_delete_rows {
+        return Ok(project_returning(rows, &spec.cols));
+    }
+    let rows = read_returning_rows(state, tenant, spec, params).await?;
+    Ok(project_returning(rows, &spec.cols))
+}
+
+/// Read the rows the RETURNING clause names, from the row store on an unguarded
+/// connection, serialized as JSON with JSON columns re-inflated. `spec.cols`
+/// being empty means `RETURNING *` (all columns); otherwise only the named
+/// columns are projected (selected and narrowed after read).
+async fn read_returning_rows(
+    state: &AppState,
+    tenant: &str,
+    spec: &ReturningSpec,
+    _params: &[bluedb_rest::Param],
+) -> Result<Vec<Value>, AppError> {
+    let storage = state.connection_unguarded(tenant).await?;
+    // Resolve the read-back predicate. UPDATE/DELETE carry their own `WHERE`; an
+    // INSERT derives `WHERE pk IN (inserted values)` from the parsed VALUES rows
+    // and the table's primary-key columns (read from the schema on the unguarded
+    // connection — RETURNING re-selects by the write's own scope, never a client
+    // scan, so the guardrail does not apply).
+    let pred = match (&spec.kind, &spec.pred, &spec.insert_value_rows) {
+        (_, Some(p), _) => Some(p.clone()),
+        (WriteKind::Insert, None, Some((columns, rows))) => {
+            let pk_cols = storage
+                .primary_key_columns(&spec.table)
+                .await
+                .map_err(|e| AppError::internal(format!("pk columns: {e}")))?;
+            insert_returning_predicate(&pk_cols, columns, rows)?
+        }
+        // No predicate at all (a no-WHERE UPDATE/DELETE matches every row; an
+        // INSERT with no resolvable VALUES, e.g. INSERT … SELECT) → read all.
+        _ => None,
+    };
+    let select = match &pred {
+        Some(p) => format!("SELECT * FROM {} WHERE {}", spec.table, p),
+        None => format!("SELECT * FROM {}", spec.table),
+    };
+    let json_cols = storage
+        .json_columns(&spec.table)
+        .await
+        .map_err(|e| AppError::internal(format!("read json catalog: {e}")))?
+        .unwrap_or_default();
+    let mut glue = Glue::new(storage);
+    let payloads = rest_sql::execute_sql(&mut glue, &select, &[], false).await?;
+    let rows = select_to_json(payloads, &json_cols);
+    Ok(rows.as_array().cloned().unwrap_or_default())
+}
+
+/// Build the `WHERE <pk> IN (...)` (single-column PK) or
+/// `WHERE (<pk1>, <pk2>) IN ((..), (..))` (composite) predicate that re-selects
+/// the rows an INSERT just added. `columns` is the INSERT's column list (empty
+/// ⇒ the table's declared order); `rows` are the rendered VALUES rows. Returns
+/// `Ok(None)` when the PK columns can't be located in the INSERT (the caller
+/// then reads every row — acceptable for RETURNING, never a client scan).
+fn insert_returning_predicate(
+    pk_cols: &[String],
+    columns: &[String],
+    rows: &[Vec<String>],
+) -> Result<Option<String>, AppError> {
+    if pk_cols.is_empty() || rows.is_empty() {
+        return Ok(None);
+    }
+    // Position of each PK column in the INSERT. When the INSERT omits the column
+    // list (`INSERT INTO t VALUES ...`), the values are in the table's declared
+    // order; we approximate that by assuming the PK is the leading column(s) at
+    // their schema position — but without the table's full column order we can
+    // only safely resolve a single PK in column-list form. For the common case
+    // (explicit columns, single-column PK) this is exact.
+    let positions: Vec<usize> = if columns.is_empty() {
+        // No column list: only safe to resolve a single PK assumed at position 0.
+        if pk_cols.len() == 1 {
+            vec![0]
+        } else {
+            return Ok(None);
+        }
+    } else {
+        pk_cols
+            .iter()
+            .map(|pk| columns.iter().position(|c| c == pk))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                AppError::bad_request(
+                    "RETURNING on INSERT requires every primary-key column to be in the column list",
+                )
+            })?
+    };
+    if positions.len() == 1 {
+        let i = positions[0];
+        let vals = rows.iter().map(|r| r.get(i).cloned().unwrap_or_else(|| "NULL".into())).collect::<Vec<_>>().join(", ");
+        Ok(Some(format!("{} IN ({})", pk_cols[0], vals)))
+    } else {
+        let tuple = format!("({})", pk_cols.join(", "));
+        let vals = rows
+            .iter()
+            .map(|r| {
+                let t = positions.iter().map(|&i| r.get(i).cloned().unwrap_or_else(|| "NULL".into())).collect::<Vec<_>>().join(", ");
+                format!("({t})")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        Ok(Some(format!("{tuple} IN ({vals})")))
+    }
+}
+
+/// Narrow each read-back row object to the `RETURNING` columns. Empty `cols` =
+/// `RETURNING *` (keep every column). Non-listed keys are dropped.
+fn project_returning(rows: Vec<Value>, cols: &[String]) -> Vec<Value> {
+    if cols.is_empty() {
+        return rows;
+    }
+    rows.into_iter()
+        .map(|row| {
+            let obj = row.as_object().cloned().unwrap_or_default();
+            let mut out = serde_json::Map::new();
+            for c in cols {
+                if let Some(v) = obj.get(c) {
+                    out.insert(c.clone(), v.clone());
+                }
+            }
+            Value::Object(out)
+        })
+        .collect()
 }
 
 /// The PostgREST filters identifying the rows an INSERT just added, from the

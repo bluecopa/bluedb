@@ -63,7 +63,7 @@ is eventually-consistent, not linearizable.
 ### Analytical reads (sealed-snapshot freshness)
 
 Reads the analytical engine serves (arbitrary filters and sorts, joins,
-aggregates, [JSON](../sql/json.md), via `POST /sql` or a `/tables` read routed
+aggregates, [JSON](../sql/json.md), via `POST /query` or a `/tables` read routed
 to it) run over the tenant's most recently **sealed** snapshot of the
 [Iceberg mirror](../lakehouse/iceberg-mirror.md). The active writer additionally
 unions its own unsealed tail, so an analytical read on the writer is still
@@ -72,6 +72,16 @@ read-your-writes. A client can require a minimum freshness with the
 than serve a stale snapshot, and `PRAGMA bluedb_read_wait_seal_n` tunes how many
 seal cycles of staleness a read tolerates. See
 [REST › Read-your-writes & freshness](../api/rest.md#read-your-writes-freshness).
+
+!!! note "Read-your-writes *correct* vs *immediate*"
+    "Read-your-writes" is a *consistency* property that holds for both read
+    surfaces on the active writer. "Read-your-writes *immediate*" is a *latency*
+    property that holds only for [`POST /sql`](../api/rest.md#post-sql-transactional-reads-writes-read-your-writes)
+    point/range reads on the primary key or a secondary index (served direct from
+    the row store). An analytical read on `/query` is read-your-writes-**correct**
+    on the writer (the unsealed tail union) but runs at **scan latency** — a
+    columnar Parquet scan plus the tail merge, not a key lookup. For sub-
+    millisecond read-your-writes, filter by the primary key or an index on `/sql`.
 
 ### Routing across failover
 

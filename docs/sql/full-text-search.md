@@ -29,7 +29,9 @@ the engine are `keyword` and `whitespace`.
 ## 2. Search through `/sql`
 
 A full-text query is a `to_tsvector(cfg, col) @@ *_tsquery(q)` predicate over
-[`POST /sql`](../api/rest.md#post-sql-run-one-parameterized-statement):
+[`POST /sql`](../api/rest.md#post-sql-transactional-reads-writes-read-your-writes)
+(the transactional surface — the `@@` is rewritten to a `pk IN (...)` point
+lookup, served at lookup latency and read-your-writes):
 
 ```sql
 SELECT id, title

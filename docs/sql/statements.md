@@ -152,9 +152,11 @@ DROP INDEX users_email ON users;
 
 !!! note
     An index is a **performance** feature: it turns an equality or range filter
-    (or `ORDER BY`) on that column into a fast index-served lookup. Queries on
-    non-indexed columns still run; they're served as analytical scans (see
-    [Reads and indexes](query-guardrail.md)).
+    (or `ORDER BY`) on that column into a fast index-served lookup on
+    [`/sql`](../api/rest.md#post-sql-transactional-reads-writes-read-your-writes).
+    Queries on non-indexed columns are rejected on `/sql` (`400 NO_INDEX`) and run
+    as analytical scans on [`/query`](../api/rest.md#post-query-analytical-reads-htap)
+    (see [Reads and indexes](query-guardrail.md)).
 
 ### Unique indexes
 
