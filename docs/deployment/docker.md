@@ -1,8 +1,8 @@
 # Docker
 
 `bluedb-server` ships as a single container image (see the repository
-`Dockerfile`). A node is **stateless** — all authoritative state is in the object
-store — so you scale or replace nodes freely.
+`Dockerfile`). A node is **stateless** (all authoritative state is in the object
+store), so you scale or replace nodes freely.
 
 ## Build
 
@@ -35,10 +35,10 @@ bootstrapped as the writer or started as a replica.
 
 bluedb picks the backend from the environment:
 
-- **S3 / MinIO / any S3-compatible** — set `BLUEDB_S3_BUCKET` (+ `BLUEDB_S3_ENDPOINT`
+- **S3 / MinIO / any S3-compatible**: set `BLUEDB_S3_BUCKET` (+ `BLUEDB_S3_ENDPOINT`
   for non-AWS, region, and credentials).
-- **Local filesystem** — set `BLUEDB_DATA_DIR` (single-node persistence).
-- **In-memory** — set neither (ephemeral; single node only).
+- **Local filesystem**: set `BLUEDB_DATA_DIR` (single-node persistence).
+- **In-memory**: set neither (ephemeral; single node only).
 
 GCS and Azure Blob are supported by the substrate via the same S3-style
 configuration where the provider offers an S3-compatible endpoint; otherwise use

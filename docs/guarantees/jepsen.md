@@ -11,28 +11,28 @@ and drives the [Docker Compose cluster](../deployment/local.md).
 
 | Workload | What it does | What it proves |
 |----------|--------------|----------------|
-| **`set`** (default) | Clients append unique integers through the active writer; a final read reads the whole set back | **No lost writes** (every acked add is present) and **no fabrication** (nothing appears that wasn't added) — durability across failover |
-| **`list-append`** | Each transaction is a `BEGIN; …; COMMIT;` of appends + reads, run as one explicit transaction | **Serializability** via Elle — flags G0/G1/G2, write skew, lost update; checked `serializable` or `strict-serializable` |
+| **`set`** (default) | Clients append unique integers through the active writer; a final read reads the whole set back | **No lost writes** (every acked add is present) and **no fabrication** (nothing appears that wasn't added). Proves durability across failover. |
+| **`list-append`** | Each transaction is a `BEGIN; …; COMMIT;` of appends + reads, run as one explicit transaction | **Serializability** via Elle: flags G0/G1/G2, write skew, lost update; checked `serializable` or `strict-serializable` |
 | **`counter`** | Concurrent autocommit `UPDATE c SET n = n + 1` | **No lost updates** (no read below the count of acked increments) |
 | **`unique`** | Many clients race to `INSERT` the same fresh primary key | **No double-apply** (an id is acked at most once) |
-| **`evidence`** | Append-heavy load on one fresh [evidence chain](../evidence/chains.md); a final read reads the whole chain back | **No acked loss** + the server-assigned `seq` is **dense, gap-free, unique `1..N`** — durability-before-ack and the [R1 dense-sequence](../evidence/chains.md) invariant hold across failover |
-| **`graph`** | The writer atomically swaps a diamond between `R→A→Z` and `R→B→Z` via [`POST /graph/{g}/mutate`](../evidence/graph.md#post-graphgraphmutate-atomic-edge-rewire); clients run `reachable(R)` concurrently | **Snapshot isolation** for [graph traversal](../evidence/graph.md#consistency) — every traversal observes one *whole* config (`{R,A,Z}` or `{R,B,Z}`), the sink `Z` is never dropped; a non-snapshot read would tear mid-swap |
+| **`evidence`** | Append-heavy load on one fresh [evidence chain](../evidence/chains.md); a final read reads the whole chain back | **No acked loss** + the server-assigned `seq` is **dense, gap-free, unique `1..N`**. Durability-before-ack and the [R1 dense-sequence](../evidence/chains.md) invariant hold across failover. |
+| **`graph`** | The writer atomically swaps a diamond between `R→A→Z` and `R→B→Z` via [`POST /graph/{g}/mutate`](../evidence/graph.md#post-graphgraphmutate-atomic-edge-rewire); clients run `reachable(R)` concurrently | **Snapshot isolation** for [graph traversal](../evidence/graph.md#consistency): every traversal observes one *whole* config (`{R,A,Z}` or `{R,B,Z}`), the sink `Z` is never dropped; a non-snapshot read would tear mid-swap |
 
 In the set/list-append/counter workloads the cluster is driven as one logical
 writer whose identity moves on failover; the client discovers the active writer
-via `/admin/status` and re-discovers on a `503` — it **follows the leader**
+via `/admin/status` and re-discovers on a `503`; it **follows the leader**
 across promotions.
 
-!!! warning "Harness ported to the schema regime — some workloads pending re-run"
+!!! warning "Harness ported to the schema regime: some workloads pending re-run"
     The merged [schema regime](../sql/query-guardrail.md) (required `PRIMARY KEY`,
     no schemaless auto-create, bounded reads) made the original Jepsen client
-    stale — it assumed a table auto-creates on first insert and that one read
+    stale: it assumed a table auto-creates on first insert and that one read
     returns the whole set. Two workloads have been ported and **re-verified on the
     live cluster against the post-group-commit write path** (see Results):
 
-    - **`set`** — creates `jset (v INTEGER PRIMARY KEY)` up front and
+    - **`set`**: creates `jset (v INTEGER PRIMARY KEY)` up front and
       keyset-paginates the final read.
-    - **`list-append`** — redesigned for
+    - **`list-append`**: redesigned for
       [index-organized](../concepts/architecture.md#storage-model-index-organized-tables)
       (PK-clustered) storage, where `SELECT … WHERE k = ?` no longer returns
       *insertion* order. Each element is one row keyed by a surrogate
@@ -44,11 +44,11 @@ across promotions.
     The **`counter`** and **`unique`** workloads have since been ported too (each
     creates its PK'd table up front in `setup!` and drives the writer via the
     JSON `/sql` + `/tables` surfaces), plus a new **`dur`** probe (a grow-only set
-    written through the `/sql` autocommit path — counter's exact write path — with
-    identifiable elements, to time any acked-write loss). See Results.
+    written through the `/sql` autocommit path, which is counter's exact write path, with
+    identifiable elements to time any acked-write loss). See Results.
 
     The **`ledger`** workload still needs the same port before it can be re-run;
-    its earlier green result predates the schema regime — treat it as pending
+    its earlier green result predates the schema regime; treat it as pending
     re-validation.
 
 ## Faults (nemesis)
@@ -72,27 +72,27 @@ Injected against the Compose stack via the `docker` CLI:
 
 - **Post-group-commit re-verification (2026-06-16):** the **`set`** workload is
   **`:valid? true`** with **`lost-count 0`** across `none` / `kill` / `partition`
-  / `mix` / `skew` on the live 3-node cluster — every acknowledged write survives
+  / `mix` / `skew` on the live 3-node cluster. Every acknowledged write survives
   a hard crash, a network partition, combined faults, and clock skew (the
   `writer_epoch` fence holds). This is the current verification on the
   group-commit write path.
 - The dependency faults (`arbiter` / `arbiter-hard` / `storage` / `disk-full`)
-  are **`:valid? true`** with **`lost-count 0`** — bluedb stays **consistent**
+  are **`:valid? true`** with **`lost-count 0`**: bluedb stays **consistent**
   (no split-brain, no lost acked writes) while losing **availability** when a
   dependency is down. This is the **CP** behavior, demonstrated.
 - **`list-append` re-verification (2026-06-16):** ported to the schema regime and
-  **`:valid? true`** on the live 3-node cluster — a clean baseline (`none`, every
+  **`:valid? true`** on the live 3-node cluster: a clean baseline (`none`, every
   transaction commits), **`mix`** (kill + partition) serializable through
   failover, and **`strict-serializable`** under `kill` (adds real-time order,
   through crashes). Elle finds no G0/G1/G2, lost update, write skew, or
   incompatible-order anomaly on the explicit-transaction (`/admin/sql`) path.
 - **Evidence chain (2026-06-16):** the **`evidence`** workload is **`:valid?
   true`** across `none` / `kill` / `partition` / `mix` on the live 3-node
-  cluster — **zero acked appends lost** and the server-assigned `seq` stayed
+  cluster: **zero acked appends lost** and the server-assigned `seq` stayed
   **dense, gap-free `1..N`** through ~22 leadership epochs. Durability-before-ack
   and dense sequencing survive crash / partition / pause + failover.
 - **Graph-traversal snapshot isolation (2026-06-16):** the **`graph`** workload
-  is **`:valid? true`** across `pause` / `kill` / `partition` / `mix` — **0
+  is **`:valid? true`** across `pause` / `kill` / `partition` / `mix`: **0
   violations, 0 sink-drops** over ~7,000 traversals racing ~2,700 atomic swaps,
   leadership moving across ~29 epochs. Every traversal pinned one snapshot and
   observed a single consistent cut; the sink was never dropped, even under
@@ -100,7 +100,7 @@ Injected against the Compose stack via the `docker` CLI:
   demonstrates [snapshot-consistent traversal](../evidence/graph.md#consistency).
 - **`counter` re-verification + a failover fix (2026-06-16):** ported to the
   schema regime, the `counter` × `kill` run first surfaced a real **failover
-  read-staleness** bug — *not* a lost write. A just-promoted node briefly
+  read-staleness** bug (*not* a lost write). A just-promoted node briefly
   advertised `role: "active"` (it had the lease) while still bound to its
   pre-failover replica `Db`, and `GET /tables` reads are not writer-gated, so a
   client following the leader read the lagging replica and saw the counter
@@ -122,7 +122,7 @@ remaining workloads are ported (see the warning above). The `set`,
 !!! note "Methodology"
     Fault windows straddle the lease TTL so failover completes inside each
     window. The clock-skew nemesis uses a `libfaketime` entrypoint. Fault
-    injection uses the `docker` CLI (no SSH) — the natural seam for a
+    injection uses the `docker` CLI (no SSH), the natural seam for a
     containerized deployment.
 
 ## Running it yourself
@@ -140,7 +140,7 @@ bin/lein run test --workload evidence --nemesis mix       --time-limit 180 $NODE
 bin/lein run test --workload graph    --nemesis pause     --time-limit 120 $NODES
 ```
 
-(Pass the `--node` flags explicitly — a shell that doesn't word-split an
+(Pass the `--node` flags explicitly: a shell that doesn't word-split an
 unquoted variable will otherwise hand them to lein as one argument.)
 
 See [`jepsen/README.md`](https://github.com/bluecopa/bluedb/blob/dev/jepsen/README.md)

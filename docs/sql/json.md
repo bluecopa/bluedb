@@ -3,7 +3,7 @@
 [← SQL index](README.md)
 
 bluedb has a **`JSON` / `JSONB` column type** and the common PostgreSQL JSON
-operators and functions — field access (`->`, `->>`), containment (`@>`, `<@`),
+operators and functions: field access (`->`, `->>`), containment (`@>`, `<@`),
 and the `jsonb_path_query` family. JSON values round-trip as **real JSON** over
 the [`/tables`](../api/rest.md) data plane, not as quoted strings.
 
@@ -11,13 +11,13 @@ the [`/tables`](../api/rest.md) data plane, not as quoted strings.
     The JSON **operators and functions** are evaluated by bluedb's analytical
     engine. You reach them two ways: through [`POST /sql`](../api/rest.md#post-sql-run-one-parameterized-statement),
     and through a [`/tables`](../api/rest.md#get-tablestable-select) read whose
-    filter uses a JSON path (`col->>key`) — that read is routed to the analytical
+    filter uses a JSON path (`col->>key`); that read is routed to the analytical
     engine automatically. Storing and retrieving whole JSON values works on every
     path; only the field-level operators are analytical-engine-only.
 
 ## The `JSON` / `JSONB` column type
 
-Declare a column `JSON` or `JSONB` (the two are interchangeable — both are stored
+Declare a column `JSON` or `JSONB` (the two are interchangeable: both are stored
 as text and returned as JSON):
 
 ```sql
@@ -39,7 +39,7 @@ curl -s -X POST localhost:8081/schema/tables -H 'content-type: application/json'
       ]}'
 ```
 
-Insert a JSON object, array, or scalar — send it as JSON, not a string:
+Insert a JSON object, array, or scalar; send it as JSON, not a string:
 
 ```bash
 curl -s -X POST localhost:8081/tables/events -H 'content-type: application/json' \
@@ -54,7 +54,7 @@ curl -s 'localhost:8081/tables/events?id=eq.1'
 # [{"id":1,"actor":"ada","attrs":{"status":"active","tags":["a","b"],"n":3}}]
 ```
 
-## Field access — `->` and `->>`
+## Field access: `->` and `->>`
 
 | Operator | Returns | Function form |
 |----------|---------|---------------|
@@ -62,7 +62,7 @@ curl -s 'localhost:8081/tables/events?id=eq.1'
 | `json ->> key` | the sub-value as **text** (a string is unquoted) | `json_get_str(json, key)` |
 
 `key` is an object field name (text) **or** an array index (integer). A parse
-failure, a missing key, or a non-navigable value yields `NULL` — never an error —
+failure, a missing key, or a non-navigable value yields `NULL` (never an error),
 so a column holding ragged JSON never fails a query.
 
 ```sql
@@ -75,7 +75,7 @@ FROM events;
 
 Operators chain left-to-right; each `->` step returns JSON the next step parses.
 Use the function form (`json_get_str(attrs,'status')`) when you want to avoid
-operator-precedence surprises — see the caveat below.
+operator-precedence surprises; see the caveat below.
 
 !!! warning "Parenthesize `->>` in a comparison"
     The analytical engine gives `->>` **lower** precedence than `=`, so a bare
@@ -87,10 +87,10 @@ operator-precedence surprises — see the caveat below.
     SELECT * FROM events WHERE json_get_str(attrs, 'status') = 'active';
     ```
 
-    Over the `/tables` query string this is handled for you — `attrs->>status=eq.active`
+    Over the `/tables` query string this is handled for you: `attrs->>status=eq.active`
     renders to the function form.
 
-## Containment — `@>` and `<@`
+## Containment: `@>` and `<@`
 
 PostgreSQL `jsonb` containment, evaluated recursively: an object contains an
 object when every key/value is contained; an array contains an array when every
@@ -114,7 +114,7 @@ SELECT * FROM events WHERE attrs -> 'tags' @> '["a"]';
     `attrs @> '{"status":null}'` is **not** equivalent, so use
     `(attrs ->> 'status') IS NOT NULL`.
 
-## Path queries — `jsonb_path_query`
+## Path queries: `jsonb_path_query`
 
 | Function | Returns |
 |----------|---------|
@@ -136,14 +136,14 @@ Supported path steps are a **navigation subset**: `$` (root), `.key` and
     - PostgreSQL `jsonb_path_query` returns **one row per match**; bluedb's is a
       scalar, so it returns the **first** match (exact for the common single-match
       path). Use `jsonb_path_query_array` to get every match as one JSON array.
-    - A path bluedb can't evaluate — filters `? (...)`, methods like `.type()`,
-      ranges `[1 to 3]`, `starts with`, arithmetic, variables — **raises an error**
+    - A path bluedb can't evaluate (filters `? (...)`, methods like `.type()`,
+      ranges `[1 to 3]`, `starts with`, arithmetic, variables) **raises an error**
       rather than returning `NULL`, so an unevaluable path is never mistaken for a
       genuine no-match. A *supported* path that matches nothing returns `NULL`.
 
 ## See also
 
-- [Expressions](expressions.md#operators) — JSON operators in the full operator set.
-- [Functions](functions.md#json) — the JSON function reference.
-- [REST API](../api/rest.md#json-path-filters-on-tables) — JSON-path filters on the `/tables` data plane.
-- [Limitations & differences](limitations.md) — the compatibility contract.
+- [Expressions](expressions.md#operators): JSON operators in the full operator set.
+- [Functions](functions.md#json): the JSON function reference.
+- [REST API](../api/rest.md#json-path-filters-on-tables): JSON-path filters on the `/tables` data plane.
+- [Limitations & differences](limitations.md): the compatibility contract.

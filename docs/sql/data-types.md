@@ -17,7 +17,7 @@
 | `TIMESTAMP` | Date + time |
 | `INTERVAL` | Duration |
 | `UUID` | 128-bit UUID |
-| `JSON` / `JSONB` | JSON document — see [JSON](json.md) |
+| `JSON` / `JSONB` | JSON document (see [JSON](json.md)) |
 
 !!! note
     `LIST`, `MAP`, and `POINT` values are also supported (for the list/map/geo

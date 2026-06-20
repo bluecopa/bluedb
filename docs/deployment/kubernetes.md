@@ -1,6 +1,6 @@
 # Kubernetes
 
-This is a deployment **guide** — the topology, the moving parts, and the key
+This is a deployment **guide**: the topology, the moving parts, and the key
 settings. It uses illustrative snippets, not a committed manifest set or Helm
 chart (those are on the roadmap).
 
@@ -37,7 +37,7 @@ flowchart TD
 | Piece | Purpose |
 |-------|---------|
 | **StatefulSet** (or Deployment) | Runs N `bluedb-server` pods with stable identities (`BLUEDB_NODE_ID` = pod name) |
-| **Lease arbiter** | A Kubernetes `coordination.k8s.io/Lease` (via the lease provider) *or* a Postgres `BLUEDB_LEASE_PG_URL` — elects one writer |
+| **Lease arbiter** | A Kubernetes `coordination.k8s.io/Lease` (via the lease provider) *or* a Postgres `BLUEDB_LEASE_PG_URL`; elects one writer |
 | **Object storage** | Managed bucket (recommended) or in-cluster MinIO |
 | **Write Service** | Routes writes to the active writer; replicas return `503` so clients re-discover the leader |
 | **Read Service** | Load-balances reads across all pods |
@@ -45,7 +45,7 @@ flowchart TD
 
 ## Configuration
 
-Each pod is configured purely through environment variables — the same ones the
+Each pod is configured purely through environment variables, the same ones the
 [Docker](docker.md) and [Compose](local.md) deployments use. A `ConfigMap` holds
 the shared settings; the pod name supplies `BLUEDB_NODE_ID`. For example
 (sketch):
@@ -77,36 +77,36 @@ See [Configuration](configuration.md) for every variable.
 
 ## Writer election: two options
 
-- **Postgres arbiter** — set `BLUEDB_LEASE_PG_URL` to a Postgres reachable from
+- **Postgres arbiter**: set `BLUEDB_LEASE_PG_URL` to a Postgres reachable from
   all pods. Simplest if you already run Postgres; identical to the Compose setup.
-- **Kubernetes `Lease`** — use the native `coordination.k8s.io/Lease` object via
+- **Kubernetes `Lease`**: use the native `coordination.k8s.io/Lease` object via
   the lease provider (no extra datastore). Requires RBAC granting the pods
   `get`/`update` on a `Lease` resource.
 
 Either way, `bluedb-ha` self-fences within `BLUEDB_LEASE_MARGIN_SECS` of expiry
-and SlateDB's epoch CAS fences any straggler — see
+and SlateDB's epoch CAS fences any straggler. See
 [Active-passive HA](../ha/active-passive.md).
 
 ## Routing writes to the leader
 
 The write `Service` must reach the active writer. Two common approaches:
 
-1. **Readiness-gated** — a pod reports *ready* only while active (a sidecar/probe
+1. **Readiness-gated**: a pod reports *ready* only while active (a sidecar/probe
    checks `/admin/status`), so the write `Service`'s endpoints contain only the
    writer. Reads use a separate always-ready `Service`.
-2. **Client-follows-leader** — point clients at any pod; on a `503` they
+2. **Client-follows-leader**: point clients at any pod; on a `503` they
    re-discover the writer via `/admin/status` (this is what the
    [Jepsen](../guarantees/jepsen.md) client does).
 
 ## Scaling
 
-- **Reads** — increase replicas; the read `Service` spreads load. No
+- **Reads**: increase replicas; the read `Service` spreads load. No
   coordination cost.
-- **Writes** — fixed at one writer (the [single-writer model](../concepts/single-writer.md));
+- **Writes**: fixed at one writer (the [single-writer model](../concepts/single-writer.md));
   scale writes by sharding across databases at the application layer.
 
 ## Multi-region
 
 Run an independent cluster per region against per-region buckets, with
-cross-region object-store replication and gated promotion — see
+cross-region object-store replication and gated promotion. See
 [Multi-region](../ha/multi-region.md).

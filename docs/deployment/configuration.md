@@ -11,11 +11,11 @@
 | `BLUEDB_NODE_ID` | `node-0` | This node's identity (use the pod name in K8s) |
 | `BLUEDB_START_PASSIVE` | unset | Start as a read replica and wait to be promoted (default bootstraps to writer) |
 | `BLUEDB_FLUSH_INTERVAL_MS` | `25` | WAL flush interval (ms), set at writer open. Lower = lower write latency but more object-store PUTs under load |
-| `BLUEDB_FTS_SEAL_INTERVAL_MS` | `30000` | Interval (ms) for the background [full-text](../sql/full-text-search.md) seal/compaction scheduler — folds the in-memory live segment into durable splits |
+| `BLUEDB_FTS_SEAL_INTERVAL_MS` | `30000` | Interval (ms) for the background [full-text](../sql/full-text-search.md) seal/compaction scheduler; folds the in-memory live segment into durable splits |
 
 ## Object store
 
-bluedb runs on any of three clouds (plus local disk). Select **one** backend —
+bluedb runs on any of three clouds (plus local disk). Select **one** backend:
 the first family whose selector variable is present wins, in the order
 **S3 → Azure → GCS → local → in-memory**.
 
@@ -36,7 +36,7 @@ the first family whose selector variable is present wins, in the order
 | `BLUEDB_AZURE_CONTAINER` | Use Azure Blob (presence selects this backend) |
 | `BLUEDB_AZURE_ACCOUNT` | Storage account name |
 | `BLUEDB_AZURE_ACCESS_KEY` | Account access key |
-| `BLUEDB_AZURE_ENDPOINT` | Override the blob endpoint (full account URL) — for Azurite or any Azure-compatible store; implies plain HTTP |
+| `BLUEDB_AZURE_ENDPOINT` | Override the blob endpoint (full account URL) for Azurite or any Azure-compatible store; implies plain HTTP |
 
 **Google Cloud Storage:**
 
@@ -59,7 +59,7 @@ single node only).
     write → close → reopen → read, including the conditional-put used for
     single-writer safety). **S3** and **Azure** are covered by emulator
     round-trip tests (MinIO, Azurite). **GCS** is verified against **real GCS**
-    — its backend uses the GCS *XML* API, which the common local emulators
+    Its backend uses the GCS *XML* API, which the common local emulators
     (fake-gcs, storage-testbench) don't fully serve, so the round-trip test
     (`gcs_real_round_trip`) is env-gated against an actual bucket. See
     `crates/bluedb-server/tests/objstore_emulators.rs`.
@@ -94,10 +94,10 @@ off until enabled with `PRAGMA lakehouse_mirror`.
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `BLUEDB_ENABLE_ADMIN_SQL` | unset (off) | Set to `1`/`true` to enable [`POST /admin/sql`](../api/rest.md#post-adminsql-arbitrary-sql-off-by-default) — arbitrary, audited SQL (DDL/txn/multi). Off by default |
-| `BLUEDB_AUTHZ_TOKENS` | unset (open mode) | Bearer-token → scope map. When unset the server runs in **open mode** (all requests allowed) — production should always set this |
+| `BLUEDB_ENABLE_ADMIN_SQL` | unset (off) | Set to `1`/`true` to enable [`POST /admin/sql`](../api/rest.md#post-adminsql-arbitrary-sql-off-by-default): arbitrary, audited SQL (DDL/txn/multi). Off by default |
+| `BLUEDB_AUTHZ_TOKENS` | unset (open mode) | Bearer-token → scope map. When unset the server runs in **open mode** (all requests allowed); production should always set this |
 
-`BLUEDB_AUTHZ_TOKENS` uses the format `tok1=scope,scope;tok2=scope` —
+`BLUEDB_AUTHZ_TOKENS` uses the format `tok1=scope,scope;tok2=scope`:
 semicolon-separated token entries, each a token followed by `=` and a
 comma-separated scope list. Recognized scopes: `data:read`, `data:write`,
 `data:query`, `schema:admin`, `superuser` (which satisfies any required scope).
@@ -111,14 +111,14 @@ BLUEDB_AUTHZ_TOKENS='reader=data:read;writer=data:read,data:write,data:query;adm
 ## Multi-tenancy
 
 Every request is scoped to a **tenant** via the `X-Bluedb-Tenant` request header
-(absent ⇒ the default tenant `_`). Tenants have fully isolated keyspaces — and,
+(absent ⇒ the default tenant `_`). Tenants have fully isolated keyspaces, and
 for the [lakehouse mirror](../lakehouse/iceberg-mirror.md#multi-tenancy), a
 separate Iceberg namespace each. Tenant names allow letters, digits, `_`, and
 `-`. No env var is needed to enable multi-tenancy; it is always on.
 
 Bind a token to one or more tenants with a `tenant:<name>` entry in
 `BLUEDB_AUTHZ_TOKENS` (alongside its scopes). The request's `X-Bluedb-Tenant`
-must then match one of the token's tenants — a `superuser` token reaches any
+must then match one of the token's tenants; a `superuser` token reaches any
 tenant, and a token with **no** `tenant:` entry may reach only the default
 tenant (so single-tenant configs keep working). In open mode (no
 `BLUEDB_AUTHZ_TOKENS`) the header is trusted.
@@ -144,4 +144,4 @@ BLUEDB_NODE_ID=node-a \
 
 !!! tip
     The same variables drive [Docker](docker.md), [Compose](local.md), and
-    [Kubernetes](kubernetes.md) — only how you supply them differs.
+    [Kubernetes](kubernetes.md); only how you supply them differs.

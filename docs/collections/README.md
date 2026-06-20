@@ -2,7 +2,7 @@
 
 bluedb exposes a **MongoDB-style document API** alongside its SQL and REST surfaces.
 You store schema-free JSON documents in named collections, filter and mutate them
-with familiar MQL operators, and run aggregation pipelines — all over plain HTTP,
+with familiar MQL operators, and run aggregation pipelines, all over plain HTTP,
 without a native MongoDB driver or the MongoDB wire protocol. A collection is
 backed by a table `coll(_id TEXT PRIMARY KEY, doc JSON)` managed transparently by
 the server. The **tenant** (analogous to a MongoDB database) is selected per-request
@@ -17,7 +17,7 @@ via `X-Bluedb-Tenant`; omitting the header uses the default tenant `_`.
 ## Authorization
 
 Collections use the same bearer-token authorization as the rest of bluedb (see
-[REST API — Authorization](../api/rest.md#authorization)).
+[REST API: Authorization](../api/rest.md#authorization)).
 
 | Operation | Required scope |
 |-----------|----------------|
@@ -213,8 +213,8 @@ Any unrecognized operator (key starting with `$`) is rejected with an error.
 | `$unionWith` | **no** | `UnsupportedStage` |
 
 All pipelines run against the **analytical engine** (DataFusion over the Iceberg
-mirror). Data is visible to `aggregate` only after the Iceberg seal cycle —
-see [Freshness](#freshness) below.
+mirror). Data is visible to `aggregate` only after the Iceberg seal cycle.
+See [Freshness](#freshness) below.
 
 ### Indexing
 
@@ -222,9 +222,9 @@ see [Freshness](#freshness) below.
 |---------|-----------|-------|
 | Single-field index | yes | `{"keys": {"field": 1}}` |
 | Unique index | yes | `{"options": {"unique": true}}` |
-| Compound index | yes | `{"keys": {"a": 1, "b": 1}}` — accelerates **full-key equality** lookups (`{a: x, b: y}`). Top-level fields only; dotted (nested) paths are rejected. Prefix-only queries or range queries fall to single-field indexes or the analytical engine. |
-| Multikey index (array field or scalar) | yes | `{"keys": {"tags": 1}}` — element-membership `find` is index-accelerated on the fast path. Top-level fields only; dotted (nested) paths are rejected. See note below. |
-| TTL index | yes (all tenants) | `{"options": {"expireAfterSeconds": N}}` — see note below |
+| Compound index | yes | `{"keys": {"a": 1, "b": 1}}`: accelerates **full-key equality** lookups (`{a: x, b: y}`). Top-level fields only; dotted (nested) paths are rejected. Prefix-only queries or range queries fall to single-field indexes or the analytical engine. |
+| Multikey index (array field or scalar) | yes | `{"keys": {"tags": 1}}`: element-membership `find` is index-accelerated on the fast path. Top-level fields only; dotted (nested) paths are rejected. See note below. |
+| TTL index | yes (all tenants) | `{"options": {"expireAfterSeconds": N}}`: see note below |
 | Geospatial index | **no** | |
 | Text index | **no** | Use [SQL full-text search](../sql/full-text-search.md) instead |
 | Partial index | **no** | |
@@ -242,16 +242,16 @@ Indexes are **gateway-maintained**: the server adds a derived column
     `{"options": {"type": "number"}}`, `{"options": {"type": "bool"}}`, or
     `{"options": {"type": "string"}}`.
 
-    - **String fields** — the derived column is TEXT; equality and range filters
+    - **String fields**: the derived column is TEXT; equality and range filters
       on string values (`{status: "active"}`) use the fast path.
-    - **Integer/boolean fields** — the derived column is an INTEGER or BOOLEAN
+    - **Integer/boolean fields**: the derived column is an INTEGER or BOOLEAN
       column. Filters on integer values (e.g. `{age: 36}`) or boolean values
       (e.g. `{enabled: true}`) are served on the **fresh fast path** (read-your-writes),
       just like string fields. `5` and `5.0` are treated as the same value.
-    - **Fractional/float fields** — a field whose sampled values include a
+    - **Fractional/float fields**: a field whose sampled values include a
       fractional part (e.g. `3.14`) cannot use the fast INT index. Queries on
       that field are served by the **analytical engine** (seconds-fresh, correct
-      results). This is automatic — type inference picks the right column type.
+      results). Type inference picks the right column type automatically.
 
     `$exists` always uses the derived column regardless of type (it is a NULL
     check and is type-agnostic).
@@ -265,7 +265,7 @@ Indexes are **gateway-maintained**: the server adds a derived column
     val = $1)`. The side table carries a secondary index on `val`, and the query
     guardrail recognizes this PK-IN-(indexed subquery) shape as index-served, so
     the read stays on the **GlueSQL transactional fast path** (read-your-writes,
-    no seal required) — a point lookup on the side table, not an analytical-engine
+    no seal required): a point lookup on the side table, not an analytical-engine
     full scan.
 
     **Dotted (nested) paths** are **not** supported for multikey indexes in v1.
@@ -276,7 +276,7 @@ Indexes are **gateway-maintained**: the server adds a derived column
     A TTL index expires documents whose TTL field value (plus `expireAfterSeconds`)
     is in the past. The numeric TTL field is interpreted as **epoch seconds**
     (Unix timestamp). A field storing epoch **milliseconds** (e.g.
-    `Date.now()` in JavaScript) will never expire as expected — convert to seconds
+    `Date.now()` in JavaScript) will never expire as expected. Convert to seconds
     before storing, or use an ISO-8601 string field (e.g. `"2026-06-15T00:00:00Z"`).
 
     TTL indexes are supported on **all tenants**. Each tenant that creates a TTL
@@ -305,8 +305,8 @@ depends on whether the filter field is indexed:
   `delete` always write through this path.
 
 **Analytical path (seconds-fresh)**
-: Queries on a field that is **not** indexed — all `aggregate` requests — and
-  queries on an indexed field whose values are fractional/float — are served by
+: Queries on a field that is **not** indexed (all `aggregate` requests), and
+  queries on an indexed field whose values are fractional/float, are served by
   the analytical engine over the Iceberg mirror. The mirror reflects data as of
   the last **seal cycle** (typically sub-second to a few seconds, depending on
   write cadence and deployment topology). Data written in the current seal window
@@ -333,23 +333,23 @@ engine; the response shape is identical regardless of which path served it.
 
 The following MongoDB features are not implemented in this release:
 
-- **MongoDB wire protocol** — native `mongosh` / `MongoClient` drivers cannot connect.
-- **Server-side cursors** — all results are returned in a single response body.
+- **MongoDB wire protocol**: native `mongosh` / `MongoClient` drivers cannot connect.
+- **Server-side cursors**: all results are returned in a single response body.
 - **Geospatial, text, partial, sparse, and hashed indexes.**
-- **Compound index on nested (dotted) paths** — compound and multikey indexes accept top-level field names only; dotted paths (e.g. `"a.b"`) are rejected.
-- **Compound index prefix/range acceleration** — a compound index `{a,b}` accelerates full-key equality (`{a:x, b:y}`) but not prefix-only (`{a:x}`) or range queries on the last component; those fall to single-field indexes or the analytical engine.
-- **Fractional/float field fast-path** — queries on a field indexed as float are served by the analytical engine (seconds-fresh, not read-your-writes).
+- **Compound index on nested (dotted) paths**: compound and multikey indexes accept top-level field names only; dotted paths (e.g. `"a.b"`) are rejected.
+- **Compound index prefix/range acceleration**: a compound index `{a,b}` accelerates full-key equality (`{a:x, b:y}`) but not prefix-only (`{a:x}`) or range queries on the last component; those fall to single-field indexes or the analytical engine.
+- **Fractional/float field fast-path**: queries on a field indexed as float are served by the analytical engine (seconds-fresh, not read-your-writes).
 - **Aggregation stages:** `$facet`, `$graphLookup`, `$bucket`/`$bucketAuto`, `$setWindowFields`, `$merge`, `$out`, `$replaceRoot`, `$replaceWith`, `$unionWith`.
-- **`$lookup` on JSON sub-field paths** — the join key must be a plain top-level field name, not a dotted path like `"address.city"`.
-- **`$unwind` on missing/null fields** — a document where the unwound field is absent or null yields no output rows (consistent with MongoDB's default behavior; `preserveNullAndEmptyArrays` is not supported).
-- **Distributed multi-document transactions** — updates are applied document-by-document; there is no multi-document ACID boundary across the collections API.
-- **Heterogeneous `_id` types** — `_id` is always `TEXT`. Integer, ObjectId, and composite `_id` values are stored as their JSON string representation.
-- **Array update operators** — `$`, `$[]`, `$[<identifier>]`, `$addToSet`, `$pop`.
-- **`$regex` in aggregation pipelines** — `$regex` is rejected in the `$match` stage that runs on the analytical engine.
+- **`$lookup` on JSON sub-field paths**: the join key must be a plain top-level field name, not a dotted path like `"address.city"`.
+- **`$unwind` on missing/null fields**: a document where the unwound field is absent or null yields no output rows (consistent with MongoDB's default behavior; `preserveNullAndEmptyArrays` is not supported).
+- **Distributed multi-document transactions**: updates are applied document-by-document; there is no multi-document ACID boundary across the collections API.
+- **Heterogeneous `_id` types**: `_id` is always `TEXT`. Integer, ObjectId, and composite `_id` values are stored as their JSON string representation.
+- **Array update operators**: `$`, `$[]`, `$[<identifier>]`, `$addToSet`, `$pop`.
+- **`$regex` in aggregation pipelines**: `$regex` is rejected in the `$match` stage that runs on the analytical engine.
 
 ## See also
 
-- [REST API](../api/rest.md) — the SQL and PostgREST data planes.
-- [Full-text search](../sql/full-text-search.md) — BM25 and trigram search over SQL.
-- [Iceberg mirror](../lakehouse/iceberg-mirror.md) — the analytical engine backing `aggregate`.
-- [Query guardrail](../sql/query-guardrail.md) — why non-indexed queries are rerouted.
+- [REST API](../api/rest.md): the SQL and PostgREST data planes.
+- [Full-text search](../sql/full-text-search.md): BM25 and trigram search over SQL.
+- [Iceberg mirror](../lakehouse/iceberg-mirror.md): the analytical engine backing `aggregate`.
+- [Query guardrail](../sql/query-guardrail.md): why non-indexed queries are rerouted.

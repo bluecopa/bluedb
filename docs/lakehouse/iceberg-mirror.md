@@ -1,14 +1,14 @@
 # Lakehouse mirror (Apache Iceberg)
 
 bluedb continuously mirrors your tables into **Apache Iceberg** tables in the
-same object storage it already runs on — so you can **join bluedb data with your
+same object storage it already runs on, so you can **join bluedb data with your
 warehouse** (BigQuery, Databricks, Snowflake, Trino, Spark, DuckDB) without any
 ETL, export job, or connector. The warehouse reads the Iceberg tables straight
 from the bucket; the join runs *inside* the warehouse.
 
 There is **no separate process and no build flag**: the mirror is always compiled
 into `bluedb-server` and controlled entirely at runtime with a PRAGMA. It is
-**off by default** — you opt in.
+**off by default**; you opt in.
 
 ```mermaid
 flowchart LR
@@ -24,8 +24,8 @@ flowchart LR
 ## Why mirror instead of federate?
 
 bluedb stores data in SlateDB's LSM format, which a warehouse can't read, and
-its SQL engine can't reach into a warehouse. Mirroring to Iceberg — the open
-table format every major engine reads — makes bluedb tables first-class in your
+its SQL engine can't reach into a warehouse. Mirroring to Iceberg (the open
+table format every major engine reads) makes bluedb tables first-class in your
 lakehouse while keeping bluedb itself fast and operational. The Iceberg files
 live **in the same bucket** as the SlateDB data, so there's one storage system to
 manage and pay for.
@@ -34,7 +34,7 @@ manage and pay for.
 
 - **Change capture is exactly-once.** Every committed change on a mirror-enabled
   table is written as a CDC entry into the *same* atomic SlateDB `WriteBatch` as
-  the row itself — so a change is captured if and only if it committed. No
+  the row itself, so a change is captured if and only if it committed. No
   triggers, no polling the table.
 - **Full CRUD via merge-on-read.** The seal loop drains the CDC log, collapses it
   last-writer-wins per primary key, and publishes one Iceberg snapshot per table:
@@ -48,11 +48,11 @@ manage and pay for.
   (manifests → manifest list → snapshot → `metadata.json`) itself and publishes
   it through its own catalog pointer. It runs on the published `apache/iceberg-rust`
   with no fork, no patch, and no `unsafe`.
-- **Sorted for free — one clustering, two engines.** bluedb tables are
+- **Sorted for free: one clustering, two engines.** bluedb tables are
   [index-organized](../concepts/architecture.md#storage-model-index-organized-tables):
   rows are stored clustered by the primary key. The seal collapses changes into
   that same key order, so each Parquet data file (and its row groups) comes out
-  **sorted by the key with no re-sort step** — yielding tight per-column min/max
+  **sorted by the key with no re-sort step**, yielding tight per-column min/max
   statistics and strong file/row-group **pruning** in the warehouse. The
   operational and analytical clusterings are the same ordering. The mirror also
   declares a matching Iceberg **sort order** (on the key columns) so engines know.
@@ -60,19 +60,19 @@ manage and pay for.
   the file count in check with two passes (see [Compaction](#compaction)): a
   cheap **minor** pass that bin-packs only the small data files, and a periodic
   **major** pass that rewrites the whole table to reclaim accumulated
-  equality-delete files. Both stream, so peak memory is ≈ one output file
+  equality-delete files. Both stream, so peak memory is about one output file
   regardless of table size.
 
 A **primary key is required** on every mirrored table (it keys the merge-on-read
-deletes) — which bluedb's [schema regime](../sql/query-guardrail.md) already
+deletes), which bluedb's [schema regime](../sql/query-guardrail.md) already
 guarantees. **Composite primary keys** (`PRIMARY KEY (a, b)`) are mirrored too:
 internally they are backed by a single hidden surrogate (`__bluedb_pk`, a `BYTEA`
 of the order-preserving component encoding) that keys the merge-on-read deletes.
 The component columns `a`, `b`, … are mirrored as ordinary, warehouse-visible
-columns — join and filter on them directly. Because each seal writes rows in
+columns; join and filter on them directly. Because each seal writes rows in
 surrogate (= tuple) order, the data files cluster by `(a, b)` and carry column
 statistics, and the mirror declares an Iceberg **sort order** on the component
-columns — so warehouses can prune files on them. (A single-column-PK table is
+columns, so warehouses can prune files on them. (A single-column-PK table is
 sorted by its primary key.)
 
 ## Enabling the mirror
@@ -95,8 +95,8 @@ PRAGMA lakehouse_mirror_table('secrets', off); -- ...except this one
 ```
 
 Enabling a table **backfills** its existing rows into Iceberg as the first
-snapshot, then keeps it current from the CDC log. The setting is **durable** —
-it is restored automatically on restart and failover. Mirroring runs only on the
+snapshot, then keeps it current from the CDC log. The setting is **durable**: it
+is restored automatically on restart and failover. Mirroring runs only on the
 active writer; a standby mirrors nothing and resumes on promotion.
 
 ## Reading from a warehouse
@@ -114,7 +114,7 @@ curl -s localhost:8081/catalog/v1/namespaces/default/tables/orders
 
 Point your warehouse's Iceberg REST catalog integration at
 `http://<bluedb-host>:<port>/catalog` and give it read access to the bucket. Use
-the namespace for the tenant you want (`default` for the default tenant — see
+the namespace for the tenant you want (`default` for the default tenant; see
 [Multi-tenancy](#multi-tenancy)). Catalog routes require a `data:read` token when
 [authorization](../operations/admin.md) is enabled, and a token only sees the
 namespaces for the tenants it is bound to.
@@ -125,12 +125,12 @@ Iceberg tables directly.
 
 ### Attaching as a durable REST catalog
 
-Attach `/catalog/v1` as a standing Iceberg REST catalog — `ATTACH … (TYPE
-ICEBERG, ENDPOINT …)` — rather than a one-shot `iceberg_scan(metadata-location)`.
+Attach `/catalog/v1` as a standing Iceberg REST catalog (`ATTACH … (TYPE
+ICEBERG, ENDPOINT …)`) rather than a one-shot `iceberg_scan(metadata-location)`.
 This is the intended integration; point the catalog URI at
 `http://<bluedb-host>:<port>/catalog` (the Iceberg client appends `/v1/…`).
 
-**Auth is a bearer token plus the namespace in the request path — there is no
+**Auth is a bearer token plus the namespace in the request path. There is no
 `X-Bluedb-Tenant` header on the catalog plane** (that header is only for the data
 plane, `/tables` and `/sql`). Each route derives the tenant from the namespace
 (`namespace == tenant`) and checks the token's scope against it:
@@ -141,16 +141,16 @@ plane, `/tables` and `/sql`). Each route derives the tenant from the namespace
 
 So off-the-shelf Iceberg REST clients (BigQuery, Snowflake, Databricks, DuckDB)
 work unchanged: they send a standard `Authorization: Bearer …` and put the
-namespace in the path — no custom headers.
+namespace in the path, with no custom headers.
 
-!!! warning "The warehouse reads data files directly — bring your own object-store credentials"
+!!! warning "The warehouse reads data files directly: bring your own object-store credentials"
     `loadTable` returns **locations only** (its `config` is empty); bluedb does
     **not** vend storage credentials. The warehouse reads the Parquet straight from
-    object storage, so it needs its **own** read access to the bucket — none for a
-    local `file://` mirror, but real bucket IAM for S3 / GCS / Azure. The bearer
+    object storage, so it needs its **own** read access to the bucket (none for a
+    local `file://` mirror, but real bucket IAM for S3 / GCS / Azure). The bearer
     token authorizes the catalog metadata, not the data-file reads.
 
-The catalog is served by the **active writer** (a passive node returns `503` —
+The catalog is served by the **active writer** (a passive node returns `503`;
 re-resolve after a failover) and reflects the most recently **sealed** snapshot.
 Creating or committing tables through the catalog is not supported (read-only).
 
@@ -158,8 +158,8 @@ Creating or committing tables through the catalog is not supported (read-only).
 
 bluedb is **multi-tenant**: every request is scoped to a tenant via the
 `X-Bluedb-Tenant` header (absent ⇒ the default tenant `_`). Each tenant has its
-own isolated keyspace, its own CDC log, and — in the mirror — its own **Iceberg
-namespace** (`namespace == tenant`; the default tenant maps to `default`). Two
+own isolated keyspace, its own CDC log, and its own **Iceberg
+namespace** in the mirror (`namespace == tenant`; the default tenant maps to `default`). Two
 tenants can mirror identically-named tables with zero overlap.
 
 ```bash
@@ -173,22 +173,22 @@ curl -s localhost:8081/sql -H 'X-Bluedb-Tenant: acme' \
 curl -s localhost:8081/catalog/v1/namespaces/acme/tables
 ```
 
-`PRAGMA lakehouse_mirror` is **per tenant** — enabling it for `acme` doesn't
+`PRAGMA lakehouse_mirror` is **per tenant**: enabling it for `acme` doesn't
 affect any other tenant. The mirror set for each tenant is restored on
 promote/failover from a durable tenant index, so no PRAGMA replay is needed.
 
 When [authorization](../operations/admin.md) is enabled, bind a token to one or
 more tenants with a `tenant:<name>` scope; the token can then act only on those
 tenants (a `superuser` token reaches any). A token with no `tenant:` binding may
-reach only the default tenant — so existing single-tenant token configs keep
+reach only the default tenant, so existing single-tenant token configs keep
 working unchanged. See [Configuration](../deployment/configuration.md#api-surface-authorization).
 
 ### Cross-engine compatibility
 
 The tables are written through the published `apache/iceberg-rust` and verified
 **by an independent engine, not our own writer**: the test suite has DuckDB's
-Iceberg extension read a self-authored table — including the equality-delete
-merge-on-read result — and read a table *through the REST catalog* end-to-end.
+Iceberg extension read a self-authored table (including the equality-delete
+merge-on-read result) and read a table *through the REST catalog* end-to-end.
 Because the metadata is standard Iceberg v2 with fully-qualified storage URIs,
 any Iceberg-v2 reader (Spark, Trino, Snowflake, BigQuery, Databricks, DuckDB)
 should read it. Run the cross-engine checks (needs `python3` + the DuckDB
@@ -209,7 +209,7 @@ table instead of rewriting it:
 - **ADD COLUMN** appears as a new Iceberg field on the next seal; rows written
   before the add read back as `NULL` (or the column's default).
 - **DROP COLUMN** removes the field from the current Iceberg schema. Old data
-  files are still readable — Iceberg projects them through the current schema by
+  files are still readable: Iceberg projects them through the current schema by
   field-id, so the remaining columns stay correctly aligned (no data rewrite).
 - **RENAME COLUMN** keeps the field-id and changes only the name, so warehouse
   queries use the new name with no rewrite.
@@ -221,7 +221,7 @@ evolving Iceberg v2 table.
 
 **Not yet reconciled:** changing a column's *type*, and adding a `LIST`/`MAP`
 column to an already-materialized table. Dropping a primary-key (or composite-key
-component) column is **rejected** — it is the merge-on-read identity and the
+component) column is **rejected**: it is the merge-on-read identity and the
 clustering key.
 
 ## Compaction
@@ -229,19 +229,19 @@ clustering key.
 Streaming the CDC log into snapshots produces many small files over time. A
 background worker keeps them in check with two complementary passes:
 
-- **Minor (incremental bin-pack)** — the frequent, cheap pass. It rewrites only
+- **Minor (incremental bin-pack)**: the frequent, cheap pass. It rewrites only
   the **small** data files (those below the target size) into fewer larger ones,
   leaving already-large files untouched, so its cost is proportional to the small
   files, not the whole table. Merge-on-read is preserved: the equality deletes
   that apply to the rewritten files are materialized into the output. Runs once a
   table exceeds `BLUEDB_LAKEHOUSE_MAX_DATA_FILES` data files.
-- **Major (whole-table rewrite)** — the periodic pass that also **reclaims
+- **Major (whole-table rewrite)**: the periodic pass that also **reclaims
   equality-delete files**: it re-materializes the entire table into fresh data
   files with all deletes applied, leaving zero delete files. Runs once a table
   exceeds `BLUEDB_LAKEHOUSE_MAX_DELETE_FILES` delete files (the minor pass keeps
   delete files around, since a delete may still target a surviving file).
 
-Both passes stream, so peak memory is ≈ one output file regardless of table size.
+Both passes stream, so peak memory is about one output file regardless of table size.
 
 Set the bin-pack **target file size** with a PRAGMA (durable per tenant, like the
 mirror flags); unset, it falls back to `BLUEDB_LAKEHOUSE_TARGET_FILE_BYTES` or a

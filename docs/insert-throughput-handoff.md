@@ -1,4 +1,4 @@
-# Handoff: single-row INSERT throughput (~100ms/insert)
+# Handoff: single-row INSERT throughput (about 100ms/insert)
 
 **Status: RESOLVED (2026-06-14) via group commit (Option 2).** See the
 "Resolution" section at the bottom. The diagnosis below is preserved for context.
@@ -8,13 +8,13 @@ This is a standalone write-up; you don't need prior context.
 ## Symptom
 
 Single-row autocommit `INSERT`s into `bluedb-sql` (GlueSQL-on-SlateDB) take
-**~100 ms each**. This makes single-row write workloads ~10 inserts/sec and
+**roughly 100 ms each**. This makes single-row write workloads about 10 inserts/sec and
 makes bulk loads (and the SQL conformance test suite) impractically slow.
 
 **Measured evidence:** loading 1,200 rows as 1,200 single-row autocommit
-`INSERT` statements into in-memory SlateDB took **~124 s (≈103 ms/insert)**. A
-selective join over the loaded tables added ~0 s, so the cost is entirely the
-inserts, not query execution. (A ~8,000-insert corpus took ~10 min.)
+`INSERT` statements into in-memory SlateDB took **roughly 124 s (about 103 ms/insert)**. A
+selective join over the loaded tables added about 0 s, so the cost is entirely the
+inserts, not query execution. (A roughly 8,000-insert corpus took about 10 min.)
 
 ## Root cause
 
@@ -27,34 +27,34 @@ In `crates/bluedb-sql/src/storage.rs`:
   **default write options**.
 - SlateDB's default `WriteOptions` has **`await_durable: true`**, so every
   `put` blocks until the write is **durable in object storage** (WAL/SST/
-  manifest round trip) before returning. On object storage that's ~100 ms.
+  manifest round trip) before returning. On object storage that's roughly 100 ms.
 - This defeats SlateDB's design: it is built to **batch** writes (memtable →
   periodic SST flush). Forcing per-write durability serializes every single-row
   insert behind its own object-store round trip.
 
 The explicit-transaction path (`Transaction::commit` → one `WriteBatch` →
-`Db::write`) is fine — it's **one** durable write per `COMMIT`, which amortizes
+`Db::write`) is fine: it's **one** durable write per `COMMIT`, which amortizes
 correctly. The problem is specifically the **autocommit single-row** path doing
 one synchronous durable write **per row**.
 
 Relevant code (reference by function, line numbers may have shifted):
-- `storage.rs` — `Transaction::begin` (autocommit → write-through), the
+- `storage.rs`: `Transaction::begin` (autocommit → write-through), the
   autocommit `writer().put(&key, &value).await`, and `Transaction::commit`
   (`WriteBatch` + `writer().write(batch).await`).
-- `connection.rs` — `Database::flush()` already exists (calls `Db::flush()`);
+- `connection.rs`: `Database::flush()` already exists (calls `Db::flush()`);
   it's the natural explicit-durability lever.
 
 ## Why it matters
 
-An OLTP database that does ~10 single-row inserts/sec is not viable for real
+An OLTP database that does about 10 single-row inserts/sec is not viable for real
 workloads, and it's the dominant cost in any test/bench that loads data. This is
 likely the single highest-impact perf issue in `bluedb-sql` today.
 
 ## Fix options
 
-### Option 1 — Relaxed durability on autocommit + background/periodic flush (recommended)
+### Option 1: Relaxed durability on autocommit + background/periodic flush (recommended)
 Issue autocommit writes with `WriteOptions { await_durable: false }` (via
-`Db::put_with_options` / `Db::write_with_options` — confirm exact API against the
+`Db::put_with_options` / `Db::write_with_options`; confirm exact API against the
 pinned slatedb 0.13). The write lands in the WAL/memtable and returns
 immediately; SlateDB flushes to object storage in the background / on an
 interval. Durability is then achieved at flush points.
@@ -68,12 +68,12 @@ interval. Durability is then achieved at flush points.
   durable-on-flush; flush runs every N ms / N writes, and on graceful
   step-down."* Verify failover cannot ack-then-lose.
 
-### Option 2 — Group commit
+### Option 2: Group commit
 Coalesce concurrent autocommit writes into a single durable object-store write,
 amortizing the round trip across many writers. Stronger durability than Option 1
 but more machinery, and it doesn't help a single serial writer.
 
-### Option 3 — Encourage transactional bulk loads
+### Option 3: Encourage transactional bulk loads
 Batch inserts in one `BEGIN … COMMIT` (already → one durable `WriteBatch`).
 Doesn't help clients doing single-row autocommit inserts, and note the **related
 bug** below.
@@ -86,22 +86,22 @@ single-writer lease are the levers to build the contract on.
 ## Verification plan
 
 1. **Reproduce:** time N (e.g. 1,000) single-row autocommit inserts into
-   in-memory SlateDB; confirm ~100 ms each.
+   in-memory SlateDB; confirm roughly 100 ms each.
 2. **Apply** relaxed durability to the autocommit write path; re-measure; expect
-   a 1–2 order-of-magnitude speedup.
+   a 1 to 2 order-of-magnitude speedup.
 3. **Durability check:** write without flushing, drop/reopen the DB, confirm
    exactly what is and isn't lost; then confirm the chosen flush points (step-
    down, interval) preserve the HA durability contract. A small crash/recovery
    test (and the Jepsen suite) should cover this.
 4. **Regression:** run the existing `bluedb-sql` transaction/isolation tests
-   (`crates/bluedb-sql/tests/{transactions,isolation}.rs`) — these assert
+   (`crates/bluedb-sql/tests/{transactions,isolation}.rs`): these assert
    snapshot isolation and that concurrent write transactions don't lose updates;
    relaxed durability must not break them.
 
-## Related (separate) bug — multi-row VALUES
+## Related (separate) bug: multi-row VALUES
 
-GlueSQL/sqlparser **rejects large multi-row `INSERT ... VALUES (..),(..),…`** —
-a 50-tuple multi-row insert failed to parse (`parser: ParserError`), while
+GlueSQL/sqlparser **rejects large multi-row `INSERT ... VALUES (..),(..),…`**: a
+50-tuple multi-row insert failed to parse (`parser: ParserError`), while
 single-row inserts work. This blocks the obvious "batch the load into one
 statement" workaround and is worth a separate look (likely a parser recursion/
 list limit). Single-row-per-statement is currently the only working insert form,
@@ -109,7 +109,7 @@ which is exactly the slow path above.
 
 ## Resolution (2026-06-14)
 
-Fixed via **group commit (Option 2)**, not relaxed durability — so the strong
+Fixed via **group commit (Option 2)**, not relaxed durability, so the strong
 durability contract is kept (`await_durable: true`; an acked write is durable in
 object storage before the ack) and the Jepsen kill/partition tests stay green.
 
@@ -129,14 +129,14 @@ What changed (`crates/bluedb-sql/src/storage.rs`, `connection.rs`):
   failover. (This also removes the previous O(n) per-insert max-scan.)
 
 Measured (Jepsen grow-only-set, concurrency 10, 45s, real 3-node cluster):
-**450 → 2052 acked inserts (~4.5×)**, `:valid? true`, `lost-count 0`; the kill
+**450 → 2052 acked inserts (about 4.5×)**, `:valid? true`, `lost-count 0`; the kill
 run sustained 2172 acked inserts across crash-failover with zero loss. The
 durability + isolation regression tests (`tests/{transactions,isolation}.rs`)
 still pass.
 
 **Note:** this is the *concurrent* throughput win (group commit needs multiple
-in-flight writers). A single serial writer still pays ~one durable round-trip per
-insert — for bulk loads from one client, wrap inserts in a `BEGIN..COMMIT` (one
+in-flight writers). A single serial writer still pays roughly one durable round-trip per
+insert. For bulk loads from one client, wrap inserts in a `BEGIN..COMMIT` (one
 `WriteBatch`). The multi-row `VALUES` parser bug above is still open. The
 remaining auto-increment-counter improvement (persist it instead of re-deriving
 from a live scan on first touch) is optional; the lazy re-derive is correct.

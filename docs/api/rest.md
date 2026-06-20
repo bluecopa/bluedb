@@ -21,9 +21,9 @@ Authorization: Bearer <token>
 ```
 
 Tokens map to **scopes** via the `BLUEDB_AUTHZ_TOKENS` env var
-(format `tok1=scope,scope;tok2=scope` — see
+(format `tok1=scope,scope;tok2=scope`; see
 [Configuration](../deployment/configuration.md)). When that variable is **unset**
-the server runs in **open mode** — every request is allowed without a token.
+the server runs in **open mode**: every request is allowed without a token.
 Production deployments should always set it. The `superuser` scope satisfies any
 required scope.
 
@@ -54,9 +54,9 @@ be bound to specific tenants with a `tenant:<name>` scope; it can then act only
 on those tenants (a `superuser` reaches any, an unbound token only the default
 tenant). See [Multi-tenancy](../deployment/configuration.md#multi-tenancy).
 
-## `POST /sql` — run one parameterized statement
+## `POST /sql`: run one parameterized statement
 
-`/sql` runs a **single, parameterized, non-DDL** statement — one
+`/sql` runs a **single, parameterized, non-DDL** statement: one
 `SELECT`/`INSERT`/`UPDATE`/`DELETE`. Bind values with `$N` placeholders and a
 `params` array (injection-proof by construction); never interpolate values into
 the SQL string.
@@ -70,9 +70,9 @@ It returns a JSON object with the result rows. See the
 [SQL reference](../sql/README.md).
 
 !!! note "Full-text search"
-    `/sql` also accepts the PostgreSQL full-text surface — `to_tsvector(cfg, col)
+    `/sql` also accepts the PostgreSQL full-text surface (`to_tsvector(cfg, col)
     @@ plainto_tsquery($1)`, `ts_rank(...)`, and trigram-accelerated
-    `col LIKE '%lit%'` — which is rewritten transparently against the live index.
+    `col LIKE '%lit%'`), which is rewritten transparently against the live index.
     See [Full-text search](../sql/full-text-search.md).
 
 !!! warning "DDL goes elsewhere"
@@ -80,7 +80,7 @@ It returns a JSON object with the result rows. See the
     accepted here. Use the structured [`/schema/*`](#schema-ddl-endpoints)
     endpoints, or `/admin/sql` for the raw escape hatch.
 
-## `POST /admin/sql` — arbitrary SQL (off by default)
+## `POST /admin/sql`: arbitrary SQL (off by default)
 
 The raw escape hatch: arbitrary SQL including DDL, transactions, and
 multi-statement scripts. It is **disabled by default** and only enabled when
@@ -93,10 +93,10 @@ curl -s localhost:8081/admin/sql -H 'content-type: application/json' \
   -d '{"sql": "BEGIN; INSERT INTO t VALUES (1); INSERT INTO t VALUES (2); COMMIT;"}'
 ```
 
-`/admin/sql` does **not** rewrite the `@@` full-text surface — it is left as the
+`/admin/sql` does **not** rewrite the `@@` full-text surface; it is left as the
 literal raw passthrough.
 
-## `GET /tables/{table}` — select
+## `GET /tables/{table}`: select
 
 Filters and modifiers go in the query string, PostgREST-style:
 
@@ -116,7 +116,7 @@ Common modifiers:
 
 A point or range filter on the primary key or a secondary-indexed column is
 served from the transactional store (fresh, read-your-writes). A filter or sort
-on any other column — or a JSON path (below) — is **routed to the analytical
+on any other column (or a JSON path, below) is **routed to the analytical
 engine** automatically; you never add an index just to make a read run. See
 [Reads and indexes](../sql/query-guardrail.md).
 
@@ -136,7 +136,7 @@ curl -s 'localhost:8081/tables/events?select=id,attrs->>status&order=id.asc'
 A JSON-path read is served by the analytical engine. Containment (`@>`) and
 `jsonb_path_query` are available over [`POST /sql`](#post-sql-run-one-parameterized-statement).
 
-### Pagination total — `Prefer: count=exact`
+### Pagination total: `Prefer: count=exact`
 
 Send `Prefer: count=exact` to get the total row count (ignoring `limit`/`offset`)
 in a PostgREST `Content-Range` response header, so a grid can show "page 1 of N":
@@ -155,7 +155,7 @@ the same engine that served the data.
 **base64**. `JSON` / `JSONB` columns are returned as real JSON (objects/arrays),
 not as a quoted string.
 
-## `POST /tables/{table}` — insert
+## `POST /tables/{table}`: insert
 
 A JSON object, or an array of objects for a batch:
 
@@ -167,7 +167,7 @@ curl -s -X POST localhost:8081/tables/users -H 'content-type: application/json' 
   -d '[{"id": 2, "name": "lin"}, {"id": 3, "name": "sam"}]'
 ```
 
-## `PATCH /tables/{table}` — update
+## `PATCH /tables/{table}`: update
 
 Assignments in the body, rows selected by the query-string filter:
 
@@ -177,7 +177,7 @@ curl -s -X PATCH 'localhost:8081/tables/users?id=eq.1' \
   -H 'content-type: application/json' -d '{"age": 37}'
 ```
 
-## `DELETE /tables/{table}` — delete
+## `DELETE /tables/{table}`: delete
 
 ```bash
 # DELETE FROM users WHERE age < 18
@@ -188,11 +188,11 @@ curl -s -X DELETE 'localhost:8081/tables/users?age=lt.18'
     A `PATCH`/`DELETE` with no filter affects every row. Always include a
     query-string filter unless you mean it.
 
-### Returning the affected rows — `Prefer: return=representation`
+### Returning the affected rows: `Prefer: return=representation`
 
 By default a write returns a count: `{"inserted": 1}`, `{"updated": 3}`,
 `{"deleted": 2}`. Send `Prefer: return=representation` to get the **affected rows
-themselves** back instead — the same JSON shape a `GET` returns (JSON columns
+themselves** back instead (the same JSON shape a `GET` returns, with JSON columns
 re-inflated):
 
 ```bash
@@ -204,7 +204,7 @@ curl -s -X POST 'localhost:8081/tables/users' \
 
 - `POST` reads the inserted rows back by primary key.
 - `PATCH` returns the rows after the update (re-selected by the same filter).
-- `DELETE` captures the matching rows **before** removing them — so you get the
+- `DELETE` captures the matching rows **before** removing them, so you get the
   deleted rows in the response.
 
 !!! note
@@ -222,7 +222,7 @@ the `schema:admin` scope and the active writer.
 | Method | Path | Purpose |
 |--------|------|---------|
 | `POST` | `/schema/tables` | Create a table from a typed column spec |
-| `GET` | `/schema/tables/{table}` | Describe a table — columns + indexes (`data:read`) |
+| `GET` | `/schema/tables/{table}` | Describe a table: columns and indexes (`data:read`) |
 | `DELETE` | `/schema/tables/{table}` | Drop a table |
 | `POST` | `/schema/tables/{table}/indexes` | Create a secondary index |
 | `DELETE` | `/schema/tables/{table}/indexes/{name}` | Drop an index |
@@ -254,7 +254,7 @@ Each column takes `name`, `type`, and optionally `primaryKey` (camelCase),
 `TIMESTAMP`, `UUID`, `JSON`/`JSONB` (see [JSON](../sql/json.md)).
 
 The optional `indexes` array declares secondary indexes in the **same schema
-apply** — each entry is `{"name": …, "columns": […]}`, equivalent to a follow-up
+apply**: each entry is `{"name": …, "columns": […]}`, equivalent to a follow-up
 `POST …/indexes` but atomic with the create.
 
 ### Describe a table
@@ -281,7 +281,7 @@ curl -s localhost:8081/schema/tables/docs
 }
 ```
 
-`indexed` is `true` for a primary-key column or one backed by a secondary index —
+`indexed` is `true` for a primary-key column or one backed by a secondary index,
 i.e. the columns a point/range filter is served from without an analytical scan.
 
 ### Create / drop an index
@@ -326,8 +326,8 @@ X-Bluedb-Watermark: acme:42
 ```
 
 (`<tenant>:<seq>`.) A read response carries the same header for the watermark it
-reflects. To require a read to reflect at least a given write — e.g. read your
-own write through the analytical engine — echo it back on the read:
+reflects. To require a read to reflect at least a given write (e.g. to read your
+own write through the analytical engine), echo it back on the read:
 
 ```
 X-Bluedb-Min-Watermark: acme:42
@@ -335,7 +335,7 @@ X-Bluedb-Min-Watermark: acme:42
 
 If the node can't satisfy that freshness (its sealed analytical snapshot is
 behind the requested sequence and it is not the active writer), it returns
-**`503`** rather than serve stale data — retry against the writer or after the
+**`503`** rather than serve stale data. Retry against the writer or after the
 next seal. How much staleness a read tolerates before that gate trips is set per
 tenant, in **seal cycles**, with a PRAGMA over [`/sql`](#post-sql-run-one-parameterized-statement)
 (default `1`):
@@ -352,7 +352,7 @@ reflects every write it has acknowledged. See
 ## Errors
 
 Error responses are JSON with a human `error` message and, when the failure is
-classified, a stable machine-readable `code` — branch on the `code`, not the
+classified, a stable machine-readable `code`. Branch on the `code`, not the
 prose:
 
 ```json
@@ -367,10 +367,10 @@ prose:
 | `TYPE_MISMATCH` | 400 | A value didn't match the column type |
 | `NO_INDEX` | 400 | A query the guardrail won't serve without an index |
 
-A write sent to a passive (non-writer) node returns `503` — re-resolve the active
+A write sent to a passive (non-writer) node returns `503`; re-resolve the active
 writer (see [Administration](../operations/admin.md)).
 
-## Collections — document API
+## Collections: document API
 
 bluedb exposes a MongoDB-style document API at `/collections/{collection}/{verb}`. It speaks HTTP/JSON (not the MongoDB wire protocol), so any HTTP client works. Supported verbs:
 
@@ -378,7 +378,7 @@ bluedb exposes a MongoDB-style document API at `/collections/{collection}/{verb}
 
 Tenant selection and bearer scopes are the same as the rest of the API: pass `X-Bluedb-Tenant` to target a tenant (default `_`), and use `data:read` / `data:write` / `schema:admin` scopes as appropriate. See the full reference at [Collections](../collections/README.md).
 
-### Collections — search endpoints
+### Collections: search endpoints
 
 An Elasticsearch-shaped search surface is available on the same path prefix:
 
@@ -402,8 +402,8 @@ warehouses use to discover and load the mirrored tables:
 
 - `GET /catalog/v1/config`
 - `GET /catalog/v1/namespaces` · `GET /catalog/v1/namespaces/{ns}`
-- `GET /catalog/v1/namespaces/{ns}/tables` — list mirrored tables
-- `GET /catalog/v1/namespaces/{ns}/tables/{table}` — `loadTable` (metadata location + schema)
+- `GET /catalog/v1/namespaces/{ns}/tables`: list mirrored tables
+- `GET /catalog/v1/namespaces/{ns}/tables/{table}`: `loadTable` (metadata location + schema)
 
 Requires `data:read` when authorization is enabled. Each **tenant** publishes its
 own namespace (`namespace == tenant`; the default tenant maps to `default`), and a
@@ -413,5 +413,5 @@ mirrored with `PRAGMA lakehouse_mirror` over [`POST /sql`](#post-sql-run-one-par
 
 ## Health & admin
 
-`GET /health`, `GET /admin/status`, `POST /admin/promote`, `POST /admin/demote` —
+`GET /health`, `GET /admin/status`, `POST /admin/promote`, `POST /admin/demote`:
 see [Administration](../operations/admin.md).

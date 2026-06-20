@@ -6,7 +6,7 @@ These are the built-in functions bluedb provides. The groupings below cover the
 common ones; signatures are PostgreSQL-style.
 
 !!! note
-    **Window functions** (`… OVER (…)` — `ROW_NUMBER`, `RANK`, running `SUM`, …)
+    **Window functions** (`… OVER (…)`: `ROW_NUMBER`, `RANK`, running `SUM`, …)
     are supported. **User-defined functions** (`CREATE FUNCTION`) are not, and
     some PostgreSQL/DuckDB-specific builtins (`arg_min`, `list_*`, `any_value`, …)
     are absent. See [Limitations](limitations.md).
@@ -52,7 +52,7 @@ FROM events GROUP BY region;
 #### Mergeable distinct-count sketches
 
 `approx_count_distinct` is one-shot. To **store** a distinct-count sketch and
-union it later — incremental rollups, or combining per-shard/per-day counts —
+union it later (incremental rollups, or combining per-shard/per-day counts),
 use the HyperLogLog sketch functions. A sketch is a `BYTEA` value you can persist:
 
 | Function | Description |
@@ -135,7 +135,7 @@ PostgreSQL-style text/number formatting.
 
 | Function | Description |
 |----------|-------------|
-| `to_char(numeric, fmt)` | Format a number to text — `9`/`0` digits, `.`/`D` decimals, `,`/`G` thousands grouping (e.g. `'FM9,999.00'`) |
+| `to_char(numeric, fmt)` | Format a number to text: `9`/`0` digits, `.`/`D` decimals, `,`/`G` thousands grouping (e.g. `'FM9,999.00'`) |
 | `to_char(date/timestamp, fmt)` | Format a temporal value to text (the same `to_char`, dispatched on argument type) |
 | `to_number(text, fmt)` | Parse a formatted number string to a float; the mask is advisory (US-style `.`/`,`), group separators and currency are stripped |
 | `format(fmt, …)` | Substitute `%s` / `%I` / `%L` with successive arguments (as text); `%%` is a literal `%` |
@@ -163,7 +163,7 @@ SELECT GENERATE_UUID() AS id;
 ```
 
 !!! note "Arrays & maps"
-    For list/map work use the `array_*` / `map_*` family — e.g. `array_append`,
+    For list/map work use the `array_*` / `map_*` family, e.g. `array_append`,
     `array_prepend`, `array_slice`, `array_sort`, `array_distinct`, `cardinality`,
     `map_keys`, `map_values`, `map_entries`. Mind the signatures: `array_prepend`
     is element-first, and `array_distinct` removes **all** duplicates (not just

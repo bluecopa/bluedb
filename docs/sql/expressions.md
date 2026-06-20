@@ -11,7 +11,7 @@
 | Logical | `AND` `OR` `NOT` |
 | Null test | `IS NULL` `IS NOT NULL` |
 | String | `||` (concatenation) |
-| JSON | `->` `->>` (field access) · `@>` `<@` (containment) — see [JSON](json.md) |
+| JSON | `->` `->>` (field access) · `@>` `<@` (containment): see [JSON](json.md) |
 
 ```sql
 SELECT price * quantity AS total FROM line_items;
@@ -32,13 +32,13 @@ SELECT * FROM products WHERE price < '9.99';
 ```
 
 This coercion is conservative: only string **literals** are cast (never a stored
-text column), and only when the literal parses into the target numeric type — so
+text column), and only when the literal parses into the target numeric type, so
 it never turns a working query into a runtime cast error.
 
 !!! warning
     **`bool`/`int` comparisons are not coerced.** `TRUE = 1` evaluates to
     **FALSE**. Engines disagree here (DuckDB/MySQL say true, PostgreSQL errors), so
-    bluedb leaves it alone — use an explicit `CAST`. A number compared to a
+    bluedb leaves it alone; use an explicit `CAST`. A number compared to a
     *non-numeric* text column (`name = 5`) is likewise not coerced.
 
 ## `CAST` and `TRY_CAST`
@@ -93,9 +93,9 @@ SELECT * FROM users WHERE deleted_at IS NULL;
 
 ## Subquery expressions
 
-`EXISTS`, scalar subqueries, and `IN (SELECT …)` are all valid in expressions —
+`EXISTS`, scalar subqueries, and `IN (SELECT …)` are all valid in expressions;
 see [Query syntax › Subqueries](query-syntax.md#subqueries).
 
 !!! note
-    **Window functions are supported** — `SUM(x) OVER (…)`, `ROW_NUMBER() OVER
+    **Window functions are supported**: `SUM(x) OVER (…)`, `ROW_NUMBER() OVER
     (…)`, `RANK()`, `LAG`/`LEAD`, and friends.

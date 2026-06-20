@@ -11,7 +11,7 @@ acknowledged write.
   enforced by SlateDB's `writer_epoch` compare-and-set. There is always one
   history.
 - **Durability of acknowledged writes.** Any write that returns success (HTTP
-  200) survives node failure and failover — it is durable in the object store
+  200) survives node failure and failover. It is durable in the object store
   before it is acknowledged.
 - **No lost updates.** A read-modify-write (e.g. `UPDATE c SET n = n + 1`) cannot
   silently clobber a concurrent one.
@@ -20,11 +20,11 @@ acknowledged write.
 - **Snapshot isolation** for transactional reads; explicit transactions are
   checked up to **strict-serializable** (see [Transactions &
   isolation](transactions.md)). [Evidence graph traversals](../evidence/graph.md#consistency)
-  on the active writer are snapshot-isolated too — each pins one snapshot, so a
+  on the active writer are snapshot-isolated too: each pins one snapshot, so a
   traversal sees a single consistent cut of the graph even under concurrent
   edge rewrites.
 - **No split-brain.** If the lease arbiter or object store is unreachable, the
-  writer self-fences and standbys decline to promote — the cluster goes
+  writer self-fences and standbys decline to promote, and the cluster goes
   *writer-less* (rejects writes) rather than admit two writers.
 
 These are not aspirational: each is exercised by the [Jepsen](jepsen.md) suite
@@ -36,7 +36,7 @@ Writes and their acknowledgement are linearizable (single serial writer, above).
 Reads have a **two-tier** model, because every node shares one object-storage
 database and a read can be served by the writer *or* a replica.
 
-### Reads on the active writer — fresh (read-your-writes)
+### Reads on the active writer (fresh, read-your-writes)
 
 The active writer serves reads from its own live state (in-memory memtable + WAL
 + SSTs), so a read on the writer reflects **every write it has acknowledged**,
@@ -47,7 +47,7 @@ This is why the mutating routes (`POST /sql`, `POST`/`PATCH`/`DELETE /tables`)
 and their read-modify-writes run only on the active node: an `UPDATE c SET n = n
 + 1` is always evaluated against the writer's live state, never a replica's.
 
-### Reads on a passive replica — bounded-stale
+### Reads on a passive replica (bounded-stale)
 
 A passive node serves reads from a `DbReader` that **follows the writer's
 manifest in object storage**, refreshed on a poll (SlateDB's
@@ -57,13 +57,13 @@ manifest in object storage**, refreshed on a poll (SlateDB's
 - can lag even flushed writes by up to one poll interval.
 
 This is **deliberate**: `GET /tables/{table}` is served by either the writer or
-a replica, so replicas absorb read load. The trade is freshness — a replica read
+a replica, so replicas absorb read load. The trade is freshness: a replica read
 is eventually-consistent, not linearizable.
 
-### Analytical reads — sealed-snapshot freshness
+### Analytical reads (sealed-snapshot freshness)
 
 Reads the analytical engine serves (arbitrary filters and sorts, joins,
-aggregates, [JSON](../sql/json.md) — via `POST /sql`, or a `/tables` read routed
+aggregates, [JSON](../sql/json.md), via `POST /sql` or a `/tables` read routed
 to it) run over the tenant's most recently **sealed** snapshot of the
 [Iceberg mirror](../lakehouse/iceberg-mirror.md). The active writer additionally
 unions its own unsealed tail, so an analytical read on the writer is still
@@ -79,7 +79,7 @@ The cluster presents as **one logical store routed through the current writer**:
 clients find it via `GET /admin/status` (`role: "active"`) and re-discover after
 a failover. Two properties keep that routing honest:
 
-- **A node reports `active` only once its writer `Db` is installed** — not merely
+- **A node reports `active` only once its writer `Db` is installed**, not merely
   when it has acquired the lease. During the brief promote window a node holds
   the lease but is still bound to its *pre-failover replica* view, so it reports
   `passive` until the writer `Db` is swapped in. A client routing to "the active
@@ -87,17 +87,17 @@ a failover. Two properties keep that routing honest:
   **writer-fresh** reads, never one still answering from a stale replica. (This
   closed a failover read-staleness bug the `counter` workload caught: a
   just-promoted node briefly advertised `active` while still serving its old
-  replica view, so its reads looked like lost increments — see
+  replica view, so its reads looked like lost increments. See
   [Jepsen](jepsen.md).)
 - **On an abrupt failover (crash / kill) the old writer is gone**, so a client's
   next read to it fails and the client re-resolves to the new writer.
 
-!!! warning "Known caveat — stale reads under a *graceful* handoff"
+!!! warning "Known caveat: stale reads under a *graceful* handoff"
     Because `GET /tables` reads are intentionally **not** writer-gated (replica
     reads are a feature), a client that caches a leader and keeps reading from a
     node that has since stepped down to `passive` can observe bounded-stale data
     (up to one manifest poll interval) until it re-resolves. This can never lose
-    or corrupt data — it is purely a *freshness* bound on reads routed to a
+    or corrupt data. It is purely a *freshness* bound on reads routed to a
     replica. For a strictly linearizable read, re-resolve the active writer for
     that read (or issue it on the `/sql` path, which runs on the writer). For
     read scaling, read any node and accept the bounded staleness.
@@ -116,7 +116,7 @@ When Postgres (the lease arbiter) or the object store is down:
 - The writer **keeps its lease validity but cannot durably write** (storage
   down) or **cannot renew and self-fences** (arbiter down).
 - Standbys **cannot acquire** the lease, so no one promotes.
-- The cluster becomes **writer-less** until the dependency recovers — and then
+- The cluster becomes **writer-less** until the dependency recovers, then
   resumes automatically. No acknowledged write is lost; no split-brain occurs.
 
 Reads continue to be served throughout (from the last durable state).
@@ -127,7 +127,7 @@ Reads continue to be served throughout (from the last durable state).
   replicas; scale writes by sharding across databases at the application layer.
 - **Linearizable reads from *replicas*.** A read served by a passive replica is
   eventually-consistent (bounded by the manifest poll interval, ~10 s). Route
-  reads to the active writer — or use the `/sql` path — for read-your-writes /
+  reads to the active writer (or use the `/sql` path) for read-your-writes and
   linearizable reads. See [Read consistency](#read-consistency).
 - **Zero-downtime writes during failover.** There is a brief writer-less window
   (~lease TTL, default 10s) while a standby promotes.
