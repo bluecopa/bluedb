@@ -810,13 +810,15 @@ impl AppState {
         Ok(())
     }
 
-    /// Return the last CDC sequence assigned to `tenant` on this writer (the
-    /// in-memory counter after the most recent CDC commit). Returns 0 when no
-    /// CDC write has yet been stamped for this tenant. Used to populate
-    /// `X-Bluedb-Watermark` on write responses.
+    /// Return the writer's last durable write sequence for `tenant`: the value
+    /// the write-response `X-Bluedb-Watermark` should reflect. This advances on
+    /// every committed mutation regardless of whether the lakehouse CDC mirror is
+    /// on, so a write always carries a non-zero watermark (the doc contract). When
+    /// CDC is enabled and has sealed further than the in-session commit count, the
+    /// CDC seq is used so the watermark stays monotonic across a failover.
     pub(crate) async fn write_watermark(&self, tenant: &str) -> i64 {
         match self.inner.db.read().await.as_ref() {
-            Some(db) => db.last_cdc_seq(tenant).await,
+            Some(db) => db.last_commit_seq(tenant).await.max(db.last_cdc_seq(tenant).await),
             None => 0,
         }
     }
@@ -1523,10 +1525,17 @@ async fn select(
         route_select_to_analytical(&state, &headers, &tenant, &rq, &json_cols, sealed).await?
     } else {
         match rest_sql::execute_query(&mut glue, &rq).await {
-            Ok(payloads) => (
-                watermark_headers(&tenant, sealed),
-                Json(select_to_json(payloads, &json_cols)),
-            ),
+            Ok(payloads) => {
+                // A read served by the writer reflects its live state, so echo the
+                // writer's watermark (advances on every commit); a replica read
+                // reflects the sealed snapshot. Mirrors `exec_sql_read`.
+                let wm = if state.is_writer() {
+                    state.write_watermark(&tenant).await
+                } else {
+                    sealed
+                };
+                (watermark_headers(&tenant, wm), Json(select_to_json(payloads, &json_cols)))
+            }
             Err(e) if is_guardrail_reject(&e) => {
                 route_select_to_analytical(&state, &headers, &tenant, &rq, &json_cols, sealed).await?
             }

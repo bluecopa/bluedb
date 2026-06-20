@@ -2202,3 +2202,54 @@ async fn multikey_scalar_field_is_indexed() {
     let docs = body["documents"].as_array().expect("documents array");
     assert_eq!(docs.len(), 0, "tags:y must match 0 docs for scalar x, got: {body}");
 }
+
+/// Regression for UAT-COLL-003: a unique single-field collection index must
+/// reject a duplicate field value. GlueSQL silently drops the UNIQUE keyword
+/// from `CREATE UNIQUE INDEX`, so uniqueness is enforced as a column-level
+/// constraint on the derived `__cidx_*` column. The duplicate surfaces as the
+/// Mongo-shaped `DuplicateKey` (code 11000) error over HTTP 409.
+#[tokio::test]
+async fn unique_single_field_index_rejects_duplicate() {
+    let app = app().await;
+
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/prod/createIndex",
+        Some(json!({ "keys": { "sku": 1 }, "options": { "unique": true, "type": "string" } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "createIndex: {body}");
+
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/prod/insert",
+        Some(json!({ "documents": [{ "_id": "p1", "sku": "A-1", "tags": ["blue", "sale"] }] })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "first insert: {body}");
+
+    // Same sku, different _id → must be rejected.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/prod/insert",
+        Some(json!({ "documents": [{ "_id": "p2", "sku": "A-1", "tags": ["red"] }] })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "duplicate should be 409, got {s}: {body}");
+    assert_eq!(body["code"].as_i64().unwrap(), 11000, "DuplicateKey code: {body}");
+    assert_eq!(body["codeName"].as_str().unwrap(), "DuplicateKey", "codeName: {body}");
+
+    // A distinct sku still inserts cleanly — uniqueness, not a blanket block.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/prod/insert",
+        Some(json!({ "documents": [{ "_id": "p3", "sku": "B-2" }] })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "distinct sku insert: {body}");
+    assert_eq!(body["insertedCount"].as_i64().unwrap(), 1);
+}

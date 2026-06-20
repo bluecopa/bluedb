@@ -109,6 +109,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 use bluedb_storage::Substrate;
 
 use crate::cdc::{next_cdc_seq, CdcConfig, CdcEntry, CdcSeq};
+use crate::connection::CommitSeq;
 use crate::colcat::ColumnCatalog;
 use crate::error::SqlError;
 use crate::keyspace::{prefix_upper_bound, Keyspace, DEFAULT_TENANT, TAG_CDC};
@@ -190,6 +191,28 @@ struct TxnState {
     /// (Spec B §4.2). Only populated when an observer is installed; empty
     /// otherwise so non-observed commits pay nothing.
     changes: Vec<RowChange>,
+    /// Set by [`record_change`] at every data-row mutation (INSERT/UPDATE/
+    /// DELETE). Used at `commit` to decide whether to advance the write
+    /// watermark: schema-only commits (DDL, `CREATE INDEX`) mutate the overlay
+    /// but carry no row change, so they should NOT consume a freshness slot —
+    /// read-your-writes keys on data writes, not DDL.
+    had_data_write: bool,
+    /// Fresh `UNIQUE` index entries staged by this txn (each a value-prefix
+    /// range to re-scan + the owning pk). Re-validated under `insert_lock` at
+    /// `commit` against live committed state, mirroring `unique_checks`, so two
+    /// concurrent autocommit inserts of the same unique value can't both commit.
+    unique_index_checks: Vec<UniqueIndexCheck>,
+}
+
+/// A staged unique-index entry pending a commit-time re-check.
+#[derive(Clone)]
+struct UniqueIndexCheck {
+    table_name: String,
+    index_name: String,
+    /// The encoded value-prefix range start to scan at commit.
+    value_prefix: Vec<u8>,
+    /// The owning row's primary key (collisions with a different pk fail).
+    pk: Key,
 }
 
 /// GlueSQL custom storage over a SlateDB database.
@@ -241,6 +264,11 @@ pub struct SlateDbStorage {
     /// Shared global CDC sequence counter (the one held by [`crate::Database`]),
     /// used to stamp CDC entries at commit. Unused when `cdc` is `None`.
     cdc_seq: CdcSeq,
+    /// Shared per-tenant commit-sequence counter (also held by
+    /// [`crate::Database`]). Advanced once per durable committed mutation
+    /// regardless of CDC, so the write watermark reflects the writer's latest
+    /// acknowledged write even when the lakehouse mirror is off.
+    commit_seq: CommitSeq,
     /// `Some` while a `BEGIN ... COMMIT/ROLLBACK` block is open.
     txn: Option<TxnState>,
 }
@@ -267,6 +295,7 @@ impl SlateDbStorage {
             Arc::new(Mutex::new(())),
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
         )
     }
 
@@ -281,6 +310,7 @@ impl SlateDbStorage {
         insert_lock: WriteLease,
         seq: SeqAllocator,
         cdc_seq: CdcSeq,
+        commit_seq: CommitSeq,
     ) -> Self {
         Self {
             substrate,
@@ -294,6 +324,7 @@ impl SlateDbStorage {
             commit_observer: None,
             cdc: None,
             cdc_seq,
+            commit_seq,
             txn: None,
         }
     }
@@ -349,6 +380,13 @@ impl SlateDbStorage {
     /// inside a txn). The buffered changes are drained at `commit`: written into
     /// the CDC namespace of the batch and/or handed to the observer.
     fn record_change(&mut self, table: &str, key: Key, row: Option<DataRow>) {
+        // A data-row mutation happened (the only callers are INSERT/UPDATE/
+        // DELETE). Mark the txn so `commit` advances the write watermark even
+        // when no observer/CDC is consuming the change — the watermark is the
+        // "writer's latest data write" signal, independent of the observer.
+        if let Some(txn) = self.txn.as_mut() {
+            txn.had_data_write = true;
+        }
         if !self.wants_changes(table) {
             return;
         }
@@ -639,6 +677,31 @@ impl SlateDbStorage {
         }
     }
 
+    /// Read the set of index names on `table` that were declared `UNIQUE` (via
+    /// `CREATE UNIQUE INDEX`), honoring the txn overlay. Empty for a table with
+    /// no unique index. Used by [`Self::apply_index_entries`] to enforce
+    /// uniqueness, since GlueSQL silently drops the UNIQUE keyword.
+    pub(crate) async fn read_unique_indexes(
+        &self,
+        table_name: &str,
+    ) -> Result<std::collections::BTreeSet<String>, SqlError> {
+        let key = self.keyspace.uniqueidx_key(table_name);
+        Ok(match self.read_key(&key).await? {
+            Some(bytes) => decode::<std::collections::BTreeSet<String>>(&bytes)?,
+            None => std::collections::BTreeSet::new(),
+        })
+    }
+
+    /// Persist `table`'s unique-index registry (the full set; overwrites).
+    pub(crate) async fn write_unique_indexes(
+        &mut self,
+        table_name: &str,
+        names: &std::collections::BTreeSet<String>,
+    ) -> Result<(), SqlError> {
+        let key = self.keyspace.uniqueidx_key(table_name);
+        self.write_key(key, encode(names)?).await
+    }
+
     /// The user primary-key column names of a composite-key table (in key
     /// order), or `None` for a single-column-PK table. Public so the lakehouse
     /// mirror can declare an Iceberg sort order on the component columns.
@@ -791,7 +854,12 @@ impl SlateDbStorage {
             .unwrap_or_default()
     }
 
-    /// Add or remove every index entry for `row` (keyed by `pk`).
+    /// Add or remove every index entry for `row` (keyed by `pk`). For a
+    /// `UNIQUE` index (per the table's unique-index registry), inserting a
+    /// value another row already owns rejects with [`SqlError::UniqueViolation`]
+    /// — GlueSQL silently drops the UNIQUE keyword from `CREATE UNIQUE INDEX`,
+    /// so bluedb-sql enforces it here. NULL indexed values (`Key::None`) never
+    /// collide (SQL NULLs-are-distinct semantics, the Postgres default).
     async fn apply_index_entries(
         &mut self,
         table_name: &str,
@@ -813,8 +881,27 @@ impl SlateDbStorage {
         } else {
             Some(columns.as_slice())
         };
+        let unique = self.read_unique_indexes(table_name).await?;
         for def in &defs {
             let value = Self::index_value(def, cols, row).await?;
+            if insert && unique.contains(&def.name) && !matches!(value, Key::None) {
+                self.enforce_unique_index(table_id, &def.name, &value, pk)
+                    .await?;
+                // Stage a commit-time re-check against live state so a concurrent
+                // inserter of the same value can't both win (mirrors the PK
+                // `unique_checks` path). The value prefix bounds the re-scan.
+                if let Some(txn) = self.txn.as_mut() {
+                    let value_prefix = self
+                        .keyspace
+                        .index_value_prefix(table_id, &def.name, &value)?;
+                    txn.unique_index_checks.push(UniqueIndexCheck {
+                        table_name: table_name.to_string(),
+                        index_name: def.name.clone(),
+                        value_prefix,
+                        pk: pk.clone(),
+                    });
+                }
+            }
             let entry_key = self
                 .keyspace
                 .index_entry_key(table_id, &def.name, &value, pk)?;
@@ -822,6 +909,33 @@ impl SlateDbStorage {
                 self.write_key(entry_key, encode(pk)?).await?;
             } else {
                 self.delete_key(entry_key).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Reject if any existing index entry for `value` already points at a
+    /// different primary key. Scans the value's prefix range (overlay-honoring),
+    /// so a collision committed by a concurrent inserter or staged earlier in
+    /// this same txn is caught.
+    async fn enforce_unique_index(
+        &self,
+        table_id: u64,
+        index_name: &str,
+        value: &Key,
+        pk: &Key,
+    ) -> Result<(), SqlError> {
+        let prefix = self
+            .keyspace
+            .index_value_prefix(table_id, index_name, value)?;
+        let end = prefix_upper_bound(&prefix);
+        for (_, v) in self.scan_range(prefix, end).await? {
+            let existing: Key = decode(&v)?;
+            if existing != *pk {
+                return Err(SqlError::UniqueViolation(format!(
+                    "duplicate entry '{}' for unique index '{index_name}'",
+                    display_key(value)
+                )));
             }
         }
         Ok(())
@@ -837,6 +951,28 @@ pub(crate) fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, SqlError> {
 /// Deserialize bytes (JSON) back into a value.
 pub(crate) fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, SqlError> {
     Ok(serde_json::from_slice(bytes)?)
+}
+
+/// Render a [`Key`] for a user-facing message without the `Key::Str("…")`
+/// `Debug` noise (e.g. `Str("a@x")` → `a@x`). `Key`'s `Debug` and `Value`'s
+/// `Display` are both unsuitable for error prose, so this covers the common
+/// scalar cases and falls back to `Debug` for the rest.
+fn display_key(key: &Key) -> String {
+    match key {
+        Key::Str(s) => s.clone(),
+        Key::Bool(b) => b.to_string(),
+        Key::I8(v) => v.to_string(),
+        Key::I16(v) => v.to_string(),
+        Key::I32(v) => v.to_string(),
+        Key::I64(v) => v.to_string(),
+        Key::U8(v) => v.to_string(),
+        Key::U16(v) => v.to_string(),
+        Key::U32(v) => v.to_string(),
+        Key::U64(v) => v.to_string(),
+        Key::F32(v) => v.to_string(),
+        Key::F64(v) => v.to_string(),
+        other => format!("{other:?}"),
+    }
 }
 
 /// Decode a big-endian `u64` table id from its stored 8-byte value.
@@ -1136,6 +1272,8 @@ impl Transaction for SlateDbStorage {
             _lease: lease,
             unique_checks: Vec::new(),
             changes: Vec::new(),
+            had_data_write: false,
+            unique_index_checks: Vec::new(),
         });
         // Return `autocommit` so GlueSQL commits after a plain statement; the
         // value is ignored for the explicit `StartTransaction` statement.
@@ -1159,8 +1297,10 @@ impl Transaction for SlateDbStorage {
                 // transaction (and a read-only explicit txn never blocks it).
                 // Pure appends/updates have no checks and stay lock-free (group
                 // commit). Acquired regardless of whether `write_lease` is already
-                // held, so explicit-transaction inserts serialize here too.
-                let _ilock = if txn.unique_checks.is_empty() {
+                // held, so explicit-transaction inserts serialize here too. UNIQUE
+                // secondary indexes need the same atomic re-check, so the lock is
+                // taken whenever either check set is non-empty.
+                let _ilock = if txn.unique_checks.is_empty() && txn.unique_index_checks.is_empty() {
                     None
                 } else {
                     Some(self.insert_lock.clone().lock_owned().await)
@@ -1176,6 +1316,30 @@ impl Transaction for SlateDbStorage {
                         // Another connection inserted this primary key since our
                         // snapshot — first committer wins, we abort.
                         return Err(SqlError::UniqueViolation(format!("{key:?}")).into());
+                    }
+                }
+                // Re-validate every staged UNIQUE index entry against LIVE
+                // committed state (bypassing the snapshot, like the PK check
+                // above): a concurrent inserter may have committed the same
+                // value after this txn's snapshot was taken.
+                for chk in &txn.unique_index_checks {
+                    let end = prefix_upper_bound(&chk.value_prefix);
+                    let mut iter = self
+                        .substrate
+                        .scan_range(&chk.value_prefix, end.as_deref())
+                        .await
+                        .map_err(SqlError::from)?;
+                    while let Some(kv) = iter.next().await.map_err(SqlError::from)? {
+                        let existing: Key = decode(&kv.value)?;
+                        if existing != chk.pk {
+                            return Err(
+                                SqlError::UniqueViolation(format!(
+                                    "duplicate entry for unique index '{}' on table '{}'",
+                                    chk.index_name, chk.table_name
+                                ))
+                                .into(),
+                            );
+                        }
                     }
                 }
                 let mut batch = WriteBatch::new();
@@ -1219,6 +1383,22 @@ impl Transaction for SlateDbStorage {
                     }
                 }
                 self.writer()?.write(batch).await.map_err(SqlError::from)?;
+                // The write watermark advances on every committed DATA mutation
+                // (INSERT/UPDATE/DELETE), even when the lakehouse CDC mirror is
+                // off (the default), so a write response always carries a
+                // non-zero `X-Bluedb-Watermark`. Schema-only commits (DDL,
+                // CREATE INDEX) mutate the overlay but set no `had_data_write`,
+                // so they do NOT consume a freshness slot — read-your-writes
+                // keys on data writes. CDC has its own sequence space
+                // (`cdc_seq`) for ordering its log; this counter is purely the
+                // "writer's last data write" signal.
+                if txn.had_data_write {
+                    {
+                        let mut g = self.commit_seq.lock().await;
+                        let next = g.get(&self.tenant).copied().unwrap_or(0) + 1;
+                        g.insert(self.tenant.clone(), next);
+                    }
+                }
                 // Wake the lakehouse seal loop now that mirror-enabled changes are
                 // durable (event-driven freshness).
                 if let Some(cdc) = cdc_to_signal {
@@ -1390,6 +1570,12 @@ impl IndexMut for SlateDbStorage {
         schema.indexes.retain(|i| i.name != index_name);
         let schema_key = self.keyspace.schema_key(table_name);
         self.write_key(schema_key, encode(&schema)?).await?;
+        // Drop the index from the unique-index registry too (if it was unique),
+        // so future inserts no longer enforce uniqueness on it.
+        let mut unique = self.read_unique_indexes(table_name).await?;
+        if unique.remove(index_name) {
+            self.write_unique_indexes(table_name, &unique).await?;
+        }
         Ok(())
     }
 }
