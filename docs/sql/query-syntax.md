@@ -42,7 +42,7 @@ as an explicit `JOIN … ON`.
 
 !!! note
     A multi-table query without a join key (a `CROSS JOIN`, or a comma join with
-    no `WHERE` equality) produces the full cartesian product — fine for small
+    no `WHERE` equality) produces the full cartesian product, fine for small
     inputs, expensive for large ones. Give every join a key when you mean an
     equi-join.
 

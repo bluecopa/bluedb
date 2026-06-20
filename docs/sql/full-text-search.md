@@ -1,14 +1,14 @@
 # Full-text search
 
 bluedb's full-text search is **SQL-integrated**: you declare a full-text index on
-a text column, then search it through ordinary SQL — a relevance predicate in
+a text column, then search it through ordinary SQL: a relevance predicate in
 `WHERE`, combinable with normal structured filters, `ORDER BY`, and pagination.
 There is **no separate search API and no search cluster**. The index (a
 BM25/tantivy index) lives in the same object-storage substrate as the table, so
 there is no ETL or sync between a database and a search engine.
 
-The surface mirrors **PostgreSQL FTS** — `to_tsvector(cfg, col) @@
-*_tsquery(q)`, with `ts_rank(...)` for ranking — so it is familiar and portable.
+The surface mirrors **PostgreSQL FTS**: `to_tsvector(cfg, col) @@
+*_tsquery(q)`, with `ts_rank(...)` for ranking, so it is familiar and portable.
 
 ## 1. Declare a full-text index
 
@@ -46,10 +46,10 @@ The `cfg` argument to `to_tsvector` (`'english'`) selects the analyzer and **mus
 match** the analyzer the index was declared with. The left-hand `col` must be the
 indexed column. Behind the scenes the engine searches the index, rewrites the
 `@@` predicate to a `pk IN (…)` over the matching rows, and lets the SQL engine
-run the rest of the query — so everything composes with normal SQL.
+run the rest of the query, so everything composes with normal SQL.
 
 !!! note "Single table, no joins"
-    An `@@` predicate is supported on a single-table `SELECT` only — a query that
+    An `@@` predicate is supported on a single-table `SELECT` only; a query that
     joins tables and uses `@@` is rejected. Run the search on the base table, then
     join its results if needed.
 
@@ -91,7 +91,7 @@ LIMIT 20;
 ```
 
 `ts_rank(to_tsvector(cfg, col), *_tsquery(q))` in an `ORDER BY` resolves to the
-BM25 relevance order from the index — `DESC` gives best-match-first. The `AND
+BM25 relevance order from the index (`DESC` gives best-match-first). The `AND
 status = 'open'` filter and `LIMIT`/`OFFSET` are applied by the SQL engine over
 the candidate rows.
 
@@ -99,7 +99,7 @@ the candidate rows.
 
 The index is maintained on **every committed write** through an in-process commit
 tap that feeds an in-memory **live segment**. So after an `INSERT`/`UPDATE`/
-`DELETE` commits, a subsequent `@@` query **sees the change immediately** — with
+`DELETE` commits, a subsequent `@@` query **sees the change immediately**, with
 no explicit flush or reindex step. Updates and deletes are reflected through
 tombstones, so a row that no longer matches drops out of results right away.
 
@@ -110,7 +110,7 @@ time. Sealed splits survive a restart.
 
 !!! note "Active node only"
     Full-text reads run only on the **active writer**, which serves all client
-    traffic in active-passive HA — so read-your-writes is cluster-wide and
+    traffic in active-passive HA, so read-your-writes is cluster-wide and
     transparent. A demoted node serves no FTS. On promotion the new active reopens
     its durable FTS engine and replays any un-sealed writes from the SQL watermark
     before serving fresh `@@` queries, so no matches are lost across failover
@@ -119,7 +119,7 @@ time. Sealed splits survive a restart.
 
 ## 6. Trigram-accelerated `LIKE`
 
-A **trigram index** accelerates substring matching — `col LIKE '%lit%'` — without
+A **trigram index** accelerates substring matching (`col LIKE '%lit%'`) without
 a full table scan. Declare it the same way as a full-text index (it takes only
 the column):
 
@@ -136,11 +136,11 @@ prefilter while the original `LIKE` is kept as the exact verify:
 SELECT id FROM docs WHERE body LIKE '%overdue%';
 ```
 
-A `LIKE` is accelerated only when its literal is a **clean infix** — at least 3
+A `LIKE` is accelerated only when its literal is a **clean infix**: at least 3
 characters, with no remaining `%`/`_` wildcards inside the core after stripping
 one optional leading and one optional trailing `%`. So `'%overdue%'`,
 `'%overdue'`, `'overdue%'`, and the bare `'overdue'` all qualify; `'%ab%'`
-(too short), `'%ov_rdue%'` (internal wildcard), and `NOT LIKE` do not — those
+(too short), `'%ov_rdue%'` (internal wildcard), and `NOT LIKE` do not; those
 fall back to a correct (but unindexed) scan.
 
 !!! note "Regex not yet supported"

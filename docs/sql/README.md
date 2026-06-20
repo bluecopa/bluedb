@@ -1,16 +1,16 @@
 # bluedb SQL
 
 bluedb speaks SQL over object storage. This section documents the SQL dialect
-bluedb accepts — which statements, clauses, types, and functions are supported,
+bluedb accepts: which statements, clauses, types, and functions are supported,
 where the behavior matches PostgreSQL/DuckDB, and where it differs.
 
 ## What powers it
 
-bluedb speaks SQL directly over its object-storage substrate — no separate
+bluedb speaks SQL directly over its object-storage substrate, with no separate
 database server. Point and range access by primary key or secondary index is
-served from the transactional store; analytical reads — joins, `GROUP BY` /
+served from the transactional store. Analytical reads (joins, `GROUP BY`,
 aggregates, window functions, subqueries, CTEs, set operations, and arbitrary
-filters and sorts — are served by a columnar engine over the same data. You
+filters and sorts) are served by a columnar engine over the same data. You
 write one SQL surface, and bluedb routes each query to the right path.
 
 ## Dialect at a glance
@@ -18,15 +18,15 @@ write one SQL surface, and bluedb routes each query to the right path.
 - Core **SQL-92** plus analytics: `SELECT` with `WHERE`, `GROUP BY` / `HAVING`,
   `ORDER BY`, `LIMIT` / `OFFSET`, `DISTINCT`, joins, subqueries, aggregates, and
   **window functions**; `CREATE TABLE` / `INSERT` / `UPDATE` / `DELETE`.
-- **Schema'd tables** — every table has a typed column list and a `PRIMARY KEY`;
+- **Schema'd tables**: every table has a typed column list and a `PRIMARY KEY`;
   schema evolution (ADD/DROP/RENAME column, RENAME TABLE) is **online** (O(1)
   metadata, no row rewrite). There are no schemaless tables.
-- **Full read surface** — `SELECT` runs any filter, sort, join, aggregate, or
+- **Full read surface**: `SELECT` runs any filter, sort, join, aggregate, or
   window function; the primary key and [secondary indexes](query-guardrail.md)
   accelerate point and range lookups.
 - **Transactions** with snapshot isolation (`BEGIN` / `COMMIT` / `ROLLBACK`).
 - **Secondary indexes**, **views**, **non-recursive CTEs**, **set operations**.
-- **JSON** — a `JSON` / `JSONB` column type with PostgreSQL operators (`->`,
+- **JSON**: a `JSON` / `JSONB` column type with PostgreSQL operators (`->`,
   `->>`, `@>`, `<@`) and the `jsonb_path_query` family.
 - Closest in feel to **PostgreSQL**; this guide calls out every place the
   behavior diverges from PostgreSQL or DuckDB.

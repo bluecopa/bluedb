@@ -1,27 +1,28 @@
 # bluedb
 
-**bluedb is an object-storage-native database.** It runs SQL, full-text search,
-and a double-entry ledger directly on object storage (S3, GCS, Azure Blob) — no
-local disks to provision and no storage cluster to operate. Schemas are explicit
-and evolve **online**: ADD/DROP/RENAME column and RENAME TABLE are O(1) metadata
-ops, never a row rewrite.
+**bluedb is a database that runs on object storage.** SQL, full-text search, and
+a double-entry ledger, all running straight on S3, GCS, or Azure Blob. There are
+no local disks to provision and no storage cluster to operate. Schemas stay
+explicit but evolve **online**: ADD/DROP/RENAME column and RENAME TABLE are O(1)
+metadata ops, never a row rewrite.
 
-It is **HTAP on one copy of your data**: transactional point, range, and indexed
-reads are served fresh from the LSM store, while analytical queries — joins,
-aggregates, window functions, and [JSON](sql/json.md) — run over a continuously,
-seconds-fresh [Apache Iceberg mirror](lakehouse/iceberg-mirror.md), through one
-SQL surface. No ETL, no second system to keep in sync.
+One copy of your data feeds both halves of the workload, which makes bluedb
+**HTAP**. Transactional point, range, and indexed reads come back fresh from the
+LSM store. The analytical queries (joins, aggregates, window functions,
+[JSON](sql/json.md)) run over a continuously seconds-fresh
+[Apache Iceberg mirror](lakehouse/iceberg-mirror.md), through the same SQL
+surface. No ETL, and no second system to keep in sync.
 
-It is **CP** (consistent under partition), built on a **single serial writer
-plus asynchronous read replicas**, with automatic failover and a real
-[Jepsen](guarantees/jepsen.md) test suite backing the consistency claims.
+Under a partition, bluedb chooses consistency. It is **CP**, built on a single
+serial writer plus asynchronous read replicas, with automatic failover. A real
+[Jepsen](guarantees/jepsen.md) test suite backs the consistency claims.
 
 ## Why it exists
 
 Object storage is the cheapest, most durable, most operationally boring storage
-there is — but it isn't a database. bluedb makes it one: it puts an LSM engine
+there is. It just isn't a database. bluedb makes it one: it puts an LSM engine
 ([SlateDB]) on the bucket, then layers SQL, search, and a ledger on top. You get
-a database whose storage scales and survives like S3, and whose nodes are
+a database whose storage scales and survives like S3, and whose nodes stay
 stateless and disposable.
 
 [SlateDB]: https://slatedb.io
@@ -46,50 +47,50 @@ flowchart TD
     HA["bluedb-ha<br/>lease election + fencing"] -.governs writer.-> SRV
 ```
 
-- **`bluedb-storage`** — the substrate: SlateDB on object storage, with
+- **`bluedb-storage`**: the SlateDB substrate on object storage, with
   tenant-namespaced, order-preserving keys.
-- **[`bluedb-sql`](sql/README.md)** — a SQL engine over the substrate: schema'd
+- **[`bluedb-sql`](sql/README.md)**: a SQL engine over the substrate. Schema'd
   tables with a `PRIMARY KEY`, online schema evolution, secondary indexes,
   transactions, views, [JSON columns and operators](sql/json.md), and a full
   `SELECT` surface (joins, aggregates, window functions, arbitrary filters and
-  sorts) — with the primary key and [indexes](sql/query-guardrail.md)
-  accelerating point/range lookups.
-- **[`bluedb-fts`](sql/full-text-search.md)** — **SQL-integrated** BM25 full-text
-  search (tantivy) over object storage: declare a full-text index and query it
-  through SQL (Postgres `@@`/`ts_rank`), read-your-writes, no separate search
-  cluster.
-- **[`bluedb-ledger`](api/ledger.md)** — a TigerBeetle-style double-entry ledger:
-  typed accounts/transfers, two-phase transfers, balances queryable over SQL.
-- **[`bluedb-lakehouse`](lakehouse/iceberg-mirror.md)** — continuously mirrors
+  sorts), with the primary key and [indexes](sql/query-guardrail.md)
+  accelerating point and range lookups.
+- **[`bluedb-fts`](sql/full-text-search.md)**: **SQL-integrated** BM25 full-text
+  search (tantivy) over object storage. Declare a full-text index and query it
+  through SQL (Postgres `@@`/`ts_rank`), with read-your-writes and no separate
+  search cluster.
+- **[`bluedb-ledger`](api/ledger.md)**: a TigerBeetle-style double-entry ledger.
+  Typed accounts and transfers, two-phase transfers, balances queryable over SQL.
+- **[`bluedb-lakehouse`](lakehouse/iceberg-mirror.md)**: continuously mirrors
   tables to **Apache Iceberg** in the same bucket (full CRUD, seconds-fresh,
-  exactly-once) so warehouses (BigQuery/Databricks/Snowflake) join bluedb data
-  with **no ETL**; served through a read-only Iceberg REST catalog.
-- **[`bluedb-evidence`](evidence/chains.md)** — append-only, **verifiable
+  exactly-once), so warehouses (BigQuery/Databricks/Snowflake) join bluedb data
+  with **no ETL**. Served through a read-only Iceberg REST catalog.
+- **[`bluedb-evidence`](evidence/chains.md)**: append-only, **verifiable
   evidence chains** (server-assigned dense sequencing, RFC 6962 Merkle
-  inclusion/consistency proofs, GDPR-grade redaction) plus a **native graph
+  inclusion/consistency proofs, GDPR-grade redaction), plus a **native graph
   store** with weighted-edge adjacency and **snapshot-isolated** traversal
   (`reachable`, `widest_path`).
-- **[Collections](collections/README.md)** — a MongoDB-style document API over
-  HTTP/JSON: schema-free collections, MQL `find`/`aggregate`, and secondary,
-  compound, and TTL indexes — no MongoDB driver required.
-- **[Collections search](collections/search.md)** — an Elasticsearch-shaped search
-  surface over collections documents: BM25 relevance, the ES query DSL
-  (`match`/`term`/`range`/`bool`/`exists`), and the ES hits-envelope response — no
-  ES client or Kibana required.
-- **`bluedb-engine`** — composes the pillars behind one facade.
-- **`bluedb-server`** — the HTTP/REST service (axum): CRUD, `/sql`, admin.
-- **[`bluedb-ha`](ha/active-passive.md)** — single-writer high availability:
-  lease election, self-fencing, automatic failover.
+- **[Collections](collections/README.md)**: a MongoDB-style document API over
+  HTTP/JSON. Schema-free collections, MQL `find`/`aggregate`, and secondary,
+  compound, and TTL indexes, with no MongoDB driver required.
+- **[Collections search](collections/search.md)**: an Elasticsearch-shaped search
+  surface over collections documents. BM25 relevance, the ES query DSL
+  (`match`/`term`/`range`/`bool`/`exists`), and the ES hits-envelope response,
+  with no ES client or Kibana required.
+- **`bluedb-engine`**: composes the pillars behind one facade.
+- **`bluedb-server`**: the HTTP/REST service (axum). CRUD, `/sql`, and admin.
+- **[`bluedb-ha`](ha/active-passive.md)**: single-writer high availability.
+  Lease election, self-fencing, automatic failover.
 
 ## Performance
 
 bluedb acks a write only once it's **durable** (`await_durable`), so write latency
-tracks the WAL flush interval (`BLUEDB_FLUSH_INTERVAL_MS`, default 25 ms) — and
-throughput **scales with the number of in-flight write clients**, because the lone
-writer's WAL group-commits every concurrent insert into a single flush. bluedb
-stays **single-writer**: the rows below are *N concurrent client connections*, each
-issuing back-to-back single-row autocommit `INSERT`s against the one writer node —
-not N writers. Measured on one node:
+tracks the WAL flush interval (`BLUEDB_FLUSH_INTERVAL_MS`, default 25 ms).
+Throughput then **scales with the number of in-flight write clients**, because the
+lone writer's WAL group-commits every concurrent insert into a single flush.
+bluedb stays **single-writer**: the rows below are *N concurrent client
+connections*, each issuing back-to-back single-row autocommit `INSERT`s against
+the one writer node, not N writers. Measured on one node:
 
 | Concurrent clients | Inserts/sec | p50 | p99 |
 |--:|--:|--:|--:|
@@ -99,23 +100,24 @@ not N writers. Measured on one node:
 | 128 | 4,800 | 27 ms | 30 ms |
 | 256 | 9,600 | 27 ms | 31 ms |
 
-Latency stays flat at ≈ the flush interval regardless of load; throughput rises
-~linearly with concurrency. A bulk load wrapped in one `BEGIN…COMMIT` commits as a
-single `WriteBatch` — thousands of rows in one durable write. Writes survive
-kill/partition with **zero acked-write loss** ([Jepsen](guarantees/jepsen.md)). See
-**[Sizing & capacity](operations/sizing.md)** to turn this into a node count — how
-many concurrent clients a node sustains, and the writes/sec that implies.
+Latency stays flat at about the flush interval regardless of load, and throughput
+rises roughly linearly with concurrency. A bulk load wrapped in one
+`BEGIN…COMMIT` commits as a single `WriteBatch`: thousands of rows in one durable
+write. Writes survive kill and partition with **zero acked-write loss**
+([Jepsen](guarantees/jepsen.md)). See **[Sizing & capacity](operations/sizing.md)**
+to turn this into a node count: how many concurrent clients a node sustains, and
+the writes/sec that implies.
 
-*Method & caveat:* single node, local-disk (SSD) backend, `flush_interval=25 ms`,
+*Method and caveat:* single node, local-disk (SSD) backend, `flush_interval=25 ms`,
 strong durability. Networked object storage (S3/GCS/Azure) adds its PUT latency on
-top of each flush, so read these as a local upper bound — a full object-store +
+top of each flush, so read these as a local upper bound. A full object-store and
 multi-node characterization is in progress. Reproduce with
 `cargo test --release -p bluedb-sql --test throughput_bench -- --ignored`.
 
 ## Start here
 
-- **[Quickstart](quickstart.md)** — run a local cluster and your first query.
-- **[SQL reference](sql/README.md)** — the dialect bluedb accepts.
-- **[Guarantees](guarantees/consistency.md)** — the consistency model and what Jepsen proves.
-- **[High availability](ha/active-passive.md)** — active-passive failover, with diagrams.
-- **[Deployment](deployment/local.md)** — local, Docker, and Kubernetes.
+- **[Quickstart](quickstart.md)**: run a local cluster and your first query.
+- **[SQL reference](sql/README.md)**: the dialect bluedb accepts.
+- **[Guarantees](guarantees/consistency.md)**: the consistency model and what Jepsen proves.
+- **[High availability](ha/active-passive.md)**: active-passive failover, with diagrams.
+- **[Deployment](deployment/local.md)**: local, Docker, and Kubernetes.

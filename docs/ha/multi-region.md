@@ -22,7 +22,7 @@ flowchart LR
 
 - **Replication.** Region A's bucket replicates to Region B's bucket using the
   object store's own **cross-region replication** (S3 CRR, GCS dual/multi-region,
-  Azure GRS). This is asynchronous — Region B lags Region A by the replication
+  Azure GRS). This is asynchronous: Region B lags Region A by the replication
   delay, which is the **RPO**.
 - **Passive region.** Region B's nodes run read-only against bucket B. They serve
   reads (lagging) and stand ready to take over.
@@ -39,8 +39,8 @@ flowchart LR
 
 ## Where this lives
 
-The cross-region pieces — replication setup, the gated-promotion wait, and the
-orchestration of a regional cutover — are a **deployment/ops concern**, not
+The cross-region pieces (replication setup, the gated-promotion wait, and the
+orchestration of a regional cutover) are a **deployment/ops concern**, not
 engine code. They drive the same `bluedb-ha` `promote`/`demote` surface that
 intra-region failover uses. `bluedb-ha` deliberately contains no cross-region
 logic: it provides the safe primitive (epoch-fenced promotion), and the
@@ -50,6 +50,6 @@ deployment layer sequences it across regions.
 
 | Goal | Posture |
 |------|---------|
-| Survive a node/AZ failure with no data loss | **Intra-region HA** (RPO 0) — see [Active-passive HA](active-passive.md) |
+| Survive a node/AZ failure with no data loss | **Intra-region HA** (RPO 0), see [Active-passive HA](active-passive.md) |
 | Survive a whole-region outage | **Multi-region active-passive** (RPO > 0, this page) |
 | Both | Intra-region HA in each region + cross-region replication |

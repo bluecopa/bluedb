@@ -8,7 +8,7 @@ durable-before-ack guarantees of the rest of the engine).
 
 Canonical state lives as native records, but a **crash-consistent SQL
 projection** dual-writes accounts and transfers into the `ledger_accounts` and
-`ledger_transfers` tables — so balances are queryable through ordinary
+`ledger_transfers` tables, so balances are queryable through ordinary
 [`/sql`](rest.md#post-sql-run-one-parameterized-statement) and
 [`/tables`](rest.md) reads alongside everything else.
 
@@ -16,10 +16,10 @@ projection** dual-writes accounts and transfers into the `ledger_accounts` and
     128-bit and 64-bit fields (`id`, `amount`, `user_data_*`, balances,
     `timestamp`, …) are serialized as **decimal strings** so JSON clients that
     parse numbers as `f64`/`i64` (browsers, some language runtimes) don't truncate
-    large values. Inputs are lenient — a JSON number is accepted too — but outputs
+    large values. Inputs are lenient (a JSON number is accepted too), but outputs
     are always strings for those fields.
 
-## `POST /ledger/accounts` — create accounts
+## `POST /ledger/accounts`: create accounts
 
 The body is a single account object **or** an array of objects. The response is
 one TigerBeetle-style result code per input item, in order.
@@ -56,9 +56,9 @@ Fields: `id` (required, 128-bit), `ledger` (required, `u32`), and optional
 | `1 << 3` | `history` | Retain balance history |
 | `1 << 4` | `imported` | Import an account with a caller-supplied timestamp |
 
-## `POST /ledger/transfers` — create transfers
+## `POST /ledger/transfers`: create transfers
 
-Same batch shape — a single object or an array — with one result code per item.
+Same batch shape (a single object or an array) with one result code per item.
 
 ```bash
 curl -s -X POST localhost:8081/ledger/transfers \
@@ -83,7 +83,7 @@ Fields: `id`, `debit_account_id`, `credit_account_id`, `amount`, and `ledger`
 
 ### Two-phase transfers
 
-A transfer can move money in two phases — reserve, then resolve — driven by
+A transfer can move money in two phases (reserve, then resolve), driven by
 flags:
 
 | Bit | Flag | Effect |
@@ -112,7 +112,7 @@ applied (the success code); anything else explains the rejection. A few common o
 
 | Result | Meaning |
 |--------|---------|
-| `created` | Applied — the account/transfer was created |
+| `created` | Applied; the account/transfer was created |
 | `linked_event_failed` | Rolled back because another item in its linked chain failed |
 | `exists` | An identical record with this id already exists (idempotent replay) |
 | `exceeds_credits` / `exceeds_debits` | Would violate an account's must-not-exceed flag |
@@ -123,7 +123,7 @@ applied (the success code); anything else explains the rejection. A few common o
 The full set is the TigerBeetle named result-code set (the engine has full
 validation-order parity); the codes above are illustrative.
 
-## `GET /ledger/accounts/{id}` — look up an account
+## `GET /ledger/accounts/{id}`: look up an account
 
 Returns the canonical account state, or `404` if it doesn't exist:
 
@@ -148,7 +148,7 @@ curl -s localhost:8081/ledger/accounts/1
 }
 ```
 
-## `GET /ledger/transfers/{id}` — look up a transfer
+## `GET /ledger/transfers/{id}`: look up a transfer
 
 Returns the canonical transfer state, or `404`:
 
@@ -172,5 +172,5 @@ FROM ledger_transfers WHERE ledger = $1;
 ```
 
 The projection is dual-written into the same atomic batch as the canonical
-records, so it is crash-consistent with them — a balance you read over SQL never
+records, so it is crash-consistent with them: a balance you read over SQL never
 disagrees with the canonical state.

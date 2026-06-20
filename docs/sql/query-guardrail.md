@@ -2,21 +2,21 @@
 
 [← SQL index](README.md)
 
-`SELECT` runs the full analytical surface — arbitrary `WHERE` filters, `ORDER BY`
+`SELECT` runs the full analytical surface (arbitrary `WHERE` filters, `ORDER BY`
 on any column, joins, `GROUP BY` / aggregates, window functions, subqueries,
-CTEs, and set operations — over any table. You never add an index just to make a
+CTEs, and set operations) over any table. You never add an index just to make a
 query *run*; indexes and the primary key are a **performance** feature.
 
 | Query shape | How it's served |
 |-------------|-----------------|
-| `WHERE` on the primary key (point, range, composite prefix/keyset) | direct key lookup — the fastest path |
+| `WHERE` on the primary key (point, range, composite prefix/keyset) | direct key lookup (the fastest path) |
 | `WHERE` / `ORDER BY` on a secondary-indexed column | index-served |
 | Filter / sort / aggregate on any other column, joins, windows | analytical scan |
 
 ## Point and range lookups
 
-A predicate on the primary key — or a composite-key prefix, range, or row-value
-keyset — is a direct key lookup, the fastest path and always consistent with your
+A predicate on the primary key (or a composite-key prefix, range, or row-value
+keyset) is a direct key lookup, the fastest path and always consistent with your
 latest write:
 
 ```sql
@@ -33,8 +33,8 @@ SELECT * FROM users WHERE email = 'ada@x.io';   -- index-served
 
 ## Analytical reads
 
-Anything else — a filter or sort on a non-indexed column, a join, an aggregate, a
-window function — is served by an analytical scan, no index required:
+Anything else (a filter or sort on a non-indexed column, a join, an aggregate, a
+window function) is served by an analytical scan, no index required:
 
 ```sql
 SELECT category, COUNT(*) FROM products GROUP BY category;
@@ -47,17 +47,17 @@ SELECT * FROM events WHERE (attrs ->> 'status') = 'active';   -- JSON, see below
 
 A [JSON](json.md) operator (`->`, `->>`, `@>`, `jsonb_path_query`, …) is served
 on this analytical path too. On the [`/tables`](../api/rest.md#get-tablestable-select)
-data plane, a read whose filter or sort needs the analytical path — an arbitrary
-non-indexed column, or a JSON path (`attrs->>status=eq.active`) — is **routed to
+data plane, a read whose filter or sort needs the analytical path (an arbitrary
+non-indexed column, or a JSON path such as `attrs->>status=eq.active`) is **routed to
 it automatically**; you never get a "needs an index" error for a read.
 
 ## Substring search
 
 `col LIKE '%infix%'` is served as a scan. A **trigram index** accelerates it
-without changing the result — see [Full-text search](full-text-search.md).
+without changing the result; see [Full-text search](full-text-search.md).
 
 ## See also
 
-- [Statements](statements.md) — every table needs a schema and a `PRIMARY KEY`.
-- [Full-text search](full-text-search.md) — `@@` and trigram-accelerated `LIKE`.
-- [Limitations & differences](limitations.md) — the compatibility contract.
+- [Statements](statements.md): every table needs a schema and a `PRIMARY KEY`.
+- [Full-text search](full-text-search.md): `@@` and trigram-accelerated `LIKE`.
+- [Limitations & differences](limitations.md): the compatibility contract.

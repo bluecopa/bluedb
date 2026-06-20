@@ -1,7 +1,7 @@
 # Local deployment
 
 The repository ships a Docker Compose stack that brings up a complete bluedb
-cluster — object store, lease arbiter, and three nodes — for development,
+cluster (object store, lease arbiter, and three nodes) for development,
 failover testing, and [Jepsen](../guarantees/jepsen.md).
 
 ## What's in the stack
@@ -19,9 +19,9 @@ flowchart TD
     N1 & N2 & N3 <--> P
 ```
 
-- **MinIO** — S3-compatible object store; the shared database lives here.
-- **Postgres** — the lease arbiter that elects exactly one writer.
-- **node1 / node2 / node3** — `bluedb-server` on host ports `8081` / `8082` /
+- **MinIO**: S3-compatible object store; the shared database lives here.
+- **Postgres**: the lease arbiter that elects exactly one writer.
+- **node1 / node2 / node3**: `bluedb-server` on host ports `8081` / `8082` /
   `8083` (container `8080`). One bootstraps as writer; the others follow as
   replicas.
 

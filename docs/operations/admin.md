@@ -19,8 +19,8 @@ curl -s localhost:8081/admin/status
 ```
 
 Returns whether this node is the **active writer** or a **passive replica**, its
-current fencing **epoch**, and the lease **expiry**. Clients use this to find —
-and follow — the leader.
+current fencing **epoch**, and the lease **expiry**. Clients use this to find and
+follow the leader.
 
 ## Manual failover
 
@@ -36,21 +36,21 @@ curl -s -X POST localhost:8082/admin/promote
 ```
 
 `promote` is safe by construction: it acquires the lease with a bumped epoch, and
-SlateDB's compare-and-set fences any node still on the old epoch — so a manual
+SlateDB's compare-and-set fences any node still on the old epoch, so a manual
 promote cannot create two writers.
 
 !!! warning "Writes target the active writer"
     `POST /sql`, `POST/PATCH/DELETE /tables/{table}` are accepted only by the
-    active writer. A replica returns `503` — the signal for a client to
+    active writer. A replica returns `503`, the signal for a client to
     re-discover the leader via `/admin/status`. Reads (`GET`) are served by any
     node.
 
 ## Health checks
 
 `GET /health` is a liveness probe (the process is up). For **readiness that
-should route writes**, gate on `/admin/status` reporting active — see the
+should route writes**, gate on `/admin/status` reporting active (see the
 [Kubernetes](../deployment/kubernetes.md#routing-writes-to-the-leader) routing
-options.
+options).
 
 ## Observing failover
 

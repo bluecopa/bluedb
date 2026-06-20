@@ -18,9 +18,9 @@ docker compose up -d --build
 
 This starts:
 
-- **MinIO** — the object store (the shared database lives here).
-- **Postgres** — the lease arbiter that elects exactly one writer.
-- **node1 / node2 / node3** — `bluedb-server` nodes on ports `8081` / `8082` /
+- **MinIO**: the object store (the shared database lives here).
+- **Postgres**: the lease arbiter that elects exactly one writer.
+- **node1 / node2 / node3**: `bluedb-server` nodes on ports `8081` / `8082` /
   `8083`. One bootstraps as the **writer**; the others follow as **read
   replicas**.
 
@@ -48,12 +48,12 @@ curl -s localhost:8081/sql -H 'content-type: application/json' \
   -d '{"sql": "SELECT name FROM users ORDER BY id"}'
 ```
 
-You can also use the PostgREST-style REST surface at `/tables/{table}` — see
+You can also use the PostgREST-style REST surface at `/tables/{table}`. See
 [REST API](api/rest.md).
 
 ## 4. Try a failover
 
-Kill the writer and watch a standby take over within the lease TTL (~10s):
+Kill the writer and watch a standby take over within the lease TTL (about 10s):
 
 ```bash
 docker kill bluedb-node1-1          # or whichever node is active
@@ -61,7 +61,7 @@ sleep 12
 curl -s localhost:8082/admin/status # a standby has promoted
 ```
 
-No acknowledged write is lost — all three nodes share the same object-storage
+No acknowledged write is lost, because all three nodes share the same object-storage
 database. See [Active-passive HA](ha/active-passive.md).
 
 ## Next steps

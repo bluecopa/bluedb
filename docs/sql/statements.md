@@ -17,17 +17,17 @@ CREATE TABLE users (
 
 !!! warning
     **Every table needs a column list and a `PRIMARY KEY`.** bluedb has no
-    schemaless tables — a column-less `CREATE TABLE`, or one without a primary
+    schemaless tables: a column-less `CREATE TABLE`, or one without a primary
     key, is rejected. The primary key is the clustered row key (so it must be
     unique and is the default scan order) and the identity column for the
     warehouse Iceberg mirror.
 
 Options:
 
-- `IF NOT EXISTS` — `CREATE TABLE IF NOT EXISTS users (…)`.
+- `IF NOT EXISTS`: `CREATE TABLE IF NOT EXISTS users (…)`.
 - `PRIMARY KEY` on a column makes it the clustered key; rows scan back in
   primary-key order without an explicit `ORDER BY` (see the [Note](#default-row-order) below).
-- `CREATE TABLE … AS SELECT …` (CTAS) is supported, including a leading `WITH` —
+- `CREATE TABLE … AS SELECT …` (CTAS) is supported, including a leading `WITH`;
   the new table still requires a `PRIMARY KEY`.
 
 ```sql
@@ -48,8 +48,8 @@ CREATE TABLE memberships (
 ```
 
 The component columns are forced `NOT NULL`. Point, **leading-prefix**, range,
-and **row-value keyset** lookups all use the key — the same shapes a Postgres
-multicolumn index serves, as fast key-served access paths:
+and **row-value keyset** lookups all use the key (the same shapes a Postgres
+multicolumn index serves) as fast key-served access paths:
 
 ```sql
 SELECT role FROM memberships WHERE org_id = 1 AND user_id = 7;   -- point
@@ -69,7 +69,7 @@ is never returned (`SELECT *` shows only your columns) and is the identity colum
 for the [Iceberg mirror](../lakehouse/iceberg-mirror.md).
 
 !!! note "v1 limitation"
-    **`UPDATE` of a key column** is rejected (it changes the row's identity —
+    **`UPDATE` of a key column** is rejected (it changes the row's identity;
     delete and re-insert instead).
 
 !!! note
@@ -86,7 +86,7 @@ DROP TABLE IF EXISTS users;
 
 ## `ALTER TABLE`
 
-Schema evolution is **online** — these are O(1) metadata changes (stable
+Schema evolution is **online**: these are O(1) metadata changes (stable
 field-ids and table-ids under the hood), never a row rewrite, so they don't block
 reads or writes:
 
@@ -106,7 +106,7 @@ ALTER TABLE users RENAME TO members;            -- O(1): no row/index re-key
     The primary key is the physical row key and the type fixes the on-disk
     encoding, so both require a rebuild: `CREATE` the new table, `INSERT … SELECT`
     into it, `DROP` the old one, and `RENAME` the new one into place (the rename
-    is O(1)). Dropping the primary-key column is rejected — a table can't be left
+    is O(1)). Dropping the primary-key column is rejected; a table can't be left
     without one.
 
 ## `INSERT`
@@ -153,7 +153,7 @@ DROP INDEX users_email ON users;
 !!! note
     An index is a **performance** feature: it turns an equality or range filter
     (or an `ORDER BY`) on that column into a fast index-served lookup. Queries on
-    non-indexed columns still run — they're served as analytical scans (see
+    non-indexed columns still run; they're served as analytical scans (see
     [Reads and indexes](query-guardrail.md)).
 
 !!! warning
@@ -190,7 +190,7 @@ See [Transactions](transactions.md) for isolation and concurrency details.
 
 ## `SET` / `PRAGMA`
 
-- `SET default_null_order = 'nulls_first' | 'nulls_last'` — controls where
+- `SET default_null_order = 'nulls_first' | 'nulls_last'`: controls where
   `NULL`s sort in `ORDER BY` (see [Query syntax](query-syntax.md#order-by)).
 - `PRAGMA lakehouse_mirror[...]` and `PRAGMA lakehouse_target_file_bytes = <n>`
   control the [Iceberg mirror](../lakehouse/iceberg-mirror.md) (mirroring on/off

@@ -3,7 +3,7 @@
 bluedb exposes an **Elasticsearch-shaped search API** over `/collections` documents.
 Documents are indexed with BM25 relevance (powered by bluedb's embedded tantivy
 engine), and the request/response shapes intentionally mirror the Elasticsearch
-`_search` API — so tooling, queries, and mental models transfer. The API speaks
+`_search` API, so tooling, queries, and mental models transfer. The API speaks
 **plain HTTP/JSON**, not the Elasticsearch wire or REST protocol: native ES clients
 (`elasticsearch-py`, `@elastic/elasticsearch`) cannot connect directly. Any HTTP
 client works.
@@ -104,7 +104,7 @@ curl -s -X POST localhost:8081/collections/articles/search \
       }'
 ```
 
-Response — the Elasticsearch hits envelope:
+Response (the Elasticsearch hits envelope):
 
 ```json
 {
@@ -129,8 +129,8 @@ Response — the Elasticsearch hits envelope:
 ```
 
 `hits.total.value` is the number of matching documents and `hits.total.relation`
-is `"eq"` for an exact count. Match counts above ~100,000 are reported with
-`"relation": "gte"` — the value is a lower bound, not an exact total.
+is `"eq"` for an exact count. Match counts above roughly 100,000 are reported with
+`"relation": "gte"`: the value is a lower bound, not an exact total.
 
 **Required scope:** `data:read`.
 
@@ -240,7 +240,7 @@ Each hit that matches a highlighted field gains a `highlight` object:
     the raw source words:
 
     - With the **`english`** (stemming) analyzer, a stemmed query term may not wrap
-      the original source word — for example, the query `"dogs"` is stemmed to
+      the original source word. For example, the query `"dogs"` is stemmed to
       `"dog"` during indexing and matching, but the source word `"dogs"` will not
       receive an `<em>` tag because the highlight pass matches the stem `"dog"`,
       not the surface form `"dogs"`. Use `standard` or `whitespace` analyzers when
@@ -256,7 +256,7 @@ Search reflects **read-your-writes on the active writer**: a document you just
 inserted, updated, or deleted is immediately visible to a search on the same node
 that accepted the write. No seal cycle is needed.
 
-Reader replicas are **eventually consistent** — they see documents only after the
+Reader replicas are **eventually consistent**: they see documents only after the
 underlying data has sealed and propagated. If you need search to reflect a recent
 write on a reader replica, route the request to the active writer.
 
@@ -285,13 +285,13 @@ isolated: a mapping declared in one tenant is invisible to another.
 | `GET /collections/{c}/searchIndex` (describe mapping) | `data:read` |
 | `POST /collections/{c}/search` | `data:read` |
 
-See [REST API — Authorization](../api/rest.md#authorization) for token and scope
+See [REST API: Authorization](../api/rest.md#authorization) for token and scope
 configuration.
 
 ## Errors
 
-Error responses use bluedb's **standard error body** — a JSON object with an
-`"error"` string field — not the Elasticsearch `error.type`/`reason` envelope:
+Error responses use bluedb's **standard error body** (a JSON object with an
+`"error"` string field), not the Elasticsearch `error.type`/`reason` envelope:
 
 ```json
 {"error": "no search mapping for collection 'articles'"}
@@ -308,6 +308,6 @@ Error responses use bluedb's **standard error body** — a JSON object with an
 
 ## See also
 
-- [Collections — MongoDB-style API](README.md) — `find`, `aggregate`, `createIndex`, and more.
-- [Full-text search](../sql/full-text-search.md) — BM25 and trigram search via SQL.
-- [REST API](../api/rest.md) — the SQL and REST data planes.
+- [Collections: MongoDB-style API](README.md): `find`, `aggregate`, `createIndex`, and more.
+- [Full-text search](../sql/full-text-search.md): BM25 and trigram search via SQL.
+- [REST API](../api/rest.md): the SQL and REST data planes.
