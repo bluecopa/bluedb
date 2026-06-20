@@ -590,6 +590,19 @@ impl FtsEngine {
         rewrite_like_query(sql, &pk_column, &candidates)
     }
 
+    /// Convert a REST [`Param`] to a JSON value, the shape `rewrite_for`
+    /// resolves `$N` placeholders against. Mirrors the engine's `param_values`
+    /// (`Param::Str` is the common FTS case — a parameterized tsquery string).
+    fn param_to_json_(p: &Param) -> serde_json::Value {
+        match p {
+            Param::Null => serde_json::Value::Null,
+            Param::Bool(b) => serde_json::Value::Bool(*b),
+            Param::Int(i) => serde_json::json!(*i),
+            Param::Float(f) => serde_json::json!(*f),
+            Param::Str(s) => serde_json::Value::String(s.clone()),
+        }
+    }
+
     /// Execute `sql`: rewrite `@@`/`ts_rank` against the live segment if present,
     /// else run unchanged. Goes through the parameterized single-DML surface.
     pub async fn execute_fts(
@@ -598,10 +611,14 @@ impl FtsEngine {
         sql: &str,
         params: &[Param],
     ) -> Result<Vec<Payload>> {
-        // Writes never contain `@@`, so the FTS rewrite is a no-op here; the
-        // parameterized-tsquery path is read-only (`exec_sql_read`), so `&[]` is
-        // correct (and avoids converting gluesql Params to JSON).
-        let rewritten = self.rewrite_for(sql, &[]).await?;
+        // The `@@` rewrite resolves `$N` placeholders against `params` (a
+        // parameterized `plainto_tsquery($1)` needs its query string to search the
+        // index), so the params must be threaded through as JSON values — both for
+        // `/sql` reads (an `@@` SELECT on the transactional fast path) and the
+        // analytical `/query` read path. Writes never contain `@@`, so this is a
+        // no-op for them.
+        let json_params: Vec<serde_json::Value> = params.iter().map(Self::param_to_json_).collect();
+        let rewritten = self.rewrite_for(sql, &json_params).await?;
         let final_sql = rewritten.as_deref().unwrap_or(sql);
         rest_sql::execute_sql(glue, final_sql, params, false).await
     }
