@@ -25,7 +25,7 @@ write one SQL surface, and bluedb routes each query to the right path.
   window function; the primary key and [secondary indexes](query-guardrail.md)
   accelerate point and range lookups.
 - **Transactions** with snapshot isolation (`BEGIN` / `COMMIT` / `ROLLBACK`).
-- **Secondary indexes**, **views**, **non-recursive CTEs**, **set operations**.
+- **Secondary indexes**, **views**, **CTEs (including `WITH RECURSIVE`)**, **set operations**.
 - **JSON**: a `JSON` / `JSONB` column type with PostgreSQL operators (`->`,
   `->>`, `@>`, `<@`) and the `jsonb_path_query` family.
 - Closest in feel to **PostgreSQL**; this guide calls out every place the

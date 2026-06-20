@@ -319,15 +319,19 @@ Once declared, query both through [`/sql`](../sql/full-text-search.md).
 
 ## Read-your-writes & freshness
 
-Every **mutating** response carries the CDC sequence the write reached:
+Every **mutating** response carries the sequence the write reached:
 
 ```
 X-Bluedb-Watermark: acme:42
 ```
 
-(`<tenant>:<seq>`.) A read response carries the same header for the watermark it
-reflects. To require a read to reflect at least a given write (e.g. to read your
-own write through the analytical engine), echo it back on the read:
+(`<tenant>:<seq>`.) The sequence is the writer's per-tenant commit counter. It
+advances on every committed `INSERT`, `UPDATE`, and `DELETE`, so a write
+response always carries a non-zero watermark whether or not the
+[lakehouse mirror](../lakehouse/iceberg-mirror.md) is on. A read response
+carries the same header for the watermark it reflects. To require a read to
+reflect at least a given write (e.g. to read your own write through the
+analytical engine), echo it back on the read:
 
 ```
 X-Bluedb-Min-Watermark: acme:42
