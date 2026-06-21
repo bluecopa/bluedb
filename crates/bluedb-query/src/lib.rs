@@ -67,8 +67,16 @@ pub fn register_extensions(ctx: &mut SessionContext) -> datafusion::error::Resul
 /// the conformance harness so both plan identically.
 pub fn analytical_context() -> datafusion::error::Result<SessionContext> {
     use datafusion::execution::SessionStateBuilder;
+    use datafusion::execution::config::SessionConfig;
+    // DataFusion implements recursive CTEs but ships them behind a flag that
+    // defaults to off. Turn it on so `WITH RECURSIVE` works on the analytical
+    // path (the engine handles the fixed-point iteration; bluedb has no reason
+    // to forbid it). Bounded by the query's own terminator (`WHERE n < k`).
+    let mut config = SessionConfig::new();
+    config.options_mut().execution.enable_recursive_ctes = true;
     let state = SessionStateBuilder::new()
         .with_default_features()
+        .with_config(config)
         .with_type_planner(Arc::new(json_udfs::JsonTypePlanner))
         .build();
     let mut ctx = SessionContext::new_with_state(state);

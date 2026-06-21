@@ -103,7 +103,7 @@ between a numeric operand and a numeric string literal compares *numerically*
   "unsupported" error (a pre-execution check walks projection, `WHERE`,
   `HAVING`, and `FROM`-derived subqueries for an `OVER` clause).
 - **Cartesian products** — `CROSS JOIN`, or comma-joins without a join key. Rejected at plan time (would materialize the full product).
-- **`WITH RECURSIVE`** — needs iterative evaluation; can't be inlined.
+- **`WITH RECURSIVE`** — needs iterative evaluation and can't be inlined into the transactional `/sql` path. It **is** supported on the analytical `/query` surface (DataFusion's `enable_recursive_ctes` flag is on there) — see `docs/sql/query-syntax.md`.
 - **Multi-column `INTERSECT` / `EXCEPT`** (multi-column `UNION`/`UNION ALL` *is* supported).
 - **Composite (multi-column) indexes.**
 - **`EXPLAIN`, `SELECT DISTINCT ON`.**
