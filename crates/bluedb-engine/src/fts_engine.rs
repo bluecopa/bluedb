@@ -662,24 +662,37 @@ impl FtsEngine {
         };
 
         for (segment, durable) in targets {
-            let (docs, tombs) = segment.drain_for_seal()?;
+            let snapshot = segment.snapshot_for_seal()?;
 
-            // Re-add live docs (id = pk.to_string(), body), superseding any prior
-            // durable copy of that pk.
-            if !docs.is_empty() {
-                let old_ids: Vec<String> = docs.iter().map(|(pk, _)| pk.to_string()).collect();
-                let tantivy_docs: Vec<TantivyDocument> = docs
-                    .iter()
-                    .map(|(pk, body)| durable_doc(&durable, *pk, body))
-                    .collect::<Result<Vec<_>>>()?;
-                durable.update(old_ids, tantivy_docs).await?;
+            let durable_result = async {
+                // Re-add live docs (id = pk.to_string(), body), superseding any prior
+                // durable copy of that pk.
+                if !snapshot.docs.is_empty() {
+                    let old_ids: Vec<String> = snapshot.docs.iter().map(|(pk, _)| pk.to_string()).collect();
+                    let tantivy_docs: Vec<TantivyDocument> = snapshot
+                        .docs
+                        .iter()
+                        .map(|(pk, body)| durable_doc(&durable, *pk, body))
+                        .collect::<Result<Vec<_>>>()?;
+                    durable.update(old_ids, tantivy_docs).await?;
+                }
+
+                // Tombstone the deleted pks in the durable tier.
+                if !snapshot.tombs.is_empty() {
+                    let dead: Vec<String> = snapshot.tombs.iter().map(|pk| pk.to_string()).collect();
+                    durable.delete(dead).await?;
+                }
+
+                Ok::<(), EngineError>(())
+            }
+            .await;
+
+            if let Err(err) = durable_result {
+                segment.abort_seal();
+                return Err(err);
             }
 
-            // Tombstone the deleted pks in the durable tier.
-            if !tombs.is_empty() {
-                let dead: Vec<String> = tombs.iter().map(|pk| pk.to_string()).collect();
-                durable.delete(dead).await?;
-            }
+            segment.finish_seal()?;
         }
         Ok(())
     }
@@ -1010,6 +1023,69 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn trigram_search_stays_visible_while_seal_snapshot_is_pending() {
+        let store = Arc::new(InMemory::new());
+        let db = Arc::new(Db::open("trgm-seal-gap", store).await.unwrap());
+        let database = Database::new(db);
+        let fts = FtsEngine::new_durable(database.substrate());
+
+        {
+            let mut g = Glue::new(database.connection_serialized());
+            g.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT);")
+                .await
+                .unwrap();
+        }
+        fts.create_trigram_index_auto(&database.connection(), "docs", "body")
+            .await
+            .unwrap();
+
+        {
+            let mut g = Glue::new(database.connection().with_commit_observer(fts.clone()));
+            g.execute("INSERT INTO docs (id, body) VALUES (1, 'quarterly invoice overdue');")
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            trigram_search(&fts, "docs", "body", "overdue").await,
+            vec![1],
+            "pre-seal live tier serves the row"
+        );
+
+        let (segment, durable) = {
+            let idx = fts.indexes.read().unwrap();
+            let def = idx
+                .get("docs")
+                .and_then(|v| v.iter().find(|d| d.column == "body" && d.kind == IndexKind::Trigram))
+                .expect("trigram def present");
+            (def.segment.clone(), def.durable.clone().expect("durable trigram tier"))
+        };
+
+        let snapshot = segment.snapshot_for_seal().unwrap();
+        assert_eq!(
+            trigram_search(&fts, "docs", "body", "overdue").await,
+            vec![1],
+            "live tier remains searchable while durable seal update is pending"
+        );
+
+        let old_ids: Vec<String> = snapshot.docs.iter().map(|(pk, _)| pk.to_string()).collect();
+        let tantivy_docs: Vec<TantivyDocument> = snapshot
+            .docs
+            .iter()
+            .map(|(pk, body)| durable_doc(&durable, *pk, body))
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        durable.update(old_ids, tantivy_docs).await.unwrap();
+        segment.finish_seal().unwrap();
+
+        assert_eq!(
+            trigram_search(&fts, "docs", "body", "overdue").await,
+            vec![1],
+            "post-finish durable tier serves the row after live is cleared"
+        );
+    }
+
     /// The live segment's covered set for `table.column` — used by the scheduler
     /// test to observe that a scheduled seal drained the live tier (a private-field
     /// reach the integration tests can't make).
@@ -1060,10 +1136,8 @@ mod tests {
 
         // Spawn the scheduler; poll (bounded ~5s) until BOTH hold: a scheduled
         // seal drained the live segment (covered empty) AND the durable tier now
-        // serves the hit. Checking the durable query inside the loop avoids racing
-        // the (non-atomic) drain→durable-write window in `seal` — `covered` clears
-        // when the live segment is drained, a beat before the durable `update`
-        // commits, so we wait for the durable hit to actually land.
+        // serves the hit. The seal only clears live after durable update/delete
+        // succeeds, so covered-empty is also a durable-visibility signal.
         let handle = fts.clone().spawn_seal_scheduler(Duration::from_millis(20));
         let mut sealed = false;
         for _ in 0..100 {

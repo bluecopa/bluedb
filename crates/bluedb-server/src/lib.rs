@@ -70,11 +70,11 @@ use slatedb::{Db, DbReader, Settings};
 /// the latency-sensitive HTTP profile. Override with `BLUEDB_FLUSH_INTERVAL_MS`.
 const DEFAULT_FLUSH_INTERVAL_MS: u64 = 25;
 
-/// The node-level default FTS seal/compaction interval. Deliberately long (30 s):
-/// the background seal's drain→durable-write window is non-atomic, so a sub-second
-/// interval could race a test mid-seal — at 30 s no sub-second test ever triggers
-/// a seal. Override with `BLUEDB_FTS_SEAL_INTERVAL_MS`. (Per-DB PRAGMA tuning is
-/// deferred; this is the node-level knob.)
+/// The node-level default FTS seal/compaction interval. Deliberately moderate
+/// (30 s): foreground writes stay lookup-latency, while the background seal still
+/// folds live search data into durable splits during normal process lifetime.
+/// Override with `BLUEDB_FTS_SEAL_INTERVAL_MS`. (Per-DB PRAGMA tuning is deferred;
+/// this is the node-level knob.)
 const DEFAULT_FTS_SEAL_INTERVAL_MS: u64 = 30_000;
 
 /// Parse a `BLUEDB_FLUSH_INTERVAL_MS` value into a `Duration`. `None`, empty, or

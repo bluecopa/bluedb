@@ -15,6 +15,7 @@
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use bluedb_fts::mapping::{Analyzer, FieldKind, FieldMapping, IndexMapping};
 use tantivy::collector::TopDocs;
@@ -52,6 +53,12 @@ pub struct LiveSegment {
     /// any durable-split hit whose pk the live tier already covers (live wins).
     covered: Mutex<HashSet<i64>>,
     dirty: AtomicBool,
+    sealing: AtomicBool,
+}
+
+pub(crate) struct SealSnapshot {
+    pub docs: Vec<(i64, String)>,
+    pub tombs: HashSet<i64>,
 }
 
 /// Map a PostgreSQL `to_tsvector` config string onto a tantivy [`Analyzer`].
@@ -114,7 +121,14 @@ impl LiveSegment {
             tombstones: Mutex::new(HashSet::new()),
             covered: Mutex::new(HashSet::new()),
             dirty: AtomicBool::new(false),
+            sealing: AtomicBool::new(false),
         })
+    }
+
+    fn wait_for_seal_to_finish(&self) {
+        while self.sealing.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     /// Buffer an indexing of `(pk, text)`. Re-indexing an existing `pk`
@@ -122,36 +136,48 @@ impl LiveSegment {
     /// an updated row never double-matches. Does not commit (deferred to
     /// [`Self::ensure_fresh`]).
     pub fn index(&self, pk: i64, text: &str) -> Result<()> {
-        let w = self.writer.lock().expect("writer mutex poisoned");
-        w.delete_term(Term::from_field_i64(self.pk_field, pk));
-        w.add_document(doc!(self.pk_field => pk, self.body_field => text.to_string()))
-            .map_err(|e| EngineError::Other(e.into()))?;
-        drop(w);
-        self.covered
-            .lock()
-            .expect("covered mutex poisoned")
-            .insert(pk);
-        self.dirty.store(true, Ordering::SeqCst);
-        Ok(())
+        loop {
+            self.wait_for_seal_to_finish();
+            let w = self.writer.lock().expect("writer mutex poisoned");
+            if self.sealing.load(Ordering::Acquire) {
+                drop(w);
+                continue;
+            }
+            w.delete_term(Term::from_field_i64(self.pk_field, pk));
+            w.add_document(doc!(self.pk_field => pk, self.body_field => text.to_string()))
+                .map_err(|e| EngineError::Other(e.into()))?;
+            self.covered
+                .lock()
+                .expect("covered mutex poisoned")
+                .insert(pk);
+            self.dirty.store(true, Ordering::SeqCst);
+            return Ok(());
+        }
     }
 
     /// Hard-delete `pk`: delete the pk term (effective at next commit) and
     /// record it in the explicit tombstone set so a search filters it out even
     /// in the pre-commit window (belt-and-suspenders NRT delete).
     pub fn tombstone(&self, pk: i64) -> Result<()> {
-        let w = self.writer.lock().expect("writer mutex poisoned");
-        w.delete_term(Term::from_field_i64(self.pk_field, pk));
-        drop(w);
-        self.tombstones
-            .lock()
-            .expect("tombstones mutex poisoned")
-            .insert(pk);
-        self.covered
-            .lock()
-            .expect("covered mutex poisoned")
-            .insert(pk);
-        self.dirty.store(true, Ordering::SeqCst);
-        Ok(())
+        loop {
+            self.wait_for_seal_to_finish();
+            let w = self.writer.lock().expect("writer mutex poisoned");
+            if self.sealing.load(Ordering::Acquire) {
+                drop(w);
+                continue;
+            }
+            w.delete_term(Term::from_field_i64(self.pk_field, pk));
+            self.tombstones
+                .lock()
+                .expect("tombstones mutex poisoned")
+                .insert(pk);
+            self.covered
+                .lock()
+                .expect("covered mutex poisoned")
+                .insert(pk);
+            self.dirty.store(true, Ordering::SeqCst);
+            return Ok(());
+        }
     }
 
     /// Lazily commit buffered writes and reload the reader if anything changed,
@@ -244,6 +270,34 @@ impl LiveSegment {
     /// tombstone the deleted pks). After this returns, a `search` yields nothing
     /// and `covered()` is empty until new writes land.
     pub fn drain_for_seal(&self) -> Result<(Vec<(i64, String)>, HashSet<i64>)> {
+        let snapshot = self.snapshot_for_seal()?;
+        self.finish_seal()?;
+        Ok((snapshot.docs, snapshot.tombs))
+    }
+
+    /// Snapshot the live segment for a two-phase seal. While this snapshot is
+    /// open, live documents remain searchable and new writes wait; the caller
+    /// must call [`Self::finish_seal`] after durable update/delete succeeds, or
+    /// [`Self::abort_seal`] after any failure.
+    pub(crate) fn snapshot_for_seal(&self) -> Result<SealSnapshot> {
+        while self
+            .sealing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        match self.snapshot_live_docs() {
+            Ok(snapshot) => Ok(snapshot),
+            Err(err) => {
+                self.abort_seal();
+                Err(err)
+            }
+        }
+    }
+
+    fn snapshot_live_docs(&self) -> Result<SealSnapshot> {
         use tantivy::collector::DocSetCollector;
         use tantivy::query::AllQuery;
 
@@ -288,28 +342,43 @@ impl LiveSegment {
             docs.push((pk, body));
         }
 
-        // Reset: clear the index (delete all docs + commit + reload), then the
-        // tombstone and covered sets.
-        {
-            let mut w = self.writer.lock().expect("writer mutex poisoned");
-            w.delete_all_documents()
-                .map_err(|e| EngineError::Other(e.into()))?;
-            w.commit().map_err(|e| EngineError::Other(e.into()))?;
-        }
-        self.reader
-            .reload()
-            .map_err(|e| EngineError::Other(e.into()))?;
-        self.tombstones
-            .lock()
-            .expect("tombstones mutex poisoned")
-            .clear();
-        self.covered
-            .lock()
-            .expect("covered mutex poisoned")
-            .clear();
-        self.dirty.store(false, Ordering::SeqCst);
+        Ok(SealSnapshot { docs, tombs })
+    }
 
-        Ok((docs, tombs))
+    /// Finish a previously snapshotted seal by clearing the live tier. Call only
+    /// after the durable tier has accepted the snapshot.
+    pub(crate) fn finish_seal(&self) -> Result<()> {
+        let result = (|| {
+            // Reset: clear the index (delete all docs + commit + reload), then the
+            // tombstone and covered sets.
+            {
+                let mut w = self.writer.lock().expect("writer mutex poisoned");
+                w.delete_all_documents()
+                    .map_err(|e| EngineError::Other(e.into()))?;
+                w.commit().map_err(|e| EngineError::Other(e.into()))?;
+            }
+            self.reader
+                .reload()
+                .map_err(|e| EngineError::Other(e.into()))?;
+            self.tombstones
+                .lock()
+                .expect("tombstones mutex poisoned")
+                .clear();
+            self.covered
+                .lock()
+                .expect("covered mutex poisoned")
+                .clear();
+            self.dirty.store(false, Ordering::SeqCst);
+            Ok(())
+        })();
+        self.sealing.store(false, Ordering::Release);
+        result
+    }
+
+    /// Release the write gate after a failed seal attempt without clearing live
+    /// data; the next seal can retry the same snapshot.
+    pub(crate) fn abort_seal(&self) {
+        self.sealing.store(false, Ordering::Release);
     }
 }
 

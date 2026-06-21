@@ -81,6 +81,7 @@ jobs:
             --report uat/reports/latest-uat-report.md
 
       - name: Upload UAT report
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: uat-report-${{ steps.profile.outputs.profile }}-${{ github.sha }}
