@@ -134,37 +134,19 @@ Multiple and chained CTEs work, and `WITH` is allowed in front of
 
 ### Recursive CTEs
 
-`WITH RECURSIVE` is supported. The recursive body is a `UNION` (or `UNION ALL`)
-of a seed `SELECT` and a recursive `SELECT` that references the CTE itself, run
-to a fixed point.
+!!! warning "`WITH RECURSIVE` is not yet enabled on `dev`"
+    Recursive CTEs were implemented behind DataFusion's `enable_recursive_ctes`
+    flag, but that wiring was lost in a squash-merge and is **not currently on
+    `dev`**. A `WITH RECURSIVE` query on `/query` will be rejected. Non-recursive
+    CTEs (`WITH …`) work on both `/sql` and `/query`. Re-landing recursive CTEs
+    is tracked in the repo's `ROADMAP.md` (Two-tier SQL surface).
 
-```sql
--- 1 through 5
-WITH RECURSIVE t(n) AS (
-    SELECT 1 AS n          -- seed
-    UNION ALL
-    SELECT n + 1 FROM t WHERE n < 5   -- recurse
-)
-SELECT n FROM t ORDER BY n;
-```
+When re-enabled, the recursive body is a `UNION` (or `UNION ALL`) of a seed
+`SELECT` and a recursive `SELECT` that references the CTE itself, run to a fixed
+point, and runs on `/query` (the analytical surface). Alias every column in the
+seed `SELECT` (`SELECT 1 AS n`, not `SELECT 1`) — the recursive planner takes the
+seed's derived column names.
 
-!!! tip "Name the seed columns"
-    Alias every column in the seed `SELECT` (`SELECT 1 AS n`, not `SELECT 1`).
-    The recursive planner takes the seed's derived column names, and a bare
-    literal leaves the column unnamed.
-
-A common use is walking an adjacency list:
-
-```sql
--- all descendants of node 1
-WITH RECURSIVE chain(id, parent) AS (
-    SELECT id, parent FROM tree WHERE id = 1
-    UNION ALL
-    SELECT tree.id, tree.parent FROM tree
-    JOIN chain ON tree.parent = chain.id
-)
-SELECT id FROM chain ORDER BY id;
-```
 
 The recursion must terminate (a `WHERE` that stops it, as above); an unbounded
 recursion does not return.
