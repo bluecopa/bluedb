@@ -393,6 +393,53 @@ async fn evidence_merkle_and_erasure_e2e() {
     assert_eq!(body["seq"], 2, "plain head unchanged: {body}");
 }
 
+/// An inclusion proof for a `seq` that doesn't exist in the chain is a
+/// not-found condition (404), not a bad-request (400). UAT-EVIDENCE-010.
+#[tokio::test]
+async fn evidence_inclusion_unknown_seq_is_404() {
+    let (_, app) = promoted().await;
+
+    // Append one event → chain "p404" has head==1.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/evidence/p404/entries",
+        Some("tenant1"),
+        Some(json!({
+            "events": [{ "type": "ev", "payload_b64": B64.encode(b"x") }]
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "append: {s} {body}");
+
+    // seq=99 doesn't exist (size=1) → 404, not 400.
+    let (s, body) = call(&app, "GET", "/evidence/p404/proof?seq=99", Some("tenant1"), None).await;
+    assert_eq!(
+        s,
+        StatusCode::NOT_FOUND,
+        "unknown proof seq must be 404, not 400: {s} {body}"
+    );
+
+    // redact of an unknown seq is already 404 (existing contract) — keep it so.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/evidence/p404/entries/99/redact",
+        Some("tenant1"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "redact unknown seq must be 404: {s} {body}");
+
+    // seq=0 (below 1) is a malformed request → stays 400.
+    let (s, body) = call(&app, "GET", "/evidence/p404/proof?seq=0", Some("tenant1"), None).await;
+    assert_eq!(
+        s,
+        StatusCode::BAD_REQUEST,
+        "seq<1 is a malformed request (400), not 404: {s} {body}"
+    );
+}
+
 #[tokio::test]
 async fn evidence_negative_seq_params_rejected() {
     let (_, app) = promoted().await;

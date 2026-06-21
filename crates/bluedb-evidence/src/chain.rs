@@ -376,10 +376,20 @@ impl Evidence {
                 "size {size} out of range (head={head})"
             )));
         }
-        if seq < 1 || seq > size {
+        // A `seq` below 1 is a malformed request (invalid argument). A `seq`
+        // beyond `size` is a *missing entry*: the slot doesn't exist in the
+        // tree, so it is a not-found condition (404), not a 400 — matching the
+        // redact/hard-delete behavior and the documented contract.
+        if seq < 1 {
             return Err(EvidenceError::InvalidArgument(format!(
                 "seq {seq} out of range (size={size})"
             )));
+        }
+        if seq > size {
+            return Err(EvidenceError::EntryNotFound {
+                chain: chain.to_string(),
+                seq,
+            });
         }
         let audit_path = crate::proof::inclusion(
             &self.substrate,
