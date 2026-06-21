@@ -18,7 +18,7 @@ use slatedb::Db;
 /// trigram index is declared) and return the matching `id`s, sorted.
 async fn engine_ids(fts: &FtsEngine, database: &Database, sql: &str) -> Vec<i64> {
     let mut g = Glue::new(database.connection_serialized());
-    let out = fts.execute_fts(&mut g, sql, &[]).await.unwrap();
+    let out = fts.execute_fts(&mut g, sql, &[], None).await.unwrap();
     ids_from(out)
 }
 

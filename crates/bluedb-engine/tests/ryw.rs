@@ -43,7 +43,7 @@ async fn read_your_writes_through_sql() {
     let mut g = Glue::new(database.connection_serialized());
     let sql =
         "SELECT id FROM docs WHERE to_tsvector('english', body) @@ plainto_tsquery('invoice overdue')";
-    let out = fts.execute_fts(&mut g, sql, &[]).await.unwrap();
+    let out = fts.execute_fts(&mut g, sql, &[], None).await.unwrap();
     match out.into_iter().next().unwrap() {
         Payload::Select { rows, .. } => {
             let ids: Vec<_> = rows.iter().map(|r| r[0].clone()).collect();
@@ -62,7 +62,7 @@ async fn read_your_writes_through_sql() {
         g.execute("DELETE FROM docs WHERE id = 1;").await.unwrap();
     }
     let mut g2 = Glue::new(database.connection_serialized());
-    let out2 = fts.execute_fts(&mut g2, sql, &[]).await.unwrap();
+    let out2 = fts.execute_fts(&mut g2, sql, &[], None).await.unwrap();
     match out2.into_iter().next().unwrap() {
         Payload::Select { rows, .. } => assert!(rows.is_empty(), "deleted row must not match"),
         other => panic!("{other:?}"),

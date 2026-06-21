@@ -387,13 +387,17 @@ fn is_indexable(expr: &Expr, indexable: &HashSet<String>) -> bool {
     column_of(expr).is_some_and(|c| indexable.contains(&c))
 }
 
-/// The column name an expression refers to, if it is a (possibly qualified or
-/// parenthesized) column reference.
+/// The column name an expression refers to, if it is a (possibly qualified,
+/// parenthesized, or null-checked) column reference. `IS NULL` / `IS NOT NULL`
+/// are recognized so the null-order rewrite's synthetic `IsNull(col)` ORDER BY
+/// term (injected by `rewrite_null_order`) is treated as a reference to `col`,
+/// not rejected as an opaque expression.
 fn column_of(expr: &Expr) -> Option<String> {
     match expr {
         Expr::Identifier(name) => Some(name.clone()),
         Expr::CompoundIdentifier { ident, .. } => Some(ident.clone()),
         Expr::Nested(inner) => column_of(inner),
+        Expr::IsNull(inner) => column_of(inner),
         _ => None,
     }
 }

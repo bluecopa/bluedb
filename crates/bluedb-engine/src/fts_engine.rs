@@ -605,11 +605,19 @@ impl FtsEngine {
 
     /// Execute `sql`: rewrite `@@`/`ts_rank` against the live segment if present,
     /// else run unchanged. Goes through the parameterized single-DML surface.
+    ///
+    /// `default_null_order`, when set (via a per-session `SET default_null_order`),
+    /// is applied to `ORDER BY` terms **after** the FTS rewrite — so an
+    /// `ORDER BY ts_rank(...)` is first turned into a `CASE pk ... END` by the FTS
+    /// rewrite, and only then does the null-order rewrite wrap it in `IS NULL`.
+    /// (The reverse order would hide `ts_rank` inside `IS NULL` and the FTS
+    /// rewrite would miss it, leaving `ts_rank` to reach the engine untranslated.)
     pub async fn execute_fts(
         &self,
         glue: &mut Glue<SlateDbStorage>,
         sql: &str,
         params: &[Param],
+        default_null_order: Option<bool>,
     ) -> Result<Vec<Payload>> {
         // The `@@` rewrite resolves `$N` placeholders against `params` (a
         // parameterized `plainto_tsquery($1)` needs its query string to search the
@@ -618,9 +626,16 @@ impl FtsEngine {
         // analytical `/query` read path. Writes never contain `@@`, so this is a
         // no-op for them.
         let json_params: Vec<serde_json::Value> = params.iter().map(Self::param_to_json_).collect();
-        let rewritten = self.rewrite_for(sql, &json_params).await?;
-        let final_sql = rewritten.as_deref().unwrap_or(sql);
-        rest_sql::execute_sql(glue, final_sql, params, false).await
+        let fts_rewritten = self.rewrite_for(sql, &json_params).await?;
+        let after_fts = fts_rewritten.as_deref().unwrap_or(sql);
+        // Apply the null-order rewrite to the FTS-rewritten SQL (never the raw
+        // input), and only when a session default was set.
+        let final_sql = if default_null_order.is_some() {
+            bluedb_sql::rewrite_null_order(after_fts, default_null_order)
+        } else {
+            after_fts.to_string()
+        };
+        rest_sql::execute_sql(glue, &final_sql, params, false).await
     }
 
     /// Fold every durable index's live segment into its durable tier, off the
@@ -841,7 +856,7 @@ mod tests {
 
         let mut g = Glue::new(database.connection_serialized());
         let sql = "SELECT id FROM docs WHERE to_tsvector('english', body) @@ plainto_tsquery('invoice overdue')";
-        let out = fts.execute_fts(&mut g, sql, &[]).await.unwrap();
+        let out = fts.execute_fts(&mut g, sql, &[], None).await.unwrap();
         match out.into_iter().next().unwrap() {
             Payload::Select { rows, .. } => {
                 let ids: Vec<_> = rows.iter().map(|r| r[0].clone()).collect();
@@ -1058,7 +1073,7 @@ mod tests {
             }
             // Live is empty → this hit can only come from the durable tier.
             let mut g = Glue::new(database.connection_serialized());
-            let out = fts.execute_fts(&mut g, sql, &[]).await.unwrap();
+            let out = fts.execute_fts(&mut g, sql, &[], None).await.unwrap();
             if let Payload::Select { rows, .. } = out.into_iter().next().unwrap() {
                 let ids: Vec<_> = rows.iter().map(|r| r[0].clone()).collect();
                 if ids == vec![GValue::I64(1)] {
