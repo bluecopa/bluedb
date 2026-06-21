@@ -263,9 +263,13 @@ curl -s -X PATCH 'localhost:8081/tables/users?id=eq.1' \
 curl -s -X DELETE 'localhost:8081/tables/users?age=lt.18'
 ```
 
-!!! warning
-    A `PATCH`/`DELETE` with no filter affects every row. Always include a
-    query-string filter unless you mean it.
+!!! warning "A filter is required"
+    A `PATCH`/`DELETE` with **no query-string filter is rejected** with
+    `400 "refusing to render UPDATE/DELETE with no filters (would affect every
+    row)"`. Always include a filter. To affect every row, use an always-true
+    predicate against an indexed column (e.g. `id=gte.0` on an integer primary
+    key), or run the bulk mutation through `POST /sql`
+    (`UPDATE`/`DELETE` without a `WHERE`).
 
 ### Returning the affected rows: `Prefer: return=representation`
 

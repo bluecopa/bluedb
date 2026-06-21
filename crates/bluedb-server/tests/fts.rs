@@ -209,6 +209,65 @@ async fn parameterized_fts_query_works_on_sql() {
     assert_eq!(body, json!([{ "id": 1 }]), "boolean query matches id=1: {body}");
 }
 
+/// FTS ranking with `ORDER BY ts_rank(...)` + `LIMIT/OFFSET` on `/sql`. The `@@`
+/// predicate rewrites to a bounded `pk IN (...)` set, so ranking that bounded set
+/// in-memory is allowed (not a scan-sort). UAT-SEARCH-003 shape.
+#[tokio::test]
+async fn fts_rank_order_by_works_on_sql() {
+    let app = make_app(true).await;
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/schema/tables",
+        Some(json!({
+            "name": "rankdocs",
+            "columns": [
+                {"name": "id", "type": "INTEGER", "primary_key": true},
+                {"name": "body", "type": "TEXT"}
+            ]
+        })),
+    )
+    .await;
+    assert!(s.is_success(), "create rankdocs: {s}");
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/schema/tables/rankdocs/fulltext-indexes",
+        Some(json!({"column": "body", "analyzer": "english"})),
+    )
+    .await;
+    assert!(s.is_success(), "create fulltext index: {s}");
+    // Multiple matching docs so rank ordering is observable.
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "INSERT INTO rankdocs (id, body) VALUES (1, 'invoice invoice overdue'), (2, 'invoice'), (3, 'weather')"})),
+    )
+    .await;
+    assert!(s.is_success(), "insert rankdocs: {s}");
+
+    // ORDER BY ts_rank with LIMIT — ranked page over the bounded match set.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({
+            "sql": "SELECT id FROM rankdocs WHERE to_tsvector('english', body) @@ plainto_tsquery('invoice') ORDER BY ts_rank(to_tsvector('english', body), plainto_tsquery('invoice')) DESC LIMIT 2"
+        })),
+    )
+    .await;
+    assert!(s.is_success(), "ranked FTS page on /sql: {s} {body}");
+    let ids: Vec<i64> = body.as_array().unwrap().iter().map(|r| r["id"].as_i64().unwrap()).collect();
+    // Both matching docs (id=1, id=2) returned, ranked; id=3 ('weather') excluded.
+    // BM25 favors the shorter doc (id=2 'invoice') over the longer one (id=1
+    // 'invoice invoice overdue') on tf-density, so the exact order is engine-defined —
+    // assert the membership and the page size, not the BM25 tiebreak.
+    assert_eq!(ids.len(), 2, "ranked page size 2: {body}");
+    assert!(ids.contains(&1) && ids.contains(&2), "both matching docs: {body}");
+    assert!(!ids.contains(&3), "non-matching doc excluded: {body}");
+}
+
 #[tokio::test]
 async fn durable_engine_serves_a_second_fulltext_index() {
     // After B4-4, `promote` binds a durable, reopened `FtsEngine` over the writer's

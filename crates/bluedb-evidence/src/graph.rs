@@ -47,26 +47,34 @@ pub struct EdgeRef {
 /// - On any weight change (or first insert) the stale out/in keys (old weight)
 ///   are deleted before the new canonical+out+in are written.
 /// - `Delete`: removes canonical+out+in if the edge exists (no-op otherwise).
+///
+/// Returns `true` when the delta changed the store (a delete that actually
+/// removed an edge, or an upsert that inserted/changed a weight). A no-op delete
+/// of a missing edge returns `false`, so callers can report the **actual** number
+/// of removals rather than the request count.
 pub(crate) async fn apply_edge_delta(
     substrate: &Substrate,
     ks: &EvidenceKeyspace,
     batch: &mut WriteBatch,
     overlay: &mut HashMap<Vec<u8>, Option<i64>>,
     d: &EdgeDelta,
-) -> Result<(), EvidenceError> {
+) -> Result<bool, EvidenceError> {
     let canon = ks.graph_edge_key(&d.graph, &d.src, &d.dst, &d.etype);
     let current: Option<i64> = match overlay.get(&canon) {
         Some(v) => *v,
         None => store::get_edge_weight(substrate, ks, &d.graph, &d.src, &d.dst, &d.etype).await?,
     };
 
-    match &d.op {
+    let changed = match &d.op {
         EdgeOp::Delete => {
             if let Some(w0) = current {
                 batch.delete(canon.clone());
                 batch.delete(ks.graph_out_key(&d.graph, &d.src, w0, &d.dst, &d.etype));
                 batch.delete(ks.graph_in_key(&d.graph, &d.dst, w0, &d.src, &d.etype));
                 overlay.insert(canon, None);
+                true
+            } else {
+                false
             }
         }
         EdgeOp::Upsert { merge } => {
@@ -74,6 +82,7 @@ pub(crate) async fn apply_edge_delta(
                 (Some(w0), Merge::Max) => w0.max(d.weight),
                 _ => d.weight,
             };
+            let weight_changed = current != Some(new_w);
             if let Some(w0) = current {
                 if w0 != new_w {
                     batch.delete(ks.graph_out_key(&d.graph, &d.src, w0, &d.dst, &d.etype));
@@ -84,9 +93,10 @@ pub(crate) async fn apply_edge_delta(
             batch.put(ks.graph_out_key(&d.graph, &d.src, new_w, &d.dst, &d.etype), MARK);
             batch.put(ks.graph_in_key(&d.graph, &d.dst, new_w, &d.src, &d.etype), MARK);
             overlay.insert(canon, Some(new_w));
+            weight_changed
         }
-    }
-    Ok(())
+    };
+    Ok(changed)
 }
 
 /// Standalone handle to the graph store in one bluedb database / tenant.
@@ -116,14 +126,15 @@ impl Graph {
         graph: &str,
         edges: &[EdgeUpsert],
         merge: Merge,
-    ) -> Result<(), EvidenceError> {
+    ) -> Result<usize, EvidenceError> {
         if edges.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
         let _lease = self.write_lease.lock().await;
         let writer = self.substrate.require_writer().map_err(|_| EvidenceError::NotWriter)?;
         let mut batch = WriteBatch::new();
         let mut overlay = HashMap::new();
+        let mut changed = 0usize;
         for e in edges {
             let d = EdgeDelta {
                 graph: graph.to_string(),
@@ -133,10 +144,12 @@ impl Graph {
                 etype: e.etype.clone(),
                 op: EdgeOp::Upsert { merge },
             };
-            apply_edge_delta(&self.substrate, &self.keyspace, &mut batch, &mut overlay, &d).await?;
+            if apply_edge_delta(&self.substrate, &self.keyspace, &mut batch, &mut overlay, &d).await? {
+                changed += 1;
+            }
         }
         if batch.is_empty() {
-            return Ok(());
+            return Ok(changed);
         }
         writer
             .write_with_options(batch, &WriteOptions { await_durable: false, ..Default::default() })
@@ -144,19 +157,22 @@ impl Graph {
             .map_err(Self::storage_err)?;
         drop(_lease);
         writer.flush().await.map_err(Self::storage_err)?;
-        Ok(())
+        Ok(changed)
     }
 
     /// Delete `edges` (by identity) from `graph`. Atomic + durable. Deleting a
-    /// non-existent edge is a no-op.
-    pub async fn delete(&self, graph: &str, edges: &[EdgeRef]) -> Result<(), EvidenceError> {
+    /// non-existent edge is a no-op. Returns the number of edges **actually
+    /// removed** (a missing edge contributes 0, so the count can be less than
+    /// `edges.len()`).
+    pub async fn delete(&self, graph: &str, edges: &[EdgeRef]) -> Result<usize, EvidenceError> {
         if edges.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
         let _lease = self.write_lease.lock().await;
         let writer = self.substrate.require_writer().map_err(|_| EvidenceError::NotWriter)?;
         let mut batch = WriteBatch::new();
         let mut overlay = HashMap::new();
+        let mut removed = 0usize;
         for e in edges {
             let d = EdgeDelta {
                 graph: graph.to_string(),
@@ -166,10 +182,12 @@ impl Graph {
                 etype: e.etype.clone(),
                 op: EdgeOp::Delete,
             };
-            apply_edge_delta(&self.substrate, &self.keyspace, &mut batch, &mut overlay, &d).await?;
+            if apply_edge_delta(&self.substrate, &self.keyspace, &mut batch, &mut overlay, &d).await? {
+                removed += 1;
+            }
         }
         if batch.is_empty() {
-            return Ok(());
+            return Ok(removed);
         }
         writer
             .write_with_options(batch, &WriteOptions { await_durable: false, ..Default::default() })
@@ -177,7 +195,7 @@ impl Graph {
             .map_err(Self::storage_err)?;
         drop(_lease);
         writer.flush().await.map_err(Self::storage_err)?;
-        Ok(())
+        Ok(removed)
     }
 
     /// Atomically apply `upserts` **and** `deletes` to `graph` in **one**
@@ -187,20 +205,26 @@ impl Graph {
     /// `A→Z` and add `R→B`, `B→Z`) without ever exposing a torn graph where the
     /// sink is unreachable. Upserts are applied before deletes, so if the same
     /// edge identity appears in both the delete wins (last-write-wins per key).
+    ///
+    /// Returns `(upserts_changed, deletes_removed)` — the number of upserts that
+    /// inserted/changed a weight, and the number of deletes that actually removed
+    /// an edge (a missing edge contributes 0).
     pub async fn mutate(
         &self,
         graph: &str,
         upserts: &[EdgeUpsert],
         deletes: &[EdgeRef],
         merge: Merge,
-    ) -> Result<(), EvidenceError> {
+    ) -> Result<(usize, usize), EvidenceError> {
         if upserts.is_empty() && deletes.is_empty() {
-            return Ok(());
+            return Ok((0, 0));
         }
         let _lease = self.write_lease.lock().await;
         let writer = self.substrate.require_writer().map_err(|_| EvidenceError::NotWriter)?;
         let mut batch = WriteBatch::new();
         let mut overlay = HashMap::new();
+        let mut upserts_changed = 0usize;
+        let mut deletes_removed = 0usize;
         for e in upserts {
             let d = EdgeDelta {
                 graph: graph.to_string(),
@@ -210,7 +234,9 @@ impl Graph {
                 etype: e.etype.clone(),
                 op: EdgeOp::Upsert { merge },
             };
-            apply_edge_delta(&self.substrate, &self.keyspace, &mut batch, &mut overlay, &d).await?;
+            if apply_edge_delta(&self.substrate, &self.keyspace, &mut batch, &mut overlay, &d).await? {
+                upserts_changed += 1;
+            }
         }
         for e in deletes {
             let d = EdgeDelta {
@@ -221,10 +247,12 @@ impl Graph {
                 etype: e.etype.clone(),
                 op: EdgeOp::Delete,
             };
-            apply_edge_delta(&self.substrate, &self.keyspace, &mut batch, &mut overlay, &d).await?;
+            if apply_edge_delta(&self.substrate, &self.keyspace, &mut batch, &mut overlay, &d).await? {
+                deletes_removed += 1;
+            }
         }
         if batch.is_empty() {
-            return Ok(());
+            return Ok((upserts_changed, deletes_removed));
         }
         writer
             .write_with_options(batch, &WriteOptions { await_durable: false, ..Default::default() })
@@ -232,7 +260,7 @@ impl Graph {
             .map_err(Self::storage_err)?;
         drop(_lease);
         writer.flush().await.map_err(Self::storage_err)?;
-        Ok(())
+        Ok((upserts_changed, deletes_removed))
     }
 
     /// Drop an ENTIRE graph: range-delete all canonical/out/in keys for `graph`

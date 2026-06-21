@@ -120,12 +120,25 @@ fn classify(schema_map: &SchemaMap, statement: &Statement) -> GlueResult<Decisio
     let indexable = indexable_columns(schema);
     let pk_cols = primary_key_columns(schema);
 
-    // ORDER BY must be served by PK order or an index, with or without a WHERE,
-    // else it is a real in-memory sort that a LIMIT would not make cheap.
-    for ob in &query.order_by {
-        let col = column_of(&ob.expr);
-        if col.as_deref().is_none_or(|c| !indexable.contains(c)) {
-            return Err(sort_err(name, col.as_deref()));
+    // Is the WHERE clause a **point set** on the PK (equality / IN-list)? When it
+    // is, an in-memory ORDER BY is O(k log k) over the bounded match set, not a
+    // scan-sort — so e.g. a full-text `ORDER BY ts_rank(...)` (rewritten to a
+    // `pk IN (...)` predicate plus a CASE-on-pk ordering) is allowed. A range or
+    // BETWEEN on an indexed column still bounds the *scan* but can match many
+    // rows, so an unindexed ORDER BY over a range is still rejected.
+    let where_point_bounded = match &select.selection {
+        None => false,
+        Some(expr) => where_is_point_bounded(&pk_cols, expr),
+    };
+
+    if !where_point_bounded {
+        // ORDER BY must be served by PK order or an index, else it is a real
+        // in-memory sort that a LIMIT would not make cheap.
+        for ob in &query.order_by {
+            let col = column_of(&ob.expr);
+            if col.as_deref().is_none_or(|c| !indexable.contains(c)) {
+                return Err(sort_err(name, col.as_deref()));
+            }
         }
     }
 
@@ -226,6 +239,44 @@ fn where_hits_index(
         }
     }
     false
+}
+
+/// True if some top-level `AND` conjunct bounds the result to a **point set**
+/// on the primary key — a PK equality (`pk = lit`) or a PK `IN (lit, …)` list.
+/// Unlike [`where_hits_index`] (which also accepts ranges and `BETWEEN`), this
+/// recognizes only shapes whose matched-row count is a known small set (e.g. a
+/// full-text `pk IN (...)` match set), so an in-memory `ORDER BY` over that set
+/// is genuinely O(k log k) and safe to allow even on a non-indexed column.
+fn where_is_point_bounded(pk_cols: &HashSet<String>, expr: &Expr) -> bool {
+    for conjunct in split_and(expr) {
+        match conjunct {
+            Expr::Nested(inner) => {
+                if where_is_point_bounded(pk_cols, inner) {
+                    return true;
+                }
+            }
+            // pk = literal  (either side)
+            Expr::BinaryOp { left, op: BinaryOperator::Eq, right }
+                if is_pk(left, pk_cols) && column_of(right).is_none() =>
+            {
+                return true
+            }
+            Expr::BinaryOp { left, op: BinaryOperator::Eq, right }
+                if is_pk(right, pk_cols) && column_of(left).is_none() =>
+            {
+                return true
+            }
+            // pk IN (literal, …)
+            Expr::InList { expr, negated: false, .. } if is_pk(expr, pk_cols) => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Is `expr` a bare reference to a primary-key column?
+fn is_pk(expr: &Expr, pk_cols: &HashSet<String>) -> bool {
+    column_of(expr).as_deref().is_some_and(|c| pk_cols.contains(c))
 }
 
 fn conjunct_hits_index(
@@ -579,6 +630,19 @@ mod tests {
     fn order_by_unindexed_column_is_rejected() {
         let m = map(vec![schema("t", &[("id", true), ("name", false)], &[])]);
         assert!(run(&m, "SELECT * FROM t WHERE id > 1 ORDER BY name").is_err());
+    }
+
+    #[test]
+    fn order_by_unindexed_over_pk_point_set_is_allowed() {
+        // A PK IN-list bounds the result to a known set (e.g. a full-text match
+        // set), so an in-memory ORDER BY on a non-indexed column is O(k log k)
+        // and allowed. This is the FTS-rank (`ORDER BY ts_rank(...)`) case.
+        let m = map(vec![schema("t", &[("id", true), ("name", false)], &[])]);
+        assert!(run(&m, "SELECT * FROM t WHERE id IN (1, 2, 3) ORDER BY name").is_ok());
+        // PK equality is point-bounded too.
+        assert!(run(&m, "SELECT * FROM t WHERE id = 1 ORDER BY name").is_ok());
+        // A range is NOT point-bounded → still rejected.
+        assert!(run(&m, "SELECT * FROM t WHERE id >= 1 ORDER BY name").is_err());
     }
 
     #[test]

@@ -2205,6 +2205,76 @@ async fn multikey_index_rejects_dotted_path() {
     );
 }
 
+/// A `$lookup` with a dotted `localField` (or `foreignField`) is rejected —
+/// nested join keys aren't supported in v1, same as dotted index paths. Without
+/// this guard the lookup silently produces empty matches. UAT-COLL-017 shape.
+#[tokio::test]
+async fn lookup_rejects_dotted_field() {
+    let (app, state) = app_with_state().await;
+    // Seed two collections and seal so the analytical read path has data.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/lookup_users/insert",
+        Some(json!({ "documents": [{ "_id": "u1", "profile": { "name": "ada" } }] })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "insert users: {body}");
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/lookup_orders/insert",
+        Some(json!({ "documents": [{ "_id": "o1", "user": "ada" }] })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "insert orders: {body}");
+    state.seal_now().await.expect("seal");
+
+    // Dotted localField → 400 BadValue, not a silent 200 with empty matches.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/lookup_users/aggregate",
+        Some(json!({
+            "pipeline": [
+                { "$lookup": {
+                    "from": "lookup_orders",
+                    "localField": "profile.name",
+                    "foreignField": "user",
+                    "as": "matches"
+                }}
+            ]
+        })),
+    )
+    .await;
+    assert!(s.is_client_error(), "dotted localField must be rejected (4xx): {s} {body}");
+    assert_eq!(body["codeName"], "BadValue", "mongo codeName: {body}");
+    let errmsg = body["errmsg"].as_str().unwrap_or("");
+    assert!(
+        errmsg.contains("dotted") || errmsg.contains("nested") || errmsg.contains("not supported"),
+        "error must mention dotted/nested paths, got: {errmsg}"
+    );
+
+    // Dotted foreignField is rejected too.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/collections/lookup_users/aggregate",
+        Some(json!({
+            "pipeline": [
+                { "$lookup": {
+                    "from": "lookup_orders",
+                    "localField": "_id",
+                    "foreignField": "user.profile",
+                    "as": "matches"
+                }}
+            ]
+        })),
+    )
+    .await;
+    assert!(s.is_client_error(), "dotted foreignField must be rejected (4xx): {s} {body}");
+}
+
 // ---------------------------------------------------------------------------
 // FIX M5: scalar value in a multikey field is indexed
 // ---------------------------------------------------------------------------

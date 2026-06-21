@@ -65,6 +65,12 @@ use crate::storage::{SeqAllocator, SlateDbStorage, WriteLease};
 /// advances for mirror-enabled tables and is what the seal loop orders on.
 pub(crate) type CommitSeq = Arc<Mutex<HashMap<String, i64>>>;
 
+/// Per-tenant `default_null_order` session state, shared by every connection
+/// vended from a [`Database`] handle. `true` = nulls first, `false` = nulls
+/// last (see [`crate::nullorder`]). Absent = engine default. Set via
+/// `SET default_null_order = '…'` on `/sql`.
+pub(crate) type NullOrder = Arc<Mutex<HashMap<String, bool>>>;
+
 /// A handle to one SlateDB database that vends isolated [`SlateDbStorage`]
 /// connections — either a **writer** handle (connections can read + write,
 /// write transactions serialized by a shared lease) or a **read-replica**
@@ -84,6 +90,8 @@ pub struct Database {
     /// regardless of CDC, so the write watermark stays meaningful when the
     /// lakehouse mirror is off. See [`Self::last_commit_seq`].
     commit_seq: CommitSeq,
+    /// Per-tenant `default_null_order` session state. See [`NullOrder`].
+    null_order: NullOrder,
 }
 
 impl Database {
@@ -109,6 +117,7 @@ impl Database {
             seq: Arc::new(Mutex::new(HashMap::new())),
             cdc_seq: Arc::new(Mutex::new(HashMap::new())),
             commit_seq: Arc::new(Mutex::new(HashMap::new())),
+            null_order: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -142,6 +151,19 @@ impl Database {
     /// Returns 0 before any mutation has committed for `tenant` this session.
     pub async fn last_commit_seq(&self, tenant: &str) -> i64 {
         self.commit_seq.lock().await.get(tenant).copied().unwrap_or(0)
+    }
+
+    /// Record `tenant`'s `SET default_null_order` choice (`true` = nulls first,
+    /// `false` = nulls last). Shared across every connection vended from this
+    /// handle, so a subsequent read on any connection honors it.
+    pub async fn set_null_order(&self, tenant: &str, nulls_first: bool) {
+        self.null_order.lock().await.insert(tenant.to_string(), nulls_first);
+    }
+
+    /// `tenant`'s `default_null_order` choice, if `SET` this session. `None`
+    /// means the engine default applies.
+    pub async fn null_order_for(&self, tenant: &str) -> Option<bool> {
+        self.null_order.lock().await.get(tenant).copied()
     }
 
     /// Is this a writer handle (vs. a read replica)?
