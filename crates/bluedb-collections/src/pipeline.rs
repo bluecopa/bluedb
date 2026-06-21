@@ -341,6 +341,18 @@ async fn stage_lookup(
         .and_then(Value::as_str)
         .ok_or_else(|| MqlError::Malformed("$lookup requires `as`".into()))?;
 
+    // Dotted (nested) join keys aren't supported in v1 — `localField` and
+    // `foreignField` name a single top-level field, not a path. (Same constraint
+    // the index declarations enforce for compound/multikey field paths.) Reject
+    // up front with a clear error instead of silently producing empty matches.
+    for (label, field) in [("localField", local), ("foreignField", foreign)] {
+        if field.contains('.') {
+            return Err(MqlError::Malformed(format!(
+                "nested (dotted) paths are not supported for ${label} in $lookup in v1"
+            )));
+        }
+    }
+
     // Temp columns — names that can't collide with `_id`/`doc`/`as`.
     let left_key = "__lookup_lkey";
     let right_key = "__lookup_rkey";

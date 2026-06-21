@@ -988,7 +988,70 @@ async fn query_rejects_non_select() {
     assert_eq!(body["code"], json!("UNSUPPORTED_STATEMENT"), "code: {body}");
 }
 
-/// `/sql` rejects a JSON-path read (`->>` / `->`) with `NO_INDEX` pointing at
+/// `SET default_null_order` runs on `/sql` as a per-session, per-tenant knob —
+/// the documented surface, not rejected as DDL. UAT-SQL-013 acceptance: "SET
+/// default_null_order accepts a documented value." Also covers the PRAGMA alias.
+#[tokio::test]
+async fn sql_set_default_null_order() {
+    let app = app().await;
+    let (s, _) = sql_admin(&app, "CREATE TABLE nullord (id INTEGER PRIMARY KEY, v INTEGER);").await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "INSERT INTO nullord VALUES (1, 10), (2, 30)"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    // SET default_null_order = 'nulls_first' — accepted on /sql, acks the choice.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "SET default_null_order = 'nulls_first'"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "SET nulls_first on /sql: {body}");
+    assert_eq!(body["ok"], json!(true));
+    assert_eq!(body["default_null_order"], json!("nulls_first"));
+
+    // SET ... = 'nulls_last' — the other documented value.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "SET default_null_order = 'nulls_last'"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "SET nulls_last on /sql: {body}");
+    assert_eq!(body["default_null_order"], json!("nulls_last"));
+
+    // PRAGMA alias is accepted too.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "PRAGMA default_null_order = 'NULLS FIRST'"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "PRAGMA nulls_first on /sql: {body}");
+    assert_eq!(body["default_null_order"], json!("nulls_first"));
+
+    // An undocumented value is rejected (the parser returns None → falls through
+    // to the DML gate, which rejects SET as non-DML with a clear error).
+    let (s, _body) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "SET default_null_order = 'sideways'"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "undocumented null-order value rejected");
+}
+
+
 /// `/query`, not a confusing `PARSE_ERROR` from GlueSQL (which can't parse the
 /// operator). JSON paths are an analytical-surface feature. UAT-SQL-004 shape.
 #[tokio::test]

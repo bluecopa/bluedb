@@ -769,6 +769,17 @@ impl AppState {
         self.inner.db.read().await
     }
 
+    /// `tenant`'s per-session `default_null_order` choice (`Some(true)` = nulls
+    /// first, `Some(false)` = nulls last), if a `SET default_null_order` ran this
+    /// session. `None` when no `SET` ran (engine default applies). Returns `None`
+    /// when no database is bound.
+    pub(crate) async fn db_null_order(&self, tenant: &str) -> Option<bool> {
+        match self.inner.db.read().await.as_ref() {
+            Some(db) => db.null_order_for(tenant).await,
+            None => None,
+        }
+    }
+
     /// A connection to the currently-bound database, or `503` if unbound. Carries
     /// the FTS commit observer so the live index is maintained on every commit.
     ///
@@ -1202,7 +1213,8 @@ fn arrow_value_to_json(
         DataType::UInt8 => json!(array.as_primitive::<UInt8Type>().value(row_idx)),
         DataType::UInt16 => json!(array.as_primitive::<UInt16Type>().value(row_idx)),
         DataType::UInt32 => json!(array.as_primitive::<UInt32Type>().value(row_idx)),
-        DataType::UInt64 => json!(array.as_primitive::<UInt64Type>().value(row_idx)),
+        // 64-bit unsigned → decimal string (precision-safe; see sql_value_to_json).
+        DataType::UInt64 => Value::String(array.as_primitive::<UInt64Type>().value(row_idx).to_string()),
         DataType::Float32 => {
             let v = array.as_primitive::<Float32Type>().value(row_idx);
             serde_json::Number::from_f64(v as f64).map(Value::Number).unwrap_or(Value::Null)
@@ -1378,6 +1390,21 @@ async fn exec_sql(
             None => return Err(AppError::internal("lakehouse manager not bound")),
         }
     }
+    // `SET default_null_order = 'nulls_first'|'nulls_last'` (or the PRAGMA form):
+    // a per-session, per-tenant knob that controls NULL placement in `ORDER BY`
+    // for reads without an explicit `NULLS FIRST`/`NULLS LAST`. Intercepted here
+    // (like the lakehouse PRAGMAs) because GlueSQL has no `SET` handler — the
+    // choice is stored on the `Database` and applied by `rewrite_null_order` on
+    // subsequent `/sql` SELECTs.
+    if let Some(nulls_first) = bluedb_sql::parse_default_null_order(&req.sql) {
+        if let Some(db) = state.db_read().await.as_ref() {
+            db.set_null_order(&tenant, nulls_first).await;
+        }
+        return Ok((
+            axum::http::HeaderMap::new(),
+            Json(json!({ "ok": true, "default_null_order": if nulls_first { "nulls_first" } else { "nulls_last" } })),
+        ));
+    }
     // `/sql` is the **read-your-writes transactional** surface. Reads run on the
     // guarded GlueSQL connection (the scan/sort guardrail is enforced), so a
     // point/range lookup by the primary key or a secondary index is served direct
@@ -1416,10 +1443,19 @@ async fn exec_sql(
     }
 
     let mut glue = Glue::new(state.connection_serialized(&tenant).await?);
+    // Apply the per-tenant `default_null_order` (set via `SET` above) to any
+    // `ORDER BY` without an explicit `NULLS FIRST`/`NULLS LAST`. A no-op when no
+    // `SET` ran this session (the engine default applies).
+    let default_null_order = state.db_null_order(&tenant).await;
+    let sql = if default_null_order.is_some() {
+        bluedb_sql::rewrite_null_order(&req.sql, default_null_order)
+    } else {
+        req.sql.clone()
+    };
     // Writes flow through the FTS engine so its commit observer indexes them; a
     // non-`@@` statement (including a guarded `SELECT`) runs unchanged. A
     // guardrail reject surfaces here as `400 NO_INDEX` via `From<EngineError>`.
-    let payloads = state.fts().await.execute_fts(&mut glue, &req.sql, &params).await?;
+    let payloads = state.fts().await.execute_fts(&mut glue, &sql, &params).await?;
     let wm = state.write_watermark(&tenant).await;
     Ok((watermark_headers(&tenant, wm), Json(payloads_to_json(payloads))))
 }
@@ -2605,7 +2641,12 @@ fn sql_value_to_json(value: &SqlValue) -> Value {
         SqlValue::U8(n) => json!(*n),
         SqlValue::U16(n) => json!(*n),
         SqlValue::U32(n) => json!(*n),
-        SqlValue::U64(n) => json!(*n),
+        // 64-bit unsigned crosses the wire as a **decimal string**, matching the
+        // documented "large integers as strings" contract (see ledger.md) and the
+        // `/query` (Decimal128) rendering — so a JS client parsing numbers as f64
+        // can't lose precision past 2^53. `u8`/`u16`/`u32` stay numeric (they fit
+        // in a safe integer); `u64` does not.
+        SqlValue::U64(n) => Value::String(n.to_string()),
         SqlValue::F32(x) => serde_json::Number::from_f64(*x as f64).map(Value::Number).unwrap_or(Value::Null),
         SqlValue::F64(x) => serde_json::Number::from_f64(*x).map(Value::Number).unwrap_or(Value::Null),
         // 128-bit ints exceed JSON's safe integer range, so emit them as

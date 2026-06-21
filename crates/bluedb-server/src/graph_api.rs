@@ -67,8 +67,11 @@ pub async fn upsert_edges(
         .map(|e| EdgeUpsert { src: e.src, dst: e.dst, weight: e.weight, etype: e.etype })
         .collect();
     let n = edges.len();
-    state.graph(&tenant).await?.upsert(&graph, &edges, merge).await.map_err(map_evidence_err)?;
-    Ok(Json(json!({ "graph": graph, "upserted": n })))
+    let changed = state.graph(&tenant).await?.upsert(&graph, &edges, merge).await.map_err(map_evidence_err)?;
+    // Report the actual number of edges written (inserted or weight-changed), not
+    // the request count, so a no-op upsert (same weight, merge=max) is honest.
+    let _ = n;
+    Ok(Json(json!({ "graph": graph, "upserted": changed })))
 }
 
 /// `DELETE /graph/{graph}/edges` — delete edges by identity.
@@ -86,9 +89,10 @@ pub async fn delete_edges(
         .into_iter()
         .map(|e| EdgeRef { src: e.src, dst: e.dst, etype: e.etype })
         .collect();
-    let n = edges.len();
-    state.graph(&tenant).await?.delete(&graph, &edges).await.map_err(map_evidence_err)?;
-    Ok(Json(json!({ "graph": graph, "deleted": n })))
+    // Report edges actually removed — a missing edge contributes 0, so deleting
+    // a non-existent edge reports `deleted: 0` (idempotent, not falsely `1`).
+    let removed = state.graph(&tenant).await?.delete(&graph, &edges).await.map_err(map_evidence_err)?;
+    Ok(Json(json!({ "graph": graph, "deleted": removed })))
 }
 
 /// `DELETE /graph/{graph}` — drop an entire graph (all its edges). `data:write`.
@@ -145,14 +149,16 @@ pub async fn mutate(
         .into_iter()
         .map(|e| EdgeRef { src: e.src, dst: e.dst, etype: e.etype })
         .collect();
-    let (nu, nd) = (upserts.len(), deletes.len());
-    state
+    // Report actual changes: upserts that inserted/changed a weight, and deletes
+    // that removed an edge (a missing edge contributes 0 — deletes win over an
+    // upsert of the same edge, per the mutate contract).
+    let (upserted, deleted) = state
         .graph(&tenant)
         .await?
         .mutate(&graph, &upserts, &deletes, merge)
         .await
         .map_err(map_evidence_err)?;
-    Ok(Json(json!({ "graph": graph, "upserted": nu, "deleted": nd })))
+    Ok(Json(json!({ "graph": graph, "upserted": upserted, "deleted": deleted })))
 }
 
 #[derive(Deserialize)]

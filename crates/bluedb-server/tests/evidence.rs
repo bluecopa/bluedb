@@ -477,3 +477,78 @@ async fn evidence_negative_seq_params_rejected() {
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "negative after: {s} {body}");
 }
+
+/// Deleting a missing graph edge reports `deleted: 0` (idempotent, honest), not
+/// the request count. Mutate reports actual upsert/delete changes too.
+/// UAT-EVIDENCE-018 shape.
+#[tokio::test]
+async fn graph_delete_missing_edge_reports_zero() {
+    let (_, app) = promoted().await;
+
+    // Upsert one real edge A->B.
+    let (s, body) = call(
+        &app,
+        "PUT",
+        "/graph/gdel/edges",
+        Some("tenant1"),
+        Some(json!({ "edges": [{ "src": "A", "dst": "B", "weight": 5 }] })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "upsert A->B: {s} {body}");
+
+    // Delete a real edge → deleted: 1.
+    let (s, body) = call(
+        &app,
+        "DELETE",
+        "/graph/gdel/edges",
+        Some("tenant1"),
+        Some(json!({ "edges": [{ "src": "A", "dst": "B" }] })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "delete A->B: {s} {body}");
+    assert_eq!(body["deleted"], json!(1), "real edge removed: {body}");
+
+    // Delete the same (now-missing) edge → deleted: 0, not 1.
+    let (s, body) = call(
+        &app,
+        "DELETE",
+        "/graph/gdel/edges",
+        Some("tenant1"),
+        Some(json!({ "edges": [{ "src": "A", "dst": "B" }] })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "re-delete missing edge: {s} {body}");
+    assert_eq!(body["deleted"], json!(0), "missing edge reports 0: {body}");
+
+    // mutate: delete-wins over a same-edge upsert, and a missing delete reports 0.
+    // Upsert A->C, then mutate {upsert A->C (no-op, same weight), delete A->C (real), delete X->Y (missing)}.
+    let (s, body) = call(
+        &app,
+        "PUT",
+        "/graph/gmut/edges",
+        Some("tenant1"),
+        Some(json!({ "edges": [{ "src": "A", "dst": "C", "weight": 3 }] })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "upsert A->C: {s} {body}");
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/graph/gmut/mutate",
+        Some("tenant1"),
+        Some(json!({
+            "upserts": [{ "src": "A", "dst": "C", "weight": 3 }],
+            "deletes": [{ "src": "A", "dst": "C" }, { "src": "X", "dst": "Y" }]
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "mutate: {s} {body}");
+    // upsert A->C is a no-op (same weight 3) → upserted: 0; delete A->C real → 1;
+    // delete X->Y missing → 0. Total deleted: 1.
+    assert_eq!(body["deleted"], json!(1), "mutate deletes: real(1) + missing(0) = 1: {body}");
+
+    // Drop a missing graph → dropped: 0.
+    let (s, body) = call(&app, "DELETE", "/graph/no_such_graph", Some("tenant1"), None).await;
+    assert_eq!(s, StatusCode::OK, "drop missing graph: {s} {body}");
+    assert_eq!(body["dropped"], json!(0), "missing graph reports dropped:0: {body}");
+}
