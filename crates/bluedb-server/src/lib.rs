@@ -1454,8 +1454,9 @@ async fn exec_sql(
 
 /// `POST /query` — the **HTAP analytical** read surface. Runs a single `SELECT`
 /// through the DataFusion front door over the tenant's Iceberg mirror ∪ unsealed
-/// CDC tail: joins, aggregates, window functions, recursive CTEs, JSON paths,
-/// and arbitrary non-indexed filters/sorts all belong here. It is the counterpart
+/// CDC tail: joins, aggregates, window functions, set operations, JSON paths,
+/// and arbitrary non-indexed filters/sorts all belong here. (Recursive CTEs are
+/// not yet enabled — see ROADMAP.) It is the counterpart
 /// to [`exec_sql`]: `/sql` serves index-only point/range reads at lookup latency
 /// and rejects scans; `/query` serves the full analytical surface at scan latency
 /// (read-your-writes on the active writer via the unsealed tail; bounded-stale on

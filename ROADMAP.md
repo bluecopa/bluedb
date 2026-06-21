@@ -17,8 +17,9 @@ self-fencing). Six follow-on tracks are merged to `dev`:
 
 `cargo test --workspace` is green (~1,000 tests); `cargo clippy --workspace` is
 clean (modulo a known `AppError` size lint); the docs site builds `--strict`
-clean and is published at **bluecopa.github.io/bluedb**. A 99-scenario black-box
-UAT suite gates the build (currently **GO** — see Verification). The tri-cloud
+clean and is published at **bluecopa.github.io/bluedb**. A black-box UAT suite
+gates the build (the full release profile is **1,659 cases**, currently **GO** —
+see Verification; PRs run a 99-case `core` smoke profile). The tri-cloud
 object store is exercised end-to-end (S3/Azure via emulators, **GCS against real
 GCS**); Jepsen re-verified the post-group-commit write path on the live 3-node
 cluster (2026-06-16).
@@ -60,7 +61,8 @@ Items below marked ✅ are done; unchecked items remain. Ordered by build-order 
 - [x] Uniqueness enforcement — gluesql enforces PRIMARY KEY (O(1) `fetch_data`) and `UNIQUE`-column (O(n) `scan_data`) constraints. **bluedb adds `CREATE UNIQUE INDEX` support** (stripped to a column-level UNIQUE constraint + a registry the guardrail consults — gluesql drops UNIQUE from `CREATE INDEX` natively).
 - [x] Cross-statement isolation under concurrent connections (`Database` vends connections sharing one `Db` + a write lease; explicit transactions are serializable; reads are snapshot-isolated and lock-free).
 - [x] **Views** — `CREATE VIEW` / `DROP VIEW` via `view_rewrite`; view references are inlined on reads (`cte::inline_views`), on both the `/sql` transactional path and the `/query` analytical path.
-- [ ] GlueSQL is OLTP/row-oriented — the transactional facts store, **not** analytics. Analytics is served by the in-process DataFusion front door (`bluedb-query`, over the Iceberg mirror — see the two-tier split below), **not** an external DuckDB/DuckLake.
+
+> **Scope note:** GlueSQL is OLTP/row-oriented — the transactional facts store, **not** analytics. Analytics is served by the in-process DataFusion front door (`bluedb-query`, over the Iceberg mirror — see the two-tier split below), **not** an external DuckDB/DuckLake.
 
 ## M3 — Engine & service — ✅ complete
 
@@ -96,8 +98,9 @@ analytical scan is rejected with `400 NO_INDEX` (the error names the index to
 create). Writes stay here, now with `INSERT`/`UPDATE`/`DELETE … RETURNING`.
 `POST /query` is the **HTAP analytical** surface — the DataFusion front door over
 the Iceberg mirror ∪ the unsealed CDC tail: joins, aggregates, window functions,
-set operations, JSON paths, recursive CTEs (below), arbitrary non-indexed
-filters/sorts. See `docs/sql/query-guardrail.md` for the cost model.
+set operations, JSON paths, and arbitrary non-indexed filters/sorts. (Recursive
+CTEs are not yet enabled — see the open item below.) See
+`docs/sql/query-guardrail.md` for the cost model.
 
 - [x] `/sql` transactional read-your-writes — guarded GlueSQL path; scan/sort guardrail; `NO_INDEX` reject with index-creation hint.
 - [x] `/query` analytical front door — DataFusion over Iceberg ∪ unsealed tail; `X-Bluedb-Min-Watermark` freshness gate; read-your-writes on the writer, bounded-stale on a replica.
@@ -105,7 +108,7 @@ filters/sorts. See `docs/sql/query-guardrail.md` for the cost model.
 - [x] `SET default_null_order = 'nulls_first'|'nulls_last'` per-session, per-tenant on `/sql` (intercepted, stored on the `Database`, applied to ORDER BY after the FTS rewrite).
 - [x] `GET /tables/{t}` auto-routes: PK/index filters → transactional fast path; non-indexed/JSON-path filters → analytical.
 - [x] Scan/sort guardrail exempts `ORDER BY` over a PK point set (equality/IN-list), so a full-text `ORDER BY ts_rank(...)` is allowed (the `@@` rewrites to a bounded `pk IN (...)` set).
-- [ ] **Recursive CTEs (`WITH RECURSIVE`)** — **NOT yet on `dev`**: the feature was built (`enable_recursive_ctes` in the analytical `SessionContext`) but lost in a squash-merge. Needs re-landing + tests + the doc page restored. *(The doc currently claims support — that's drift to fix.)*
+- [ ] **Recursive CTEs (`WITH RECURSIVE`)** — **NOT yet on `dev`**: the feature was built (`enable_recursive_ctes` in the analytical `SessionContext`) but lost in a squash-merge. Needs re-landing + tests. *(The doc page, `docs/sql/query-syntax.md`, already warns that `WITH RECURSIVE` is not enabled — no doc drift to fix; only the code needs re-landing.)*
 - [ ] REST `?col=fts.<query>` DSL operator on `/tables` *(deferred)*.
 
 ## SQL-integrated full-text search (Spec B) — ✅ built
@@ -188,7 +191,7 @@ event-driven seal. The four v1-limitation spike items are shipped:
 - [ ] Benchmarks: index throughput, query latency, rebuild time, memory.
 - [ ] Fuzz the split parser.
 - [x] HA chaos/failover tests — real Jepsen suite: `set` × {none, kill, partition, mix, skew} all `:valid? true` / lost-count 0; `evidence` + `graph` workloads live-validated. *(Remaining: port `list-append`/`counter`/`unique`/`ledger` to the schema regime; load/soak tests.)*
-- [x] **Black-box UAT** — a 99-scenario HTTP suite gates the build (currently **GO**: 99/99, 2026-06-20, post the two-tier split + RETURNING + batch-2/3 fixes). Covers SQL (transactional + analytical), REST, collections, search, ledger, evidence, graph, HA.
+- [x] **Black-box UAT** — an HTTP suite gates the build. The full release profile is **1,659 cases**, currently **GO** (1,659/1,659, rev `3cf8b0d`, 2026-06-21 — the 99-case `core` smoke profile runs on PRs). Covers SQL (transactional + analytical), REST, collections, search, ledger, evidence, graph, HA.
 - [ ] **CI gaps** — `.github/workflows/` has `deny.yml` (cargo-deny), `docs.yml`, `uat.yml` (server build + UAT), `testkit-wheels.yml`. **Missing**: a workflow that runs `cargo test --workspace`, `cargo clippy -D warnings`, and `cargo fmt --check` on PRs.
 
 ### Security & multi-tenancy
