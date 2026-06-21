@@ -98,9 +98,8 @@ analytical scan is rejected with `400 NO_INDEX` (the error names the index to
 create). Writes stay here, now with `INSERT`/`UPDATE`/`DELETE … RETURNING`.
 `POST /query` is the **HTAP analytical** surface — the DataFusion front door over
 the Iceberg mirror ∪ the unsealed CDC tail: joins, aggregates, window functions,
-set operations, JSON paths, and arbitrary non-indexed filters/sorts. (Recursive
-CTEs are not yet enabled — see the open item below.) See
-`docs/sql/query-guardrail.md` for the cost model.
+set operations, JSON paths, recursive CTEs (below), and arbitrary non-indexed
+filters/sorts. See `docs/sql/query-guardrail.md` for the cost model.
 
 - [x] `/sql` transactional read-your-writes — guarded GlueSQL path; scan/sort guardrail; `NO_INDEX` reject with index-creation hint.
 - [x] `/query` analytical front door — DataFusion over Iceberg ∪ unsealed tail; `X-Bluedb-Min-Watermark` freshness gate; read-your-writes on the writer, bounded-stale on a replica.
@@ -108,7 +107,7 @@ CTEs are not yet enabled — see the open item below.) See
 - [x] `SET default_null_order = 'nulls_first'|'nulls_last'` per-session, per-tenant on `/sql` (intercepted, stored on the `Database`, applied to ORDER BY after the FTS rewrite).
 - [x] `GET /tables/{t}` auto-routes: PK/index filters → transactional fast path; non-indexed/JSON-path filters → analytical.
 - [x] Scan/sort guardrail exempts `ORDER BY` over a PK point set (equality/IN-list), so a full-text `ORDER BY ts_rank(...)` is allowed (the `@@` rewrites to a bounded `pk IN (...)` set).
-- [ ] **Recursive CTEs (`WITH RECURSIVE`)** — **NOT yet on `dev`**: the feature was built (`enable_recursive_ctes` in the analytical `SessionContext`) but lost in a squash-merge. Needs re-landing + tests. *(The doc page, `docs/sql/query-syntax.md`, already warns that `WITH RECURSIVE` is not enabled — no doc drift to fix; only the code needs re-landing.)*
+- [x] **Recursive CTEs (`WITH RECURSIVE`)** — `enable_recursive_ctes` turned on in the analytical `SessionContext`; runs on `/query` (the GlueSQL `/sql` path can't inline recursion). Bounded by the query's own terminator (`WHERE n < k`). Tests: `recursive_cte_returns_the_recursed_rows` (pure recursion + adjacency-list tree walk), `recursive_cte_accepts_bound_parameter`.
 - [ ] REST `?col=fts.<query>` DSL operator on `/tables` *(deferred)*.
 
 ## SQL-integrated full-text search (Spec B) — ✅ built

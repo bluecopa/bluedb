@@ -1251,3 +1251,91 @@ async fn sql_returning_writes() {
     assert_eq!(s, StatusCode::OK, "re-read: {body}");
     assert_eq!(body, json!([]), "deleted row is gone: {body}");
 }
+
+/// Recursive CTEs are supported (DataFusion implements them; bluedb enables the
+/// flag). A genuinely self-referential `WITH RECURSIVE` returning 1..5.
+#[tokio::test]
+async fn recursive_cte_returns_the_recursed_rows() {
+    let app = app().await;
+    let (s, _) = sql_admin(
+        &app,
+        "CREATE TABLE rc (id INTEGER PRIMARY KEY, parent INTEGER)",
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    let (s, body) = sql_admin(
+        &app,
+        "INSERT INTO rc VALUES (1, NULL), (2, 1), (3, 2), (4, 3), (5, 4)",
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "seed insert: {body}");
+
+    // Classic 1..5 via self-recursion (no table reference, pure recursion).
+    // The seed aliases the column explicitly: DataFusion's recursive planner
+    // takes the seed's derived column name, and a bare `SELECT 1` would leave
+    // it unnamed (`Int64(1)`), so aliasing is the robust form.
+    //
+    // Routed to `/query` (the DataFusion analytical surface): `/sql` (GlueSQL)
+    // rejects any `WITH` clause, and recursive CTEs need `enable_recursive_ctes`
+    // which only the analytical `SessionContext` turns on.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/query",
+        Some(json!({ "sql": "WITH RECURSIVE t(n) AS (\
+            SELECT 1 AS n UNION ALL SELECT n + 1 FROM t WHERE n < 5\
+        ) SELECT n FROM t ORDER BY n" })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "recursive CTE: {body}");
+    let ns: Vec<i64> = body
+        .as_array()
+        .expect("rows array")
+        .iter()
+        .map(|r| r["n"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ns, vec![1, 2, 3, 4, 5], "recursive 1..5: {body}");
+
+    // Tree walk: the descendant chain from id=1 via the parent adjacency.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/query",
+        Some(json!({ "sql": "WITH RECURSIVE chain(id, parent) AS (SELECT id, parent FROM rc WHERE id = 1 UNION ALL SELECT rc.id, rc.parent FROM rc JOIN chain ON rc.parent = chain.id) SELECT id FROM chain ORDER BY id" })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "tree-walk recursive CTE: {body}");
+    let ids: Vec<i64> = body
+        .as_array()
+        .expect("rows array")
+        .iter()
+        .map(|r| r["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids, vec![1, 2, 3, 4, 5], "descendant chain: {body}");
+}
+
+/// A recursive CTE accepts a `$N` bound parameter (the recursion terminator can
+/// be bound), proving the analytical path binds params through the recursion.
+#[tokio::test]
+async fn recursive_cte_accepts_bound_parameter() {
+    let app = app().await;
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/query",
+        Some(json!({
+            "sql": "WITH RECURSIVE t(n) AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t WHERE n < $1) SELECT n FROM t ORDER BY n",
+            "params": [3]
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "parameterized recursive CTE: {body}");
+    let ns: Vec<i64> = body
+        .as_array()
+        .expect("rows array")
+        .iter()
+        .map(|r| r["n"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ns, vec![1, 2, 3], "bounded by $1=3: {body}");
+}

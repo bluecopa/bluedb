@@ -129,9 +129,9 @@ matches. A write that matched no rows returns `[]`.
 `/query` is the **analytical** surface and the counterpart to `/sql`. It runs a
 single `SELECT` through the DataFusion front door over the tenant's Iceberg
 mirror ∪ the unsealed CDC tail: joins, `GROUP BY`/aggregates, window functions,
-non-recursive CTEs, set operations, JSON paths, and arbitrary non-indexed
-filters/sorts all belong here. (Recursive CTEs are designed but not yet
-enabled on `dev`.) It never rejects a read on indexing grounds.
+CTEs (including `WITH RECURSIVE`), set operations, JSON paths, and arbitrary
+non-indexed filters/sorts all belong here. It never rejects a read on indexing
+grounds.
 
 ```bash
 curl -s localhost:8081/query -H 'content-type: application/json' \
