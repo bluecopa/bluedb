@@ -551,6 +551,81 @@ async fn trigram_like_over_http_read_your_writes() {
 }
 
 #[tokio::test]
+async fn sql_search_indexes_see_tables_batch_insert_immediately() {
+    let app = make_app(true).await;
+
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/schema/tables",
+        Some(json!({
+            "name": "docs",
+            "columns": [
+                {"name": "id", "type": "INTEGER", "primary_key": true},
+                {"name": "title", "type": "TEXT"},
+                {"name": "body", "type": "TEXT"},
+                {"name": "status", "type": "TEXT"}
+            ]
+        })),
+    )
+    .await;
+    assert!(s.is_success(), "create table: {s}");
+
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/schema/tables/docs/fulltext-indexes",
+        Some(json!({"column": "body", "analyzer": "english"})),
+    )
+    .await;
+    assert!(s.is_success(), "create fulltext index: {s} {body}");
+
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/schema/tables/docs/trigram-indexes",
+        Some(json!({"column": "body"})),
+    )
+    .await;
+    assert!(s.is_success(), "create trigram index: {s} {body}");
+
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/tables/docs",
+        Some(json!([
+            {"id": 1, "title": "Invoice", "body": "invoice overdue payment", "status": "open"},
+            {"id": 2, "title": "Greeting", "body": "hello database storage", "status": "open"}
+        ])),
+    )
+    .await;
+    assert!(s.is_success(), "batch insert through /tables: {s} {body}");
+
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({
+            "sql": "SELECT id, title FROM docs WHERE to_tsvector('english', body) @@ plainto_tsquery($1) ORDER BY id",
+            "params": ["invoice overdue"]
+        })),
+    )
+    .await;
+    assert!(s.is_success(), "parameterized FTS select: {s} {body}");
+    assert_eq!(body, json!([{ "id": 1, "title": "Invoice" }]), "FTS sees /tables batch insert");
+
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "SELECT id FROM docs WHERE body LIKE '%overdue%'"})),
+    )
+    .await;
+    assert!(s.is_success(), "trigram LIKE select: {s} {body}");
+    assert_eq!(body, json!([{ "id": 1 }]), "trigram LIKE sees /tables batch insert");
+}
+
+#[tokio::test]
 async fn trigram_index_on_missing_table_is_400() {
     let app = make_app(true).await;
     let (s, body) = call(

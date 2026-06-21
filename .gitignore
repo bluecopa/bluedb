@@ -7,3 +7,7 @@ Cargo.lock.orig
 .vscode/
 /site
 /.venv-docs
+/uat/reports/*.md
+/uat/reports/*.txt
+!/uat/reports/blessed/
+!/uat/reports/blessed/**

@@ -1,0 +1,124 @@
+name: uat
+
+# Black-box user acceptance testing. Pull requests run the broad 99-case core
+# profile for faster feedback. Every push to dev runs the full release profile.
+on:
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - "docs/**"
+      - "uat/**"
+      - ".github/workflows/uat.yml"
+  push:
+    branches: [dev]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - "docs/**"
+      - "uat/**"
+      - ".github/workflows/uat.yml"
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "UAT profile to run"
+        required: true
+        default: "full"
+        type: choice
+        options:
+          - smoke
+          - core
+          - full
+          - negative
+      bless_release_report:
+        description: "Commit the passing full-profile report as the blessed release report on dev"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  uat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build bluedb-server
+        run: cargo build -p bluedb-server
+
+      - name: Compile UAT harness
+        run: python3 -m py_compile uat/uat_suite.py uat/bless_report.py uat/bluedb_uat/*.py uat/bluedb_uat/features/*.py
+
+      - name: Select UAT profile
+        id: profile
+        shell: bash
+        run: |
+          profile="${{ github.event.inputs.profile }}"
+          if [ -z "$profile" ]; then
+            if [ "${{ github.event_name }}" = "pull_request" ]; then
+              profile="core"
+            else
+              profile="full"
+            fi
+          fi
+          echo "profile=$profile" >> "$GITHUB_OUTPUT"
+
+      - name: List registered cases
+        run: |
+          mkdir -p uat/reports
+          python3 uat/uat_suite.py --profile "${{ steps.profile.outputs.profile }}" --list-cases | tee uat/reports/case-catalog.txt
+
+      - name: Run UAT
+        run: |
+          python3 uat/uat_suite.py \
+            --server-bin target/debug/bluedb-server \
+            --profile "${{ steps.profile.outputs.profile }}" \
+            --fail-on-uat-failure \
+            --report uat/reports/latest-uat-report.md
+
+      - name: Upload UAT report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: uat-report-${{ steps.profile.outputs.profile }}-${{ github.sha }}
+          path: |
+            uat/reports/latest-uat-report.md
+            uat/reports/case-catalog.txt
+          if-no-files-found: error
+
+  bless:
+    needs: uat
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/dev' &&
+      github.event.inputs.profile == 'full' &&
+      github.event.inputs.bless_release_report == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download UAT report
+        uses: actions/download-artifact@v4
+        with:
+          name: uat-report-full-${{ github.sha }}
+          path: uat/reports
+
+      - name: Bless release report
+        run: python3 uat/bless_report.py --source uat/reports/latest-uat-report.md
+
+      - name: Commit blessed report
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add uat/reports/blessed
+          git diff --cached --quiet && exit 0
+          short_sha="$(git rev-parse --short HEAD)"
+          git commit -m "docs: bless UAT report for ${short_sha}"
+          git push
