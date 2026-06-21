@@ -15,7 +15,7 @@ use slatedb::Db;
 /// Run an `@@` query through the engine and return the matching `id`s.
 async fn query_ids(fts: &FtsEngine, database: &Database, sql: &str) -> Vec<i64> {
     let mut g = Glue::new(database.connection_serialized());
-    let out = fts.execute_fts(&mut g, sql, &[]).await.unwrap();
+    let out = fts.execute_fts(&mut g, sql, &[], None).await.unwrap();
     match out.into_iter().next().unwrap() {
         Payload::Select { rows, .. } => rows
             .iter()

@@ -918,6 +918,86 @@ async fn sql_serves_secondary_index_read() {
     assert_eq!(body, json!([{ "id": 2 }]), "secondary-index read: {body}");
 }
 
+/// An indexed range predicate with `ORDER BY` the same indexed column — the
+/// UAT-SQL-015 shape. Created via the structured `/schema` endpoint exactly as
+/// the UAT does (table + `/schema/.../indexes`), to catch any path difference.
+#[tokio::test]
+async fn sql_indexed_range_order_by_indexed_column() {
+    let app = app().await;
+    // Structured table create (as the UAT does).
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/schema/tables",
+        Some(json!({
+            "name": "sqlrange",
+            "columns": [
+                {"name": "id", "type": "INTEGER", "primary_key": true},
+                {"name": "score", "type": "INTEGER"},
+                {"name": "label", "type": "TEXT"}
+            ]
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    // Structured index create (as the UAT does).
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/schema/tables/sqlrange/indexes",
+        Some(json!({"name": "sqlrange_score", "columns": ["score"]})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    // Insert via the /tables REST data plane (as the UAT does — NOT /sql).
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/tables/sqlrange",
+        Some(json!([
+            {"id": 1, "score": 20, "label": "mid"},
+            {"id": 2, "score": 10, "label": "low"},
+            {"id": 3, "score": 30, "label": "high"}
+        ])),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    // Parameterized indexed range + ORDER BY the indexed column.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "SELECT id, score FROM sqlrange WHERE score >= $1 ORDER BY score ASC", "params": [20]})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "indexed range + ORDER BY indexed: {body}");
+    assert_eq!(body, json!([{ "id": 1, "score": 20 }, { "id": 3, "score": 30 }]), "range mismatch: {body}");
+
+    // Regression: a prior `SET default_null_order = 'nulls_first'` (UAT-SQL-013)
+    // injects an `IS_NULL(col)` ORDER BY term via rewrite_null_order, which the
+    // guardrail must recognize as a column reference (not an opaque expr). This
+    // reproduces the UAT-SQL-015 cross-scenario failure: SQL-013 sets nulls_first
+    // on the default tenant, then SQL-015's indexed ORDER BY broke.
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "SET default_null_order = 'nulls_first'"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "SET nulls_first: {s}");
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "SELECT id, score FROM sqlrange WHERE score >= $1 ORDER BY score ASC", "params": [20]})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "indexed ORDER BY after SET nulls_first must still pass: {body}");
+    assert_eq!(body, json!([{ "id": 1, "score": 20 }, { "id": 3, "score": 30 }]), "range after SET: {body}");
+}
+
 /// `/sql` **rejects** a non-indexed filter with `400 NO_INDEX` (the flip), and
 /// the error points the client at the index to create.
 #[tokio::test]

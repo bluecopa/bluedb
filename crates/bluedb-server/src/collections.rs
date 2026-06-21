@@ -115,7 +115,7 @@ pub(crate) async fn run_write(
     params: &[bluedb_rest::Param],
 ) -> Result<(), AppError> {
     let mut glue = Glue::new(state.connection_serialized(tenant).await?);
-    state.fts().await.execute_fts(&mut glue, sql, params).await?;
+    state.fts().await.execute_fts(&mut glue, sql, params, None).await?;
     Ok(())
 }
 

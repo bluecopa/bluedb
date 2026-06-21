@@ -1443,19 +1443,11 @@ async fn exec_sql(
     }
 
     let mut glue = Glue::new(state.connection_serialized(&tenant).await?);
-    // Apply the per-tenant `default_null_order` (set via `SET` above) to any
-    // `ORDER BY` without an explicit `NULLS FIRST`/`NULLS LAST`. A no-op when no
-    // `SET` ran this session (the engine default applies).
+    // The per-tenant `default_null_order` (set via `SET` above) is applied to
+    // `ORDER BY` terms by `execute_fts` AFTER the FTS rewrite (so `ts_rank` is
+    // rewritten to a CASE first; see `execute_fts`). A no-op when no `SET` ran.
     let default_null_order = state.db_null_order(&tenant).await;
-    let sql = if default_null_order.is_some() {
-        bluedb_sql::rewrite_null_order(&req.sql, default_null_order)
-    } else {
-        req.sql.clone()
-    };
-    // Writes flow through the FTS engine so its commit observer indexes them; a
-    // non-`@@` statement (including a guarded `SELECT`) runs unchanged. A
-    // guardrail reject surfaces here as `400 NO_INDEX` via `From<EngineError>`.
-    let payloads = state.fts().await.execute_fts(&mut glue, &sql, &params).await?;
+    let payloads = state.fts().await.execute_fts(&mut glue, &req.sql, &params, default_null_order).await?;
     let wm = state.write_watermark(&tenant).await;
     Ok((watermark_headers(&tenant, wm), Json(payloads_to_json(payloads))))
 }
@@ -2413,7 +2405,7 @@ async fn run_write_returning(
     state
         .fts()
         .await
-        .execute_fts(&mut glue, &spec.write_sql, params)
+        .execute_fts(&mut glue, &spec.write_sql, params, None)
         .await?;
 
     if let Some(rows) = pre_delete_rows {

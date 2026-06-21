@@ -268,6 +268,99 @@ async fn fts_rank_order_by_works_on_sql() {
     assert!(!ids.contains(&3), "non-matching doc excluded: {body}");
 }
 
+/// FTS rank ORDER BY **conjoined with a structured filter** (`@@ AND status = $2`)
+/// plus `ORDER BY ts_rank(...)`. UAT-SEARCH-003 shape: the `@@` must rewrite to
+/// `pk IN (...)`, the structured filter must survive, and `ts_rank` must be
+/// replaced by the CASE-on-pk rank ordering — otherwise GlueSQL rejects
+/// `ts_rank` as an unsupported custom function.
+#[tokio::test]
+async fn fts_rank_with_structured_filter_and_pagination() {
+    let app = make_app(true).await;
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/schema/tables",
+        Some(json!({
+            "name": "ftrank2",
+            "columns": [
+                {"name": "id", "type": "INTEGER", "primary_key": true},
+                {"name": "body", "type": "TEXT"},
+                {"name": "status", "type": "TEXT"}
+            ]
+        })),
+    )
+    .await;
+    assert!(s.is_success(), "create ftrank2: {s}");
+    // Structured-filter index on status + fulltext index on body.
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/schema/tables/ftrank2/indexes",
+        Some(json!({"name": "ftrank2_status", "columns": ["status"]})),
+    )
+    .await;
+    assert!(s.is_success(), "create status index: {s}");
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/schema/tables/ftrank2/fulltext-indexes",
+        Some(json!({"column": "body", "analyzer": "english"})),
+    )
+    .await;
+    assert!(s.is_success(), "create fulltext index: {s}");
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "INSERT INTO ftrank2 VALUES (1, 'invoice overdue overdue payment', 'open'), (2, 'invoice overdue payment', 'open'), (3, 'invoice overdue archived', 'closed')"})),
+    )
+    .await;
+    assert!(s.is_success(), "insert ftrank2: {s}");
+
+    let rank_expr = "ts_rank(to_tsvector('english', body), plainto_tsquery($1))";
+    // First ranked page: @@ + status='open' filter, ORDER BY ts_rank DESC, LIMIT 1.
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({
+            "sql": format!("SELECT id FROM ftrank2 WHERE to_tsvector('english', body) @@ plainto_tsquery($1) AND status = $2 ORDER BY {rank_expr} DESC LIMIT 1 OFFSET 0"),
+            "params": ["invoice overdue", "open"]
+        })),
+    )
+    .await;
+    assert!(s.is_success(), "FTS rank + structured filter + pagination on /sql: {s} {body}");
+    assert_eq!(body.as_array().unwrap().len(), 1, "one row on page 1: {body}");
+    // id=1 (tf=2) ranks above id=2 (tf=1) for DESC rank.
+    assert_eq!(body[0]["id"], json!(1), "top-ranked open doc: {body}");
+
+    // Regression: a prior `SET default_null_order = 'nulls_first'` (UAT-SQL-013)
+    // must not break a subsequent FTS rank query. The null-order rewrite runs
+    // AFTER the FTS rewrite, so `ts_rank` is rewritten to a CASE first (otherwise
+    // the null-order rewrite would wrap `ts_rank` in IS NULL and the FTS rewrite
+    // would miss it → "CustomFunction is not supported"). Reproduces UAT-SEARCH-003.
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "SET default_null_order = 'nulls_first'"})),
+    )
+    .await;
+    assert_eq!(s, 200, "SET nulls_first: {s}");
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({
+            "sql": format!("SELECT id FROM ftrank2 WHERE to_tsvector('english', body) @@ plainto_tsquery($1) AND status = $2 ORDER BY {rank_expr} DESC LIMIT 1 OFFSET 0"),
+            "params": ["invoice overdue", "open"]
+        })),
+    )
+    .await;
+    assert!(s.is_success(), "FTS rank query after SET nulls_first must still work: {s} {body}");
+    assert_eq!(body[0]["id"], json!(1), "top-ranked open doc after SET: {body}");
+}
+
 #[tokio::test]
 async fn durable_engine_serves_a_second_fulltext_index() {
     // After B4-4, `promote` binds a durable, reopened `FtsEngine` over the writer's
