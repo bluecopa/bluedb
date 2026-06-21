@@ -1,5 +1,10 @@
 # bluedb
 
+[![UAT](https://github.com/bluecopa/bluedb/actions/workflows/uat.yml/badge.svg?branch=dev)](https://github.com/bluecopa/bluedb/actions/workflows/uat.yml?query=branch%3Adev)
+[![Blessed UAT](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fbluecopa%2Fbluedb%2Fdev%2Fuat%2Freports%2Fblessed%2Fuat-badge.json)](uat/reports/blessed/latest-uat-report.md)
+[![docs](https://github.com/bluecopa/bluedb/actions/workflows/docs.yml/badge.svg?branch=dev)](https://github.com/bluecopa/bluedb/actions/workflows/docs.yml?query=branch%3Adev)
+[![cargo-deny](https://github.com/bluecopa/bluedb/actions/workflows/deny.yml/badge.svg?branch=dev)](https://github.com/bluecopa/bluedb/actions/workflows/deny.yml?query=branch%3Adev)
+
 An **object-storage-native data substrate**, in Rust. Durable state lives in
 object storage (S3 / GCS / Azure Blob) via [**SlateDB**](https://slatedb.io);
 compute is **stateless and horizontally scalable**, with single-writer safety and
@@ -20,6 +25,13 @@ mkdocs serve   # http://127.0.0.1:8000
 
 Start with the [Quickstart](docs/quickstart.md) and the
 [Architecture overview](docs/concepts/architecture.md).
+
+## Acceptance
+
+The checked-in black-box UAT suite lives in [`uat/`](uat/README.md). Pull
+requests run the `core` profile; pushes to `dev` run the `full` profile and
+upload the generated report as a workflow artifact. The latest manually blessed
+release snapshot is [`uat/reports/blessed/latest-uat-report.md`](uat/reports/blessed/latest-uat-report.md).
 
 ## What it does
 
