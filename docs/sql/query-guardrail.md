@@ -26,7 +26,7 @@ to create. `/query` never rejects a read on indexing grounds — it scans.
 | Read your own write back at lookup latency | `/sql` (on the writer) |
 | Run a one-statement `INSERT`/`UPDATE`/`DELETE` (with optional `RETURNING`) | `/sql` |
 | Filter or sort on a non-indexed column | `/query` (or `GET /tables`, which auto-routes) |
-| Join, aggregate, window, recursive CTE | `/query` |
+| Join, aggregate, window, CTE | `/query` |
 | Filter/project a JSON path (`data->>'status'`) | `/query` |
 | Full-text `@@` search | `/sql` (single-table) |
 
