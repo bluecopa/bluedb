@@ -9,7 +9,7 @@ description = "Single-writer high-availability for bluedb: a lease/fencing-token
 # Opt-in Postgres-backed lease arbiter + node registry (the HA shared stores).
 # Off by default so the core crate stays dependency-light.
 postgres = ["dep:tokio-postgres"]
-# Opt-in Kubernetes-native node registry (liveness from the K8s API, via kube-rs).
+# Opt-in Kubernetes-native lease arbiter + node registry (via kube-rs).
 # Off by default AND on non-K8s builds so the heavy kube/k8s-openapi deps are
 # never pulled unless explicitly requested.
 kubernetes = ["dep:kube", "dep:k8s-openapi"]
@@ -20,7 +20,7 @@ async-trait   = { workspace = true }
 anyhow        = { workspace = true }
 thiserror     = { workspace = true }
 tokio-postgres = { version = "0.7", optional = true }
-# Kubernetes node-registry deps — ONLY compiled under the `kubernetes` feature.
+# Kubernetes deps — ONLY compiled under the `kubernetes` feature.
 # `kube` brings the typed client over the workspace's existing rustls/hyper
 # stack (no openssl); `k8s-openapi` provides the typed API objects (Pod /
 # EndpointSlice) and MUST pin exactly one Kubernetes API version via a feature

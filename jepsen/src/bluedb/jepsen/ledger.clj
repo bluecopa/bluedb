@@ -54,23 +54,23 @@
 
 (defn- create-accounts! [node base n]
   (http/post (str (h/base node) "/ledger/accounts")
-             {:throw-exceptions false :socket-timeout 8000 :connection-timeout 2000
-              :content-type :json
-              :body (json/generate-string
-                     (mapv (fn [i] {:id (str (account-id base i)) :ledger the-ledger :code 1})
-                           (range 1 (inc n))))}))
+             (h/opts :socket-timeout 8000 :connection-timeout 2000
+                     :content-type :json
+                     :body (json/generate-string
+                            (mapv (fn [i] {:id (str (account-id base i)) :ledger the-ledger :code 1})
+                                  (range 1 (inc n)))))))
 
 (defn- post-transfer! [node {:keys [id debit credit amount]}]
   (http/post (str (h/base node) "/ledger/transfers")
-             {:throw-exceptions false :socket-timeout 8000 :connection-timeout 2000
-              :content-type :json
-              :body (json/generate-string
-                     [{:id (str id) :debit_account_id (str debit) :credit_account_id (str credit)
-                       :amount (str amount) :ledger the-ledger :code 1}])}))
+             (h/opts :socket-timeout 8000 :connection-timeout 2000
+                     :content-type :json
+                     :body (json/generate-string
+                            [{:id (str id) :debit_account_id (str debit) :credit_account_id (str credit)
+                              :amount (str amount) :ledger the-ledger :code 1}]))))
 
 (defn- read-account [node id]
   (let [r (http/get (str (h/base node) "/ledger/accounts/" id)
-                    {:throw-exceptions false :socket-timeout 5000 :connection-timeout 2000})]
+                    (h/opts :socket-timeout 5000 :connection-timeout 2000))]
     (when (= 200 (:status r))
       (let [m (json/parse-string (:body r) true)]
         {:debits_posted  (bigint (:debits_posted m))

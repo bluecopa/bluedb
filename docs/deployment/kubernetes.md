@@ -55,7 +55,9 @@ the shared settings; the pod name supplies `BLUEDB_NODE_ID`. For example
 BLUEDB_S3_BUCKET: bluedb
 BLUEDB_S3_REGION: us-east-1
 BLUEDB_DB_PATH: bluedb
-BLUEDB_LEASE_PG_URL: postgresql://…           # or the K8s Lease provider
+BLUEDB_LEASE_BACKEND: kubernetes
+BLUEDB_K8S_NAMESPACE: default
+BLUEDB_K8S_LEASE_NAME: bluedb-writer
 BLUEDB_LEASE_TTL_SECS: "15"
 BLUEDB_LEASE_MARGIN_SECS: "5"
 ```
@@ -80,8 +82,49 @@ See [Configuration](configuration.md) for every variable.
 - **Postgres arbiter**: set `BLUEDB_LEASE_PG_URL` to a Postgres reachable from
   all pods. Simplest if you already run Postgres; identical to the Compose setup.
 - **Kubernetes `Lease`**: use the native `coordination.k8s.io/Lease` object via
-  the lease provider (no extra datastore). Requires RBAC granting the pods
-  `get`/`update` on a `Lease` resource.
+  `BLUEDB_LEASE_BACKEND=kubernetes` (no extra datastore). The image must be
+  built with the `kubernetes` cargo feature, for example
+  `docker build --build-arg BLUEDB_CARGO_FEATURES=kubernetes ...`.
+
+The Kubernetes backend uses `metadata.resourceVersion` as the compare-and-swap
+guard on Lease updates. The provider creates the Lease if it does not exist,
+preserves the fencing epoch on renew, and bumps it only when the holder changes.
+
+### RBAC
+
+Grant the bluedb ServiceAccount permission to update the Lease and list
+EndpointSlices for the Kubernetes node registry:
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: bluedb
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: bluedb
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: bluedb
+subjects:
+  - kind: ServiceAccount
+    name: bluedb
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: bluedb
+```
 
 Either way, `bluedb-ha` self-fences within `BLUEDB_LEASE_MARGIN_SECS` of expiry
 and SlateDB's epoch CAS fences any straggler. See

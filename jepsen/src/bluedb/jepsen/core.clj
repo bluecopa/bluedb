@@ -18,11 +18,10 @@
     debits and credits stay conserved and that observed totals match the
     acknowledged-applied set (no double-apply / no lost transfer) under faults.
 
-  Faults (--nemesis): none | kill | partition | partition-half | skew | pause |
-  arbiter | storage | disk-full | mix | chaos, injected via the docker CLI (skew
-  = libfaketime; pause = docker pause; partition-half = isolate a 2-node
-  minority; arbiter/storage = freeze Postgres/MinIO; disk-full = fill MinIO's
-  bounded data dir).
+  Faults (--nemesis): none | kill | partition | partition-half | lease | skew |
+  pause | arbiter | storage | disk-full | mix | chaos. Docker mode injects via
+  the docker CLI. Kubernetes mode injects via kubectl against pods, NetworkPolicy,
+  and the coordination.k8s.io Lease.
 
   Run against the up docker-compose cluster, e.g.:
 
@@ -52,26 +51,29 @@
   "A no-op DB (the cluster is managed by docker-compose). setup!/teardown! only
   (re)create a clean schema on the active writer — drop everything, then run the
   workload's DDL."
-  []
-  (reify db/DB
-    (setup! [_ _test node]
-      (when (= node (h/active-node))
-        (info "resetting schema on" node)
-        (h/exec-sql! node "DROP TABLE IF EXISTS jset;")
-        (h/exec-sql! node "DROP TABLE IF EXISTS la;")
-        (h/exec-sql! node "DROP TABLE IF EXISTS cnt;")
-        (h/exec-sql! node "DROP TABLE IF EXISTS u;")
-        (h/exec-sql! node "CREATE TABLE jset (v INTEGER);")
-        (h/exec-sql! node "CREATE TABLE la (k INTEGER, v INTEGER);")
-        (h/exec-sql! node "CREATE TABLE cnt (id INTEGER PRIMARY KEY, n INTEGER);")
-        (h/exec-sql! node "INSERT INTO cnt VALUES (1, 0);")
-        (h/exec-sql! node "CREATE TABLE u (id INTEGER PRIMARY KEY);")))
-    (teardown! [_ _test node]
-      (when (= node (h/active-node))
-        (h/exec-sql! node "DROP TABLE IF EXISTS jset;")
-        (h/exec-sql! node "DROP TABLE IF EXISTS la;")
-        (h/exec-sql! node "DROP TABLE IF EXISTS cnt;")
-        (h/exec-sql! node "DROP TABLE IF EXISTS u;")))))
+  [opts]
+  (let [target-ready? (atom false)]
+    (reify db/DB
+      (setup! [_ _test node]
+        (when (compare-and-set! target-ready? false true)
+          (bn/setup-target! opts))
+        (when (= node (h/active-node))
+          (info "resetting schema on" node)
+          (h/exec-sql! node "DROP TABLE IF EXISTS jset;")
+          (h/exec-sql! node "DROP TABLE IF EXISTS la;")
+          (h/exec-sql! node "DROP TABLE IF EXISTS cnt;")
+          (h/exec-sql! node "DROP TABLE IF EXISTS u;")
+          (h/exec-sql! node "CREATE TABLE jset (v INTEGER);")
+          (h/exec-sql! node "CREATE TABLE la (k INTEGER, v INTEGER);")
+          (h/exec-sql! node "CREATE TABLE cnt (id INTEGER PRIMARY KEY, n INTEGER);")
+          (h/exec-sql! node "INSERT INTO cnt VALUES (1, 0);")
+          (h/exec-sql! node "CREATE TABLE u (id INTEGER PRIMARY KEY);")))
+      (teardown! [_ _test node]
+        (when (= node (h/active-node))
+          (h/exec-sql! node "DROP TABLE IF EXISTS jset;")
+          (h/exec-sql! node "DROP TABLE IF EXISTS la;")
+          (h/exec-sql! node "DROP TABLE IF EXISTS cnt;")
+          (h/exec-sql! node "DROP TABLE IF EXISTS u;"))))))
 
 (defn- set-workload
   "Grow-only set: infinite stream of unique-int adds + a final whole-set read."
@@ -130,7 +132,7 @@
    :final-generator (gen/once {:type :invoke :f :insert :value 999999})
    :checker         (bu/checker)})
 
-(def fault-cycles
+(def docker-fault-cycles
   "Maps --nemesis to the cycle of nemesis ops. Sleeps straddle the lease TTL
   (10s) so failover completes inside a fault window."
   {"kill"      [(gen/sleep 6)  {:type :info :f :kill-writer}
@@ -164,6 +166,53 @@
                 (gen/sleep 5)  {:type :info :f :isolate-half}
                 (gen/sleep 14) {:type :info :f :heal}]
    "none"      []})
+
+(def k8s-fault-cycles
+  "Kubernetes-supported fault cycles. Unsupported docker-only faults such as
+  clock skew, Postgres pause, MinIO pause, and disk fill are intentionally not
+  mapped here."
+  {"kill"      [(gen/sleep 6)  {:type :info :f :kill-writer}
+                (gen/sleep 14) {:type :info :f :start-all}]
+   "partition" [(gen/sleep 6)  {:type :info :f :partition-writer}
+                (gen/sleep 14) {:type :info :f :heal}]
+   "partition-half" [(gen/sleep 6)  {:type :info :f :isolate-half}
+                     (gen/sleep 14) {:type :info :f :heal}]
+   "lease"     [(gen/sleep 6)  {:type :info :f :delete-lease}
+                (gen/sleep 14) {:type :info :f :start-all}]
+   "mix"       [(gen/sleep 6)  {:type :info :f :kill-writer}
+                (gen/sleep 14) {:type :info :f :start-all}
+                (gen/sleep 6)  {:type :info :f :partition-writer}
+                (gen/sleep 14) {:type :info :f :heal}
+                (gen/sleep 6)  {:type :info :f :delete-lease}
+                (gen/sleep 14) {:type :info :f :start-all}]
+   "chaos"     [(gen/sleep 6)  {:type :info :f :kill-writer}
+                (gen/sleep 14) {:type :info :f :start-all}
+                (gen/sleep 5)  {:type :info :f :isolate-half}
+                (gen/sleep 14) {:type :info :f :heal}
+                (gen/sleep 5)  {:type :info :f :delete-lease}
+                (gen/sleep 14) {:type :info :f :start-all}]
+   "none"      []})
+
+(defn fault-cycle [backend kind]
+  (let [cycles (case backend
+                 "kubernetes" k8s-fault-cycles
+                 docker-fault-cycles)]
+    (or (get cycles kind)
+        (throw (ex-info "Nemesis is not supported for backend"
+                        {:backend backend :nemesis kind
+                         :supported (sort (keys cycles))})))))
+
+(defn recovery-ops [backend]
+  (case backend
+    "kubernetes" [{:type :info :f :heal}
+                  {:type :info :f :start-all}]
+    [{:type :info :f :heal}
+     {:type :info :f :start-all}
+     {:type :info :f :resume}
+     {:type :info :f :resume-postgres}
+     {:type :info :f :start-postgres}
+     {:type :info :f :resume-minio}
+     {:type :info :f :free-disk}]))
 
 (defn- ledger-workload
   "Random posted transfers among a fixed set of accounts, plus reads. Checks
@@ -222,8 +271,11 @@
 
 (defn bluedb-test
   [opts]
-  (let [kind      (:nemesis opts "mix")
-        cycle-ops (get fault-cycles kind (get fault-cycles "mix"))
+  (let [backend   (:nemesis-backend opts (or (System/getenv "BLUEDB_JEPSEN_NEMESIS_BACKEND") "docker"))
+        opts      (assoc opts :nemesis-backend backend)
+        kind      (:nemesis opts "mix")
+        cycle-ops (fault-cycle backend kind)
+        recover   (recovery-ops backend)
         wname     (:workload opts "set")
         wl        ((case wname
                      "list-append" list-append-workload
@@ -239,28 +291,24 @@
            opts
            {:name      (str "bluedb-" wname "-" kind)
             :os        os/noop
-            :db        (bluedb-db)
+            :db        (bluedb-db opts)
             :client    (:client wl)
-            :nemesis   (bn/nemesis)
+            :nemesis   (bn/nemesis opts)
             :ssh       {:dummy? true}
             :nodes     (vec (keys h/ports))
             :generator
-            (gen/phases
-             (->> (let [g (:generator wl), s (:stagger wl 1/50)]
-                    (if (and s (pos? s)) (gen/stagger s g) g))
-                  (gen/nemesis (when (seq cycle-ops) (gen/cycle cycle-ops)))
-                  (gen/time-limit (:time-limit opts 120)))
-             ;; recover everything (network, processes, infra, disk) before the
-             ;; final read, so a run cut mid-outage still has a writer to read.
-             (gen/nemesis (gen/once {:type :info :f :heal}))
-             (gen/nemesis (gen/once {:type :info :f :start-all}))
-             (gen/nemesis (gen/once {:type :info :f :resume}))
-             (gen/nemesis (gen/once {:type :info :f :resume-postgres}))
-             (gen/nemesis (gen/once {:type :info :f :start-postgres}))
-             (gen/nemesis (gen/once {:type :info :f :resume-minio}))
-             (gen/nemesis (gen/once {:type :info :f :free-disk}))
-             (gen/sleep 25)
-             (gen/clients (:final-generator wl)))
+            (apply gen/phases
+                   (concat
+                    [(->> (let [g (:generator wl), s (:stagger wl 1/50)]
+                            (if (and s (pos? s)) (gen/stagger s g) g))
+                          (gen/nemesis (when (seq cycle-ops) (gen/cycle cycle-ops)))
+                          (gen/time-limit (:time-limit opts 120)))]
+                    ;; recover everything supported by the selected backend
+                    ;; before the final read, so a run cut mid-outage still has
+                    ;; a writer to read.
+                    (map #(gen/nemesis (gen/once %)) recover)
+                    [(gen/sleep 25)
+                     (gen/clients (:final-generator wl))]))
             :checker
             (checker/compose
              {:workload   (:checker wl)
@@ -271,11 +319,28 @@
 (def cli-opts
   "Extra command-line options beyond Jepsen's defaults."
   [[nil "--nemesis NAME"
-    "Faults: kill|partition|partition-half|skew|pause|arbiter|storage|disk-full|mix|chaos|none"
+    "Faults: kill|partition|partition-half|lease|skew|pause|arbiter|storage|disk-full|mix|chaos|none"
     :default "mix"
-    :validate [#{"kill" "partition" "partition-half" "skew" "pause"
+    :validate [#{"kill" "partition" "partition-half" "lease" "skew" "pause"
                  "arbiter" "arbiter-hard" "storage" "disk-full" "mix" "chaos" "none"}
                "unknown nemesis"]]
+   [nil "--nemesis-backend NAME" "Fault backend: docker | kubernetes"
+    :default (or (System/getenv "BLUEDB_JEPSEN_NEMESIS_BACKEND") "docker")
+    :validate [#{"docker" "kubernetes"} "must be docker or kubernetes"]]
+   [nil "--k8s-namespace NAME" "Kubernetes namespace for --nemesis-backend kubernetes"
+    :default (or (System/getenv "BLUEDB_JEPSEN_K8S_NAMESPACE") "bluedb")]
+   [nil "--k8s-selector SELECTOR" "Kubernetes pod label selector for BlueDB pods"
+    :default (or (System/getenv "BLUEDB_JEPSEN_K8S_SELECTOR") "app.kubernetes.io/name=bluedb")]
+   [nil "--k8s-deployment NAME" "Kubernetes Deployment to scale/wait for BlueDB pods"
+    :default (or (System/getenv "BLUEDB_JEPSEN_K8S_DEPLOYMENT") "bluedb")]
+   [nil "--k8s-port PORT" "BlueDB container port for pod port-forwarding"
+    :default (or (System/getenv "BLUEDB_JEPSEN_K8S_PORT") "8080")
+    :parse-fn #(Integer/parseInt %)]
+   [nil "--k8s-lease NAME" "Kubernetes Lease object name to delete during lease faults"
+    :default (or (System/getenv "BLUEDB_JEPSEN_K8S_LEASE") "bluedb-writer")]
+   [nil "--k8s-replicas N" "If positive, scale the Deployment before running Kubernetes Jepsen"
+    :default (or (System/getenv "BLUEDB_JEPSEN_K8S_REPLICAS") "0")
+    :parse-fn #(Integer/parseInt %)]
    [nil "--workload NAME" "Workload: set | list-append | counter | unique | ledger | evidence | graph | dur"
     :default "set"
     :validate [#{"set" "list-append" "counter" "unique" "ledger" "evidence" "graph" "dur"}

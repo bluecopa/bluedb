@@ -22,9 +22,9 @@ pub(crate) fn map_evidence_err(e: EvidenceError) -> AppError {
         EvidenceError::IdemConflict => {
             AppError::conflict("E_IDEM_CONFLICT: idempotency key reused with a different payload")
         }
-        EvidenceError::ChainModeConflict(c) => {
-            AppError::conflict(format!("E_CHAIN_MODE_CONFLICT: chain '{c}' already exists with a different mode"))
-        }
+        EvidenceError::ChainModeConflict(c) => AppError::conflict(format!(
+            "E_CHAIN_MODE_CONFLICT: chain '{c}' already exists with a different mode"
+        )),
         EvidenceError::EntryNotFound { chain, seq } => {
             AppError::not_found(format!("entry {seq} not found in chain '{chain}'"))
         }
@@ -32,12 +32,12 @@ pub(crate) fn map_evidence_err(e: EvidenceError) -> AppError {
             AppError::service_unavailable("node is a read-only replica (not the active writer)")
         }
         EvidenceError::Storage(e) => AppError::internal(format!("evidence storage: {e}")),
-        EvidenceError::NotVerified(c) => {
-            AppError::bad_request(format!("E_NOT_VERIFIED: chain '{c}' is not a verified chain"))
-        }
-        EvidenceError::VerifiedNoDelete(c) => {
-            AppError::conflict(format!("E_VERIFIED_NO_DELETE: chain '{c}' is verified; cannot hard-delete"))
-        }
+        EvidenceError::NotVerified(c) => AppError::bad_request(format!(
+            "E_NOT_VERIFIED: chain '{c}' is not a verified chain"
+        )),
+        EvidenceError::VerifiedNoDelete(c) => AppError::conflict(format!(
+            "E_VERIFIED_NO_DELETE: chain '{c}' is verified; cannot hard-delete"
+        )),
         EvidenceError::InvalidArgument(m) => AppError::bad_request(m),
     }
 }
@@ -129,7 +129,9 @@ pub async fn append(
                     let getstr = |k: &str| e.get(k).and_then(|v| v.as_str());
                     let graph = getstr("graph")
                         .ok_or_else(|| {
-                            AppError::bad_request(format!("events[{i}].edges[{j}]: missing 'graph'"))
+                            AppError::bad_request(format!(
+                                "events[{i}].edges[{j}]: missing 'graph'"
+                            ))
                         })?
                         .to_string();
                     let src = getstr("src")
@@ -160,16 +162,28 @@ pub async fn append(
                         Some("delete") => bluedb_evidence::EdgeOp::Delete,
                         Some(o) => {
                             return Err(AppError::bad_request(format!(
-                                "events[{i}].edges[{j}]: unknown op '{o}' (want 'upsert' or 'delete')"
-                            )))
+                            "events[{i}].edges[{j}]: unknown op '{o}' (want 'upsert' or 'delete')"
+                        )))
                         }
                     };
-                    out.push(bluedb_evidence::EdgeDelta { graph, src, dst, weight, etype, op });
+                    out.push(bluedb_evidence::EdgeDelta {
+                        graph,
+                        src,
+                        dst,
+                        weight,
+                        etype,
+                        op,
+                    });
                 }
                 out
             }
         };
-        entries.push(bluedb_evidence::EntryInput { etype, payload, at, edges });
+        entries.push(bluedb_evidence::EntryInput {
+            etype,
+            payload,
+            at,
+            edges,
+        });
     }
 
     let idem_key = body
@@ -243,24 +257,23 @@ pub async fn read_entries(
     let tenant = state.tenant(&headers)?;
     let ev = state.evidence(&tenant).await?;
 
-    let entries: Vec<(i64, bluedb_evidence::EntryRecord)> =
-        if q.after.is_some() {
-            // read_from path
-            let after = q.after.unwrap_or(0);
-            ev.read_from(&chain, after, q.limit)
-                .await
-                .map_err(map_evidence_err)?
-        } else {
-            // read_range path (default: from=1, to=head)
-            let lo = q.from.unwrap_or(1);
-            let hi = match q.to {
-                Some(t) => t,
-                None => ev.head(&chain).await.map_err(map_evidence_err)?,
-            };
-            ev.read_range(&chain, lo, hi)
-                .await
-                .map_err(map_evidence_err)?
+    let entries: Vec<(i64, bluedb_evidence::EntryRecord)> = if q.after.is_some() {
+        // read_from path
+        let after = q.after.unwrap_or(0);
+        ev.read_from(&chain, after, q.limit)
+            .await
+            .map_err(map_evidence_err)?
+    } else {
+        // read_range path (default: from=1, to=head)
+        let lo = q.from.unwrap_or(1);
+        let hi = match q.to {
+            Some(t) => t,
+            None => ev.head(&chain).await.map_err(map_evidence_err)?,
         };
+        ev.read_range(&chain, lo, hi)
+            .await
+            .map_err(map_evidence_err)?
+    };
 
     let out: Vec<Value> = entries
         .into_iter()
@@ -292,8 +305,15 @@ pub async fn redact(
     state.require_active()?;
     state.authorize(&headers, Scope::SchemaAdmin)?;
     let tenant = state.tenant(&headers)?;
-    state.evidence(&tenant).await?.redact(&chain, seq).await.map_err(map_evidence_err)?;
-    Ok(Json(json!({ "chain": chain, "seq": seq, "redacted": true })))
+    state
+        .evidence(&tenant)
+        .await?
+        .redact(&chain, seq)
+        .await
+        .map_err(map_evidence_err)?;
+    Ok(Json(
+        json!({ "chain": chain, "seq": seq, "redacted": true }),
+    ))
 }
 
 // --- DELETE /evidence/{chain}/entries/{seq} ---------------------------------
@@ -318,8 +338,15 @@ pub async fn hard_delete(
     state.require_active()?;
     state.authorize(&headers, Scope::SchemaAdmin)?;
     let tenant = state.tenant(&headers)?;
-    state.evidence(&tenant).await?.hard_delete(&chain, seq, q.retract_edges).await.map_err(map_evidence_err)?;
-    Ok(Json(json!({ "chain": chain, "seq": seq, "deleted": true, "retract_edges": q.retract_edges })))
+    state
+        .evidence(&tenant)
+        .await?
+        .hard_delete(&chain, seq, q.retract_edges)
+        .await
+        .map_err(map_evidence_err)?;
+    Ok(Json(
+        json!({ "chain": chain, "seq": seq, "deleted": true, "retract_edges": q.retract_edges }),
+    ))
 }
 
 // --- GET /evidence/{chain}/digest -------------------------------------------
@@ -332,7 +359,12 @@ pub async fn digest(
 ) -> Result<Json<Value>, AppError> {
     state.authorize(&headers, Scope::DataRead)?;
     let tenant = state.tenant(&headers)?;
-    let d = state.evidence(&tenant).await?.digest(&chain).await.map_err(map_evidence_err)?;
+    let d = state
+        .evidence(&tenant)
+        .await?
+        .digest(&chain)
+        .await
+        .map_err(map_evidence_err)?;
     Ok(Json(json!({ "size": d.size, "root_hash": hex32(&d.root) })))
 }
 
@@ -349,7 +381,12 @@ pub async fn digest_signed(
     let signer = state.signer().ok_or_else(|| {
         AppError::not_implemented("digest signing is not enabled (set BLUEDB_EVIDENCE_SIGNING)")
     })?;
-    let d = state.evidence(&tenant).await?.digest(&chain).await.map_err(map_evidence_err)?;
+    let d = state
+        .evidence(&tenant)
+        .await?
+        .digest(&chain)
+        .await
+        .map_err(map_evidence_err)?;
     let ts = now_millis();
     let payload = bluedb_evidence::sth_payload(&tenant, &chain, d.size, &d.root, ts);
     let (key_version, sig) = signer.sign(&payload).await?;
@@ -387,7 +424,10 @@ pub async fn signing_key(
 
 fn now_millis() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 // --- GET /evidence/{chain}/proof?seq&size -----------------------------------
@@ -414,7 +454,9 @@ pub async fn inclusion(
         .await
         .map_err(map_evidence_err)?;
     let path: Vec<String> = p.audit_path.iter().map(hex32).collect();
-    Ok(Json(json!({ "seq": p.seq, "size": p.size, "audit_path": path })))
+    Ok(Json(
+        json!({ "seq": p.seq, "size": p.size, "audit_path": path }),
+    ))
 }
 
 // --- GET /evidence/{chain}/consistency?from&to ------------------------------
@@ -441,5 +483,7 @@ pub async fn consistency(
         .await
         .map_err(map_evidence_err)?;
     let proof: Vec<String> = c.proof.iter().map(hex32).collect();
-    Ok(Json(json!({ "first": c.first, "second": c.second, "proof": proof })))
+    Ok(Json(
+        json!({ "first": c.first, "second": c.second, "proof": proof }),
+    ))
 }

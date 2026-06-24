@@ -43,17 +43,17 @@ mod catalog;
 pub mod objstore;
 mod schema;
 
+use arrow_array::RecordBatch;
 use bluedb_engine::{rest_sql, EngineError, FtsEngine};
 use bluedb_ha::{HaError, NodeRegistry, Status, WriterController};
 use bluedb_ledger::Ledger;
-use arrow_array::RecordBatch;
 
 mod collections;
-mod ledger_api;
 mod evidence_api;
 mod graph_api;
-mod signer;
+mod ledger_api;
 mod search;
+mod signer;
 
 /// ES256-DER verification helper, re-exported for Rust consumers (and the e2e
 /// test) to verify Signed Tree Heads against a published SPKI-PEM public key.
@@ -61,7 +61,9 @@ pub use signer::verify_es256_der;
 
 use bluedb_lakehouse::{object_store_file_io, LakehouseConfig, LakehouseManager};
 use bluedb_rest::{parse_filters, DeleteRequest, InsertRequest, UpdateRequest};
-use bluedb_sql::{parse_lakehouse_pragma, CdcConfig, Database, LhPragma, SlateDbStorage, DEFAULT_TENANT};
+use bluedb_sql::{
+    parse_lakehouse_pragma, CdcConfig, Database, LhPragma, SlateDbStorage, DEFAULT_TENANT,
+};
 use gluesql_core::prelude::{Glue, Payload, Value as SqlValue};
 use slatedb::object_store::ObjectStore;
 use slatedb::{Db, DbReader, Settings};
@@ -123,7 +125,9 @@ fn parse_ms(raw: Option<&str>, default_ms: u64) -> Duration {
 /// `BLUEDB_LAKEHOUSE_SEAL_DEBOUNCE_MS`, default 2 s (seconds-fresh mirror).
 fn lakehouse_seal_debounce() -> Duration {
     parse_ms(
-        std::env::var("BLUEDB_LAKEHOUSE_SEAL_DEBOUNCE_MS").ok().as_deref(),
+        std::env::var("BLUEDB_LAKEHOUSE_SEAL_DEBOUNCE_MS")
+            .ok()
+            .as_deref(),
         2_000,
     )
 }
@@ -132,7 +136,9 @@ fn lakehouse_seal_debounce() -> Duration {
 /// `BLUEDB_LAKEHOUSE_SEAL_MAX_INTERVAL_MS`, default 10 s.
 fn lakehouse_seal_max_interval() -> Duration {
     parse_ms(
-        std::env::var("BLUEDB_LAKEHOUSE_SEAL_MAX_INTERVAL_MS").ok().as_deref(),
+        std::env::var("BLUEDB_LAKEHOUSE_SEAL_MAX_INTERVAL_MS")
+            .ok()
+            .as_deref(),
         10_000,
     )
 }
@@ -141,7 +147,9 @@ fn lakehouse_seal_max_interval() -> Duration {
 /// `BLUEDB_LAKEHOUSE_COMPACTION_INTERVAL_MS`, default 60 s.
 fn lakehouse_compaction_interval() -> Duration {
     parse_ms(
-        std::env::var("BLUEDB_LAKEHOUSE_COMPACTION_INTERVAL_MS").ok().as_deref(),
+        std::env::var("BLUEDB_LAKEHOUSE_COMPACTION_INTERVAL_MS")
+            .ok()
+            .as_deref(),
         60_000,
     )
 }
@@ -229,6 +237,12 @@ struct Inner {
     /// node advertising itself as the writer. Gates [`AppState::require_active`] and
     /// the role reported by `GET /admin/status`.
     writer_bound: AtomicBool,
+    /// True while [`AppState::promote`] has entered the critical section that may
+    /// acquire the lease and open/bind the writer `Db`. During this window the
+    /// lease controller can be Active before [`Inner::writer_bound`] flips true;
+    /// the HA tick must renew that lease, not misclassify it as an orphaned
+    /// controller and demote it out from under the in-flight promotion.
+    promotion_inflight: AtomicBool,
     /// Bearer-token → scopes map. Unset = open mode (all requests allowed).
     /// Set once at startup via [`AppState::with_authz`].
     authz: OnceLock<Arc<authz::Authz>>,
@@ -291,6 +305,34 @@ struct Inner {
     node_registry: Option<Arc<dyn NodeRegistry>>,
 }
 
+struct PromotionPermit<'a> {
+    flag: &'a AtomicBool,
+}
+
+impl<'a> PromotionPermit<'a> {
+    fn acquire(flag: &'a AtomicBool) -> Option<Self> {
+        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self { flag })
+    }
+}
+
+impl Drop for PromotionPermit<'_> {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
+    }
+}
+
+struct PromotionRenewer {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for PromotionRenewer {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
 impl AppState {
     /// Build state over an object store + SlateDB path + lease controller. The
     /// node starts with **no** bound database; call [`AppState::promote`] (to
@@ -312,6 +354,7 @@ impl AppState {
                 db: RwLock::new(None),
                 admin_sql_enabled: AtomicBool::new(false),
                 writer_bound: AtomicBool::new(false),
+                promotion_inflight: AtomicBool::new(false),
                 authz: OnceLock::new(),
                 fts: RwLock::new(FtsEngine::new()),
                 search: RwLock::new(search::SearchEngine::empty()),
@@ -420,9 +463,9 @@ impl AppState {
                 let mount = std::env::var("BLUEDB_EVIDENCE_VAULT_MOUNT")
                     .unwrap_or_else(|_| "transit".to_string());
                 let key = req_env("BLUEDB_EVIDENCE_VAULT_KEY")?;
-                Some(EvidenceSigner::Vault(signer::vault::VaultTransitSigner::new(
-                    addr, token, mount, key,
-                )?))
+                Some(EvidenceSigner::Vault(
+                    signer::vault::VaultTransitSigner::new(addr, token, mount, key)?,
+                ))
             }
             other => {
                 return Err(AppError::internal(format!(
@@ -451,7 +494,9 @@ impl AppState {
     /// `self` for chaining; the existing `AppState::new` signature is unchanged.
     /// Safe to call before or after [`AppState::promote`].
     pub fn with_admin_sql_enabled(self, enabled: bool) -> Self {
-        self.inner.admin_sql_enabled.store(enabled, Ordering::Relaxed);
+        self.inner
+            .admin_sql_enabled
+            .store(enabled, Ordering::Relaxed);
         self
     }
 
@@ -470,13 +515,22 @@ impl AppState {
 
     /// Authorize `required` scope from the request's `Authorization: Bearer` token.
     /// Open mode (no authz configured) always allows. Composes with `require_active`.
-    pub(crate) fn authorize(&self, headers: &axum::http::HeaderMap, required: authz::Scope) -> Result<(), AppError> {
-        let Some(authz) = self.inner.authz.get() else { return Ok(()); };
+    pub(crate) fn authorize(
+        &self,
+        headers: &axum::http::HeaderMap,
+        required: authz::Scope,
+    ) -> Result<(), AppError> {
+        let Some(authz) = self.inner.authz.get() else {
+            return Ok(());
+        };
         let token = bearer_token(headers);
         if authz.allows(token, required) {
             Ok(())
         } else if token.is_none() {
-            Err(AppError::plain(StatusCode::UNAUTHORIZED, "missing or malformed bearer token"))
+            Err(AppError::plain(
+                StatusCode::UNAUTHORIZED,
+                "missing or malformed bearer token",
+            ))
         } else {
             Err(AppError::plain(StatusCode::FORBIDDEN, "insufficient scope"))
         }
@@ -485,8 +539,14 @@ impl AppState {
     /// Authorize the request's token to act on `tenant`. Open mode allows; with
     /// authz on, the token must be bound to the tenant (or be `superuser`). See
     /// [`authz::Authz::allows_tenant`].
-    pub(crate) fn authorize_tenant(&self, headers: &axum::http::HeaderMap, tenant: &str) -> Result<(), AppError> {
-        let Some(authz) = self.inner.authz.get() else { return Ok(()); };
+    pub(crate) fn authorize_tenant(
+        &self,
+        headers: &axum::http::HeaderMap,
+        tenant: &str,
+    ) -> Result<(), AppError> {
+        let Some(authz) = self.inner.authz.get() else {
+            return Ok(());
+        };
         if authz.allows_tenant(bearer_token(headers), tenant) {
             Ok(())
         } else {
@@ -526,15 +586,66 @@ impl AppState {
         &self.inner.writer
     }
 
+    fn start_promotion_renewer(&self) -> PromotionRenewer {
+        let writer = self.inner.writer.clone();
+        let node_id = writer.node_id().to_string();
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                match writer.renew_once().await {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(err) => {
+                        eprintln!(
+                            "bluedb-server: node '{node_id}' failed to renew writer lease during promotion: {err}"
+                        );
+                        break;
+                    }
+                }
+            }
+        });
+        PromotionRenewer { handle }
+    }
+
     /// Acquire the writer lease and open a writer `Db` (creating it if absent).
     /// Opening the writer bumps SlateDB's `writer_epoch`, fencing a dead writer.
     pub async fn promote(&self) -> Result<(), AppError> {
-        self.inner.writer.promote().await.map_err(AppError::from_ha)?;
-        let db = Db::builder(self.inner.db_path.clone(), self.inner.object_store.clone())
+        let Some(_permit) = PromotionPermit::acquire(&self.inner.promotion_inflight) else {
+            return Err(AppError::service_unavailable(
+                "writer promotion is already in progress",
+            ));
+        };
+        self.inner
+            .writer
+            .promote()
+            .await
+            .map_err(AppError::from_ha)?;
+        let _renewer = self.start_promotion_renewer();
+        let db = match Db::builder(self.inner.db_path.clone(), self.inner.object_store.clone())
             .with_settings(writer_settings())
             .build()
             .await
-            .map_err(|err| AppError::internal(format!("open writer db: {err}")))?;
+        {
+            Ok(db) => db,
+            Err(err) => {
+                eprintln!(
+                    "bluedb-server: node '{}' acquired writer lease but failed to open writer DB: {err}",
+                    self.inner.writer.node_id()
+                );
+                let _ = self.inner.writer.demote().await;
+                return Err(AppError::internal(format!("open writer db: {err}")));
+            }
+        };
+        if !self.inner.writer.is_active() {
+            eprintln!(
+                "bluedb-server: node '{}' lost writer lease while opening writer DB",
+                self.inner.writer.node_id()
+            );
+            let _ = db.close().await;
+            return Err(AppError::service_unavailable(
+                "writer lease lost while opening writer DB",
+            ));
+        }
         // One `Database` handle backs BOTH the SQL slot AND the durable FTS engine
         // (it's `Clone` + carries the shared substrate), so FTS splits live in the
         // same object store as the SQL data.
@@ -721,6 +832,19 @@ impl AppState {
     ///   least serving reads as a replica.
     pub async fn ha_tick(&self) {
         if self.inner.writer.is_active() {
+            if !self.inner.writer_bound.load(Ordering::Acquire) {
+                if self.inner.promotion_inflight.load(Ordering::Acquire) {
+                    let _ = self.inner.writer.renew_once().await;
+                    return;
+                }
+                eprintln!(
+                    "bluedb-server: node '{}' held writer lease without a bound writer DB; releasing lease",
+                    self.inner.writer.node_id()
+                );
+                let _ = self.inner.writer.demote().await;
+                self.attach_reader_if_unbound().await;
+                return;
+            }
             match self.inner.writer.renew_once().await {
                 Ok(true) => {}
                 _ => self.attach_reader().await, // lost the lease → become a replica
@@ -829,7 +953,10 @@ impl AppState {
     /// CDC seq is used so the watermark stays monotonic across a failover.
     pub(crate) async fn write_watermark(&self, tenant: &str) -> i64 {
         match self.inner.db.read().await.as_ref() {
-            Some(db) => db.last_commit_seq(tenant).await.max(db.last_cdc_seq(tenant).await),
+            Some(db) => db
+                .last_commit_seq(tenant)
+                .await
+                .max(db.last_cdc_seq(tenant).await),
             None => 0,
         }
     }
@@ -850,7 +977,10 @@ impl AppState {
     /// routes that can run a single-statement read-modify-write (`/sql`,
     /// `/admin/sql`, `PATCH`, `DELETE`) so concurrent RMWs can't lose an update.
     /// Guarded for the same reason as [`Self::connection`].
-    pub(crate) async fn connection_serialized(&self, tenant: &str) -> Result<SlateDbStorage, AppError> {
+    pub(crate) async fn connection_serialized(
+        &self,
+        tenant: &str,
+    ) -> Result<SlateDbStorage, AppError> {
         let fts = self.inner.fts.read().await.clone();
         match self.inner.db.read().await.as_ref() {
             Some(db) => Ok(db
@@ -895,7 +1025,10 @@ impl AppState {
 
     /// Build an [`Evidence`] handle over the currently-bound database for `tenant`,
     /// or `503` if the node has no database yet. Mirrors [`Self::ledger`].
-    pub(crate) async fn evidence(&self, tenant: &str) -> Result<bluedb_evidence::Evidence, AppError> {
+    pub(crate) async fn evidence(
+        &self,
+        tenant: &str,
+    ) -> Result<bluedb_evidence::Evidence, AppError> {
         match self.inner.db.read().await.as_ref() {
             Some(db) => Ok(bluedb_evidence::Evidence::new(db, tenant)),
             None => Err(AppError::service_unavailable(
@@ -924,7 +1057,10 @@ impl AppState {
         } else {
             Err(AppError::plain(
                 StatusCode::SERVICE_UNAVAILABLE,
-                format!("node '{}' is passive (not the active writer)", self.inner.writer.node_id()),
+                format!(
+                    "node '{}' is passive (not the active writer)",
+                    self.inner.writer.node_id()
+                ),
             ))
         }
     }
@@ -972,7 +1108,10 @@ pub fn build_app(state: AppState) -> Router {
             get(schema::describe_table).delete(schema::drop_table),
         )
         .route("/schema/tables/{table}/indexes", post(schema::create_index))
-        .route("/schema/tables/{table}/indexes/{name}", delete(schema::drop_index))
+        .route(
+            "/schema/tables/{table}/indexes/{name}",
+            delete(schema::drop_index),
+        )
         .route(
             "/schema/tables/{table}/fulltext-indexes",
             post(schema::create_fulltext_index),
@@ -992,13 +1131,25 @@ pub fn build_app(state: AppState) -> Router {
             post(evidence_api::append).get(evidence_api::read_entries),
         )
         .route("/evidence/{chain}/head", get(evidence_api::head))
-        .route("/evidence/{chain}/entries/{seq}/redact", post(evidence_api::redact))
-        .route("/evidence/{chain}/entries/{seq}", delete(evidence_api::hard_delete))
+        .route(
+            "/evidence/{chain}/entries/{seq}/redact",
+            post(evidence_api::redact),
+        )
+        .route(
+            "/evidence/{chain}/entries/{seq}",
+            delete(evidence_api::hard_delete),
+        )
         .route("/evidence/{chain}/digest", get(evidence_api::digest))
-        .route("/evidence/{chain}/digest/signed", get(evidence_api::digest_signed))
+        .route(
+            "/evidence/{chain}/digest/signed",
+            get(evidence_api::digest_signed),
+        )
         .route("/evidence/signing-key", get(evidence_api::signing_key))
         .route("/evidence/{chain}/proof", get(evidence_api::inclusion))
-        .route("/evidence/{chain}/consistency", get(evidence_api::consistency))
+        .route(
+            "/evidence/{chain}/consistency",
+            get(evidence_api::consistency),
+        )
         // Native graph store (edge maintenance + read-only traversal).
         .route(
             "/graph/{graph}/edges",
@@ -1012,7 +1163,10 @@ pub fn build_app(state: AppState) -> Router {
         .route("/catalog/v1/config", get(catalog::config))
         .route("/catalog/v1/namespaces", get(catalog::list_namespaces))
         .route("/catalog/v1/namespaces/{ns}", get(catalog::get_namespace))
-        .route("/catalog/v1/namespaces/{ns}/tables", get(catalog::list_tables))
+        .route(
+            "/catalog/v1/namespaces/{ns}/tables",
+            get(catalog::list_tables),
+        )
         .route(
             "/catalog/v1/namespaces/{ns}/tables/{table}",
             get(catalog::load_table),
@@ -1020,10 +1174,16 @@ pub fn build_app(state: AppState) -> Router {
         // Document-oriented collections API.
         .route("/collections/{coll}/insert", post(collections::insert))
         .route("/collections/{coll}/find", post(collections::find))
-        .route("/collections/{coll}/createIndex", post(collections::create_index))
+        .route(
+            "/collections/{coll}/createIndex",
+            post(collections::create_index),
+        )
         .route("/collections/{coll}/update", post(collections::update))
         .route("/collections/{coll}/delete", post(collections::delete))
-        .route("/collections/{coll}/aggregate", post(collections::aggregate))
+        .route(
+            "/collections/{coll}/aggregate",
+            post(collections::aggregate),
+        )
         .route("/collections/{coll}/count", post(collections::count))
         .route(
             "/collections/{coll}/searchIndex",
@@ -1190,10 +1350,9 @@ fn arrow_value_to_json(
 ) -> Value {
     use arrow_array::cast::AsArray;
     use arrow_array::types::{
-        Int8Type, Int16Type, Int32Type, Int64Type,
-        UInt8Type, UInt16Type, UInt32Type, UInt64Type,
-        Float32Type, Float64Type, Date32Type, Decimal128Type,
-        TimestampMicrosecondType, Time64MicrosecondType,
+        Date32Type, Decimal128Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
+        Int8Type, Time64MicrosecondType, TimestampMicrosecondType, UInt16Type, UInt32Type,
+        UInt64Type, UInt8Type,
     };
     use arrow_schema::{DataType, TimeUnit};
 
@@ -1204,7 +1363,9 @@ fn arrow_value_to_json(
         DataType::Boolean => {
             if let Some(a) = array.as_any().downcast_ref::<arrow_array::BooleanArray>() {
                 Value::Bool(a.value(row_idx))
-            } else { Value::Null }
+            } else {
+                Value::Null
+            }
         }
         DataType::Int8 => json!(array.as_primitive::<Int8Type>().value(row_idx)),
         DataType::Int16 => json!(array.as_primitive::<Int16Type>().value(row_idx)),
@@ -1214,24 +1375,40 @@ fn arrow_value_to_json(
         DataType::UInt16 => json!(array.as_primitive::<UInt16Type>().value(row_idx)),
         DataType::UInt32 => json!(array.as_primitive::<UInt32Type>().value(row_idx)),
         // 64-bit unsigned → decimal string (precision-safe; see sql_value_to_json).
-        DataType::UInt64 => Value::String(array.as_primitive::<UInt64Type>().value(row_idx).to_string()),
+        DataType::UInt64 => Value::String(
+            array
+                .as_primitive::<UInt64Type>()
+                .value(row_idx)
+                .to_string(),
+        ),
         DataType::Float32 => {
             let v = array.as_primitive::<Float32Type>().value(row_idx);
-            serde_json::Number::from_f64(v as f64).map(Value::Number).unwrap_or(Value::Null)
+            serde_json::Number::from_f64(v as f64)
+                .map(Value::Number)
+                .unwrap_or(Value::Null)
         }
         DataType::Float64 => {
             let v = array.as_primitive::<Float64Type>().value(row_idx);
-            serde_json::Number::from_f64(v).map(Value::Number).unwrap_or(Value::Null)
+            serde_json::Number::from_f64(v)
+                .map(Value::Number)
+                .unwrap_or(Value::Null)
         }
         DataType::Utf8 => {
             if let Some(a) = array.as_any().downcast_ref::<arrow_array::StringArray>() {
                 Value::String(a.value(row_idx).to_string())
-            } else { Value::Null }
+            } else {
+                Value::Null
+            }
         }
         DataType::LargeUtf8 => {
-            if let Some(a) = array.as_any().downcast_ref::<arrow_array::LargeStringArray>() {
+            if let Some(a) = array
+                .as_any()
+                .downcast_ref::<arrow_array::LargeStringArray>()
+            {
                 Value::String(a.value(row_idx).to_string())
-            } else { Value::Null }
+            } else {
+                Value::Null
+            }
         }
         DataType::Decimal128(_precision, scale) => {
             let scale = *scale as u32;
@@ -1246,7 +1423,9 @@ fn arrow_value_to_json(
             }
         }
         DataType::Timestamp(TimeUnit::Microsecond, _) => {
-            let micros = array.as_primitive::<TimestampMicrosecondType>().value(row_idx);
+            let micros = array
+                .as_primitive::<TimestampMicrosecondType>()
+                .value(row_idx);
             match chrono::DateTime::from_timestamp_micros(micros) {
                 Some(dt) => Value::String(format_naive_datetime(&dt.naive_utc())),
                 None => Value::Null,
@@ -1279,7 +1458,10 @@ fn arrow_value_to_json(
 
 /// Render every element of a list cell's child array as a JSON array, using the
 /// shared per-value conversion for the element `data_type`.
-fn list_values_to_json(values: &dyn arrow_array::Array, data_type: &arrow_schema::DataType) -> Value {
+fn list_values_to_json(
+    values: &dyn arrow_array::Array,
+    data_type: &arrow_schema::DataType,
+) -> Value {
     let elems = (0..values.len())
         .map(|i| arrow_value_to_json(values, data_type, i))
         .collect();
@@ -1385,7 +1567,10 @@ async fn exec_sql(
                     .apply_pragma(&tenant, pragma)
                     .await
                     .map_err(|e| AppError::internal(format!("lakehouse pragma: {e}")))?;
-                return Ok((axum::http::HeaderMap::new(), Json(json!({ "ok": true, "pragma": name }))));
+                return Ok((
+                    axum::http::HeaderMap::new(),
+                    Json(json!({ "ok": true, "pragma": name })),
+                ));
             }
             None => return Err(AppError::internal("lakehouse manager not bound")),
         }
@@ -1402,7 +1587,9 @@ async fn exec_sql(
         }
         return Ok((
             axum::http::HeaderMap::new(),
-            Json(json!({ "ok": true, "default_null_order": if nulls_first { "nulls_first" } else { "nulls_last" } })),
+            Json(
+                json!({ "ok": true, "default_null_order": if nulls_first { "nulls_first" } else { "nulls_last" } }),
+            ),
         ));
     }
     // `/sql` is the **read-your-writes transactional** surface. Reads run on the
@@ -1414,7 +1601,11 @@ async fn exec_sql(
     // (joins, aggregates, windows, JSON paths, non-indexed filters/sorts) belong
     // on [`exec_query`] (`POST /query`). FTS `@@` reads stay here: the FTS engine
     // rewrites them to `pk IN (...)` first, which the guardrail accepts.
-    let params = req.params.iter().map(json_to_param).collect::<Result<Vec<_>, _>>()?;
+    let params = req
+        .params
+        .iter()
+        .map(json_to_param)
+        .collect::<Result<Vec<_>, _>>()?;
 
     // RETURNING: a write that asks for the affected rows back. GlueSQL rejects
     // `RETURNING` at translate time, so we implement it ourselves: strip the
@@ -1447,9 +1638,16 @@ async fn exec_sql(
     // `ORDER BY` terms by `execute_fts` AFTER the FTS rewrite (so `ts_rank` is
     // rewritten to a CASE first; see `execute_fts`). A no-op when no `SET` ran.
     let default_null_order = state.db_null_order(&tenant).await;
-    let payloads = state.fts().await.execute_fts(&mut glue, &req.sql, &params, default_null_order).await?;
+    let payloads = state
+        .fts()
+        .await
+        .execute_fts(&mut glue, &req.sql, &params, default_null_order)
+        .await?;
     let wm = state.write_watermark(&tenant).await;
-    Ok((watermark_headers(&tenant, wm), Json(payloads_to_json(payloads))))
+    Ok((
+        watermark_headers(&tenant, wm),
+        Json(payloads_to_json(payloads)),
+    ))
 }
 
 /// `POST /query` — the **HTAP analytical** read surface. Runs a single `SELECT`
@@ -1499,18 +1697,23 @@ fn is_read_query(sql: &str) -> bool {
 /// scan of the SQL text so it catches any reference (FROM, JOIN, subquery).
 fn references_glue_meta_table(sql: &str) -> bool {
     let upper = sql.to_ascii_uppercase();
-    ["GLUE_OBJECTS", "GLUE_TABLES", "GLUE_TABLE_COLUMNS", "GLUE_INDEXES"]
-        .into_iter()
-        .any(|t| {
-            let i = match upper.find(t) {
-                Some(i) => i,
-                None => return false,
-            };
-            let before = upper[..i].chars().next_back();
-            let after = upper[i + t.len()..].chars().next();
-            !matches!(before, Some(c) if c.is_alphanumeric() || c == '_')
-                && !matches!(after, Some(c) if c.is_alphanumeric() || c == '_')
-        })
+    [
+        "GLUE_OBJECTS",
+        "GLUE_TABLES",
+        "GLUE_TABLE_COLUMNS",
+        "GLUE_INDEXES",
+    ]
+    .into_iter()
+    .any(|t| {
+        let i = match upper.find(t) {
+            Some(i) => i,
+            None => return false,
+        };
+        let before = upper[..i].chars().next_back();
+        let after = upper[i + t.len()..].chars().next();
+        !matches!(before, Some(c) if c.is_alphanumeric() || c == '_')
+            && !matches!(after, Some(c) if c.is_alphanumeric() || c == '_')
+    })
 }
 
 /// True if `sql` contains a JSON-path operator (`->>` or `->`). These are
@@ -1599,7 +1802,10 @@ async fn exec_query_inner(
     } else {
         sealed
     };
-    Ok((watermark_headers(tenant, wm), Json(record_batches_to_json(&batches))))
+    Ok((
+        watermark_headers(tenant, wm),
+        Json(record_batches_to_json(&batches)),
+    ))
 }
 
 /// `POST /admin/sql` — arbitrary SQL (DDL/txns/multi). Off by default; audited.
@@ -1615,7 +1821,11 @@ async fn admin_sql(
     let tenant = state.tenant(&headers)?;
     state.require_active()?;
     eprintln!("bluedb-audit: /admin/sql executed: {}", req.sql);
-    let params = req.params.iter().map(json_to_param).collect::<Result<Vec<_>, _>>()?;
+    let params = req
+        .params
+        .iter()
+        .map(json_to_param)
+        .collect::<Result<Vec<_>, _>>()?;
     let mut glue = Glue::new(state.connection_serialized(&tenant).await?);
     let payloads = rest_sql::execute_sql(&mut glue, &req.sql, &params, true).await?;
     Ok(Json(payloads_to_json(payloads)))
@@ -1644,8 +1854,8 @@ async fn select(
     // `%3E%3E`-encoded from any conformant client, and `parse_query` expects
     // already-decoded text. Separators (`&`/`=`) are literal in the URL, so they
     // survive; only `%XX` escapes within keys/values are decoded.
-    let decoded_qs = percent_encoding::percent_decode_str(query.as_deref().unwrap_or(""))
-        .decode_utf8_lossy();
+    let decoded_qs =
+        percent_encoding::percent_decode_str(query.as_deref().unwrap_or("")).decode_utf8_lossy();
     let rq = bluedb_rest::parse_query(&table, &decoded_qs).map_err(EngineError::from)?;
 
     let mut glue = Glue::new(state.connection(&tenant).await?);
@@ -1677,10 +1887,14 @@ async fn select(
                 } else {
                     sealed
                 };
-                (watermark_headers(&tenant, wm), Json(select_to_json(payloads, &json_cols)))
+                (
+                    watermark_headers(&tenant, wm),
+                    Json(select_to_json(payloads, &json_cols)),
+                )
             }
             Err(e) if is_guardrail_reject(&e) => {
-                route_select_to_analytical(&state, &headers, &tenant, &rq, &json_cols, sealed).await?
+                route_select_to_analytical(&state, &headers, &tenant, &rq, &json_cols, sealed)
+                    .await?
             }
             Err(e) => return Err(e.into()),
         }
@@ -1827,14 +2041,26 @@ async fn insert(
         let payloads = rest_sql::execute_insert_batch(&mut glue, &req).await?;
         payloads
             .iter()
-            .filter_map(|p| if let Payload::Insert(n) = p { Some(*n) } else { None })
+            .filter_map(|p| {
+                if let Payload::Insert(n) = p {
+                    Some(*n)
+                } else {
+                    None
+                }
+            })
             .sum()
     } else {
         let mut glue = Glue::new(state.connection(&tenant).await?);
         let payloads = rest_sql::execute_insert(&mut glue, &req).await?;
         payloads
             .iter()
-            .filter_map(|p| if let Payload::Insert(n) = p { Some(*n) } else { None })
+            .filter_map(|p| {
+                if let Payload::Insert(n) = p {
+                    Some(*n)
+                } else {
+                    None
+                }
+            })
             .sum()
     };
     let wm = state.write_watermark(&tenant).await;
@@ -1853,7 +2079,10 @@ async fn insert(
         }
         // Can't identify the rows by PK (e.g. multi-row composite) → fall back to count.
     }
-    Ok((watermark_headers(&tenant, wm), Json(json!({ "inserted": inserted }))))
+    Ok((
+        watermark_headers(&tenant, wm),
+        Json(json!({ "inserted": inserted })),
+    ))
 }
 
 /// `PATCH /tables/{table}?<filters>` — UPDATE (JSON assignments body).
@@ -1875,7 +2104,11 @@ async fn update(
         .into_iter()
         .map(|(col, value)| Ok((col, json_scalar_to_dsl(&value)?)))
         .collect::<Result<Vec<_>, AppError>>()?;
-    let req = UpdateRequest { table, assignments, filters };
+    let req = UpdateRequest {
+        table,
+        assignments,
+        filters,
+    };
     // UPDATE is a read-modify-write; serialize so concurrent ones can't lose.
     let mut glue = Glue::new(state.connection_serialized(&tenant).await?);
     let payloads = rest_sql::execute_update(&mut glue, &req).await?;
@@ -1888,7 +2121,10 @@ async fn update(
         let rows = read_affected_json(&state, &tenant, &req.table, req.filters.clone()).await?;
         return Ok((watermark_headers(&tenant, wm), Json(rows)));
     }
-    Ok((watermark_headers(&tenant, wm), Json(payloads_to_json(payloads))))
+    Ok((
+        watermark_headers(&tenant, wm),
+        Json(payloads_to_json(payloads)),
+    ))
 }
 
 /// `DELETE /tables/{table}?<filters>` — DELETE.
@@ -1920,7 +2156,10 @@ async fn delete_rows(
     let wm = state.write_watermark(&tenant).await;
     match repr {
         Some(rows) => Ok((watermark_headers(&tenant, wm), Json(rows))),
-        None => Ok((watermark_headers(&tenant, wm), Json(payloads_to_json(payloads)))),
+        None => Ok((
+            watermark_headers(&tenant, wm),
+            Json(payloads_to_json(payloads)),
+        )),
     }
 }
 
@@ -1932,7 +2171,10 @@ async fn delete_rows(
 /// serving from the pre-failover reader (see [`Inner::writer_bound`]).
 async fn admin_status(State(state): State<AppState>) -> Json<Value> {
     let writer_bound = state.inner.writer_bound.load(Ordering::Acquire);
-    Json(status_json_effective(&state.inner.writer.status(), writer_bound))
+    Json(status_json_effective(
+        &state.inner.writer.status(),
+        writer_bound,
+    ))
 }
 
 /// `POST /admin/promote` — acquire the lease + open the writer database.
@@ -2023,15 +2265,22 @@ fn build_insert(table: String, body: Value) -> Result<(InsertRequest, bool), App
     for object in &objects {
         let mut row = Vec::with_capacity(columns.len());
         for column in &columns {
-            let value = object
-                .get(column)
-                .ok_or_else(|| AppError::bad_request(format!("row is missing column '{column}'")))?;
+            let value = object.get(column).ok_or_else(|| {
+                AppError::bad_request(format!("row is missing column '{column}'"))
+            })?;
             row.push(json_scalar_to_dsl(value)?);
         }
         rows.push(row);
     }
 
-    Ok((InsertRequest { table, columns, rows }, is_batch))
+    Ok((
+        InsertRequest {
+            table,
+            columns,
+            rows,
+        },
+        is_batch,
+    ))
 }
 
 /// Render a JSON value into the DSL string form `bluedb-rest` expects. (Like
@@ -2080,7 +2329,12 @@ fn select_to_json(payloads: Vec<Payload>, json_cols: &[String]) -> Value {
                 .map(|m| {
                     let obj: Map<String, Value> = m
                         .iter()
-                        .map(|(k, v)| (k.clone(), reinflate_json(k, sql_value_to_json(v), json_cols)))
+                        .map(|(k, v)| {
+                            (
+                                k.clone(),
+                                reinflate_json(k, sql_value_to_json(v), json_cols),
+                            )
+                        })
                         .collect();
                     Value::Object(obj)
                 })
@@ -2177,7 +2431,11 @@ fn content_range(offset: usize, returned: usize, total: i64) -> String {
 /// filter must run on the analytical engine (GlueSQL has no JSON functions);
 /// everything else counts on an unguarded SlateDB connection — the client opted
 /// into the scan, and the count reflects fresh OLTP state.
-async fn count_rows(state: &AppState, tenant: &str, rq: &bluedb_rest::RestQuery) -> Result<i64, AppError> {
+async fn count_rows(
+    state: &AppState,
+    tenant: &str,
+    rq: &bluedb_rest::RestQuery,
+) -> Result<i64, AppError> {
     let (sql, params) = rq.to_count_sql_with_params().map_err(EngineError::from)?;
     if rq.has_json_path() {
         let manager = state.lakehouse().await.ok_or_else(|| {
@@ -2313,7 +2571,12 @@ fn parse_returning(sql: &str) -> Result<Option<ReturningSpec>, AppError> {
             let insert_value_rows = rows.map(|r| (columns, r));
             (WriteKind::Insert, table, returning, None, insert_value_rows)
         }
-        Statement::Update { table, selection, returning, .. } => {
+        Statement::Update {
+            table,
+            selection,
+            returning,
+            ..
+        } => {
             let returning = returning.take();
             let pred = selection.as_ref().map(|e| e.to_string());
             let table = table_name_of_relation(&table.relation);
@@ -2333,7 +2596,9 @@ fn parse_returning(sql: &str) -> Result<Option<ReturningSpec>, AppError> {
         }
         _ => return Ok(None),
     };
-    let Some(returning) = returning else { return Ok(None) };
+    let Some(returning) = returning else {
+        return Ok(None);
+    };
     // Resolve the projected columns: `*` → all (empty), else each named column.
     let mut cols = Vec::new();
     let mut star = false;
@@ -2341,7 +2606,10 @@ fn parse_returning(sql: &str) -> Result<Option<ReturningSpec>, AppError> {
         match item {
             SelectItem::Wildcard(_) => star = true,
             SelectItem::UnnamedExpr(Expr::Identifier(id))
-            | SelectItem::ExprWithAlias { expr: Expr::Identifier(id), .. } => cols.push(id.value.clone()),
+            | SelectItem::ExprWithAlias {
+                expr: Expr::Identifier(id),
+                ..
+            } => cols.push(id.value.clone()),
             other => {
                 return Err(AppError::bad_request(format!(
                     "RETURNING only supports `*` or bare column names; got `{other}`"
@@ -2364,10 +2632,7 @@ fn parse_returning(sql: &str) -> Result<Option<ReturningSpec>, AppError> {
 
 /// The unqualified last segment of a sqlparser [`ObjectName`] (the table name).
 fn table_name_of(name: &gluesql_core::sqlparser::ast::ObjectName) -> String {
-    name.0
-        .last()
-        .map(|i| i.value.clone())
-        .unwrap_or_default()
+    name.0.last().map(|i| i.value.clone()).unwrap_or_default()
 }
 
 /// The table name a `FROM` relation names, whatever its shape.
@@ -2499,14 +2764,22 @@ fn insert_returning_predicate(
     };
     if positions.len() == 1 {
         let i = positions[0];
-        let vals = rows.iter().map(|r| r.get(i).cloned().unwrap_or_else(|| "NULL".into())).collect::<Vec<_>>().join(", ");
+        let vals = rows
+            .iter()
+            .map(|r| r.get(i).cloned().unwrap_or_else(|| "NULL".into()))
+            .collect::<Vec<_>>()
+            .join(", ");
         Ok(Some(format!("{} IN ({})", pk_cols[0], vals)))
     } else {
         let tuple = format!("({})", pk_cols.join(", "));
         let vals = rows
             .iter()
             .map(|r| {
-                let t = positions.iter().map(|&i| r.get(i).cloned().unwrap_or_else(|| "NULL".into())).collect::<Vec<_>>().join(", ");
+                let t = positions
+                    .iter()
+                    .map(|&i| r.get(i).cloned().unwrap_or_else(|| "NULL".into()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 format!("({t})")
             })
             .collect::<Vec<_>>()
@@ -2599,8 +2872,10 @@ fn payload_to_json(payload: Payload) -> Value {
         Payload::SelectMap(maps) => Value::Array(
             maps.into_iter()
                 .map(|m| {
-                    let obj: Map<String, Value> =
-                        m.iter().map(|(k, v)| (k.clone(), sql_value_to_json(v))).collect();
+                    let obj: Map<String, Value> = m
+                        .iter()
+                        .map(|(k, v)| (k.clone(), sql_value_to_json(v)))
+                        .collect();
                     Value::Object(obj)
                 })
                 .collect(),
@@ -2639,8 +2914,12 @@ fn sql_value_to_json(value: &SqlValue) -> Value {
         // can't lose precision past 2^53. `u8`/`u16`/`u32` stay numeric (they fit
         // in a safe integer); `u64` does not.
         SqlValue::U64(n) => Value::String(n.to_string()),
-        SqlValue::F32(x) => serde_json::Number::from_f64(*x as f64).map(Value::Number).unwrap_or(Value::Null),
-        SqlValue::F64(x) => serde_json::Number::from_f64(*x).map(Value::Number).unwrap_or(Value::Null),
+        SqlValue::F32(x) => serde_json::Number::from_f64(*x as f64)
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
+        SqlValue::F64(x) => serde_json::Number::from_f64(*x)
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
         // 128-bit ints exceed JSON's safe integer range, so emit them as
         // decimal strings (precision-preserving, like the `/ledger` API). This
         // is what makes the ledger's U128 projection columns usable over HTTP.
@@ -2720,9 +2999,18 @@ mod flush_interval_cfg {
     #[test]
     fn defaults_to_25ms_and_parses_override() {
         assert_eq!(parse_flush_interval_ms(None), Duration::from_millis(25));
-        assert_eq!(parse_flush_interval_ms(Some("50")), Duration::from_millis(50));
-        assert_eq!(parse_flush_interval_ms(Some("100")), Duration::from_millis(100));
-        assert_eq!(parse_flush_interval_ms(Some("abc")), Duration::from_millis(25));
+        assert_eq!(
+            parse_flush_interval_ms(Some("50")),
+            Duration::from_millis(50)
+        );
+        assert_eq!(
+            parse_flush_interval_ms(Some("100")),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            parse_flush_interval_ms(Some("abc")),
+            Duration::from_millis(25)
+        );
         assert_eq!(parse_flush_interval_ms(Some("")), Duration::from_millis(25));
         assert_eq!(parse_flush_interval_ms(Some("0")), Duration::from_millis(0));
     }
@@ -2735,12 +3023,30 @@ mod fts_seal_interval_cfg {
 
     #[test]
     fn defaults_to_30s_and_parses_override() {
-        assert_eq!(parse_fts_seal_interval_ms(None), Duration::from_millis(30_000));
-        assert_eq!(parse_fts_seal_interval_ms(Some("5000")), Duration::from_millis(5_000));
-        assert_eq!(parse_fts_seal_interval_ms(Some("100")), Duration::from_millis(100));
-        assert_eq!(parse_fts_seal_interval_ms(Some("abc")), Duration::from_millis(30_000));
-        assert_eq!(parse_fts_seal_interval_ms(Some("")), Duration::from_millis(30_000));
-        assert_eq!(parse_fts_seal_interval_ms(Some("0")), Duration::from_millis(0));
+        assert_eq!(
+            parse_fts_seal_interval_ms(None),
+            Duration::from_millis(30_000)
+        );
+        assert_eq!(
+            parse_fts_seal_interval_ms(Some("5000")),
+            Duration::from_millis(5_000)
+        );
+        assert_eq!(
+            parse_fts_seal_interval_ms(Some("100")),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            parse_fts_seal_interval_ms(Some("abc")),
+            Duration::from_millis(30_000)
+        );
+        assert_eq!(
+            parse_fts_seal_interval_ms(Some("")),
+            Duration::from_millis(30_000)
+        );
+        assert_eq!(
+            parse_fts_seal_interval_ms(Some("0")),
+            Duration::from_millis(0)
+        );
     }
 }
 
@@ -2773,6 +3079,51 @@ mod insert_routing {
     }
 }
 
+#[cfg(test)]
+mod ha_promotion_state {
+    use super::AppState;
+    use bluedb_ha::{LocalLeaseProvider, SystemClock, WriterController};
+    use slatedb::object_store::{memory::InMemory, ObjectStore};
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn ha_tick_keeps_active_controller_while_promotion_is_binding_writer_db() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let writer = Arc::new(WriterController::new(
+            "node-a",
+            Arc::new(LocalLeaseProvider::new()),
+            Arc::new(SystemClock),
+            Duration::from_secs(30),
+            Duration::from_secs(5),
+        ));
+        let state = AppState::new(store, "bluedb", writer);
+
+        state.writer().promote().await.expect("lease acquired");
+        state
+            .inner
+            .promotion_inflight
+            .store(true, Ordering::Release);
+
+        state.ha_tick().await;
+        assert!(
+            state.writer().is_active(),
+            "promotion-in-flight active controller must renew, not demote"
+        );
+
+        state
+            .inner
+            .promotion_inflight
+            .store(false, Ordering::Release);
+        state.ha_tick().await;
+        assert!(
+            !state.writer().is_active(),
+            "orphaned active controller should be released once no promotion is in flight"
+        );
+    }
+}
+
 // --- errors -----------------------------------------------------------------
 
 /// An HTTP error: a status plus a message rendered as `{"error": ...}`.
@@ -2791,7 +3142,12 @@ pub struct AppError {
 impl AppError {
     /// Build a plain error without extra headers.
     fn plain(status: StatusCode, message: impl Into<String>) -> Self {
-        Self { status, message: message.into(), extra_headers: None, code: None }
+        Self {
+            status,
+            message: message.into(),
+            extra_headers: None,
+            code: None,
+        }
     }
 
     /// Attach a stable machine-readable code (see [`Self::code`]).
@@ -2869,7 +3225,9 @@ fn classify_engine_error(err: &EngineError) -> (StatusCode, Option<&'static str>
     }
     if let EngineError::Sql(g) = err {
         match g {
-            G::Parser(_) | G::Translate(_) => return (StatusCode::BAD_REQUEST, Some("PARSE_ERROR")),
+            G::Parser(_) | G::Translate(_) => {
+                return (StatusCode::BAD_REQUEST, Some("PARSE_ERROR"))
+            }
             G::Value(_) => return (StatusCode::BAD_REQUEST, Some("TYPE_MISMATCH")),
             _ => {}
         }

@@ -24,16 +24,15 @@
   ;; UPDATE is a self-contained read-modify-write on the PK (WHERE id = 1 is
   ;; PK-served, so the guardrail allows it); the writer serializes such RMWs.
   (http/post (str (h/base node) "/sql")
-             {:body (json/generate-string
-                     {:sql (format "UPDATE cnt SET n = n + %d WHERE id = 1;" delta)})
-              :content-type :json
-              :throw-exceptions false
-              :socket-timeout 8000
-              :connection-timeout 2000}))
+             (h/opts :body (json/generate-string
+                             {:sql (format "UPDATE cnt SET n = n + %d WHERE id = 1;" delta)})
+                     :content-type :json
+                     :socket-timeout 8000
+                     :connection-timeout 2000)))
 
 (defn- read-counter [node]
   (let [r (http/get (str (h/base node) "/tables/cnt?id=eq.1")
-                    {:throw-exceptions false :socket-timeout 5000 :connection-timeout 2000})]
+                    (h/opts :socket-timeout 5000 :connection-timeout 2000))]
     (when (= 200 (:status r))
       (some-> (json/parse-string (:body r) true) first :n))))
 

@@ -10,6 +10,15 @@ store), so you scale or replace nodes freely.
 docker build -t bluedb-server:dev .
 ```
 
+For a Kubernetes image that can use the native `coordination.k8s.io/Lease`
+arbiter and EndpointSlice node registry:
+
+```bash
+docker build \
+  --build-arg BLUEDB_CARGO_FEATURES=kubernetes \
+  -t bluedb-server:k8s .
+```
+
 ## Run a node
 
 Point a node at an object store and (for multi-node) a lease arbiter, entirely
@@ -47,7 +56,8 @@ the provider's gateway.
 ## Multi-node
 
 Run several nodes pointed at the **same** bucket + `BLUEDB_DB_PATH` and the
-**same** `BLUEDB_LEASE_PG_URL`, each with a distinct `BLUEDB_NODE_ID`. The lease
-arbiter elects one writer; the rest serve reads. This is exactly what the
-[Compose stack](local.md) does. See [Configuration](configuration.md) for the
-full variable list and [Kubernetes](kubernetes.md) for an orchestrated topology.
+same lease backend, each with a distinct `BLUEDB_NODE_ID`. Outside Kubernetes,
+use the same `BLUEDB_LEASE_PG_URL`. In Kubernetes, build with the `kubernetes`
+feature and set `BLUEDB_LEASE_BACKEND=kubernetes`. The lease arbiter elects one
+writer; the rest serve reads. See [Configuration](configuration.md) for the full
+variable list and [Kubernetes](kubernetes.md) for an orchestrated topology.
