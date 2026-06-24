@@ -68,6 +68,7 @@ pub fn register_extensions(ctx: &mut SessionContext) -> datafusion::error::Resul
 pub fn analytical_context() -> datafusion::error::Result<SessionContext> {
     use datafusion::execution::config::SessionConfig;
     use datafusion::execution::SessionStateBuilder;
+
     // DataFusion implements recursive CTEs but ships them behind a flag that
     // defaults to off. Turn it on so `WITH RECURSIVE` works on the analytical
     // path (the engine handles the fixed-point iteration; bluedb has no reason
