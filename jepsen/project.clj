@@ -3,7 +3,7 @@
   :url "https://github.com/bluecopa/bluedb"
   :main bluedb.jepsen.core
   :jvm-opts ["-Djava.awt.headless=true"
-             ;; JDK 17 needs these opened for Jepsen's transitive deps
+             ;; Jepsen's transitive deps still use reflective access on modern JDKs.
              "--add-opens=java.base/java.lang=ALL-UNNAMED"
              "--add-opens=java.base/java.util=ALL-UNNAMED"
              "--add-opens=java.base/java.util.concurrent=ALL-UNNAMED"

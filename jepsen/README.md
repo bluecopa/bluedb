@@ -91,8 +91,11 @@ window. The clock-skew nemesis needs the image's libfaketime entrypoint
 ## Running
 
 Prereqs: the cluster must be **up** (`docker compose up -d` from the repo root)
-and **Java 21+** on `$PATH` (a transitive dep needs `java.util.SequencedCollection`;
-JDK 17 fails to load it). Leiningen is vendored at `bin/lein`.
+and **Java 21+** installed (a transitive dep needs `java.util.SequencedCollection`;
+JDK 17 fails to load it). Leiningen is vendored at `bin/lein`; the wrapper
+selects Java 21+ from `LEIN_JAVA_CMD`, `JAVA_CMD`, `JAVA_HOME`, `PATH`, macOS
+`/usr/libexec/java_home`, or Homebrew `openjdk@21`, and fails fast if none is
+available.
 
 > **Schema-regime note.** The merged schema regime removed schemaless table
 > auto-create and caps a single read at 100 rows. Two workloads are ported for it:
@@ -134,8 +137,8 @@ JDK 17 fails to load it). Leiningen is vendored at `bin/lein`.
 ```bash
 cd jepsen
 export LEIN_HOME="$PWD/.lein"
-# point at a JDK 21+ if your default `java` is older, e.g. on macOS:
-# export JAVA_HOME=$(/usr/libexec/java_home -v 24); export PATH="$JAVA_HOME/bin:$PATH"
+# Optional override when multiple JDKs are installed:
+# export JAVA_HOME=/opt/homebrew/opt/openjdk@21
 
 NODES="--node node1 --node node2 --node node3"
 
