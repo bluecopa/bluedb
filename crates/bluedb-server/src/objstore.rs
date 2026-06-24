@@ -84,8 +84,8 @@ impl ObjectStoreConfig {
             ObjectStoreConfig::Gcs { bucket, .. } => format!("gs://{bucket}"),
             ObjectStoreConfig::Azure { container, .. } => format!("abfss://{container}"),
             ObjectStoreConfig::Local { dir } => {
-                let abs = std::fs::canonicalize(dir)
-                    .unwrap_or_else(|_| std::path::PathBuf::from(dir));
+                let abs =
+                    std::fs::canonicalize(dir).unwrap_or_else(|_| std::path::PathBuf::from(dir));
                 format!("file://{}", abs.display())
             }
             ObjectStoreConfig::Memory => String::new(),
@@ -98,7 +98,13 @@ impl ObjectStoreConfig {
 /// local creates the directory; memory is ephemeral.
 pub fn build_object_store(cfg: &ObjectStoreConfig) -> anyhow::Result<Arc<dyn ObjectStore>> {
     match cfg {
-        ObjectStoreConfig::S3 { bucket, region, endpoint, access_key_id, secret_access_key } => {
+        ObjectStoreConfig::S3 {
+            bucket,
+            region,
+            endpoint,
+            access_key_id,
+            secret_access_key,
+        } => {
             let mut b = AmazonS3Builder::new()
                 .with_bucket_name(bucket.clone())
                 .with_region(region.clone().unwrap_or_else(|| "us-east-1".to_string()));
@@ -115,7 +121,12 @@ pub fn build_object_store(cfg: &ObjectStoreConfig) -> anyhow::Result<Arc<dyn Obj
             eprintln!("bluedb-server: object store = S3 (bucket={bucket})");
             Ok(Arc::new(b.build()?))
         }
-        ObjectStoreConfig::Azure { container, account, access_key, endpoint } => {
+        ObjectStoreConfig::Azure {
+            container,
+            account,
+            access_key,
+            endpoint,
+        } => {
             let mut b = MicrosoftAzureBuilder::new().with_container_name(container.clone());
             if let Some(a) = account {
                 b = b.with_account(a.clone());
@@ -130,7 +141,10 @@ pub fn build_object_store(cfg: &ObjectStoreConfig) -> anyhow::Result<Arc<dyn Obj
             eprintln!("bluedb-server: object store = Azure Blob (container={container})");
             Ok(Arc::new(b.build()?))
         }
-        ObjectStoreConfig::Gcs { bucket, service_account } => {
+        ObjectStoreConfig::Gcs {
+            bucket,
+            service_account,
+        } => {
             let mut b = GoogleCloudStorageBuilder::new().with_bucket_name(bucket.clone());
             if let Some(sa) = service_account {
                 b = b.with_service_account_path(sa.clone());
@@ -157,8 +171,10 @@ mod tests {
 
     /// Build a `get` closure from a fixed set of key/value pairs.
     fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
-        let map: HashMap<String, String> =
-            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         move |k| map.get(k).cloned()
     }
 
@@ -221,7 +237,10 @@ mod tests {
         let cfg = parse_object_store_config(env(&[
             ("BLUEDB_AZURE_CONTAINER", "c"),
             ("BLUEDB_AZURE_ACCOUNT", "devstoreaccount1"),
-            ("BLUEDB_AZURE_ENDPOINT", "http://azurite:10000/devstoreaccount1"),
+            (
+                "BLUEDB_AZURE_ENDPOINT",
+                "http://azurite:10000/devstoreaccount1",
+            ),
         ]));
         assert_eq!(
             cfg,
@@ -252,7 +271,12 @@ mod tests {
     #[test]
     fn local_selected_when_only_data_dir_present() {
         let cfg = parse_object_store_config(env(&[("BLUEDB_DATA_DIR", "/data")]));
-        assert_eq!(cfg, ObjectStoreConfig::Local { dir: "/data".into() });
+        assert_eq!(
+            cfg,
+            ObjectStoreConfig::Local {
+                dir: "/data".into()
+            }
+        );
     }
 
     #[test]
@@ -291,7 +315,9 @@ mod tests {
     #[test]
     fn builds_local_dir() {
         let dir = std::env::temp_dir().join("bluedb-objstore-test-local");
-        let cfg = ObjectStoreConfig::Local { dir: dir.to_string_lossy().into_owned() };
+        let cfg = ObjectStoreConfig::Local {
+            dir: dir.to_string_lossy().into_owned(),
+        };
         assert!(build_object_store(&cfg).is_ok());
     }
 
@@ -352,7 +378,10 @@ mod tests {
     fn builds_gcs_with_bucket_only() {
         // No service account / ADC present in tests → credentials resolve to None
         // and build() still succeeds (deferred to request time).
-        let cfg = ObjectStoreConfig::Gcs { bucket: "g".into(), service_account: None };
+        let cfg = ObjectStoreConfig::Gcs {
+            bucket: "g".into(),
+            service_account: None,
+        };
         assert!(build_object_store(&cfg).is_ok());
     }
 }

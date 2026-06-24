@@ -33,15 +33,15 @@ use bluedb_fts::merge::Compactor;
 use bluedb_fts::open::open_split_lazy;
 use bluedb_fts::policy::CompactionPolicy;
 use bluedb_fts::search::{
-    multi_split_count_query_filtered, multi_split_search_filtered,
-    multi_split_search_filtered_ids, multi_split_search_query_filtered_ids,
-    multi_split_search_query_sorted_ids, MultiSplitHit, SplitHandle,
+    multi_split_count_query_filtered, multi_split_search_filtered, multi_split_search_filtered_ids,
+    multi_split_search_query_filtered_ids, multi_split_search_query_sorted_ids, MultiSplitHit,
+    SplitHandle,
 };
-use tantivy::query::Query;
 use bluedb_fts::tombstones::Tombstones;
 use bluedb_fts::writer::IndexWriter;
 use bluedb_fts::IdField;
 use bluedb_storage::{BlobStore, BlobStoreMut, SlateDbBlobStore};
+use tantivy::query::Query;
 
 use crate::error::Result;
 
@@ -180,7 +180,13 @@ impl FtsIndex {
         let mut manifest = self.load_manifest().await?;
         let mut tombstones = self.load_tombstones().await?;
         let mut writer = IndexWriter::new();
-        let result = writer.update(&mut manifest, &mut tombstones, old_ids, self.schema.clone(), docs)?;
+        let result = writer.update(
+            &mut manifest,
+            &mut tombstones,
+            old_ids,
+            self.schema.clone(),
+            docs,
+        )?;
         self.blob
             .put(&result.blob_key, Bytes::from(result.split_bytes))
             .await?;
@@ -211,13 +217,20 @@ impl FtsIndex {
 
     /// Search the index for `query` over `fields`, returning the top `limit`
     /// live hits (tombstoned docs excluded, generation-scoped + deduped).
-    pub async fn search(&self, query: &str, fields: &[Field], limit: usize) -> Result<Vec<MultiSplitHit>> {
+    pub async fn search(
+        &self,
+        query: &str,
+        fields: &[Field],
+        limit: usize,
+    ) -> Result<Vec<MultiSplitHit>> {
         let manifest = self.load_manifest().await?;
         let tombstones = self.load_tombstones().await?;
         let opened = self.open_splits(manifest.splits.iter()).await?;
         let handles: Vec<SplitHandle> = opened
             .iter()
-            .map(|(id, generation, index)| SplitHandle::with_generation(id.clone(), *generation, index))
+            .map(|(id, generation, index)| {
+                SplitHandle::with_generation(id.clone(), *generation, index)
+            })
             .collect();
         Ok(multi_split_search_filtered(
             &handles,
@@ -244,7 +257,9 @@ impl FtsIndex {
         let opened = self.open_splits(manifest.splits.iter()).await?;
         let handles: Vec<SplitHandle> = opened
             .iter()
-            .map(|(id, generation, index)| SplitHandle::with_generation(id.clone(), *generation, index))
+            .map(|(id, generation, index)| {
+                SplitHandle::with_generation(id.clone(), *generation, index)
+            })
             .collect();
         Ok(multi_split_search_filtered_ids(
             &handles,
@@ -267,7 +282,9 @@ impl FtsIndex {
         let opened = self.open_splits(manifest.splits.iter()).await?;
         let handles: Vec<SplitHandle> = opened
             .iter()
-            .map(|(id, generation, index)| SplitHandle::with_generation(id.clone(), *generation, index))
+            .map(|(id, generation, index)| {
+                SplitHandle::with_generation(id.clone(), *generation, index)
+            })
             .collect();
         Ok(multi_split_search_query_filtered_ids(
             &handles,
@@ -285,7 +302,9 @@ impl FtsIndex {
         let opened = self.open_splits(manifest.splits.iter()).await?;
         let handles: Vec<SplitHandle> = opened
             .iter()
-            .map(|(id, generation, index)| SplitHandle::with_generation(id.clone(), *generation, index))
+            .map(|(id, generation, index)| {
+                SplitHandle::with_generation(id.clone(), *generation, index)
+            })
             .collect();
         Ok(multi_split_count_query_filtered(
             &handles,
@@ -308,7 +327,9 @@ impl FtsIndex {
         let opened = self.open_splits(manifest.splits.iter()).await?;
         let handles: Vec<SplitHandle> = opened
             .iter()
-            .map(|(id, generation, index)| SplitHandle::with_generation(id.clone(), *generation, index))
+            .map(|(id, generation, index)| {
+                SplitHandle::with_generation(id.clone(), *generation, index)
+            })
             .collect();
         Ok(multi_split_search_query_sorted_ids(
             &handles,
@@ -340,10 +361,17 @@ impl FtsIndex {
         }
 
         let opened = self
-            .open_splits(manifest.splits.iter().filter(|sm| plan.contains(&sm.split_id)))
+            .open_splits(
+                manifest
+                    .splits
+                    .iter()
+                    .filter(|sm| plan.contains(&sm.split_id)),
+            )
             .await?;
-        let inputs: Vec<(String, u64, &tantivy::Index)> =
-            opened.iter().map(|(id, generation, index)| (id.clone(), *generation, index)).collect();
+        let inputs: Vec<(String, u64, &tantivy::Index)> = opened
+            .iter()
+            .map(|(id, generation, index)| (id.clone(), *generation, index))
+            .collect();
 
         let result = Compactor::new().compact(
             &manifest,
@@ -385,7 +413,10 @@ impl FtsIndex {
                     Ok(Some(summary)) => {
                         tracing_log(&format!(
                             "bluedb-engine[{}]: compacted into {} ({} superseded, {} blobs GC'd)",
-                            self.index_id, summary.compacted_split_id, summary.superseded, summary.deleted_blobs
+                            self.index_id,
+                            summary.compacted_split_id,
+                            summary.superseded,
+                            summary.deleted_blobs
                         ));
                     }
                     Ok(None) => {}

@@ -22,7 +22,9 @@ pub(crate) struct EvidenceKeyspace {
 
 impl EvidenceKeyspace {
     pub(crate) fn new(tenant: &str) -> Self {
-        Self { ks: Keyspace::new(tenant) }
+        Self {
+            ks: Keyspace::new(tenant),
+        }
     }
 
     /// `<len(chain)::u32-be> <chain_utf8>` — length-prefixed so names form
@@ -45,7 +47,8 @@ impl EvidenceKeyspace {
 
     /// Shared prefix of every entry key for `chain`.
     pub(crate) fn entry_prefix(&self, chain: &str) -> Vec<u8> {
-        self.ks.external_key(TAG_EVIDENCE_ENTRY, &Self::chain_suffix(chain))
+        self.ks
+            .external_key(TAG_EVIDENCE_ENTRY, &Self::chain_suffix(chain))
     }
 
     /// Exclusive upper bound for a range scan over all entries of `chain`.
@@ -55,7 +58,8 @@ impl EvidenceKeyspace {
 
     /// Key for the per-chain monotonic sequence counter.
     pub(crate) fn seq_key(&self, chain: &str) -> Vec<u8> {
-        self.ks.external_key(TAG_EVIDENCE_SEQ, &Self::chain_suffix(chain))
+        self.ks
+            .external_key(TAG_EVIDENCE_SEQ, &Self::chain_suffix(chain))
     }
 
     /// Key for an idempotency record `(chain, idem_token)`.
@@ -67,12 +71,14 @@ impl EvidenceKeyspace {
 
     /// Key for the chain-level metadata record.
     pub(crate) fn chain_meta_key(&self, chain: &str) -> Vec<u8> {
-        self.ks.external_key(TAG_EVIDENCE_CHAIN, &Self::chain_suffix(chain))
+        self.ks
+            .external_key(TAG_EVIDENCE_CHAIN, &Self::chain_suffix(chain))
     }
 
     /// Key for the per-chain Merkle frontier (verified chains only).
     pub(crate) fn merkle_key(&self, chain: &str) -> Vec<u8> {
-        self.ks.external_key(TAG_EVIDENCE_MERKLE, &Self::chain_suffix(chain))
+        self.ks
+            .external_key(TAG_EVIDENCE_MERKLE, &Self::chain_suffix(chain))
     }
 
     /// Key for a persisted complete-subtree Merkle node at `(level, index)`:
@@ -97,7 +103,14 @@ impl EvidenceKeyspace {
 
     /// Out-adjacency key: `graph ‖ src ‖ weight_obe ‖ dst ‖ type`. Value = `[1u8]`.
     /// A node's out-edges sort by weight ascending under the `(graph, src)` prefix.
-    pub(crate) fn graph_out_key(&self, graph: &str, src: &str, weight: i64, dst: &str, etype: &str) -> Vec<u8> {
+    pub(crate) fn graph_out_key(
+        &self,
+        graph: &str,
+        src: &str,
+        weight: i64,
+        dst: &str,
+        etype: &str,
+    ) -> Vec<u8> {
         let mut s = Vec::new();
         push_lp(&mut s, graph);
         push_lp(&mut s, src);
@@ -108,7 +121,14 @@ impl EvidenceKeyspace {
     }
 
     /// In-adjacency key: `graph ‖ dst ‖ weight_obe ‖ src ‖ type`. Value = `[1u8]`.
-    pub(crate) fn graph_in_key(&self, graph: &str, dst: &str, weight: i64, src: &str, etype: &str) -> Vec<u8> {
+    pub(crate) fn graph_in_key(
+        &self,
+        graph: &str,
+        dst: &str,
+        weight: i64,
+        src: &str,
+        etype: &str,
+    ) -> Vec<u8> {
         let mut s = Vec::new();
         push_lp(&mut s, graph);
         push_lp(&mut s, dst);
@@ -211,7 +231,12 @@ mod tests {
     fn weight_obe_is_order_preserving() {
         let ws = [i64::MIN, -1000, -1, 0, 1, 1000, i64::MAX];
         for pair in ws.windows(2) {
-            assert!(weight_obe(pair[0]) < weight_obe(pair[1]), "{} vs {}", pair[0], pair[1]);
+            assert!(
+                weight_obe(pair[0]) < weight_obe(pair[1]),
+                "{} vs {}",
+                pair[0],
+                pair[1]
+            );
         }
         for w in ws {
             assert_eq!(weight_from_obe(&weight_obe(w)), w);
@@ -301,7 +326,10 @@ mod tests {
         let ks = EvidenceKeyspace::new("acme");
         assert_ne!(ks.merkle_node_key("c", 1, 0), ks.merkle_node_key("c", 1, 1));
         assert_ne!(ks.merkle_node_key("c", 1, 0), ks.merkle_node_key("c", 2, 0));
-        assert_ne!(ks.merkle_node_key("c", 1, 0), EvidenceKeyspace::new("globex").merkle_node_key("c", 1, 0));
+        assert_ne!(
+            ks.merkle_node_key("c", 1, 0),
+            EvidenceKeyspace::new("globex").merkle_node_key("c", 1, 0)
+        );
         // Distinct namespace from the frontier (0x1A) and chains.
         assert_ne!(ks.merkle_node_key("c", 1, 0), ks.merkle_key("c"));
     }

@@ -73,7 +73,11 @@ fn collect_id_v(batches: &[arrow_array::RecordBatch]) -> Vec<(i64, i64)> {
 async fn ryw_union_reflects_post_seal_mutations() {
     let (db, cdc, eng) = make_engine().await;
     eng.enable_table("t").await.unwrap();
-    ddl(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, label TEXT);").await;
+    ddl(
+        &db,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, label TEXT);",
+    )
+    .await;
 
     // Seal three rows into Iceberg (the columnar bulk).
     dml(
@@ -108,8 +112,17 @@ async fn ryw_union_reflects_post_seal_mutations() {
 async fn union_equals_sealed_when_tail_empty() {
     let (db, cdc, eng) = make_engine().await;
     eng.enable_table("t").await.unwrap();
-    ddl(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, label TEXT);").await;
-    dml(&db, &cdc, "INSERT INTO t VALUES (1, 10, 'a'), (2, 20, 'b');").await;
+    ddl(
+        &db,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, label TEXT);",
+    )
+    .await;
+    dml(
+        &db,
+        &cdc,
+        "INSERT INTO t VALUES (1, 10, 'a'), (2, 20, 'b');",
+    )
+    .await;
     eng.seal().await.unwrap();
 
     let batches = query_sql_unified(eng.clone(), "t", "SELECT id, v FROM t ORDER BY id")
@@ -125,9 +138,22 @@ async fn unified_join_across_two_tables() {
     let (db, cdc, eng) = make_engine().await;
     eng.enable_table("orders").await.unwrap();
     eng.enable_table("customers").await.unwrap();
-    ddl(&db, "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT);").await;
-    ddl(&db, "CREATE TABLE orders (id INTEGER PRIMARY KEY, amount INTEGER);").await;
-    dml(&db, &cdc, "INSERT INTO customers VALUES (1, 'alice'), (2, 'bob');").await;
+    ddl(
+        &db,
+        "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT);",
+    )
+    .await;
+    ddl(
+        &db,
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, amount INTEGER);",
+    )
+    .await;
+    dml(
+        &db,
+        &cdc,
+        "INSERT INTO customers VALUES (1, 'alice'), (2, 'bob');",
+    )
+    .await;
     dml(&db, &cdc, "INSERT INTO orders VALUES (1, 100), (2, 200);").await;
     eng.seal().await.unwrap();
 

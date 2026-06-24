@@ -93,7 +93,11 @@ async fn bound_int_param_widens_into_decimal_column() {
         )
         .await
         .expect("parameterised insert into a DECIMAL column should succeed");
-    assert!(matches!(payloads[0], Payload::Insert(1)), "got {:?}", payloads[0]);
+    assert!(
+        matches!(payloads[0], Payload::Insert(1)),
+        "got {:?}",
+        payloads[0]
+    );
 
     // It is stored as a real DECIMAL (the cast widened I64 → Decimal).
     let rows = select_rows(exec_one(&mut glue, "SELECT amount FROM t WHERE id = 1;").await);
@@ -111,7 +115,11 @@ async fn bound_int_param_widens_into_decimal_column() {
         )
         .await
         .expect("parameterised update of a DECIMAL column should succeed");
-    assert!(matches!(updated[0], Payload::Update(1)), "got {:?}", updated[0]);
+    assert!(
+        matches!(updated[0], Payload::Update(1)),
+        "got {:?}",
+        updated[0]
+    );
 }
 
 /// A `JSON`/`JSONB` column normalises to `TEXT` for GlueSQL, and the JSON-ness is
@@ -130,8 +138,13 @@ async fn json_columns_normalize_to_text_and_are_catalogued() {
     // JSON/JSONB were rewritten to TEXT so GlueSQL accepts the DDL.
     let upper = rewritten.to_uppercase();
     assert!(upper.contains("TEXT"), "expected TEXT, got: {rewritten}");
-    assert!(!upper.contains("JSON"), "JSON should be gone, got: {rewritten}");
-    glue.execute(&rewritten).await.expect("execute normalised DDL");
+    assert!(
+        !upper.contains("JSON"),
+        "JSON should be gone, got: {rewritten}"
+    );
+    glue.execute(&rewritten)
+        .await
+        .expect("execute normalised DDL");
 
     // The JSON columns are remembered (in declaration order); non-JSON columns are not.
     let json_cols = glue

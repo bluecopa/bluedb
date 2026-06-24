@@ -294,13 +294,19 @@ mod tests {
     fn run_first_and_array() {
         let j = r#"{"a":{"b":7},"items":[10,20,30]}"#;
         assert_eq!(run(j, "$.a.b", Output::First).unwrap(), Some("7".into()));
-        assert_eq!(run(j, "$.items[1]", Output::First).unwrap(), Some("20".into()));
+        assert_eq!(
+            run(j, "$.items[1]", Output::First).unwrap(),
+            Some("20".into())
+        );
         assert_eq!(
             run(j, "$.items[*]", Output::Array).unwrap(),
             Some("[10,20,30]".into())
         );
         // string match keeps JSON quotes (it's jsonb)
-        assert_eq!(run(r#"{"k":"v"}"#, "$.k", Output::First).unwrap(), Some(r#""v""#.into()));
+        assert_eq!(
+            run(r#"{"k":"v"}"#, "$.k", Output::First).unwrap(),
+            Some(r#""v""#.into())
+        );
         // supported path, genuine no-match → NULL (Postgres-faithful)
         assert_eq!(run(j, "$.nope", Output::First).unwrap(), None);
     }
@@ -337,7 +343,11 @@ mod tests {
             Some("7".into())
         );
         assert_eq!(
-            one(&ctx, r#"SELECT jsonb_path_query_array('{"x":[1,2,3]}', '$.x[*]')"#).await,
+            one(
+                &ctx,
+                r#"SELECT jsonb_path_query_array('{"x":[1,2,3]}', '$.x[*]')"#
+            )
+            .await,
             Some("[1,2,3]".into())
         );
         // a supported path that matches nothing → NULL
@@ -361,7 +371,11 @@ mod tests {
         // full analytical context rather than a bare register().
         let ctx = crate::analytical_context().unwrap();
         assert_eq!(
-            one(&ctx, r#"SELECT jsonb_path_query('{"a":42}', '$.a'::jsonpath)"#).await,
+            one(
+                &ctx,
+                r#"SELECT jsonb_path_query('{"a":42}', '$.a'::jsonpath)"#
+            )
+            .await,
             Some("42".into())
         );
     }

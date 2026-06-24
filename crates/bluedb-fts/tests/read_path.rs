@@ -38,7 +38,10 @@ async fn storage_directory_reads_substrate_byte_exact() {
     let handle: Arc<dyn FileHandle> = dir
         .get_file_handle(Path::new("idx/split-001.data"))
         .expect("file handle");
-    let slice = handle.read_bytes_async(100..200).await.expect("async slice");
+    let slice = handle
+        .read_bytes_async(100..200)
+        .await
+        .expect("async slice");
     assert_eq!(&slice[..], &content[100..200], "byte-range read must match");
 
     let all = dir

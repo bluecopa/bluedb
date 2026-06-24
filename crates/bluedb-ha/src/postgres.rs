@@ -150,7 +150,12 @@ fn ttl_millis(ttl: Duration) -> i64 {
 
 #[async_trait]
 impl LeaseProvider for PostgresLeaseProvider {
-    async fn try_acquire(&self, holder: &str, ttl: Duration, now_millis: i64) -> Result<Option<Lease>> {
+    async fn try_acquire(
+        &self,
+        holder: &str,
+        ttl: Duration,
+        now_millis: i64,
+    ) -> Result<Option<Lease>> {
         let expires = now_millis + ttl_millis(ttl);
         // Atomic upsert. The DO UPDATE only fires when the row is ours, free, or
         // expired (the WHERE); otherwise nothing is written and no row is
@@ -175,7 +180,13 @@ impl LeaseProvider for PostgresLeaseProvider {
         Ok(row.as_ref().map(Self::row_to_lease))
     }
 
-    async fn renew(&self, holder: &str, epoch: u64, ttl: Duration, now_millis: i64) -> Result<Option<Lease>> {
+    async fn renew(
+        &self,
+        holder: &str,
+        epoch: u64,
+        ttl: Duration,
+        now_millis: i64,
+    ) -> Result<Option<Lease>> {
         let expires = now_millis + ttl_millis(ttl);
         let sql = "\
             UPDATE bluedb_lease SET expires_at_millis = $1 \
@@ -184,7 +195,16 @@ impl LeaseProvider for PostgresLeaseProvider {
         let row = self
             .live()
             .await?
-            .query_opt(sql, &[&expires, &self.resource, &holder, &(epoch as i64), &now_millis])
+            .query_opt(
+                sql,
+                &[
+                    &expires,
+                    &self.resource,
+                    &holder,
+                    &(epoch as i64),
+                    &now_millis,
+                ],
+            )
             .await
             .context("lease renew")?;
         Ok(row.as_ref().map(Self::row_to_lease))

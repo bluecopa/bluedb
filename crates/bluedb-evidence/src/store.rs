@@ -38,7 +38,10 @@ pub(crate) async fn get_seq(
 ) -> Result<i64> {
     match substrate.get(&ks.seq_key(chain)).await? {
         Some(b) => {
-            let arr: [u8; 8] = b.as_ref().try_into().context("seq counter must be 8 bytes")?;
+            let arr: [u8; 8] = b
+                .as_ref()
+                .try_into()
+                .context("seq counter must be 8 bytes")?;
             Ok(i64::from_be_bytes(arr))
         }
         None => Ok(0),
@@ -79,8 +82,15 @@ pub(crate) async fn get_merkle_node(
     level: u8,
     index: u64,
 ) -> Result<Option<[u8; 32]>> {
-    match substrate.get(&ks.merkle_node_key(chain, level, index)).await? {
-        Some(b) => Ok(Some(b.as_ref().try_into().context("merkle node must be 32 bytes")?)),
+    match substrate
+        .get(&ks.merkle_node_key(chain, level, index))
+        .await?
+    {
+        Some(b) => Ok(Some(
+            b.as_ref()
+                .try_into()
+                .context("merkle node must be 32 bytes")?,
+        )),
         None => Ok(None),
     }
 }
@@ -108,9 +118,15 @@ pub(crate) async fn get_edge_weight(
     dst: &str,
     etype: &str,
 ) -> Result<Option<i64>> {
-    match substrate.get(&ks.graph_edge_key(graph, src, dst, etype)).await? {
+    match substrate
+        .get(&ks.graph_edge_key(graph, src, dst, etype))
+        .await?
+    {
         Some(b) => {
-            let arr: [u8; 8] = b.as_ref().try_into().context("edge weight must be 8 bytes")?;
+            let arr: [u8; 8] = b
+                .as_ref()
+                .try_into()
+                .context("edge weight must be 8 bytes")?;
             Ok(Some(crate::keyspace::weight_from_obe(&arr)))
         }
         None => Ok(None),
@@ -121,10 +137,10 @@ pub(crate) async fn get_edge_weight(
 mod tests {
     use super::*;
     use crate::model::{ChainMeta, EntryRecord};
-    use std::sync::Arc;
     use bluedb_sql::Database;
     use slatedb::object_store::memory::InMemory;
     use slatedb::Db;
+    use std::sync::Arc;
 
     async fn writer_database() -> Database {
         let db = Db::open("evidence-test", Arc::new(InMemory::new()))
@@ -147,7 +163,10 @@ mod tests {
         let substrate = database.substrate();
         let ks = EvidenceKeyspace::new("acme");
         let writer = substrate.require_writer().unwrap();
-        writer.put(&ks.seq_key("chain-a"), &42i64.to_be_bytes()).await.unwrap();
+        writer
+            .put(&ks.seq_key("chain-a"), &42i64.to_be_bytes())
+            .await
+            .unwrap();
         assert_eq!(get_seq(&substrate, &ks, "chain-a").await.unwrap(), 42);
     }
 
@@ -179,11 +198,20 @@ mod tests {
         let database = writer_database().await;
         let substrate = database.substrate();
         let ks = EvidenceKeyspace::new("acme");
-        assert_eq!(get_merkle_node(&substrate, &ks, "c", 1, 0).await.unwrap(), None);
+        assert_eq!(
+            get_merkle_node(&substrate, &ks, "c", 1, 0).await.unwrap(),
+            None
+        );
         let writer = substrate.require_writer().unwrap();
         let h = [7u8; 32];
-        writer.put(&ks.merkle_node_key("c", 1, 0), &h).await.unwrap();
-        assert_eq!(get_merkle_node(&substrate, &ks, "c", 1, 0).await.unwrap(), Some(h));
+        writer
+            .put(&ks.merkle_node_key("c", 1, 0), &h)
+            .await
+            .unwrap();
+        assert_eq!(
+            get_merkle_node(&substrate, &ks, "c", 1, 0).await.unwrap(),
+            Some(h)
+        );
     }
 
     #[tokio::test]
@@ -191,9 +219,25 @@ mod tests {
         let database = writer_database().await;
         let substrate = database.substrate();
         let ks = EvidenceKeyspace::new("acme");
-        assert_eq!(get_edge_weight(&substrate, &ks, "g", "u", "v", "").await.unwrap(), None);
+        assert_eq!(
+            get_edge_weight(&substrate, &ks, "g", "u", "v", "")
+                .await
+                .unwrap(),
+            None
+        );
         let writer = substrate.require_writer().unwrap();
-        writer.put(&ks.graph_edge_key("g", "u", "v", ""), &crate::keyspace::weight_obe(-7)).await.unwrap();
-        assert_eq!(get_edge_weight(&substrate, &ks, "g", "u", "v", "").await.unwrap(), Some(-7));
+        writer
+            .put(
+                &ks.graph_edge_key("g", "u", "v", ""),
+                &crate::keyspace::weight_obe(-7),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            get_edge_weight(&substrate, &ks, "g", "u", "v", "")
+                .await
+                .unwrap(),
+            Some(-7)
+        );
     }
 }

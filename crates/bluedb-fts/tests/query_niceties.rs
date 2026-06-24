@@ -29,7 +29,14 @@ fn schema() -> (Schema, Field, Field, Field) {
     (sb.build(), body, cat, year)
 }
 
-fn doc(body_f: Field, body: &str, cat_f: Field, cat: &str, year_f: Field, year: u64) -> TantivyDocument {
+fn doc(
+    body_f: Field,
+    body: &str,
+    cat_f: Field,
+    cat: &str,
+    year_f: Field,
+    year: u64,
+) -> TantivyDocument {
     let mut d = TantivyDocument::default();
     d.add_text(body_f, body);
     d.add_text(cat_f, cat);
@@ -94,7 +101,11 @@ fn pagination_returns_consecutive_non_overlapping_pages() {
     );
 
     // Offset past the end yields nothing.
-    assert!(multi_split_search_paginated(&handles, "ledger", &[body], 10, 5).unwrap().is_empty());
+    assert!(
+        multi_split_search_paginated(&handles, "ledger", &[body], 10, 5)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]

@@ -43,5 +43,8 @@ async fn added_column_appends_a_new_slot() {
         .unwrap();
     g.execute("ALTER TABLE t ADD COLUMN c TEXT").await.unwrap();
     // [0,1] then append slot 2 ⇒ [0,1,2].
-    assert_eq!(g.storage.column_slots("t").await.unwrap(), Some(vec![0, 1, 2]));
+    assert_eq!(
+        g.storage.column_slots("t").await.unwrap(),
+        Some(vec![0, 1, 2])
+    );
 }

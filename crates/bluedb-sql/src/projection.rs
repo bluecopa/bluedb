@@ -119,9 +119,9 @@ impl ProjectedTable {
     pub async fn ensure(&self, database: &Database) -> Result<(), SqlError> {
         let ddl = self.create_table_ddl();
         let mut glue = Glue::new(database.connection_serialized());
-        glue.execute(&ddl)
-            .await
-            .map_err(|e| SqlError::SlateDb(format!("create projection table {}: {e}", self.table)))?;
+        glue.execute(&ddl).await.map_err(|e| {
+            SqlError::SlateDb(format!("create projection table {}: {e}", self.table))
+        })?;
         Ok(())
     }
 
@@ -311,12 +311,23 @@ mod tests {
                 )
                 .unwrap();
             batch.put(k, &v);
-            database.substrate().require_writer().unwrap().write(batch).await.unwrap();
+            database
+                .substrate()
+                .require_writer()
+                .unwrap()
+                .write(batch)
+                .await
+                .unwrap();
         }
 
         let mut glue = Glue::new(database.connection());
-        let out = glue.execute("SELECT debits_posted FROM ledger_accounts").await.unwrap();
-        let Payload::Select { rows, .. } = &out[0] else { panic!() };
+        let out = glue
+            .execute("SELECT debits_posted FROM ledger_accounts")
+            .await
+            .unwrap();
+        let Payload::Select { rows, .. } = &out[0] else {
+            panic!()
+        };
         assert_eq!(rows.len(), 1, "same pk overwrites, not appends");
         assert_eq!(rows[0][0], SqlValue::U128(25));
     }

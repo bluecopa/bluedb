@@ -205,8 +205,12 @@ fn sub_table_factor(factor: &mut TableFactor, scope: &Scope, changed: &mut bool)
 fn sub_expr(expr: &mut Expr, scope: &Scope, changed: &mut bool) {
     match expr {
         Expr::Subquery(query)
-        | Expr::InSubquery { subquery: query, .. }
-        | Expr::Exists { subquery: query, .. } => inline_query(query, scope, changed),
+        | Expr::InSubquery {
+            subquery: query, ..
+        }
+        | Expr::Exists {
+            subquery: query, ..
+        } => inline_query(query, scope, changed),
         Expr::BinaryOp { left, right, .. } => {
             sub_expr(left, scope, changed);
             sub_expr(right, scope, changed);
@@ -231,32 +235,49 @@ mod tests {
         let out = inline_ctes("WITH c AS (SELECT a FROM t WHERE a > 1) SELECT a FROM c");
         let up = out.to_uppercase();
         assert!(!up.contains("WITH "), "WITH should be gone: {out}");
-        assert!(up.contains("AS C"), "CTE should become a derived table aliased C: {out}");
+        assert!(
+            up.contains("AS C"),
+            "CTE should become a derived table aliased C: {out}"
+        );
     }
 
     #[test]
     fn inlines_two_ctes() {
-        let out = inline_ctes("WITH a AS (SELECT x FROM t1), b AS (SELECT y FROM t2) SELECT x FROM a, b");
+        let out =
+            inline_ctes("WITH a AS (SELECT x FROM t1), b AS (SELECT y FROM t2) SELECT x FROM a, b");
         assert!(!out.to_uppercase().contains("WITH "), "got: {out}");
-        assert_eq!(out.matches("SELECT").count() >= 3, true, "both CTEs inlined: {out}");
+        assert_eq!(
+            out.matches("SELECT").count() >= 3,
+            true,
+            "both CTEs inlined: {out}"
+        );
     }
 
     #[test]
     fn inlines_cte_in_create_table_as() {
         let out = inline_ctes("CREATE TABLE u AS WITH c AS (SELECT a FROM t) SELECT a FROM c");
-        assert!(!out.to_uppercase().contains("WITH "), "WITH should be gone: {out}");
+        assert!(
+            !out.to_uppercase().contains("WITH "),
+            "WITH should be gone: {out}"
+        );
     }
 
     #[test]
     fn inlines_cte_in_insert() {
         let out = inline_ctes("INSERT INTO u WITH c AS (SELECT a FROM t) SELECT a FROM c");
-        assert!(!out.to_uppercase().contains("WITH "), "WITH should be gone: {out}");
+        assert!(
+            !out.to_uppercase().contains("WITH "),
+            "WITH should be gone: {out}"
+        );
     }
 
     #[test]
     fn leaves_recursive_cte() {
         let sql = "WITH RECURSIVE c AS (SELECT 1 AS n UNION SELECT n + 1 FROM c) SELECT n FROM c";
-        assert!(inline_ctes(sql).to_uppercase().contains("RECURSIVE"), "recursive CTE must not be inlined");
+        assert!(
+            inline_ctes(sql).to_uppercase().contains("RECURSIVE"),
+            "recursive CTE must not be inlined"
+        );
     }
 
     #[test]

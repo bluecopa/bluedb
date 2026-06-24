@@ -14,11 +14,11 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use bluedb_sql::{collapse_lww, CdcConfig, Database, LhPragma, DEFAULT_TENANT};
-use tokio::task::JoinHandle;
-use tokio::time::Instant;
 use gluesql_core::store::{DataRow, Store};
 use iceberg::io::FileIO;
 use serde::{Deserialize, Serialize};
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use crate::schema::table_to_iceberg;
 use crate::writer::LakehouseWriter;
@@ -145,10 +145,7 @@ impl LakehouseEngine {
             serde_json::to_vec(&*state)?
         };
         let path = Self::registry_path(&self.root, &self.namespace);
-        self.file_io
-            .new_output(&path)?
-            .write(bytes.into())
-            .await?;
+        self.file_io.new_output(&path)?.write(bytes.into()).await?;
         Ok(())
     }
 
@@ -473,14 +470,20 @@ impl LakehouseEngine {
     /// Number of live data files in a table's current Iceberg state.
     pub async fn data_file_count(&self, table: &str) -> Result<usize> {
         let schema = self.fetch_schema(table).await?;
-        self.writer_for(table, &schema, &[]).await?.data_file_count().await
+        self.writer_for(table, &schema, &[])
+            .await?
+            .data_file_count()
+            .await
     }
 
     /// Number of live equality-delete files in a table's current Iceberg state
     /// (drives the worker's choice of major vs minor compaction).
     pub async fn delete_file_count(&self, table: &str) -> Result<usize> {
         let schema = self.fetch_schema(table).await?;
-        self.writer_for(table, &schema, &[]).await?.delete_file_count().await
+        self.writer_for(table, &schema, &[])
+            .await?
+            .delete_file_count()
+            .await
     }
 
     /// Spawn a throttled background worker that compacts mirrored tables whose
@@ -534,13 +537,25 @@ impl LakehouseEngine {
     /// `X-Bluedb-Min-Watermark` request header.
     pub async fn sealed_watermark(&self) -> i64 {
         let tables: Vec<String> = {
-            self.state.read().unwrap().materialized.iter().cloned().collect()
+            self.state
+                .read()
+                .unwrap()
+                .materialized
+                .iter()
+                .cloned()
+                .collect()
         };
         let mut max = 0i64;
         for table in tables {
-            let Ok(schema) = self.try_fetch_schema(&table).await else { continue; };
-            let Some(schema) = schema else { continue; };
-            let Ok(writer) = self.writer_for(&table, &schema, &[]).await else { continue; };
+            let Ok(schema) = self.try_fetch_schema(&table).await else {
+                continue;
+            };
+            let Some(schema) = schema else {
+                continue;
+            };
+            let Ok(writer) = self.writer_for(&table, &schema, &[]).await else {
+                continue;
+            };
             if let Some(wm) = writer.current_watermark() {
                 max = max.max(wm);
             }
@@ -582,7 +597,13 @@ impl LakehouseEngine {
     /// once) and still have metadata on disk — what the REST catalog lists.
     pub async fn list_iceberg_tables(&self) -> Result<Vec<String>> {
         let candidates: Vec<String> = {
-            self.state.read().unwrap().materialized.iter().cloned().collect()
+            self.state
+                .read()
+                .unwrap()
+                .materialized
+                .iter()
+                .cloned()
+                .collect()
         };
         let mut out = Vec::new();
         for table in candidates {
@@ -853,10 +874,7 @@ impl LakehouseEngine {
 
     /// Read every current row of `table` (engine-internal scan — guardrail-exempt,
     /// since the seal path must read full tables for backfill/compaction).
-    async fn scan_all_rows(
-        &self,
-        table: &str,
-    ) -> Result<Vec<(gluesql_core::data::Key, DataRow)>> {
+    async fn scan_all_rows(&self, table: &str) -> Result<Vec<(gluesql_core::data::Key, DataRow)>> {
         use futures::TryStreamExt;
         let conn = self.db.connection_for_tenant(&self.tenant);
         let iter = conn.scan_data(table).await.map_err(glue_err)?;

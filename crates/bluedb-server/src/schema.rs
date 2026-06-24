@@ -126,7 +126,9 @@ fn validate_type(ty: &str) -> Result<&'static str, AppError> {
         // tracked so reads re-inflate; accept them in the structured create path.
         "JSON" => Ok("JSON"),
         "JSONB" => Ok("JSONB"),
-        other => Err(AppError::bad_request(format!("unsupported column type '{other}'"))),
+        other => Err(AppError::bad_request(format!(
+            "unsupported column type '{other}'"
+        ))),
     }
 }
 
@@ -199,7 +201,10 @@ pub(crate) async fn create_table(
             .iter()
             .map(|c| ident(c))
             .collect::<Result<Vec<_>, _>>()?;
-        let sql = format!("CREATE INDEX {index_name} ON {table} ({});", cols.join(", "));
+        let sql = format!(
+            "CREATE INDEX {index_name} ON {table} ({});",
+            cols.join(", ")
+        );
         run_ddl(&state, &tenant, sql).await?;
         created_indexes.push(index_name);
     }
@@ -325,9 +330,14 @@ pub(crate) async fn create_index(
         .map(|c| ident(c))
         .collect::<Result<Vec<_>, _>>()?;
 
-    let sql = format!("CREATE INDEX {index_name} ON {table} ({});", cols.join(", "));
+    let sql = format!(
+        "CREATE INDEX {index_name} ON {table} ({});",
+        cols.join(", ")
+    );
     run_ddl(&state, &tenant, sql).await?;
-    Ok(Json(json!({ "created_index": true, "name": index_name, "table": table })))
+    Ok(Json(
+        json!({ "created_index": true, "name": index_name, "table": table }),
+    ))
 }
 
 /// `POST /schema/tables/{table}/fulltext-indexes` — declare a fulltext index on
@@ -397,5 +407,7 @@ pub(crate) async fn drop_index(
     // GlueSQL DROP INDEX uses the table-qualified form: DROP INDEX table.index_name
     let sql = format!("DROP INDEX {table}.{index_name};");
     run_ddl(&state, &tenant, sql).await?;
-    Ok(Json(json!({ "dropped_index": true, "name": index_name, "table": table })))
+    Ok(Json(
+        json!({ "dropped_index": true, "name": index_name, "table": table }),
+    ))
 }

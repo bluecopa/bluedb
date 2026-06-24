@@ -21,7 +21,10 @@ async fn durability_survives_reopen() {
         let store = SlateDbBlobStore::open_local(dir.path())
             .await
             .expect("open session 1");
-        store.put("alpha", Bytes::from_static(b"hello")).await.unwrap();
+        store
+            .put("alpha", Bytes::from_static(b"hello"))
+            .await
+            .unwrap();
         store
             .put("beta", Bytes::from_static(b"world-of-bytes"))
             .await
@@ -35,7 +38,10 @@ async fn durability_survives_reopen() {
         let store = SlateDbBlobStore::open_local(dir.path())
             .await
             .expect("reopen session 2");
-        let a = store.get_all("alpha").await.expect("read alpha after reopen");
+        let a = store
+            .get_all("alpha")
+            .await
+            .expect("read alpha after reopen");
         let b = store.get_all("beta").await.expect("read beta after reopen");
         assert_eq!(a.as_ref(), b"hello", "alpha did not survive reopen");
         assert_eq!(b.as_ref(), b"world-of-bytes", "beta did not survive reopen");
@@ -53,7 +59,10 @@ async fn durability_survives_reopen_via_flush() {
         let store = SlateDbBlobStore::open_local(dir.path())
             .await
             .expect("open");
-        store.put("k", Bytes::from_static(b"persisted")).await.unwrap();
+        store
+            .put("k", Bytes::from_static(b"persisted"))
+            .await
+            .unwrap();
         store.flush().await.expect("flush");
         // Intentionally drop without close().
         drop(store);
@@ -62,7 +71,11 @@ async fn durability_survives_reopen_via_flush() {
         .await
         .expect("reopen");
     assert_eq!(
-        store.get_all("k").await.expect("read after flush+reopen").as_ref(),
+        store
+            .get_all("k")
+            .await
+            .expect("read after flush+reopen")
+            .as_ref(),
         b"persisted"
     );
     store.shutdown().await.unwrap();
@@ -73,13 +86,19 @@ async fn durability_survives_reopen_via_flush() {
 async fn write_seam_put_get_delete() {
     let store = SlateDbBlobStore::open_in_memory().await.unwrap();
 
-    store.put("doc", Bytes::from_static(b"0123456789")).await.unwrap();
+    store
+        .put("doc", Bytes::from_static(b"0123456789"))
+        .await
+        .unwrap();
     assert_eq!(store.get_all("doc").await.unwrap().as_ref(), b"0123456789");
     assert_eq!(store.get_range("doc", 2..5).await.unwrap().as_ref(), b"234");
     assert_eq!(store.len("doc").await.unwrap(), 10);
 
     store.delete("doc").await.unwrap();
-    assert!(store.get_all("doc").await.is_err(), "delete should remove the key");
+    assert!(
+        store.get_all("doc").await.is_err(),
+        "delete should remove the key"
+    );
 
     // Deleting a missing key is a no-op (does not error).
     store.delete("doc").await.unwrap();
@@ -91,14 +110,30 @@ async fn scan_prefix_is_ordered_and_scoped() {
     let store = SlateDbBlobStore::open_in_memory().await.unwrap();
 
     // Insert out of order, across two prefixes.
-    store.put("split/c", Bytes::from_static(b"3")).await.unwrap();
-    store.put("split/a", Bytes::from_static(b"1")).await.unwrap();
-    store.put("split/b", Bytes::from_static(b"2")).await.unwrap();
-    store.put("other/z", Bytes::from_static(b"x")).await.unwrap();
+    store
+        .put("split/c", Bytes::from_static(b"3"))
+        .await
+        .unwrap();
+    store
+        .put("split/a", Bytes::from_static(b"1"))
+        .await
+        .unwrap();
+    store
+        .put("split/b", Bytes::from_static(b"2"))
+        .await
+        .unwrap();
+    store
+        .put("other/z", Bytes::from_static(b"x"))
+        .await
+        .unwrap();
 
     let got = store.scan_prefix("split/").await.unwrap();
     let keys: Vec<&str> = got.iter().map(|(k, _)| k.as_str()).collect();
-    assert_eq!(keys, vec!["split/a", "split/b", "split/c"], "must be ordered & scoped");
+    assert_eq!(
+        keys,
+        vec!["split/a", "split/b", "split/c"],
+        "must be ordered & scoped"
+    );
     let vals: Vec<&[u8]> = got.iter().map(|(_, v)| v.as_ref()).collect();
     assert_eq!(vals, vec![b"1".as_ref(), b"2", b"3"]);
 
@@ -129,7 +164,10 @@ async fn chunked_split_and_range_reassembly() {
     chunked.put_chunked("big", &data).await.unwrap();
 
     assert_eq!(chunked.len_chunked("big").await.unwrap(), 21);
-    assert_eq!(chunked.get_all_chunked("big").await.unwrap().as_ref(), &data[..]);
+    assert_eq!(
+        chunked.get_all_chunked("big").await.unwrap().as_ref(),
+        &data[..]
+    );
 
     // Range spanning multiple chunks, with partial chunks at both ends.
     let r = chunked.get_range_chunked("big", 3..14).await.unwrap();
@@ -140,7 +178,11 @@ async fn chunked_split_and_range_reassembly() {
     assert_eq!(r.as_ref(), &data[5..7]);
 
     // Empty range.
-    assert!(chunked.get_range_chunked("big", 7..7).await.unwrap().is_empty());
+    assert!(chunked
+        .get_range_chunked("big", 7..7)
+        .await
+        .unwrap()
+        .is_empty());
 
     // Out-of-bounds range errors.
     assert!(chunked.get_range_chunked("big", 0..22).await.is_err());
@@ -149,7 +191,10 @@ async fn chunked_split_and_range_reassembly() {
     let small: Vec<u8> = vec![99, 98];
     chunked.put_chunked("big", &small).await.unwrap();
     assert_eq!(chunked.len_chunked("big").await.unwrap(), 2);
-    assert_eq!(chunked.get_all_chunked("big").await.unwrap().as_ref(), &small[..]);
+    assert_eq!(
+        chunked.get_all_chunked("big").await.unwrap().as_ref(),
+        &small[..]
+    );
 
     // Delete removes everything.
     chunked.delete_chunked("big").await.unwrap();

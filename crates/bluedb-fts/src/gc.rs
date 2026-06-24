@@ -176,7 +176,10 @@ mod tests {
         // cutoff = 200: "old" (max 100 < 200) is expired; "mid" (max 250) and the
         // time-less "notime" are kept.
         let keys = expired_by_time(&m, 200);
-        assert_eq!(keys, vec!["indexes/recon-2026/splits/old.split".to_string()]);
+        assert_eq!(
+            keys,
+            vec!["indexes/recon-2026/splits/old.split".to_string()]
+        );
         // A cutoff past everything expires both time-ranged splits but never the
         // time-less one.
         assert_eq!(expired_by_time(&m, 10_000).len(), 2);

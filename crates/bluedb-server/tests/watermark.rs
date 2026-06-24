@@ -85,11 +85,14 @@ async fn call_full(
     let body = if bytes.is_empty() {
         Value::Null
     } else {
-        serde_json::from_slice(&bytes).unwrap_or_else(|_| {
-            Value::String(String::from_utf8_lossy(&bytes).into_owned())
-        })
+        serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()))
     };
-    FullResponse { status, headers, body }
+    FullResponse {
+        status,
+        headers,
+        body,
+    }
 }
 
 /// Parse `X-Bluedb-Watermark: <tenant>:<seq>` and return the seq.
@@ -115,8 +118,14 @@ async fn write_returns_watermark_header_with_increasing_seq() {
         None,
         None,
         Some(json!({"sql": "PRAGMA lakehouse_mirror = on"})),
-    ).await;
-    assert!(r.status.is_success(), "pragma on: {} {:?}", r.status, r.body);
+    )
+    .await;
+    assert!(
+        r.status.is_success(),
+        "pragma on: {} {:?}",
+        r.status,
+        r.body
+    );
 
     // DDL (admin SQL) — no CDC seq expected on DDL.
     let r = call_full(
@@ -126,7 +135,8 @@ async fn write_returns_watermark_header_with_increasing_seq() {
         None,
         None,
         Some(json!({"sql": "CREATE TABLE items (id INTEGER PRIMARY KEY, val TEXT)"})),
-    ).await;
+    )
+    .await;
     assert!(r.status.is_success(), "create: {}", r.status);
 
     // First INSERT via /tables — should return watermark.
@@ -137,10 +147,16 @@ async fn write_returns_watermark_header_with_increasing_seq() {
         None,
         None,
         Some(json!({"id": 1, "val": "a"})),
-    ).await;
-    assert!(r1.status.is_success(), "insert1: {} {:?}", r1.status, r1.body);
-    let (tenant1, seq1) = parse_watermark_header(&r1.headers)
-        .expect("X-Bluedb-Watermark missing on write response");
+    )
+    .await;
+    assert!(
+        r1.status.is_success(),
+        "insert1: {} {:?}",
+        r1.status,
+        r1.body
+    );
+    let (tenant1, seq1) =
+        parse_watermark_header(&r1.headers).expect("X-Bluedb-Watermark missing on write response");
     assert_eq!(tenant1, "_", "tenant should be default '_'");
     assert!(seq1 > 0, "seq should be positive, got {seq1}");
 
@@ -152,11 +168,15 @@ async fn write_returns_watermark_header_with_increasing_seq() {
         None,
         None,
         Some(json!({"id": 2, "val": "b"})),
-    ).await;
+    )
+    .await;
     assert!(r2.status.is_success(), "insert2: {}", r2.status);
-    let (_, seq2) = parse_watermark_header(&r2.headers)
-        .expect("X-Bluedb-Watermark missing on second write");
-    assert!(seq2 > seq1, "seq must be monotonically increasing: {seq1} -> {seq2}");
+    let (_, seq2) =
+        parse_watermark_header(&r2.headers).expect("X-Bluedb-Watermark missing on second write");
+    assert!(
+        seq2 > seq1,
+        "seq must be monotonically increasing: {seq1} -> {seq2}"
+    );
 }
 
 // ----- test (a) via /sql -----
@@ -167,25 +187,40 @@ async fn write_via_sql_returns_watermark_header() {
     let app = build_app(state.clone());
 
     let r = call_full(
-        &app, "POST", "/sql", None, None,
+        &app,
+        "POST",
+        "/sql",
+        None,
+        None,
         Some(json!({"sql": "PRAGMA lakehouse_mirror = on"})),
-    ).await;
+    )
+    .await;
     assert!(r.status.is_success());
 
     let r = call_full(
-        &app, "POST", "/admin/sql", None, None,
+        &app,
+        "POST",
+        "/admin/sql",
+        None,
+        None,
         Some(json!({"sql": "CREATE TABLE events (id INTEGER PRIMARY KEY, name TEXT)"})),
-    ).await;
+    )
+    .await;
     assert!(r.status.is_success());
 
     // INSERT via /sql.
     let r = call_full(
-        &app, "POST", "/sql", None, None,
+        &app,
+        "POST",
+        "/sql",
+        None,
+        None,
         Some(json!({"sql": "INSERT INTO events VALUES (1, 'boot')"})),
-    ).await;
+    )
+    .await;
     assert!(r.status.is_success(), "insert: {} {:?}", r.status, r.body);
-    let (tenant, seq) = parse_watermark_header(&r.headers)
-        .expect("X-Bluedb-Watermark missing on /sql write");
+    let (tenant, seq) =
+        parse_watermark_header(&r.headers).expect("X-Bluedb-Watermark missing on /sql write");
     assert_eq!(tenant, "_");
     assert!(seq > 0, "seq > 0, got {seq}");
 }
@@ -198,29 +233,54 @@ async fn read_with_min_watermark_at_most_sealed_serves_and_echoes_watermark() {
     let app = build_app(state.clone());
 
     // Enable CDC.
-    let r = call_full(&app, "POST", "/sql", None, None,
-        Some(json!({"sql": "PRAGMA lakehouse_mirror = on"}))).await;
+    let r = call_full(
+        &app,
+        "POST",
+        "/sql",
+        None,
+        None,
+        Some(json!({"sql": "PRAGMA lakehouse_mirror = on"})),
+    )
+    .await;
     assert!(r.status.is_success());
 
-    let r = call_full(&app, "POST", "/admin/sql", None, None,
-        Some(json!({"sql": "CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)"}))).await;
+    let r = call_full(
+        &app,
+        "POST",
+        "/admin/sql",
+        None,
+        None,
+        Some(json!({"sql": "CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)"})),
+    )
+    .await;
     assert!(r.status.is_success());
 
     // Write one row.
-    let rw = call_full(&app, "POST", "/tables/docs", None, None,
-        Some(json!({"id": 1, "body": "hello"}))).await;
+    let rw = call_full(
+        &app,
+        "POST",
+        "/tables/docs",
+        None,
+        None,
+        Some(json!({"id": 1, "body": "hello"})),
+    )
+    .await;
     assert!(rw.status.is_success());
-    let (_, _write_seq) = parse_watermark_header(&rw.headers)
-        .expect("watermark on write");
+    let (_, _write_seq) = parse_watermark_header(&rw.headers).expect("watermark on write");
 
     // Force a seal so the watermark is durably in Iceberg.
     state.seal_now().await.expect("seal");
 
     // Read with min-watermark = 0 (always ≤ sealed) — must succeed + echo watermark.
     let rr = call_full(&app, "GET", "/tables/docs", None, Some("0"), None).await;
-    assert!(rr.status.is_success(), "read with min=0: {} {:?}", rr.status, rr.body);
-    let (tenant, sealed_seq) = parse_watermark_header(&rr.headers)
-        .expect("X-Bluedb-Watermark missing on read response");
+    assert!(
+        rr.status.is_success(),
+        "read with min=0: {} {:?}",
+        rr.status,
+        rr.body
+    );
+    let (tenant, sealed_seq) =
+        parse_watermark_header(&rr.headers).expect("X-Bluedb-Watermark missing on read response");
     assert_eq!(tenant, "_");
     assert!(sealed_seq >= 0, "sealed seq should be non-negative");
 }
@@ -236,36 +296,60 @@ async fn get_tables_with_min_watermark_above_sealed_still_serves() {
     let state = make_state().await;
     let app = build_app(state.clone());
 
-    let r = call_full(&app, "POST", "/sql", None, None,
-        Some(json!({"sql": "PRAGMA lakehouse_mirror = on"}))).await;
+    let r = call_full(
+        &app,
+        "POST",
+        "/sql",
+        None,
+        None,
+        Some(json!({"sql": "PRAGMA lakehouse_mirror = on"})),
+    )
+    .await;
     assert!(r.status.is_success());
 
-    let r = call_full(&app, "POST", "/admin/sql", None, None,
-        Some(json!({"sql": "CREATE TABLE things (id INTEGER PRIMARY KEY, name TEXT)"}))).await;
+    let r = call_full(
+        &app,
+        "POST",
+        "/admin/sql",
+        None,
+        None,
+        Some(json!({"sql": "CREATE TABLE things (id INTEGER PRIMARY KEY, name TEXT)"})),
+    )
+    .await;
     assert!(r.status.is_success());
 
     // Write a row to create some CDC entries.
-    let rw = call_full(&app, "POST", "/tables/things", None, None,
-        Some(json!({"id": 1, "name": "one"}))).await;
+    let rw = call_full(
+        &app,
+        "POST",
+        "/tables/things",
+        None,
+        None,
+        Some(json!({"id": 1, "name": "one"})),
+    )
+    .await;
     assert!(rw.status.is_success());
-    let (_, write_seq) = parse_watermark_header(&rw.headers)
-        .expect("watermark on write");
+    let (_, write_seq) = parse_watermark_header(&rw.headers).expect("watermark on write");
 
     // Do NOT seal — the Iceberg sealed watermark is still 0.
     // Ask for a min-watermark higher than anything sealed so far.
     let future_seq = write_seq + 1_000_000;
     let rr = call_full(
-        &app, "GET", "/tables/things",
+        &app,
+        "GET",
+        "/tables/things",
         None,
         Some(&future_seq.to_string()),
         None,
-    ).await;
+    )
+    .await;
     // P2.2 correction: GET /tables reads from SlateDB, not Iceberg, so the
     // freshness gate must NOT 503 here — the data IS available from SlateDB.
     assert!(
         rr.status.is_success(),
         "GET /tables with min > sealed must succeed (SlateDB is fresher than the seal): {} {:?}",
-        rr.status, rr.body
+        rr.status,
+        rr.body
     );
 }
 
@@ -278,30 +362,69 @@ async fn watermark_is_scoped_per_tenant() {
 
     // Enable CDC for both tenants.
     for tenant in ["ta", "tb"] {
-        let r = call_full(&app, "POST", "/sql", Some(tenant), None,
-            Some(json!({"sql": "PRAGMA lakehouse_mirror = on"}))).await;
-        assert!(r.status.is_success(), "pragma on tenant {tenant}: {}", r.status);
+        let r = call_full(
+            &app,
+            "POST",
+            "/sql",
+            Some(tenant),
+            None,
+            Some(json!({"sql": "PRAGMA lakehouse_mirror = on"})),
+        )
+        .await;
+        assert!(
+            r.status.is_success(),
+            "pragma on tenant {tenant}: {}",
+            r.status
+        );
     }
 
     // Create table + insert for tenant "ta".
-    let r = call_full(&app, "POST", "/admin/sql", Some("ta"), None,
-        Some(json!({"sql": "CREATE TABLE ta_tbl (id INTEGER PRIMARY KEY, v TEXT)"}))).await;
+    let r = call_full(
+        &app,
+        "POST",
+        "/admin/sql",
+        Some("ta"),
+        None,
+        Some(json!({"sql": "CREATE TABLE ta_tbl (id INTEGER PRIMARY KEY, v TEXT)"})),
+    )
+    .await;
     assert!(r.status.is_success());
 
-    let r1 = call_full(&app, "POST", "/tables/ta_tbl", Some("ta"), None,
-        Some(json!({"id": 1, "v": "x"}))).await;
+    let r1 = call_full(
+        &app,
+        "POST",
+        "/tables/ta_tbl",
+        Some("ta"),
+        None,
+        Some(json!({"id": 1, "v": "x"})),
+    )
+    .await;
     assert!(r1.status.is_success(), "ta write: {}", r1.status);
     let (t1, seq_ta) = parse_watermark_header(&r1.headers).expect("ta watermark");
     assert_eq!(t1, "ta");
     assert!(seq_ta > 0);
 
     // Create table + insert for tenant "tb".
-    let r = call_full(&app, "POST", "/admin/sql", Some("tb"), None,
-        Some(json!({"sql": "CREATE TABLE tb_tbl (id INTEGER PRIMARY KEY, v TEXT)"}))).await;
+    let r = call_full(
+        &app,
+        "POST",
+        "/admin/sql",
+        Some("tb"),
+        None,
+        Some(json!({"sql": "CREATE TABLE tb_tbl (id INTEGER PRIMARY KEY, v TEXT)"})),
+    )
+    .await;
     assert!(r.status.is_success());
 
-    let r2 = call_full(&app, "POST", "/tables/tb_tbl", Some("tb"), None,
-        Some(json!({"id": 1, "v": "y"}))).await;
+    let r2 = call_full(
+        &app,
+        "POST",
+        "/tables/tb_tbl",
+        Some("tb"),
+        None,
+        Some(json!({"id": 1, "v": "y"})),
+    )
+    .await;
     assert!(r2.status.is_success(), "tb write: {}", r2.status);
     let (t2, seq_tb) = parse_watermark_header(&r2.headers).expect("tb watermark");
     assert_eq!(t2, "tb");
@@ -310,7 +433,10 @@ async fn watermark_is_scoped_per_tenant() {
     // The two tenants have independent CDC seq spaces starting at 1 each.
     // Both should be 1 for their first writes.
     assert_eq!(seq_ta, 1, "ta first write seq should be 1");
-    assert_eq!(seq_tb, 1, "tb first write seq should be 1 (independent counter)");
+    assert_eq!(
+        seq_tb, 1,
+        "tb first write seq should be 1 (independent counter)"
+    );
 }
 
 // ----- Phase 2.2 tests -----
@@ -320,8 +446,15 @@ async fn watermark_is_scoped_per_tenant() {
 // a dummy GET that echoes the sealed watermark).
 async fn setup_analytical_table(state: &AppState, app: &axum::Router) -> i64 {
     // Turn on the lakehouse mirror.
-    let r = call_full(app, "POST", "/sql", None, None,
-        Some(json!({"sql": "PRAGMA lakehouse_mirror = on"}))).await;
+    let r = call_full(
+        app,
+        "POST",
+        "/sql",
+        None,
+        None,
+        Some(json!({"sql": "PRAGMA lakehouse_mirror = on"})),
+    )
+    .await;
     assert!(r.status.is_success(), "pragma: {} {:?}", r.status, r.body);
 
     // Create table: `products (id INTEGER PK, name TEXT, score INTEGER)`.
@@ -333,9 +466,21 @@ async fn setup_analytical_table(state: &AppState, app: &axum::Router) -> i64 {
 
     // Insert rows via /sql.
     for (id, name, score) in [(1, "alpha", 90), (2, "beta", 40), (3, "gamma", 75)] {
-        let r = call_full(app, "POST", "/sql", None, None,
-            Some(json!({"sql": format!("INSERT INTO products VALUES ({id}, '{name}', {score})")}))).await;
-        assert!(r.status.is_success(), "insert {id}: {} {:?}", r.status, r.body);
+        let r = call_full(
+            app,
+            "POST",
+            "/sql",
+            None,
+            None,
+            Some(json!({"sql": format!("INSERT INTO products VALUES ({id}, '{name}', {score})")})),
+        )
+        .await;
+        assert!(
+            r.status.is_success(),
+            "insert {id}: {} {:?}",
+            r.status,
+            r.body
+        );
     }
 
     // Seal so the Iceberg snapshot exists.
@@ -343,8 +488,15 @@ async fn setup_analytical_table(state: &AppState, app: &axum::Router) -> i64 {
 
     // Read the sealed watermark from the response header of a GET /tables request.
     let r = call_full(app, "GET", "/tables/products", None, None, None).await;
-    assert!(r.status.is_success(), "GET products: {} {:?}", r.status, r.body);
-    parse_watermark_header(&r.headers).map(|(_, seq)| seq).unwrap_or(0)
+    assert!(
+        r.status.is_success(),
+        "GET products: {} {:?}",
+        r.status,
+        r.body
+    );
+    parse_watermark_header(&r.headers)
+        .map(|(_, seq)| seq)
+        .unwrap_or(0)
 }
 
 // ----- test: guardrail-rejected SELECT is routed to the analytical path -----
@@ -363,24 +515,39 @@ async fn guardrail_rejected_select_routed_to_analytical_path_returns_correct_row
     // Query: filter on `score` (non-indexed) + ORDER BY `score` (non-indexed).
     // `/sql` rejects this (index-only RYW surface); `/query` serves it analytically.
     let r = call_full(
-        &app, "POST", "/query", None, None,
+        &app,
+        "POST",
+        "/query",
+        None,
+        None,
         Some(json!({"sql": "SELECT id, name FROM products WHERE score > 50 ORDER BY score DESC"})),
-    ).await;
+    )
+    .await;
     assert!(
         r.status.is_success(),
         "analytical query on /query must succeed: {} {:?}",
-        r.status, r.body
+        r.status,
+        r.body
     );
 
     // Expect rows with score > 50: alpha (90) and gamma (75), in DESC order.
     let rows = r.body.as_array().expect("response is an array of rows");
-    assert_eq!(rows.len(), 2, "expected 2 rows with score > 50, got {rows:?}");
+    assert_eq!(
+        rows.len(),
+        2,
+        "expected 2 rows with score > 50, got {rows:?}"
+    );
 
     // alpha (90) first, gamma (75) second (DESC by score).
-    let names: Vec<&str> = rows.iter()
+    let names: Vec<&str> = rows
+        .iter()
         .map(|row| row["name"].as_str().unwrap_or("?"))
         .collect();
-    assert_eq!(names, vec!["alpha", "gamma"], "rows should be alpha then gamma (score DESC): {names:?}");
+    assert_eq!(
+        names,
+        vec!["alpha", "gamma"],
+        "rows should be alpha then gamma (score DESC): {names:?}"
+    );
 }
 
 // ----- test: analytical path honors X-Bluedb-Min-Watermark (P4) -----
@@ -398,33 +565,56 @@ async fn analytical_path_honors_min_watermark() {
 
     // (a) min <= sealed: served from the sealed Iceberg snapshot.
     let r_ok = call_full(
-        &app, "POST", "/query", None, Some("0"),
+        &app,
+        "POST",
+        "/query",
+        None,
+        Some("0"),
         Some(json!({"sql": "SELECT id, name FROM products WHERE score > 50 ORDER BY score DESC"})),
-    ).await;
+    )
+    .await;
     assert!(
         r_ok.status.is_success(),
         "analytical path with min=0 (<=sealed) must succeed: {} {:?}",
-        r_ok.status, r_ok.body
+        r_ok.status,
+        r_ok.body
     );
     // Response should echo the sealed watermark.
     let wm = r_ok.headers.get("x-bluedb-watermark");
-    assert!(wm.is_some(), "analytical response must include X-Bluedb-Watermark");
+    assert!(
+        wm.is_some(),
+        "analytical response must include X-Bluedb-Watermark"
+    );
 
     // (b) min > sealed on the active writer: P4 serves FRESH (not 503).
     let future_seq = sealed + 1_000_000;
     let r_fresh = call_full(
-        &app, "POST", "/query", None, Some(&future_seq.to_string()),
+        &app,
+        "POST",
+        "/query",
+        None,
+        Some(&future_seq.to_string()),
         Some(json!({"sql": "SELECT id, name FROM products WHERE score > 50 ORDER BY score DESC"})),
-    ).await;
+    )
+    .await;
     assert!(
         r_fresh.status.is_success(),
         "P4: analytical path with min > sealed must serve FRESH on the active writer, not 503: {} {:?}",
         r_fresh.status, r_fresh.body
     );
     // Same rows as the sealed path: alpha (90), gamma (75) by score DESC.
-    let names: Vec<&str> = r_fresh.body.as_array().expect("rows array")
-        .iter().map(|row| row["name"].as_str().unwrap_or("?")).collect();
-    assert_eq!(names, vec!["alpha", "gamma"], "fresh rows must match: {names:?}");
+    let names: Vec<&str> = r_fresh
+        .body
+        .as_array()
+        .expect("rows array")
+        .iter()
+        .map(|row| row["name"].as_str().unwrap_or("?"))
+        .collect();
+    assert_eq!(
+        names,
+        vec!["alpha", "gamma"],
+        "fresh rows must match: {names:?}"
+    );
     assert!(
         r_fresh.headers.get("x-bluedb-watermark").is_some(),
         "fresh serve must include X-Bluedb-Watermark"
@@ -443,8 +633,15 @@ async fn writer_serves_unsealed_fresh_row_on_analytical_path() {
     let state = make_state().await;
     let app = build_app(state.clone());
 
-    let r = call_full(&app, "POST", "/sql", None, None,
-        Some(json!({"sql": "PRAGMA lakehouse_mirror = on"}))).await;
+    let r = call_full(
+        &app,
+        "POST",
+        "/sql",
+        None,
+        None,
+        Some(json!({"sql": "PRAGMA lakehouse_mirror = on"})),
+    )
+    .await;
     assert!(r.status.is_success());
 
     let r = call_full(&app, "POST", "/admin/sql", None, None,
@@ -454,9 +651,23 @@ async fn writer_serves_unsealed_fresh_row_on_analytical_path() {
     // Write rows; capture the write watermark. Do NOT seal — sealed stays 0.
     let mut write_seq = 0i64;
     for (id, name, score) in [(1, "alpha", 90), (2, "beta", 40), (3, "gamma", 75)] {
-        let r = call_full(&app, "POST", "/sql", None, None,
-            Some(json!({"sql": format!("INSERT INTO fresh_items VALUES ({id}, '{name}', {score})")}))).await;
-        assert!(r.status.is_success(), "insert {id}: {} {:?}", r.status, r.body);
+        let r = call_full(
+            &app,
+            "POST",
+            "/sql",
+            None,
+            None,
+            Some(
+                json!({"sql": format!("INSERT INTO fresh_items VALUES ({id}, '{name}', {score})")}),
+            ),
+        )
+        .await;
+        assert!(
+            r.status.is_success(),
+            "insert {id}: {} {:?}",
+            r.status,
+            r.body
+        );
         if let Some((_, seq)) = parse_watermark_header(&r.headers) {
             write_seq = seq;
         }
@@ -467,17 +678,34 @@ async fn writer_serves_unsealed_fresh_row_on_analytical_path() {
     // watermark, which is still 0). The non-indexed filter on `score` runs on the
     // analytical path (`/query`); P4 must serve the UNSEALED rows fresh.
     let r = call_full(
-        &app, "POST", "/query", None, Some(&write_seq.to_string()),
-        Some(json!({"sql": "SELECT id, name FROM fresh_items WHERE score > 50 ORDER BY score DESC"})),
-    ).await;
+        &app,
+        "POST",
+        "/query",
+        None,
+        Some(&write_seq.to_string()),
+        Some(
+            json!({"sql": "SELECT id, name FROM fresh_items WHERE score > 50 ORDER BY score DESC"}),
+        ),
+    )
+    .await;
     assert!(
         r.status.is_success(),
         "P4: writer must serve unsealed fresh rows for min={write_seq} > sealed=0: {} {:?}",
-        r.status, r.body
+        r.status,
+        r.body
     );
-    let names: Vec<&str> = r.body.as_array().expect("rows array")
-        .iter().map(|row| row["name"].as_str().unwrap_or("?")).collect();
-    assert_eq!(names, vec!["alpha", "gamma"], "expected alpha, gamma (score DESC): {names:?}");
+    let names: Vec<&str> = r
+        .body
+        .as_array()
+        .expect("rows array")
+        .iter()
+        .map(|row| row["name"].as_str().unwrap_or("?"))
+        .collect();
+    assert_eq!(
+        names,
+        vec!["alpha", "gamma"],
+        "expected alpha, gamma (score DESC): {names:?}"
+    );
 }
 
 // ----- P4 test: PRAGMA bluedb_read_wait_seal_n is accepted and stored ---------
@@ -487,43 +715,104 @@ async fn read_wait_seal_n_pragma_is_accepted_and_affects_decision() {
     let state = make_state().await;
     let app = build_app(state.clone());
 
-    let r = call_full(&app, "POST", "/sql", None, None,
-        Some(json!({"sql": "PRAGMA lakehouse_mirror = on"}))).await;
+    let r = call_full(
+        &app,
+        "POST",
+        "/sql",
+        None,
+        None,
+        Some(json!({"sql": "PRAGMA lakehouse_mirror = on"})),
+    )
+    .await;
     assert!(r.status.is_success());
 
     // The PRAGMA is intercepted (gluesql would reject it) and acked by name.
-    let r = call_full(&app, "POST", "/sql", None, None,
-        Some(json!({"sql": "PRAGMA bluedb_read_wait_seal_n = 3"}))).await;
-    assert!(r.status.is_success(), "pragma accepted: {} {:?}", r.status, r.body);
+    let r = call_full(
+        &app,
+        "POST",
+        "/sql",
+        None,
+        None,
+        Some(json!({"sql": "PRAGMA bluedb_read_wait_seal_n = 3"})),
+    )
+    .await;
+    assert!(
+        r.status.is_success(),
+        "pragma accepted: {} {:?}",
+        r.status,
+        r.body
+    );
     assert_eq!(
-        r.body["pragma"].as_str(), Some("bluedb_read_wait_seal_n"),
-        "ack must name the pragma: {:?}", r.body
+        r.body["pragma"].as_str(),
+        Some("bluedb_read_wait_seal_n"),
+        "ack must name the pragma: {:?}",
+        r.body
     );
 
     // `0` (reset to default) is also accepted and acked by name. (The stored
     // value itself is engine-internal; its effect is covered below.)
-    let r = call_full(&app, "POST", "/sql", None, None,
-        Some(json!({"sql": "SET bluedb_read_wait_seal_n = 0"}))).await;
-    assert!(r.status.is_success(), "pragma reset: {} {:?}", r.status, r.body);
+    let r = call_full(
+        &app,
+        "POST",
+        "/sql",
+        None,
+        None,
+        Some(json!({"sql": "SET bluedb_read_wait_seal_n = 0"})),
+    )
+    .await;
+    assert!(
+        r.status.is_success(),
+        "pragma reset: {} {:?}",
+        r.status,
+        r.body
+    );
     assert_eq!(r.body["pragma"].as_str(), Some("bluedb_read_wait_seal_n"));
 
     // With the pragma set to a non-default value, a min > sealed analytical read
     // still serves fresh on the writer (the pragma tunes the follower-redirect
     // budget, not the writer's own fresh-serve).
-    let r = call_full(&app, "POST", "/sql", None, None,
-        Some(json!({"sql": "PRAGMA bluedb_read_wait_seal_n = 5"}))).await;
-    assert!(r.status.is_success());
-    let _ = call_full(&app, "POST", "/admin/sql", None, None,
-        Some(json!({"sql": "CREATE TABLE wpragma (id INTEGER PRIMARY KEY, score INTEGER)"}))).await;
-    let _ = call_full(&app, "POST", "/sql", None, None,
-        Some(json!({"sql": "INSERT INTO wpragma VALUES (1, 99)"}))).await;
     let r = call_full(
-        &app, "POST", "/query", None, Some("1000000"),
+        &app,
+        "POST",
+        "/sql",
+        None,
+        None,
+        Some(json!({"sql": "PRAGMA bluedb_read_wait_seal_n = 5"})),
+    )
+    .await;
+    assert!(r.status.is_success());
+    let _ = call_full(
+        &app,
+        "POST",
+        "/admin/sql",
+        None,
+        None,
+        Some(json!({"sql": "CREATE TABLE wpragma (id INTEGER PRIMARY KEY, score INTEGER)"})),
+    )
+    .await;
+    let _ = call_full(
+        &app,
+        "POST",
+        "/sql",
+        None,
+        None,
+        Some(json!({"sql": "INSERT INTO wpragma VALUES (1, 99)"})),
+    )
+    .await;
+    let r = call_full(
+        &app,
+        "POST",
+        "/query",
+        None,
+        Some("1000000"),
         Some(json!({"sql": "SELECT id FROM wpragma WHERE score > 0"})),
-    ).await;
+    )
+    .await;
     assert!(
         r.status.is_success(),
-        "writer serves fresh even with pragma set: {} {:?}", r.status, r.body
+        "writer serves fresh even with pragma set: {} {:?}",
+        r.status,
+        r.body
     );
 }
 
@@ -543,7 +832,11 @@ async fn unpromoted_node_fails_fast_503_on_sql() {
     let r = tokio::time::timeout(
         Duration::from_secs(5),
         call_full(
-            &app, "POST", "/sql", None, None,
+            &app,
+            "POST",
+            "/sql",
+            None,
+            None,
             Some(json!({"sql": "INSERT INTO whatever VALUES (1)"})),
         ),
     )
@@ -553,7 +846,8 @@ async fn unpromoted_node_fails_fast_503_on_sql() {
         r.status,
         StatusCode::SERVICE_UNAVAILABLE,
         "unpromoted node must 503 (writer unavailable): {} {:?}",
-        r.status, r.body
+        r.status,
+        r.body
     );
 }
 
@@ -569,11 +863,23 @@ async fn unpromoted_node_fails_fast_503_on_sql() {
 /// Helper: set up a typed-column table, insert one row, seal to Iceberg.
 /// Returns the sealed watermark seq.
 async fn setup_typed_table(state: &AppState, app: &axum::Router) -> i64 {
-    let r = call_full(app, "POST", "/sql", None, None,
-        Some(json!({"sql": "PRAGMA lakehouse_mirror = on"}))).await;
+    let r = call_full(
+        app,
+        "POST",
+        "/sql",
+        None,
+        None,
+        Some(json!({"sql": "PRAGMA lakehouse_mirror = on"})),
+    )
+    .await;
     assert!(r.status.is_success(), "pragma: {} {:?}", r.status, r.body);
 
-    let r = call_full(app, "POST", "/admin/sql", None, None,
+    let r = call_full(
+        app,
+        "POST",
+        "/admin/sql",
+        None,
+        None,
         Some(json!({"sql":
             "CREATE TABLE typed_row (\
                 id INTEGER PRIMARY KEY, \
@@ -583,11 +889,23 @@ async fn setup_typed_table(state: &AppState, app: &axum::Router) -> i64 {
                 ts TIMESTAMP, \
                 slot TIME\
             )"
-        }))).await;
-    assert!(r.status.is_success(), "create typed_row: {} {:?}", r.status, r.body);
+        })),
+    )
+    .await;
+    assert!(
+        r.status.is_success(),
+        "create typed_row: {} {:?}",
+        r.status,
+        r.body
+    );
 
     // Insert one row with known values.
-    let r = call_full(app, "POST", "/sql", None, None,
+    let r = call_full(
+        app,
+        "POST",
+        "/sql",
+        None,
+        None,
         Some(json!({"sql":
             "INSERT INTO typed_row VALUES (\
                 1, \
@@ -597,14 +915,23 @@ async fn setup_typed_table(state: &AppState, app: &axum::Router) -> i64 {
                 TIMESTAMP '2024-03-15 12:34:56', \
                 TIME '14:30:05'\
             )"
-        }))).await;
-    assert!(r.status.is_success(), "insert typed_row: {} {:?}", r.status, r.body);
+        })),
+    )
+    .await;
+    assert!(
+        r.status.is_success(),
+        "insert typed_row: {} {:?}",
+        r.status,
+        r.body
+    );
 
     state.seal_now().await.expect("seal typed_row");
 
     let r = call_full(app, "GET", "/tables/typed_row", None, None, None).await;
     assert!(r.status.is_success());
-    parse_watermark_header(&r.headers).map(|(_, seq)| seq).unwrap_or(0)
+    parse_watermark_header(&r.headers)
+        .map(|(_, seq)| seq)
+        .unwrap_or(0)
 }
 
 #[tokio::test]
@@ -618,7 +945,9 @@ async fn decimal_date_timestamp_time_render_identically_on_both_paths() {
     let r_oltp = call_full(&app, "GET", "/tables/typed_row", None, None, None).await;
     assert!(
         r_oltp.status.is_success(),
-        "OLTP path must succeed: {} {:?}", r_oltp.status, r_oltp.body
+        "OLTP path must succeed: {} {:?}",
+        r_oltp.status,
+        r_oltp.body
     );
     let oltp_rows = r_oltp.body.as_array().expect("OLTP response is an array");
     assert_eq!(oltp_rows.len(), 1, "expected 1 row from OLTP path");
@@ -626,60 +955,82 @@ async fn decimal_date_timestamp_time_render_identically_on_both_paths() {
 
     // --- Analytical path (`/query`): non-indexed WHERE score > 0 → DataFusion ---
     let r_analytical = call_full(
-        &app, "POST", "/query", None, None,
+        &app,
+        "POST",
+        "/query",
+        None,
+        None,
         Some(json!({"sql": "SELECT * FROM typed_row WHERE score > 0 ORDER BY id"})),
-    ).await;
+    )
+    .await;
     assert!(
         r_analytical.status.is_success(),
-        "analytical path must succeed: {} {:?}", r_analytical.status, r_analytical.body
+        "analytical path must succeed: {} {:?}",
+        r_analytical.status,
+        r_analytical.body
     );
-    let analytical_rows = r_analytical.body.as_array().expect("analytical response is an array");
-    assert_eq!(analytical_rows.len(), 1, "expected 1 row from analytical path");
+    let analytical_rows = r_analytical
+        .body
+        .as_array()
+        .expect("analytical response is an array");
+    assert_eq!(
+        analytical_rows.len(),
+        1,
+        "expected 1 row from analytical path"
+    );
     let analytical = &analytical_rows[0];
 
     // Assert canonical rendering for each typed column.
     // DECIMAL 12.34 → normalized string "12.34" (trailing zeros stripped).
     assert_eq!(
         oltp["amount"], analytical["amount"],
-        "DECIMAL: OLTP={} analytical={}", oltp["amount"], analytical["amount"]
+        "DECIMAL: OLTP={} analytical={}",
+        oltp["amount"], analytical["amount"]
     );
     assert_eq!(
         oltp["amount"],
         Value::String("12.34".to_string()),
-        "DECIMAL canonical form should be \"12.34\", got {}", oltp["amount"]
+        "DECIMAL canonical form should be \"12.34\", got {}",
+        oltp["amount"]
     );
 
     // DATE '2024-03-15' → ISO-8601 "2024-03-15".
     assert_eq!(
         oltp["day"], analytical["day"],
-        "DATE: OLTP={} analytical={}", oltp["day"], analytical["day"]
+        "DATE: OLTP={} analytical={}",
+        oltp["day"], analytical["day"]
     );
     assert_eq!(
         oltp["day"],
         Value::String("2024-03-15".to_string()),
-        "DATE canonical form should be \"2024-03-15\", got {}", oltp["day"]
+        "DATE canonical form should be \"2024-03-15\", got {}",
+        oltp["day"]
     );
 
     // TIMESTAMP '2024-03-15 12:34:56' → "2024-03-15T12:34:56".
     assert_eq!(
         oltp["ts"], analytical["ts"],
-        "TIMESTAMP: OLTP={} analytical={}", oltp["ts"], analytical["ts"]
+        "TIMESTAMP: OLTP={} analytical={}",
+        oltp["ts"], analytical["ts"]
     );
     assert_eq!(
         oltp["ts"],
         Value::String("2024-03-15T12:34:56".to_string()),
-        "TIMESTAMP canonical form should be \"2024-03-15T12:34:56\", got {}", oltp["ts"]
+        "TIMESTAMP canonical form should be \"2024-03-15T12:34:56\", got {}",
+        oltp["ts"]
     );
 
     // TIME '14:30:05' → "14:30:05".
     assert_eq!(
         oltp["slot"], analytical["slot"],
-        "TIME: OLTP={} analytical={}", oltp["slot"], analytical["slot"]
+        "TIME: OLTP={} analytical={}",
+        oltp["slot"], analytical["slot"]
     );
     assert_eq!(
         oltp["slot"],
         Value::String("14:30:05".to_string()),
-        "TIME canonical form should be \"14:30:05\", got {}", oltp["slot"]
+        "TIME canonical form should be \"14:30:05\", got {}",
+        oltp["slot"]
     );
 }
 
@@ -692,12 +1043,26 @@ async fn json_accessors_work_on_the_analytical_path() {
     let state = make_state().await;
     let app = build_app(state.clone());
 
-    let r = call_full(&app, "POST", "/sql", None, None,
-        Some(json!({"sql": "PRAGMA lakehouse_mirror = on"}))).await;
+    let r = call_full(
+        &app,
+        "POST",
+        "/sql",
+        None,
+        None,
+        Some(json!({"sql": "PRAGMA lakehouse_mirror = on"})),
+    )
+    .await;
     assert!(r.status.is_success(), "pragma: {} {:?}", r.status, r.body);
 
-    let r = call_full(&app, "POST", "/admin/sql", None, None,
-        Some(json!({"sql": "CREATE TABLE docs (id INTEGER PRIMARY KEY, data JSON)"}))).await;
+    let r = call_full(
+        &app,
+        "POST",
+        "/admin/sql",
+        None,
+        None,
+        Some(json!({"sql": "CREATE TABLE docs (id INTEGER PRIMARY KEY, data JSON)"})),
+    )
+    .await;
     assert!(r.status.is_success(), "create: {} {:?}", r.status, r.body);
 
     // Insert JSON documents (the JSON column stores canonical text).
@@ -706,9 +1071,21 @@ async fn json_accessors_work_on_the_analytical_path() {
         (1, r#"{"status":"active","n":90}"#),
         (2, r#"{"status":"idle","n":40}"#),
     ] {
-        let r = call_full(&app, "POST", "/sql", None, None,
-            Some(json!({"sql": format!("INSERT INTO docs VALUES ({id}, '{body}')")}))).await;
-        assert!(r.status.is_success(), "insert {id}: {} {:?}", r.status, r.body);
+        let r = call_full(
+            &app,
+            "POST",
+            "/sql",
+            None,
+            None,
+            Some(json!({"sql": format!("INSERT INTO docs VALUES ({id}, '{body}')")})),
+        )
+        .await;
+        assert!(
+            r.status.is_success(),
+            "insert {id}: {} {:?}",
+            r.status,
+            r.body
+        );
         if let Some((_, seq)) = parse_watermark_header(&r.headers) {
             write_seq = seq;
         }
@@ -718,13 +1095,23 @@ async fn json_accessors_work_on_the_analytical_path() {
     // run on the analytical surface (`/query`); min-watermark forces a fresh
     // (unsealed) read on the writer.
     let r = call_full(
-        &app, "POST", "/query", None, Some(&write_seq.to_string()),
+        &app,
+        "POST",
+        "/query",
+        None,
+        Some(&write_seq.to_string()),
         Some(json!({
             "sql": "SELECT id, data->>'status' AS status, data->>'n' AS n \
                     FROM docs WHERE (data->>'status') = 'active'"
         })),
-    ).await;
-    assert!(r.status.is_success(), "json query: {} {:?}", r.status, r.body);
+    )
+    .await;
+    assert!(
+        r.status.is_success(),
+        "json query: {} {:?}",
+        r.status,
+        r.body
+    );
     let rows = r.body.as_array().expect("rows array");
     assert_eq!(rows.len(), 1, "only the active row: {:?}", r.body);
     assert_eq!(rows[0]["id"], json!(1));

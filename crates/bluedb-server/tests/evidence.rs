@@ -56,7 +56,8 @@ async fn call(
     let json = if bytes.is_empty() {
         Value::Null
     } else {
-        serde_json::from_slice(&bytes).unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()))
+        serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()))
     };
     (status, json)
 }
@@ -180,7 +181,10 @@ async fn evidence_create_chain_explicit() {
     .await;
     assert_eq!(s, StatusCode::CONFLICT, "mode conflict: {s} {body}");
     assert!(
-        body["error"].as_str().unwrap_or("").contains("E_CHAIN_MODE_CONFLICT"),
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("E_CHAIN_MODE_CONFLICT"),
         "conflict message: {body}"
     );
 }
@@ -218,7 +222,10 @@ async fn evidence_idempotency() {
     )
     .await;
     assert_eq!(s, StatusCode::OK, "replay: {s} {replay}");
-    assert_eq!(first["seqs"], replay["seqs"], "replay must return same seqs");
+    assert_eq!(
+        first["seqs"], replay["seqs"],
+        "replay must return same seqs"
+    );
 
     // Different payload with same key → 409 IdemConflict.
     let (s, body) = call(
@@ -234,7 +241,10 @@ async fn evidence_idempotency() {
     .await;
     assert_eq!(s, StatusCode::CONFLICT, "idem conflict: {s} {body}");
     assert!(
-        body["error"].as_str().unwrap_or("").contains("E_IDEM_CONFLICT"),
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("E_IDEM_CONFLICT"),
         "idem conflict message: {body}"
     );
 }
@@ -262,21 +272,51 @@ async fn evidence_merkle_and_erasure_e2e() {
     let (s, body) = call(&app, "GET", "/evidence/v/digest", Some("tenant1"), None).await;
     assert_eq!(s, StatusCode::OK, "digest: {s} {body}");
     assert_eq!(body["size"], 5, "digest size: {body}");
-    let root_hash = body["root_hash"].as_str().expect("root_hash is string").to_string();
-    assert_eq!(root_hash.len(), 64, "root_hash must be 64 hex chars: {root_hash}");
-    assert!(root_hash.chars().all(|c| c.is_ascii_hexdigit()), "root_hash lowercase hex: {root_hash}");
+    let root_hash = body["root_hash"]
+        .as_str()
+        .expect("root_hash is string")
+        .to_string();
+    assert_eq!(
+        root_hash.len(),
+        64,
+        "root_hash must be 64 hex chars: {root_hash}"
+    );
+    assert!(
+        root_hash.chars().all(|c| c.is_ascii_hexdigit()),
+        "root_hash lowercase hex: {root_hash}"
+    );
     let digest_before = root_hash;
 
     // GET /evidence/v/proof?seq=3 → audit_path non-empty.
-    let (s, body) = call(&app, "GET", "/evidence/v/proof?seq=3", Some("tenant1"), None).await;
+    let (s, body) = call(
+        &app,
+        "GET",
+        "/evidence/v/proof?seq=3",
+        Some("tenant1"),
+        None,
+    )
+    .await;
     assert_eq!(s, StatusCode::OK, "proof: {s} {body}");
     let audit_path = body["audit_path"].as_array().expect("audit_path is array");
-    assert!(!audit_path.is_empty(), "audit_path should be non-empty for size=5: {body}");
+    assert!(
+        !audit_path.is_empty(),
+        "audit_path should be non-empty for size=5: {body}"
+    );
 
     // GET /evidence/v/consistency?from=2 → proof present.
-    let (s, body) = call(&app, "GET", "/evidence/v/consistency?from=2", Some("tenant1"), None).await;
+    let (s, body) = call(
+        &app,
+        "GET",
+        "/evidence/v/consistency?from=2",
+        Some("tenant1"),
+        None,
+    )
+    .await;
     assert_eq!(s, StatusCode::OK, "consistency: {s} {body}");
-    assert!(body["proof"].as_array().is_some(), "consistency proof field: {body}");
+    assert!(
+        body["proof"].as_array().is_some(),
+        "consistency proof field: {body}"
+    );
 
     // POST /evidence/v/entries/3/redact → 200.
     let (s, body) = call(
@@ -304,7 +344,10 @@ async fn evidence_merkle_and_erasure_e2e() {
     assert_eq!(rows.len(), 5, "5 rows: {body}");
     let row3 = rows.iter().find(|r| r["seq"] == 3).expect("row seq=3");
     assert_eq!(row3["redacted"], true, "seq=3 redacted: {row3}");
-    assert!(row3.get("payload_b64").is_none() || row3["payload_b64"].is_null(), "seq=3 no payload_b64: {row3}");
+    assert!(
+        row3.get("payload_b64").is_none() || row3["payload_b64"].is_null(),
+        "seq=3 no payload_b64: {row3}"
+    );
 
     // GET /evidence/v/head → 5.
     let (s, body) = call(&app, "GET", "/evidence/v/head", Some("tenant1"), None).await;
@@ -332,9 +375,16 @@ async fn evidence_merkle_and_erasure_e2e() {
     assert_eq!(s, StatusCode::OK, "create plain chain: {s} {body}");
 
     let (s, body) = call(&app, "GET", "/evidence/p/digest", Some("tenant1"), None).await;
-    assert_eq!(s, StatusCode::BAD_REQUEST, "digest on plain chain: {s} {body}");
+    assert_eq!(
+        s,
+        StatusCode::BAD_REQUEST,
+        "digest on plain chain: {s} {body}"
+    );
     assert!(
-        body["error"].as_str().unwrap_or("").contains("E_NOT_VERIFIED"),
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("E_NOT_VERIFIED"),
         "E_NOT_VERIFIED message: {body}"
     );
 
@@ -347,9 +397,16 @@ async fn evidence_merkle_and_erasure_e2e() {
         None,
     )
     .await;
-    assert_eq!(s, StatusCode::CONFLICT, "hard-delete on verified: {s} {body}");
+    assert_eq!(
+        s,
+        StatusCode::CONFLICT,
+        "hard-delete on verified: {s} {body}"
+    );
     assert!(
-        body["error"].as_str().unwrap_or("").contains("E_VERIFIED_NO_DELETE"),
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("E_VERIFIED_NO_DELETE"),
         "E_VERIFIED_NO_DELETE message: {body}"
     );
 
@@ -413,7 +470,14 @@ async fn evidence_inclusion_unknown_seq_is_404() {
     assert_eq!(s, StatusCode::OK, "append: {s} {body}");
 
     // seq=99 doesn't exist (size=1) → 404, not 400.
-    let (s, body) = call(&app, "GET", "/evidence/p404/proof?seq=99", Some("tenant1"), None).await;
+    let (s, body) = call(
+        &app,
+        "GET",
+        "/evidence/p404/proof?seq=99",
+        Some("tenant1"),
+        None,
+    )
+    .await;
     assert_eq!(
         s,
         StatusCode::NOT_FOUND,
@@ -429,10 +493,21 @@ async fn evidence_inclusion_unknown_seq_is_404() {
         None,
     )
     .await;
-    assert_eq!(s, StatusCode::NOT_FOUND, "redact unknown seq must be 404: {s} {body}");
+    assert_eq!(
+        s,
+        StatusCode::NOT_FOUND,
+        "redact unknown seq must be 404: {s} {body}"
+    );
 
     // seq=0 (below 1) is a malformed request → stays 400.
-    let (s, body) = call(&app, "GET", "/evidence/p404/proof?seq=0", Some("tenant1"), None).await;
+    let (s, body) = call(
+        &app,
+        "GET",
+        "/evidence/p404/proof?seq=0",
+        Some("tenant1"),
+        None,
+    )
+    .await;
     assert_eq!(
         s,
         StatusCode::BAD_REQUEST,
@@ -545,10 +620,25 @@ async fn graph_delete_missing_edge_reports_zero() {
     assert_eq!(s, StatusCode::OK, "mutate: {s} {body}");
     // upsert A->C is a no-op (same weight 3) → upserted: 0; delete A->C real → 1;
     // delete X->Y missing → 0. Total deleted: 1.
-    assert_eq!(body["deleted"], json!(1), "mutate deletes: real(1) + missing(0) = 1: {body}");
+    assert_eq!(
+        body["deleted"],
+        json!(1),
+        "mutate deletes: real(1) + missing(0) = 1: {body}"
+    );
 
     // Drop a missing graph → dropped: 0.
-    let (s, body) = call(&app, "DELETE", "/graph/no_such_graph", Some("tenant1"), None).await;
+    let (s, body) = call(
+        &app,
+        "DELETE",
+        "/graph/no_such_graph",
+        Some("tenant1"),
+        None,
+    )
+    .await;
     assert_eq!(s, StatusCode::OK, "drop missing graph: {s} {body}");
-    assert_eq!(body["dropped"], json!(0), "missing graph reports dropped:0: {body}");
+    assert_eq!(
+        body["dropped"],
+        json!(0),
+        "missing graph reports dropped:0: {body}"
+    );
 }

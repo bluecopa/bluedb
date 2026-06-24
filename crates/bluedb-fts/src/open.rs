@@ -62,9 +62,9 @@ async fn read_footer<B: BlobStore + ?Sized>(blob: &B, key: &str) -> anyhow::Resu
     // Layout: [ body ][ bundle-meta ][ bundle-meta len: u32 ][ hotcache ][ hotcache len: u32 ].
     // `hotcache_end` is where the hotcache region ends (== start of its len field).
     let hotcache_end = total - U32_LEN;
-    let hotcache_start = hotcache_end
-        .checked_sub(hotcache_len)
-        .ok_or_else(|| anyhow::anyhow!("split footer is malformed (hotcache_len={hotcache_len})"))?;
+    let hotcache_start = hotcache_end.checked_sub(hotcache_len).ok_or_else(|| {
+        anyhow::anyhow!("split footer is malformed (hotcache_len={hotcache_len})")
+    })?;
     // The bundle-meta len field sits immediately before the hotcache.
     if hotcache_start < U32_LEN {
         anyhow::bail!("split footer is malformed (no room for bundle-meta len)");
@@ -220,10 +220,7 @@ impl Directory for SplitBlobDirectory {
 /// open would fail.
 ///
 /// Returns a ready-to-search [`tantivy::Index`]. No `get_all` is ever issued.
-pub async fn open_split_lazy(
-    blob: Arc<dyn BlobStore>,
-    key: &str,
-) -> anyhow::Result<Index> {
+pub async fn open_split_lazy(blob: Arc<dyn BlobStore>, key: &str) -> anyhow::Result<Index> {
     let footer = read_footer(blob.as_ref(), key).await?;
     if footer.hotcache.is_empty() {
         anyhow::bail!(

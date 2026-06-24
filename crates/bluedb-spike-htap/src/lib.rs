@@ -40,8 +40,8 @@ use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator,
 };
-use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation};
 use parquet::file::properties::WriterProperties;
@@ -89,10 +89,7 @@ pub async fn memory_catalog(warehouse: &str) -> impl Catalog {
     MemoryCatalogBuilder::default()
         .load(
             "spike",
-            HashMap::from([(
-                MEMORY_CATALOG_WAREHOUSE.to_string(),
-                warehouse.to_string(),
-            )]),
+            HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse.to_string())]),
         )
         .await
         .expect("build memory catalog")
@@ -121,10 +118,8 @@ pub async fn create_and_populate(catalog: &dyn Catalog, rows: RecordBatch) -> Ta
     // Write a Parquet data file through the TABLE's FileIO so it lands in the
     // same (in-memory) store the reader will use.
     let data_file = {
-        let parquet = ParquetWriterBuilder::new(
-            WriterProperties::builder().build(),
-            Arc::new(hist_schema()),
-        );
+        let parquet =
+            ParquetWriterBuilder::new(WriterProperties::builder().build(), Arc::new(hist_schema()));
         let rolling = RollingFileWriterBuilder::new_with_default_file_size(
             parquet,
             table.file_io().clone(),

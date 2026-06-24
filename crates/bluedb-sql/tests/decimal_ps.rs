@@ -17,7 +17,11 @@ use slatedb::object_store::memory::InMemory;
 use slatedb::Db;
 
 async fn new_glue() -> Glue<SlateDbStorage> {
-    let db = Arc::new(Db::open("decimal-ps-test", Arc::new(InMemory::new())).await.unwrap());
+    let db = Arc::new(
+        Db::open("decimal-ps-test", Arc::new(InMemory::new()))
+            .await
+            .unwrap(),
+    );
     Glue::new(Database::new(db).connection_serialized())
 }
 
@@ -71,11 +75,21 @@ async fn decimal_ps_insert_select_roundtrip() {
     .await
     .unwrap();
 
-    exec(&mut glue, "INSERT INTO prices VALUES (1, 9.99)").await.unwrap();
-    exec(&mut glue, "INSERT INTO prices VALUES (2, 123.45)").await.unwrap();
-    exec(&mut glue, "INSERT INTO prices VALUES (3, 0.01)").await.unwrap();
+    exec(&mut glue, "INSERT INTO prices VALUES (1, 9.99)")
+        .await
+        .unwrap();
+    exec(&mut glue, "INSERT INTO prices VALUES (2, 123.45)")
+        .await
+        .unwrap();
+    exec(&mut glue, "INSERT INTO prices VALUES (3, 0.01)")
+        .await
+        .unwrap();
 
-    let got = rows(exec(&mut glue, "SELECT id, amount FROM prices ORDER BY id").await.unwrap());
+    let got = rows(
+        exec(&mut glue, "SELECT id, amount FROM prices ORDER BY id")
+            .await
+            .unwrap(),
+    );
     assert_eq!(got.len(), 3, "expected 3 rows");
     // Confirm ids survive.
     assert_eq!(got[0][0], Value::I64(1));
@@ -102,9 +116,15 @@ async fn numeric_ps_insert_select_roundtrip() {
     .await
     .unwrap();
 
-    exec(&mut glue, "INSERT INTO measurements VALUES (1, 3.1416)").await.unwrap();
+    exec(&mut glue, "INSERT INTO measurements VALUES (1, 3.1416)")
+        .await
+        .unwrap();
 
-    let got = rows(exec(&mut glue, "SELECT reading FROM measurements WHERE id = 1").await.unwrap());
+    let got = rows(
+        exec(&mut glue, "SELECT reading FROM measurements WHERE id = 1")
+            .await
+            .unwrap(),
+    );
     assert_eq!(got.len(), 1);
     assert!(
         matches!(got[0][0], Value::Decimal(_)),
@@ -128,10 +148,20 @@ async fn bare_decimal_still_works() {
     )
     .await
     .unwrap();
-    exec(&mut glue, "INSERT INTO bare VALUES (1, 42.0)").await.unwrap();
-    let got = rows(exec(&mut glue, "SELECT val FROM bare WHERE id = 1").await.unwrap());
+    exec(&mut glue, "INSERT INTO bare VALUES (1, 42.0)")
+        .await
+        .unwrap();
+    let got = rows(
+        exec(&mut glue, "SELECT val FROM bare WHERE id = 1")
+            .await
+            .unwrap(),
+    );
     assert_eq!(got.len(), 1);
-    assert!(matches!(got[0][0], Value::Decimal(_)), "val should be Decimal, got {:?}", got[0][0]);
+    assert!(
+        matches!(got[0][0], Value::Decimal(_)),
+        "val should be Decimal, got {:?}",
+        got[0][0]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -154,7 +184,14 @@ async fn other_types_unaffected() {
     )
     .await
     .unwrap();
-    let got = rows(exec(&mut glue, "SELECT id, name, active, score FROM mixed WHERE id = 1").await.unwrap());
+    let got = rows(
+        exec(
+            &mut glue,
+            "SELECT id, name, active, score FROM mixed WHERE id = 1",
+        )
+        .await
+        .unwrap(),
+    );
     assert_eq!(got.len(), 1);
     assert_eq!(got[0][0], Value::I64(1));
     assert!(matches!(got[0][1], Value::Str(_)), "name should be Str");

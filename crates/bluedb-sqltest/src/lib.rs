@@ -26,12 +26,12 @@ use datafusion::catalog::{SchemaProvider, TableProvider};
 use datafusion::datasource::MemTable;
 use datafusion::error::{DataFusionError, Result as DfResult};
 use gluesql_core::prelude::{Glue, Payload, Value};
-use slatedb::object_store::ObjectStore;
 use slatedb::config::Settings;
 use slatedb::object_store::memory::InMemory;
+use slatedb::object_store::ObjectStore;
 use slatedb::Db;
-use std::time::Duration;
 use sqllogictest::{default_validator, AsyncDB, DBOutput, DefaultColumnType, Normalizer};
+use std::time::Duration;
 
 /// A GlueSQL engine error, surfaced to sqllogictest as the backend `Error`.
 ///
@@ -201,11 +201,7 @@ pub fn lenient_validator(
 }
 
 fn lines_match(actual: &[String], expected: &[String]) -> bool {
-    actual.len() == expected.len()
-        && actual
-            .iter()
-            .zip(expected)
-            .all(|(a, e)| tokens_match(a, e))
+    actual.len() == expected.len() && actual.iter().zip(expected).all(|(a, e)| tokens_match(a, e))
 }
 
 /// Compare two whitespace-separated lines token by token, treating two tokens as
@@ -229,7 +225,10 @@ fn payload_to_output(payload: Payload) -> DBOutput<DefaultColumnType> {
     match payload {
         Payload::Select { labels, rows } => rows_to_output(labels.len(), rows),
         Payload::SelectMap(maps) => {
-            let rows: Vec<Vec<Value>> = maps.into_iter().map(|m| m.into_values().collect()).collect();
+            let rows: Vec<Vec<Value>> = maps
+                .into_iter()
+                .map(|m| m.into_values().collect())
+                .collect();
             let width = rows.first().map(Vec::len).unwrap_or(0);
             rows_to_output(width, rows)
         }
@@ -652,5 +651,8 @@ fn batch_from_rows(labels: &[String], rows: &[Vec<Value>]) -> anyhow::Result<Rec
         arrays.push(arr);
     }
 
-    Ok(RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), arrays)?)
+    Ok(RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(fields)),
+        arrays,
+    )?)
 }

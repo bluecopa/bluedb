@@ -42,12 +42,23 @@ pub trait LeaseProvider: Send + Sync + 'static {
     /// `now_millis`. Returns the granted [`Lease`] (epoch bumped on a genuine
     /// change of holder; preserved when `holder` already holds a live lease), or
     /// `None` if a *different* holder currently has an unexpired lease.
-    async fn try_acquire(&self, holder: &str, ttl: Duration, now_millis: i64) -> Result<Option<Lease>>;
+    async fn try_acquire(
+        &self,
+        holder: &str,
+        ttl: Duration,
+        now_millis: i64,
+    ) -> Result<Option<Lease>>;
 
     /// Extend `holder`'s lease, identified by `epoch`. Returns the refreshed
     /// lease, or `None` if `holder` no longer holds it at `epoch` (lost it — the
     /// caller MUST self-fence). Never bumps the epoch.
-    async fn renew(&self, holder: &str, epoch: u64, ttl: Duration, now_millis: i64) -> Result<Option<Lease>>;
+    async fn renew(
+        &self,
+        holder: &str,
+        epoch: u64,
+        ttl: Duration,
+        now_millis: i64,
+    ) -> Result<Option<Lease>>;
 
     /// Best-effort release of `holder`'s lease at `epoch` (no-op if not held).
     async fn release(&self, holder: &str, epoch: u64) -> Result<()>;
@@ -83,7 +94,12 @@ impl LocalLeaseProvider {
 
 #[async_trait]
 impl LeaseProvider for LocalLeaseProvider {
-    async fn try_acquire(&self, holder: &str, ttl: Duration, now_millis: i64) -> Result<Option<Lease>> {
+    async fn try_acquire(
+        &self,
+        holder: &str,
+        ttl: Duration,
+        now_millis: i64,
+    ) -> Result<Option<Lease>> {
         let mut inner = self.inner.lock().expect("lease mutex poisoned");
 
         // Held by a *different*, still-live holder → denied.
@@ -112,7 +128,13 @@ impl LeaseProvider for LocalLeaseProvider {
         Ok(Some(lease))
     }
 
-    async fn renew(&self, holder: &str, epoch: u64, ttl: Duration, now_millis: i64) -> Result<Option<Lease>> {
+    async fn renew(
+        &self,
+        holder: &str,
+        epoch: u64,
+        ttl: Duration,
+        now_millis: i64,
+    ) -> Result<Option<Lease>> {
         let mut inner = self.inner.lock().expect("lease mutex poisoned");
         match &inner.lease {
             // Still ours, same epoch, not yet expired → extend.

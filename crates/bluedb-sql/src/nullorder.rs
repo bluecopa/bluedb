@@ -35,7 +35,11 @@ pub fn rewrite_null_order(sql: &str, default: Option<bool>) -> String {
     for stmt in &mut statements {
         if let Statement::Query(query) = stmt {
             if let Some(order_by) = &mut query.order_by {
-                if order_by.exprs.iter().any(|e| effective(e, default).is_some()) {
+                if order_by
+                    .exprs
+                    .iter()
+                    .any(|e| effective(e, default).is_some())
+                {
                     order_by.exprs = expand(&order_by.exprs, default);
                     changed = true;
                 }
@@ -132,7 +136,10 @@ mod tests {
         // Explicit NULLS FIRST is honored (and stripped) even with no SET.
         let out = rewrite_null_order("SELECT s FROM t ORDER BY s NULLS FIRST", None);
         assert!(out.to_uppercase().contains("IS NULL DESC"), "got: {out}");
-        assert!(!out.to_uppercase().contains("NULLS FIRST"), "must strip NULLS FIRST: {out}");
+        assert!(
+            !out.to_uppercase().contains("NULLS FIRST"),
+            "must strip NULLS FIRST: {out}"
+        );
     }
 
     #[test]
@@ -140,7 +147,10 @@ mod tests {
         // Key says NULLS LAST while session default is first -> explicit wins.
         let out = rewrite_null_order("SELECT s FROM t ORDER BY s NULLS LAST", Some(true));
         assert!(out.contains("IS NULL"), "got: {out}");
-        assert!(!out.to_uppercase().contains("IS NULL DESC"), "explicit LAST wins: {out}");
+        assert!(
+            !out.to_uppercase().contains("IS NULL DESC"),
+            "explicit LAST wins: {out}"
+        );
     }
 
     #[test]
@@ -164,10 +174,22 @@ mod tests {
 
     #[test]
     fn detects_set_statement() {
-        assert_eq!(parse_default_null_order("SET default_null_order='nulls_first';"), Some(true));
-        assert_eq!(parse_default_null_order("SET default_null_order='nulls_last'"), Some(false));
-        assert_eq!(parse_default_null_order("PRAGMA default_null_order='NULLS FIRST'"), Some(true));
-        assert_eq!(parse_default_null_order("SET default_null_order='UNKNOWN'"), None);
+        assert_eq!(
+            parse_default_null_order("SET default_null_order='nulls_first';"),
+            Some(true)
+        );
+        assert_eq!(
+            parse_default_null_order("SET default_null_order='nulls_last'"),
+            Some(false)
+        );
+        assert_eq!(
+            parse_default_null_order("PRAGMA default_null_order='NULLS FIRST'"),
+            Some(true)
+        );
+        assert_eq!(
+            parse_default_null_order("SET default_null_order='UNKNOWN'"),
+            None
+        );
         assert_eq!(parse_default_null_order("SELECT 1"), None);
         assert_eq!(parse_default_null_order("SET foo='bar'"), None);
     }

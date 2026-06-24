@@ -28,7 +28,10 @@ fn pg_url() -> Option<String> {
 }
 
 fn unique_resource(prefix: &str) -> String {
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     format!("{prefix}-{nanos}")
 }
 
@@ -59,7 +62,11 @@ async fn election_renew_and_handover() {
     let p = provider_or_skip!("election");
 
     // a takes the fresh lease at epoch 1.
-    let a = p.try_acquire("a", TTL, 0).await.unwrap().expect("a acquires");
+    let a = p
+        .try_acquire("a", TTL, 0)
+        .await
+        .unwrap()
+        .expect("a acquires");
     assert_eq!(a.epoch, 1);
     assert_eq!(a.expires_at_millis, 10_000);
 
@@ -67,12 +74,20 @@ async fn election_renew_and_handover() {
     assert!(p.try_acquire("b", TTL, 1_000).await.unwrap().is_none());
 
     // a renews (same epoch, extended expiry).
-    let renewed = p.renew("a", 1, TTL, 2_000).await.unwrap().expect("a renews");
+    let renewed = p
+        .renew("a", 1, TTL, 2_000)
+        .await
+        .unwrap()
+        .expect("a renews");
     assert_eq!(renewed.epoch, 1);
     assert_eq!(renewed.expires_at_millis, 12_000);
 
     // After expiry, b takes over with a strictly higher fencing epoch.
-    let b = p.try_acquire("b", TTL, 13_000).await.unwrap().expect("b takes expired lease");
+    let b = p
+        .try_acquire("b", TTL, 13_000)
+        .await
+        .unwrap()
+        .expect("b takes expired lease");
     assert_eq!(b.epoch, 2);
 
     // a, having lost it, fails to renew → must self-fence.
@@ -85,10 +100,16 @@ async fn epoch_preserved_on_self_reacquire_bumped_on_handover() {
 
     assert_eq!(p.try_acquire("a", TTL, 0).await.unwrap().unwrap().epoch, 1);
     // Re-acquiring our own live lease keeps the epoch.
-    assert_eq!(p.try_acquire("a", TTL, 1_000).await.unwrap().unwrap().epoch, 1);
+    assert_eq!(
+        p.try_acquire("a", TTL, 1_000).await.unwrap().unwrap().epoch,
+        1
+    );
     // Release, then a genuine handover bumps it.
     p.release("a", 1).await.unwrap();
-    assert_eq!(p.try_acquire("b", TTL, 2_000).await.unwrap().unwrap().epoch, 2);
+    assert_eq!(
+        p.try_acquire("b", TTL, 2_000).await.unwrap().unwrap().epoch,
+        2
+    );
 }
 
 #[tokio::test]
@@ -97,7 +118,11 @@ async fn release_frees_the_lease_immediately() {
     p.try_acquire("a", TTL, 0).await.unwrap().unwrap();
     p.release("a", 1).await.unwrap();
     // Free now (no need to wait for expiry).
-    let b = p.try_acquire("b", TTL, 1).await.unwrap().expect("b acquires freed lease");
+    let b = p
+        .try_acquire("b", TTL, 1)
+        .await
+        .unwrap()
+        .expect("b acquires freed lease");
     assert_eq!(b.epoch, 2);
 }
 
@@ -113,13 +138,14 @@ async fn concurrent_acquire_grants_exactly_one() {
     // Two independent providers (separate connections) racing for ONE resource —
     // the real test of the atomic upsert across connections.
     let resource = unique_resource("race");
-    let pa = PostgresLeaseProvider::connect(&url, resource.clone()).await.unwrap();
-    let pb = PostgresLeaseProvider::connect(&url, resource).await.unwrap();
+    let pa = PostgresLeaseProvider::connect(&url, resource.clone())
+        .await
+        .unwrap();
+    let pb = PostgresLeaseProvider::connect(&url, resource)
+        .await
+        .unwrap();
 
-    let (ra, rb) = tokio::join!(
-        pa.try_acquire("a", TTL, 0),
-        pb.try_acquire("b", TTL, 0),
-    );
+    let (ra, rb) = tokio::join!(pa.try_acquire("a", TTL, 0), pb.try_acquire("b", TTL, 0),);
     let granted = [ra.unwrap().is_some(), rb.unwrap().is_some()];
     assert_eq!(
         granted.iter().filter(|g| **g).count(),
@@ -167,8 +193,16 @@ async fn registry_heartbeat_live_and_url_for() {
     reg.heartbeat(&id, "http://a:8080").await.unwrap();
 
     // Live + resolvable within TTL.
-    assert_eq!(reg.url_for(&id).await.unwrap(), Some("http://a:8080".to_string()));
-    assert!(reg.live_nodes().await.unwrap().iter().any(|(n, u)| n == &id && u == "http://a:8080"));
+    assert_eq!(
+        reg.url_for(&id).await.unwrap(),
+        Some("http://a:8080".to_string())
+    );
+    assert!(reg
+        .live_nodes()
+        .await
+        .unwrap()
+        .iter()
+        .any(|(n, u)| n == &id && u == "http://a:8080"));
 }
 
 #[tokio::test]
@@ -179,11 +213,19 @@ async fn registry_entry_ages_out_past_ttl() {
     reg.heartbeat(&id, "http://a:8080").await.unwrap(); // last_heartbeat = 0
 
     clock.set(9_999);
-    assert_eq!(reg.url_for(&id).await.unwrap(), Some("http://a:8080".to_string()));
+    assert_eq!(
+        reg.url_for(&id).await.unwrap(),
+        Some("http://a:8080".to_string())
+    );
 
     clock.set(10_001);
     assert_eq!(reg.url_for(&id).await.unwrap(), None, "aged out past TTL");
-    assert!(!reg.live_nodes().await.unwrap().iter().any(|(n, _)| n == &id));
+    assert!(!reg
+        .live_nodes()
+        .await
+        .unwrap()
+        .iter()
+        .any(|(n, _)| n == &id));
 }
 
 #[tokio::test]

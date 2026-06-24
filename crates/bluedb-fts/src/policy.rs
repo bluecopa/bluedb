@@ -112,7 +112,12 @@ mod tests {
     fn manifest(n_splits: usize, docs_per_split: u64) -> Manifest {
         let mut m = Manifest::new("recon-2026");
         for i in 0..n_splits {
-            m.push(SplitMeta::new(format!("split-{i:03}"), docs_per_split, 100, 1));
+            m.push(SplitMeta::new(
+                format!("split-{i:03}"),
+                docs_per_split,
+                100,
+                1,
+            ));
         }
         m
     }
@@ -125,8 +130,14 @@ mod tests {
             min_splits_to_merge: 2,
         };
         let empty = Tombstones::new("recon-2026");
-        assert!(!p.should_compact(&manifest(3, 10), &empty), "at the cap, not over");
-        assert!(p.should_compact(&manifest(4, 10), &empty), "over the cap fires");
+        assert!(
+            !p.should_compact(&manifest(3, 10), &empty),
+            "at the cap, not over"
+        );
+        assert!(
+            p.should_compact(&manifest(4, 10), &empty),
+            "over the cap fires"
+        );
     }
 
     #[test]
@@ -142,7 +153,10 @@ mod tests {
         for i in 0..6 {
             tombs.delete_doc(format!("id-{i}")); // 6/20 = 0.30, NOT > 0.30
         }
-        assert!(!p.should_compact(&m, &tombs), "ratio at threshold does not fire");
+        assert!(
+            !p.should_compact(&m, &tombs),
+            "ratio at threshold does not fire"
+        );
         tombs.delete_doc("id-extra"); // 7/20 = 0.35 > 0.30
         assert!(p.should_compact(&m, &tombs), "ratio over threshold fires");
     }
@@ -155,9 +169,18 @@ mod tests {
             min_splits_to_merge: 2,
         };
         let empty = Tombstones::new("recon-2026");
-        assert!(!p.should_compact(&manifest(1, 10), &empty), "one split never merges");
-        assert!(!p.should_compact(&manifest(0, 0), &empty), "empty index never merges");
-        assert!(p.should_compact(&manifest(2, 10), &empty), "two splits can merge");
+        assert!(
+            !p.should_compact(&manifest(1, 10), &empty),
+            "one split never merges"
+        );
+        assert!(
+            !p.should_compact(&manifest(0, 0), &empty),
+            "empty index never merges"
+        );
+        assert!(
+            p.should_compact(&manifest(2, 10), &empty),
+            "two splits can merge"
+        );
     }
 
     #[test]

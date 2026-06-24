@@ -255,10 +255,7 @@ impl LiveSegment {
     /// whose pk is in this set — the live tier holds the authoritative (latest or
     /// deleted) version of those pks, so a stale durable copy must not surface.
     pub fn covered(&self) -> HashSet<i64> {
-        self.covered
-            .lock()
-            .expect("covered mutex poisoned")
-            .clone()
+        self.covered.lock().expect("covered mutex poisoned").clone()
     }
 
     /// Drain the live segment for a seal: return `(live docs as (pk, body),
@@ -364,10 +361,7 @@ impl LiveSegment {
                 .lock()
                 .expect("tombstones mutex poisoned")
                 .clear();
-            self.covered
-                .lock()
-                .expect("covered mutex poisoned")
-                .clear();
+            self.covered.lock().expect("covered mutex poisoned").clear();
             self.dirty.store(false, Ordering::SeqCst);
             Ok(())
         })();
@@ -476,7 +470,13 @@ pub(crate) fn translate_query(query: &str, kind: TsQueryKind) -> String {
             // tantivy handles quotes / `-term` / OR; just normalize a bare `or`.
             query
                 .split_whitespace()
-                .map(|t| if t.eq_ignore_ascii_case("or") { "OR" } else { t })
+                .map(|t| {
+                    if t.eq_ignore_ascii_case("or") {
+                        "OR"
+                    } else {
+                        t
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(" ")
         }
@@ -497,7 +497,9 @@ mod tests {
         .unwrap();
         seg.index(2, "weather report sunny skies").unwrap();
         seg.index(3, "overdue invoice").unwrap();
-        let hits = seg.search("invoice overdue", TsQueryKind::Plain, 10).unwrap();
+        let hits = seg
+            .search("invoice overdue", TsQueryKind::Plain, 10)
+            .unwrap();
         let pks: Vec<i64> = hits.iter().map(|h| h.pk).collect();
         assert!(pks.contains(&1) && pks.contains(&3));
         assert!(!pks.contains(&2), "non-matching row must not appear");
@@ -510,13 +512,25 @@ mod tests {
 
     #[test]
     fn translate_to_tsquery_operators() {
-        assert_eq!(translate_query("invoice & overdue", TsQueryKind::ToTsQuery), "invoice AND overdue");
-        assert_eq!(translate_query("invoice | report", TsQueryKind::ToTsQuery), "invoice OR report");
+        assert_eq!(
+            translate_query("invoice & overdue", TsQueryKind::ToTsQuery),
+            "invoice AND overdue"
+        );
+        assert_eq!(
+            translate_query("invoice | report", TsQueryKind::ToTsQuery),
+            "invoice OR report"
+        );
         // `!X` → tantivy's `-X` MustNot prefix (the `NOT` keyword nests into an
         // all-negative inner boolean that matches nothing; see translate_query docs).
-        assert_eq!(translate_query("invoice & !weather", TsQueryKind::ToTsQuery), "invoice AND -weather");
+        assert_eq!(
+            translate_query("invoice & !weather", TsQueryKind::ToTsQuery),
+            "invoice AND -weather"
+        );
         // `:*` prefix / weight markers are stripped.
-        assert_eq!(translate_query("invoic:* & overdue:A", TsQueryKind::ToTsQuery), "invoic AND overdue");
+        assert_eq!(
+            translate_query("invoic:* & overdue:A", TsQueryKind::ToTsQuery),
+            "invoic AND overdue"
+        );
     }
 
     #[test]
@@ -525,16 +539,31 @@ mod tests {
         // honored; metacharacters are removed and the bare terms joined with an
         // explicit `AND` (so both FTS tiers parse identically regardless of any
         // per-parser default-conjunction setting).
-        assert_eq!(translate_query("invoice & overdue", TsQueryKind::Plain), "invoice AND overdue");
-        assert_eq!(translate_query("INVOICE Overdue", TsQueryKind::Plain), "invoice AND overdue");
+        assert_eq!(
+            translate_query("invoice & overdue", TsQueryKind::Plain),
+            "invoice AND overdue"
+        );
+        assert_eq!(
+            translate_query("INVOICE Overdue", TsQueryKind::Plain),
+            "invoice AND overdue"
+        );
     }
 
     #[test]
     fn translate_websearch_normalizes_or() {
         // tantivy already handles "phrase", -term; a bare `or` becomes the OR operator.
-        assert_eq!(translate_query("foo or bar", TsQueryKind::Websearch), "foo OR bar");
-        assert_eq!(translate_query("\"quarterly invoice\"", TsQueryKind::Websearch), "\"quarterly invoice\"");
-        assert_eq!(translate_query("foo -bar", TsQueryKind::Websearch), "foo -bar");
+        assert_eq!(
+            translate_query("foo or bar", TsQueryKind::Websearch),
+            "foo OR bar"
+        );
+        assert_eq!(
+            translate_query("\"quarterly invoice\"", TsQueryKind::Websearch),
+            "\"quarterly invoice\""
+        );
+        assert_eq!(
+            translate_query("foo -bar", TsQueryKind::Websearch),
+            "foo -bar"
+        );
     }
 
     #[test]
@@ -542,9 +571,15 @@ mod tests {
         let seg = LiveSegment::new("english").unwrap();
         seg.index(1, "invoice overdue payment").unwrap();
         seg.index(2, "invoice only here").unwrap();
-        let hits = seg.search("invoice overdue", TsQueryKind::Plain, 10).unwrap();
+        let hits = seg
+            .search("invoice overdue", TsQueryKind::Plain, 10)
+            .unwrap();
         let pks: Vec<i64> = hits.iter().map(|h| h.pk).collect();
-        assert_eq!(pks, vec![1], "Plain conjoins terms: row with only 'invoice' is excluded");
+        assert_eq!(
+            pks,
+            vec![1],
+            "Plain conjoins terms: row with only 'invoice' is excluded"
+        );
     }
 
     #[test]
@@ -628,7 +663,8 @@ mod tests {
         // Through the trait (table/column are informational for the single-column
         // B2a segment).
         let via_trait = FtsSearcher::search(&seg, &predicate).await.unwrap();
-        let via_inherent = LiveSegment::search(&seg, "invoice", TsQueryKind::Plain, DEFAULT_LIMIT).unwrap();
+        let via_inherent =
+            LiveSegment::search(&seg, "invoice", TsQueryKind::Plain, DEFAULT_LIMIT).unwrap();
         let tp: Vec<i64> = via_trait.iter().map(|h| h.pk).collect();
         let ip: Vec<i64> = via_inherent.iter().map(|h| h.pk).collect();
         assert_eq!(tp, ip);
@@ -675,7 +711,10 @@ mod tests {
             .map(|h| h.pk)
             .collect();
         assert!(after.contains(&1));
-        assert!(!after.contains(&3), "tombstoned pk must not appear immediately");
+        assert!(
+            !after.contains(&3),
+            "tombstoned pk must not appear immediately"
+        );
     }
 
     // --- Task 3: seal-support — covered set + drain_for_seal ---
@@ -691,7 +730,11 @@ mod tests {
 
         let mut covered: Vec<i64> = seg.covered().into_iter().collect();
         covered.sort_unstable();
-        assert_eq!(covered, vec![1, 2, 3], "covered = every pk index/tombstone touched");
+        assert_eq!(
+            covered,
+            vec![1, 2, 3],
+            "covered = every pk index/tombstone touched"
+        );
     }
 
     #[tokio::test]
@@ -708,9 +751,18 @@ mod tests {
         // it's in the tombstone set, NOT the docs vec.
         assert_eq!(docs.len(), 1, "only the single live doc (pk 1)");
         assert_eq!(docs[0].0, 1, "the live pk");
-        assert_eq!(docs[0].1, "first updated", "latest text per pk (post-update)");
-        assert!(tombs.contains(&2), "tombstoned pk 2 is in the tombstone set");
-        assert!(!docs.iter().any(|(pk, _)| *pk == 2), "tombstoned pk not in docs vec");
+        assert_eq!(
+            docs[0].1, "first updated",
+            "latest text per pk (post-update)"
+        );
+        assert!(
+            tombs.contains(&2),
+            "tombstoned pk 2 is in the tombstone set"
+        );
+        assert!(
+            !docs.iter().any(|(pk, _)| *pk == 2),
+            "tombstoned pk not in docs vec"
+        );
 
         // Reset: a subsequent search returns nothing, covered() is empty,
         // tombstones cleared.
@@ -736,9 +788,17 @@ mod tests {
         seg.tombstone(2).unwrap();
         seg.tombstone(3).unwrap();
         let hits = seg.search("invoice", TsQueryKind::Plain, 2).unwrap();
-        assert_eq!(hits.len(), 2, "limit=2 must yield 2 LIVE hits, not 2-minus-tombstones");
+        assert_eq!(
+            hits.len(),
+            2,
+            "limit=2 must yield 2 LIVE hits, not 2-minus-tombstones"
+        );
         for h in &hits {
-            assert!(h.pk == 4 || h.pk == 5, "only live pks 4/5 may appear, got {}", h.pk);
+            assert!(
+                h.pk == 4 || h.pk == 5,
+                "only live pks 4/5 may appear, got {}",
+                h.pk
+            );
         }
     }
 }

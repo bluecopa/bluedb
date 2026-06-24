@@ -34,7 +34,9 @@ fn value_to_u128(v: &Value, field: &str) -> Result<u128, AppError> {
             .map(u128::from)
             .ok_or_else(|| AppError::bad_request(format!("{field}: not a non-negative integer"))),
         Value::Null => Ok(0),
-        _ => Err(AppError::bad_request(format!("{field}: expected a string or number"))),
+        _ => Err(AppError::bad_request(format!(
+            "{field}: expected a string or number"
+        ))),
     }
 }
 
@@ -80,7 +82,9 @@ fn body_objects(body: Value, what: &str) -> Result<Vec<Map<String, Value>>, AppE
             .into_iter()
             .map(|item| match item {
                 Value::Object(map) => Ok(map),
-                other => Err(AppError::bad_request(format!("{what} must be JSON objects, got {other}"))),
+                other => Err(AppError::bad_request(format!(
+                    "{what} must be JSON objects, got {other}"
+                ))),
             })
             .collect(),
         other => Err(AppError::bad_request(format!(
@@ -181,7 +185,10 @@ pub async fn create_accounts(
 ) -> Result<Json<Value>, AppError> {
     state.require_active()?;
     let objects = body_objects(body, "account")?;
-    let specs: Vec<Account> = objects.iter().map(parse_account).collect::<Result<_, _>>()?;
+    let specs: Vec<Account> = objects
+        .iter()
+        .map(parse_account)
+        .collect::<Result<_, _>>()?;
     let ledger = state.ledger().await?;
     let results = ledger
         .create_accounts(&specs)
@@ -204,7 +211,10 @@ pub async fn create_transfers(
 ) -> Result<Json<Value>, AppError> {
     state.require_active()?;
     let objects = body_objects(body, "transfer")?;
-    let specs: Vec<Transfer> = objects.iter().map(parse_transfer).collect::<Result<_, _>>()?;
+    let specs: Vec<Transfer> = objects
+        .iter()
+        .map(parse_transfer)
+        .collect::<Result<_, _>>()?;
     let ledger = state.ledger().await?;
     let results = ledger
         .create_transfers(&specs)
@@ -224,9 +234,15 @@ pub async fn get_account(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, AppError> {
-    let id: u128 = id.parse().map_err(|_| AppError::bad_request("invalid account id"))?;
+    let id: u128 = id
+        .parse()
+        .map_err(|_| AppError::bad_request("invalid account id"))?;
     let ledger = state.ledger().await?;
-    match ledger.lookup_account(id).await.map_err(|e| AppError::internal(e.to_string()))? {
+    match ledger
+        .lookup_account(id)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?
+    {
         Some(a) => Ok(Json(account_json(&a))),
         None => Err(AppError::not_found(format!("account {id} not found"))),
     }
@@ -237,9 +253,15 @@ pub async fn get_transfer(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, AppError> {
-    let id: u128 = id.parse().map_err(|_| AppError::bad_request("invalid transfer id"))?;
+    let id: u128 = id
+        .parse()
+        .map_err(|_| AppError::bad_request("invalid transfer id"))?;
     let ledger = state.ledger().await?;
-    match ledger.lookup_transfer(id).await.map_err(|e| AppError::internal(e.to_string()))? {
+    match ledger
+        .lookup_transfer(id)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?
+    {
         Some(t) => Ok(Json(transfer_json(&t))),
         None => Err(AppError::not_found(format!("transfer {id} not found"))),
     }

@@ -57,7 +57,10 @@ async fn bm25_query_over_split_in_slatedb() {
         if name.ends_with(".lock") {
             continue; // tantivy lock files are not part of the split
         }
-        files.push((PathBuf::from(name), std::fs::read(&path).expect("read file")));
+        files.push((
+            PathBuf::from(name),
+            std::fs::read(&path).expect("read file"),
+        ));
     }
     let split_bytes = pack_split(&files);
 

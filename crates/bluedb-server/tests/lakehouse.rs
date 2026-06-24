@@ -58,7 +58,13 @@ async fn http_writes_seal_into_iceberg_and_appear_in_rest_catalog() {
     let app = build_app(state.clone());
 
     // Turn the mirror on (opt-out default) via PRAGMA over /sql.
-    let (s, body) = call(&app, "POST", "/sql", Some(json!({"sql": "PRAGMA lakehouse_mirror = on"}))).await;
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "PRAGMA lakehouse_mirror = on"})),
+    )
+    .await;
     assert!(s.is_success(), "pragma on: {s} {body}");
 
     // Create a table (PK required by the schema regime) + write through /sql.
@@ -87,7 +93,13 @@ async fn http_writes_seal_into_iceberg_and_appear_in_rest_catalog() {
         .await;
         assert!(s.is_success(), "insert {id}: {s}");
     }
-    let (s, _) = call(&app, "POST", "/sql", Some(json!({"sql": "DELETE FROM docs WHERE id = 2"}))).await;
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "DELETE FROM docs WHERE id = 2"})),
+    )
+    .await;
     assert!(s.is_success(), "delete: {s}");
 
     // Force a deterministic seal (the background loop would also fire it).
@@ -102,12 +114,24 @@ async fn http_writes_seal_into_iceberg_and_appear_in_rest_catalog() {
         .iter()
         .map(|i| i["name"].as_str().unwrap())
         .collect();
-    assert!(names.contains(&"docs"), "catalog should list docs, got {names:?}");
+    assert!(
+        names.contains(&"docs"),
+        "catalog should list docs, got {names:?}"
+    );
 
     // loadTable returns a metadata location + schema with our columns.
-    let (s, load) = call(&app, "GET", "/catalog/v1/namespaces/default/tables/docs", None).await;
+    let (s, load) = call(
+        &app,
+        "GET",
+        "/catalog/v1/namespaces/default/tables/docs",
+        None,
+    )
+    .await;
     assert!(s.is_success(), "load table: {s} {load}");
-    assert!(load["metadata-location"].as_str().unwrap().ends_with(".metadata.json"));
+    assert!(load["metadata-location"]
+        .as_str()
+        .unwrap()
+        .ends_with(".metadata.json"));
     let metadata = load["metadata"].to_string();
     assert!(metadata.contains("\"id\""), "schema has id: {metadata}");
     assert!(metadata.contains("\"body\""), "schema has body: {metadata}");
@@ -119,7 +143,13 @@ async fn pragma_off_means_no_mirror() {
     let app = build_app(state.clone());
 
     // Opt-in default (off) — and a table is created + written but never mirrored.
-    let (s, _) = call(&app, "POST", "/sql", Some(json!({"sql": "PRAGMA lakehouse_mirror = off"}))).await;
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "PRAGMA lakehouse_mirror = off"})),
+    )
+    .await;
     assert!(s.is_success(), "pragma off: {s}");
     let (s, _) = call(
         &app,
@@ -132,7 +162,13 @@ async fn pragma_off_means_no_mirror() {
     )
     .await;
     assert!(s.is_success(), "create table: {s}");
-    let (s, _) = call(&app, "POST", "/sql", Some(json!({"sql": "INSERT INTO secret VALUES (1)"}))).await;
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "INSERT INTO secret VALUES (1)"})),
+    )
+    .await;
     assert!(s.is_success(), "insert: {s}");
 
     state.seal_now().await.unwrap();
@@ -150,7 +186,13 @@ async fn altered_column_visible_through_rest_catalog() {
     let state = make_state().await;
     let app = build_app(state.clone());
 
-    let (s, _) = call(&app, "POST", "/sql", Some(json!({"sql": "PRAGMA lakehouse_mirror = on"}))).await;
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "PRAGMA lakehouse_mirror = on"})),
+    )
+    .await;
     assert!(s.is_success());
     let (s, _) = call(
         &app,
@@ -167,23 +209,53 @@ async fn altered_column_visible_through_rest_catalog() {
     .await;
     assert!(s.is_success(), "create table: {s}");
 
-    let (s, _) = call(&app, "POST", "/sql", Some(json!({"sql": "INSERT INTO docs VALUES (1, 'a')"}))).await;
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "INSERT INTO docs VALUES (1, 'a')"})),
+    )
+    .await;
     assert!(s.is_success());
     state.seal_now().await.expect("seal");
 
     // ALTER ADD COLUMN over /admin/sql (DDL surface), write a row, seal again.
-    let (s, body) = call(&app, "POST", "/admin/sql", Some(json!({"sql": "ALTER TABLE docs ADD COLUMN c INTEGER"}))).await;
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/admin/sql",
+        Some(json!({"sql": "ALTER TABLE docs ADD COLUMN c INTEGER"})),
+    )
+    .await;
     assert!(s.is_success(), "alter add: {s} {body}");
-    let (s, _) = call(&app, "POST", "/sql", Some(json!({"sql": "INSERT INTO docs VALUES (2, 'b', 7)"}))).await;
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "INSERT INTO docs VALUES (2, 'b', 7)"})),
+    )
+    .await;
     assert!(s.is_success());
     state.seal_now().await.expect("seal");
 
     // The REST catalog's loadTable schema now carries the new column.
-    let (s, load) = call(&app, "GET", "/catalog/v1/namespaces/default/tables/docs", None).await;
+    let (s, load) = call(
+        &app,
+        "GET",
+        "/catalog/v1/namespaces/default/tables/docs",
+        None,
+    )
+    .await;
     assert!(s.is_success(), "load table: {s} {load}");
     let metadata = load["metadata"].to_string();
-    assert!(metadata.contains("\"c\""), "evolved schema should expose c: {metadata}");
-    assert!(metadata.contains("\"body\""), "schema still has body: {metadata}");
+    assert!(
+        metadata.contains("\"c\""),
+        "evolved schema should expose c: {metadata}"
+    );
+    assert!(
+        metadata.contains("\"body\""),
+        "schema still has body: {metadata}"
+    );
 }
 
 #[tokio::test]
@@ -207,14 +279,30 @@ async fn drop_key_column_rejected_over_http() {
     assert!(s.is_success(), "create table: {s}");
 
     // Dropping the primary-key column is rejected (it is the merge-on-read identity).
-    let (s, body) = call(&app, "POST", "/admin/sql", Some(json!({"sql": "ALTER TABLE docs DROP COLUMN id"}))).await;
-    assert_eq!(s, StatusCode::BAD_REQUEST, "drop key should be rejected: {body}");
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/admin/sql",
+        Some(json!({"sql": "ALTER TABLE docs DROP COLUMN id"})),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::BAD_REQUEST,
+        "drop key should be rejected: {body}"
+    );
     assert!(
         body.to_string().to_lowercase().contains("primary key"),
         "error should mention the primary key: {body}"
     );
     // A non-key column still drops.
-    let (s, body) = call(&app, "POST", "/admin/sql", Some(json!({"sql": "ALTER TABLE docs DROP COLUMN body"}))).await;
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/admin/sql",
+        Some(json!({"sql": "ALTER TABLE docs DROP COLUMN body"})),
+    )
+    .await;
     assert!(s.is_success(), "drop non-key column: {s} {body}");
 }
 
@@ -234,7 +322,13 @@ async fn target_file_bytes_pragma_accepted_over_http() {
     .await;
     assert!(s.is_success(), "target pragma: {s} {body}");
 
-    let (s, _) = call(&app, "POST", "/sql", Some(json!({"sql": "PRAGMA lakehouse_mirror = on"}))).await;
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "PRAGMA lakehouse_mirror = on"})),
+    )
+    .await;
     assert!(s.is_success());
     let (s, _) = call(
         &app,
@@ -250,12 +344,24 @@ async fn target_file_bytes_pragma_accepted_over_http() {
     )
     .await;
     assert!(s.is_success(), "create table: {s}");
-    let (s, _) = call(&app, "POST", "/sql", Some(json!({"sql": "INSERT INTO docs VALUES (1, 'a')"}))).await;
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "INSERT INTO docs VALUES (1, 'a')"})),
+    )
+    .await;
     assert!(s.is_success());
     state.seal_now().await.expect("seal");
 
     // Mirror still materializes through the REST catalog after setting the target.
-    let (s, load) = call(&app, "GET", "/catalog/v1/namespaces/default/tables/docs", None).await;
+    let (s, load) = call(
+        &app,
+        "GET",
+        "/catalog/v1/namespaces/default/tables/docs",
+        None,
+    )
+    .await;
     assert!(s.is_success(), "load table: {s} {load}");
     assert!(load["metadata"].to_string().contains("\"id\""));
 }

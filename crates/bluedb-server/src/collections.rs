@@ -25,7 +25,6 @@ use gluesql_core::store::Store;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use bluedb_engine::rest_sql;
 use bluedb_collections::{
     error::MqlError,
     filter::{parse_filter, sort_accessor},
@@ -38,6 +37,7 @@ use bluedb_collections::{
     project::apply_projection,
     update::apply_update,
 };
+use bluedb_engine::rest_sql;
 
 use crate::{authz::Scope, run_read_routed, schema::ident, AppError, AppState};
 
@@ -61,9 +61,9 @@ impl From<AppError> for CollError {
     fn from(e: AppError) -> Self {
         let (code, code_name): (i32, &'static str) = match e.error_code() {
             Some("UNIQUE_VIOLATION") => (11000, "DuplicateKey"),
-            Some("NOT_FOUND")        => (26,    "NamespaceNotFound"),
+            Some("NOT_FOUND") => (26, "NamespaceNotFound"),
             Some("PARSE_ERROR") | Some("TYPE_MISMATCH") | Some("NO_INDEX") => (2, "BadValue"),
-            _                        => (8,     "UnknownError"),
+            _ => (8, "UnknownError"),
         };
         let body = json!({
             "ok": 0,
@@ -97,9 +97,7 @@ impl From<MqlError> for CollError {
 /// on every insert without any prior existence check.
 async fn ensure_collection(state: &AppState, tenant: &str, coll: &str) -> Result<(), AppError> {
     state.require_active()?;
-    let sql = format!(
-        "CREATE TABLE IF NOT EXISTS {coll} (_id TEXT PRIMARY KEY, doc JSON);"
-    );
+    let sql = format!("CREATE TABLE IF NOT EXISTS {coll} (_id TEXT PRIMARY KEY, doc JSON);");
     let mut glue = Glue::new(state.connection_serialized(tenant).await?);
     rest_sql::execute_sql(&mut glue, &sql, &[], true).await?;
     Ok(())
@@ -115,18 +113,18 @@ pub(crate) async fn run_write(
     params: &[bluedb_rest::Param],
 ) -> Result<(), AppError> {
     let mut glue = Glue::new(state.connection_serialized(tenant).await?);
-    state.fts().await.execute_fts(&mut glue, sql, params, None).await?;
+    state
+        .fts()
+        .await
+        .execute_fts(&mut glue, sql, params, None)
+        .await?;
     Ok(())
 }
 
 /// Run a DDL statement (ALTER TABLE, CREATE INDEX) with `allow_arbitrary = true`.
 /// DDL does not go through the FTS rewriter (which would reject it via the DML
 /// guard). Uses a serialized connection for write ordering.
-pub(crate) async fn run_ddl(
-    state: &AppState,
-    tenant: &str,
-    sql: &str,
-) -> Result<(), AppError> {
+pub(crate) async fn run_ddl(state: &AppState, tenant: &str, sql: &str) -> Result<(), AppError> {
     state.require_active()?;
     let mut glue = Glue::new(state.connection_serialized(tenant).await?);
     rest_sql::execute_sql(&mut glue, sql, &[], true).await?;
@@ -149,8 +147,7 @@ pub(crate) async fn run_read_routed_for_mutation(
     match run_read_routed(state, tenant, sql, params).await {
         Ok(rows) => Ok(rows),
         Err(ref e)
-            if e.message().contains("planning SQL")
-                || e.message().contains("table not found") =>
+            if e.message().contains("planning SQL") || e.message().contains("table not found") =>
         {
             // The collection has no Iceberg snapshot yet (never sealed) → 0 matches.
             Ok(vec![])
@@ -297,9 +294,8 @@ async fn ensure_multikey_side_table(
     tenant: &str,
     side: &str,
 ) -> Result<(), AppError> {
-    let create_table = format!(
-        "CREATE TABLE IF NOT EXISTS {side} (rid TEXT PRIMARY KEY, _id TEXT, val TEXT);"
-    );
+    let create_table =
+        format!("CREATE TABLE IF NOT EXISTS {side} (rid TEXT PRIMARY KEY, _id TEXT, val TEXT);");
     run_ddl(state, tenant, &create_table).await?;
 
     // Create INDEX(val) once. Stable name: `{side}_val`.
@@ -386,7 +382,13 @@ async fn delete_multikey_for_doc(
     let sides = multikey_side_tables(state, tenant, coll).await?;
     for (side, _field) in sides {
         let sql = format!("DELETE FROM {side} WHERE _id = $1;");
-        run_write(state, tenant, &sql, &[bluedb_rest::Param::Str(doc_id.to_string())]).await?;
+        run_write(
+            state,
+            tenant,
+            &sql,
+            &[bluedb_rest::Param::Str(doc_id.to_string())],
+        )
+        .await?;
     }
     Ok(())
 }
@@ -532,7 +534,13 @@ async fn rewrite_doc_row(
     for (side, field) in &mk_sides {
         // Delete old elements for this document.
         let del_sql = format!("DELETE FROM {side} WHERE _id = $1;");
-        run_write(state, tenant, &del_sql, &[bluedb_rest::Param::Str(id.to_string())]).await?;
+        run_write(
+            state,
+            tenant,
+            &del_sql,
+            &[bluedb_rest::Param::Str(id.to_string())],
+        )
+        .await?;
         // Re-insert new elements (array or scalar — FIX M5).
         match doc.get(field.as_str()) {
             Some(Value::Array(arr)) => {
@@ -720,7 +728,8 @@ pub(crate) async fn insert(
     // Search-index maintenance runs AFTER the durable SQL write has committed.
     // A failure here must NOT fail the already-committed write — log and swallow;
     // the index self-heals on the next write or mapping re-declare (backfill).
-    if let Err(e) = crate::search::maintain_on_upsert(&state, &tenant, &coll, &inserted_docs).await {
+    if let Err(e) = crate::search::maintain_on_upsert(&state, &tenant, &coll, &inserted_docs).await
+    {
         eprintln!("bluedb-server: search index maintenance failed for collection {coll}: {e:?}");
     }
 
@@ -760,9 +769,15 @@ pub(crate) async fn find(
 
     // Build the map of indexed paths: derived column name → IndexType.
     // The filter's to_sql_indexed takes this map keyed by derived column name.
-    let col_types = indexed_col_types(&state, &tenant, &coll).await.unwrap_or_default();
-    let cdefs = compound_col_defs(&state, &tenant, &coll).await.unwrap_or_default();
-    let mk_sides = multikey_side_tables(&state, &tenant, &coll).await.unwrap_or_default();
+    let col_types = indexed_col_types(&state, &tenant, &coll)
+        .await
+        .unwrap_or_default();
+    let cdefs = compound_col_defs(&state, &tenant, &coll)
+        .await
+        .unwrap_or_default();
+    let mk_sides = multikey_side_tables(&state, &tenant, &coll)
+        .await
+        .unwrap_or_default();
 
     // Build the WHERE clause and collect bound parameters.
     // Priority: multikey single-equality → compound → single-field indexed.
@@ -782,7 +797,8 @@ pub(crate) async fn find(
     // (e.g. `$in` on a multikey field, mixed predicates) fall through to the
     // existing routing and are handled by the JSON accessor / DataFusion path.
     let mut params: Vec<Value> = Vec::new();
-    let where_sql = if let Some(mk_sql) = try_multikey_match(&filter, &mk_sides, &coll, &mut params) {
+    let where_sql = if let Some(mk_sql) = try_multikey_match(&filter, &mk_sides, &coll, &mut params)
+    {
         mk_sql
     } else if let Some(sql) = try_compound_match(&filter, &cdefs, &mut params) {
         sql
@@ -805,7 +821,11 @@ pub(crate) async fn find(
         if !sort_obj.is_empty() {
             let mut order_parts: Vec<String> = Vec::new();
             for (field, dir_val) in sort_obj {
-                let dir = if dir_val.as_i64().unwrap_or(1) < 0 { "DESC" } else { "ASC" };
+                let dir = if dir_val.as_i64().unwrap_or(1) < 0 {
+                    "DESC"
+                } else {
+                    "ASC"
+                };
                 let col_expr = sort_accessor(field);
                 order_parts.push(format!("{col_expr} {dir}"));
             }
@@ -832,8 +852,9 @@ pub(crate) async fn find(
         // it (via select_to_json / reinflate_rows), so `doc` should already be a
         // JSON object. Handle the string fallback for safety.
         let doc = match row.get("doc") {
-            Some(Value::String(s)) => serde_json::from_str::<Value>(s)
-                .unwrap_or_else(|_| Value::String(s.clone())),
+            Some(Value::String(s)) => {
+                serde_json::from_str::<Value>(s).unwrap_or_else(|_| Value::String(s.clone()))
+            }
             Some(v) => v.clone(),
             None => continue,
         };
@@ -900,7 +921,7 @@ pub(crate) async fn create_index(
             // indexes is deferred to v2.
             if p.contains('.') {
                 return Err(AppError::bad_request(
-                    "nested (dotted) paths are not supported for compound indexes in v1"
+                    "nested (dotted) paths are not supported for compound indexes in v1",
                 )
                 .with_code("PARSE_ERROR")
                 .into());
@@ -910,7 +931,11 @@ pub(crate) async fn create_index(
         let dcol = compound_col(&paths);
         let index_name = format!(
             "cidxm_{coll}_{}",
-            paths.iter().map(|p| p.replace('.', "_")).collect::<Vec<_>>().join("_")
+            paths
+                .iter()
+                .map(|p| p.replace('.', "_"))
+                .collect::<Vec<_>>()
+                .join("_")
         );
 
         // Step 1: Add the TEXT column if not present. A unique compound index is
@@ -921,9 +946,8 @@ pub(crate) async fn create_index(
         let already_exists = existing_cdefs.iter().any(|(c, _)| c == &dcol);
         if !already_exists {
             let unique_constraint = if req.options.unique { " UNIQUE" } else { "" };
-            let alter_sql = format!(
-                "ALTER TABLE {coll} ADD COLUMN {dcol} TEXT{unique_constraint};"
-            );
+            let alter_sql =
+                format!("ALTER TABLE {coll} ADD COLUMN {dcol} TEXT{unique_constraint};");
             run_ddl(&state, &tenant, &alter_sql).await?;
         }
 
@@ -942,10 +966,7 @@ pub(crate) async fn create_index(
             };
             let key = compound_key(&doc, &paths);
             let update_sql = format!("UPDATE {coll} SET {dcol} = $1 WHERE _id = $2;");
-            let params = vec![
-                bluedb_rest::Param::Str(key),
-                bluedb_rest::Param::Str(id),
-            ];
+            let params = vec![bluedb_rest::Param::Str(key), bluedb_rest::Param::Str(id)];
             run_write(&state, &tenant, &update_sql, &params).await?;
         }
 
@@ -957,9 +978,7 @@ pub(crate) async fn create_index(
             .map_err(|e| AppError::internal(format!("fetch schema: {e}")))?;
         let index_exists = schema.is_some_and(|s| s.indexes.iter().any(|i| i.name == index_name));
         if !index_exists {
-            let create_idx_sql = format!(
-                "CREATE INDEX {index_name} ON {coll} ({dcol});"
-            );
+            let create_idx_sql = format!("CREATE INDEX {index_name} ON {coll} ({dcol});");
             run_ddl(&state, &tenant, &create_idx_sql).await?;
         }
 
@@ -975,7 +994,11 @@ pub(crate) async fn create_index(
     let path = path.clone();
 
     if !valid_path(&path) {
-        return Err(AppError::bad_request(format!("invalid index field path: {path:?}")).with_code("PARSE_ERROR").into());
+        return Err(
+            AppError::bad_request(format!("invalid index field path: {path:?}"))
+                .with_code("PARSE_ERROR")
+                .into(),
+        );
     }
 
     // Read existing docs to sample the field (needed for multikey detection and backfill).
@@ -995,13 +1018,16 @@ pub(crate) async fn create_index(
             for part in path.split('.') {
                 cur = cur.get(part)?;
             }
-            if cur.is_null() { None } else { Some(cur.clone()) }
+            if cur.is_null() {
+                None
+            } else {
+                Some(cur.clone())
+            }
         })
         .collect();
 
     // Detect multikey: explicit opt-in OR any sampled value is an array.
-    let is_multikey = req.options.multikey
-        || sample_values.iter().any(|v| v.is_array());
+    let is_multikey = req.options.multikey || sample_values.iter().any(|v| v.is_array());
 
     if is_multikey {
         // -----------------------------------------------------------------------
@@ -1021,7 +1047,7 @@ pub(crate) async fn create_index(
         // -----------------------------------------------------------------------
         if path.contains('.') {
             return Err(AppError::bad_request(
-                "nested (dotted) paths are not supported for multikey indexes in v1"
+                "nested (dotted) paths are not supported for multikey indexes in v1",
             )
             .with_code("PARSE_ERROR")
             .into());
@@ -1048,13 +1074,22 @@ pub(crate) async fn create_index(
             for part in path.split('.') {
                 match cur.get(part) {
                     Some(v) => cur = v,
-                    None => { found = false; break; }
+                    None => {
+                        found = false;
+                        break;
+                    }
                 }
             }
             if found {
                 // Clear any prior entries first (idempotent backfill).
                 let del_sql = format!("DELETE FROM {side} WHERE _id = $1;");
-                run_write(&state, &tenant, &del_sql, &[bluedb_rest::Param::Str(id.clone())]).await?;
+                run_write(
+                    &state,
+                    &tenant,
+                    &del_sql,
+                    &[bluedb_rest::Param::Str(id.clone())],
+                )
+                .await?;
                 match cur {
                     Value::Array(arr) => {
                         insert_multikey_elements(&state, &tenant, &side, &id, arr).await?;
@@ -1077,10 +1112,7 @@ pub(crate) async fn create_index(
     // -----------------------------------------------------------------------
 
     let dcol = derived_col(&path);
-    let index_name = format!(
-        "cidx_{coll}_{}",
-        path.replace('.', "_")
-    );
+    let index_name = format!("cidx_{coll}_{}", path.replace('.', "_"));
 
     // Step 1: Add the derived column if it doesn't already exist.
     let existing_col_types = indexed_col_types(&state, &tenant, &coll).await?;
@@ -1112,9 +1144,8 @@ pub(crate) async fn create_index(
         // and UPDATE (see `bluedb_sql::SlateDbStorage` → `UNIQUE_VIOLATION`),
         // so we get real enforcement by adding it to the column instead.
         let unique_constraint = if req.options.unique { " UNIQUE" } else { "" };
-        let alter_sql = format!(
-            "ALTER TABLE {coll} ADD COLUMN {dcol} {sql_type}{unique_constraint};"
-        );
+        let alter_sql =
+            format!("ALTER TABLE {coll} ADD COLUMN {dcol} {sql_type}{unique_constraint};");
         run_ddl(&state, &tenant, &alter_sql).await?;
     }
 
@@ -1136,10 +1167,7 @@ pub(crate) async fn create_index(
         };
         if let Some(val) = derive_typed_value(&doc, &path, idx_type) {
             let update_sql = format!("UPDATE {coll} SET {dcol} = $1 WHERE _id = $2;");
-            let params = vec![
-                json_value_to_param(&val),
-                bluedb_rest::Param::Str(id),
-            ];
+            let params = vec![json_value_to_param(&val), bluedb_rest::Param::Str(id)];
             run_write(&state, &tenant, &update_sql, &params).await?;
         }
     }
@@ -1162,11 +1190,9 @@ pub(crate) async fn create_index(
     // Step 4 (TTL only): register the expiry config in __bluedb_ttl.
     if let Some(secs) = req.options.expire_after_seconds {
         if secs < 0 {
-            return Err(AppError::bad_request(
-                "expireAfterSeconds must be >= 0",
-            )
-            .with_code("PARSE_ERROR")
-            .into());
+            return Err(AppError::bad_request("expireAfterSeconds must be >= 0")
+                .with_code("PARSE_ERROR")
+                .into());
         }
         // Register the per-tenant TTL config and record this tenant in the
         // global registry so the sweep loop picks it up on every tick.
@@ -1203,8 +1229,12 @@ pub(crate) async fn update(
         .map_err(|e| AppError::bad_request(e.to_string()).with_code("PARSE_ERROR"))?;
 
     // Fetch index columns once — used for both the SELECT routing and the UPDATE.
-    let dcols = indexed_col_types(&state, &tenant, &coll).await.unwrap_or_default();
-    let cdefs = compound_col_defs(&state, &tenant, &coll).await.unwrap_or_default();
+    let dcols = indexed_col_types(&state, &tenant, &coll)
+        .await
+        .unwrap_or_default();
+    let cdefs = compound_col_defs(&state, &tenant, &coll)
+        .await
+        .unwrap_or_default();
 
     // Build the typed indexed map for query routing.
     let indexed: HashMap<String, IndexType> = collect_filter_paths(&filter)
@@ -1295,7 +1325,9 @@ pub(crate) async fn delete(
     let filter = parse_filter(&req.filter)
         .map_err(|e| AppError::bad_request(e.to_string()).with_code("PARSE_ERROR"))?;
 
-    let dcols = indexed_col_types(&state, &tenant, &coll).await.unwrap_or_default();
+    let dcols = indexed_col_types(&state, &tenant, &coll)
+        .await
+        .unwrap_or_default();
 
     let indexed: HashMap<String, IndexType> = collect_filter_paths(&filter)
         .into_iter()
@@ -1433,9 +1465,13 @@ fn lookup_as_field_names(stages: &[Value]) -> Vec<String> {
 ///   excludes them).
 /// - A `null` `as` cell (no-match left row, a SQL NULL list) becomes `[]`.
 fn reinflate_lookup_arrays(rows: &mut Value, fields: &[String]) {
-    let Some(arr) = rows.as_array_mut() else { return };
+    let Some(arr) = rows.as_array_mut() else {
+        return;
+    };
     for row in arr {
-        let Some(map) = row.as_object_mut() else { continue };
+        let Some(map) = row.as_object_mut() else {
+            continue;
+        };
         for field in fields {
             match map.get(field) {
                 // The serialized list: parse each string element, drop nulls.
@@ -1489,8 +1525,12 @@ pub(crate) async fn count(
         .map_err(|e| AppError::bad_request(e.to_string()).with_code("PARSE_ERROR"))?;
 
     // Resolve indexed paths — same logic as `find`.
-    let col_types = indexed_col_types(&state, &tenant, &coll).await.unwrap_or_default();
-    let cdefs = compound_col_defs(&state, &tenant, &coll).await.unwrap_or_default();
+    let col_types = indexed_col_types(&state, &tenant, &coll)
+        .await
+        .unwrap_or_default();
+    let cdefs = compound_col_defs(&state, &tenant, &coll)
+        .await
+        .unwrap_or_default();
 
     let mut params: Vec<Value> = Vec::new();
     let where_sql = if let Some(sql) = try_compound_match(&filter, &cdefs, &mut params) {
@@ -1567,24 +1607,32 @@ async fn upsert_ttl_config(
 ) -> Result<(), AppError> {
     // GlueSQL has no ON CONFLICT; delete-then-insert is idempotent for a PRIMARY KEY table.
     let del_sql = format!("DELETE FROM {TTL_TABLE} WHERE collection = $1;");
-    run_write(state, tenant, &del_sql, &[bluedb_rest::Param::Str(coll.to_string())]).await?;
-    let ins_sql = format!(
-        "INSERT INTO {TTL_TABLE} (collection, field, seconds) VALUES ($1, $2, $3);"
-    );
-    run_write(state, tenant, &ins_sql, &[
-        bluedb_rest::Param::Str(coll.to_string()),
-        bluedb_rest::Param::Str(field.to_string()),
-        bluedb_rest::Param::Int(seconds),
-    ])
+    run_write(
+        state,
+        tenant,
+        &del_sql,
+        &[bluedb_rest::Param::Str(coll.to_string())],
+    )
+    .await?;
+    let ins_sql =
+        format!("INSERT INTO {TTL_TABLE} (collection, field, seconds) VALUES ($1, $2, $3);");
+    run_write(
+        state,
+        tenant,
+        &ins_sql,
+        &[
+            bluedb_rest::Param::Str(coll.to_string()),
+            bluedb_rest::Param::Str(field.to_string()),
+            bluedb_rest::Param::Int(seconds),
+        ],
+    )
     .await
 }
 
 /// Ensure the `__bluedb_ttl_tenants(tenant TEXT PRIMARY KEY)` table exists in
 /// the DEFAULT_TENANT keyspace (the global TTL tenant registry).
 async fn ensure_ttl_tenants_registry(state: &AppState) -> Result<(), AppError> {
-    let sql = format!(
-        "CREATE TABLE IF NOT EXISTS {TTL_TENANTS_TABLE} (tenant TEXT PRIMARY KEY);"
-    );
+    let sql = format!("CREATE TABLE IF NOT EXISTS {TTL_TENANTS_TABLE} (tenant TEXT PRIMARY KEY);");
     run_ddl(state, bluedb_sql::DEFAULT_TENANT, &sql).await
 }
 
@@ -1594,9 +1642,21 @@ async fn register_ttl_tenant(state: &AppState, tenant: &str) -> Result<(), AppEr
     ensure_ttl_tenants_registry(state).await?;
     // DELETE-then-INSERT is idempotent for a PRIMARY KEY table (GlueSQL has no ON CONFLICT).
     let del = format!("DELETE FROM {TTL_TENANTS_TABLE} WHERE tenant = $1;");
-    run_write(state, bluedb_sql::DEFAULT_TENANT, &del, &[bluedb_rest::Param::Str(tenant.to_string())]).await?;
+    run_write(
+        state,
+        bluedb_sql::DEFAULT_TENANT,
+        &del,
+        &[bluedb_rest::Param::Str(tenant.to_string())],
+    )
+    .await?;
     let ins = format!("INSERT INTO {TTL_TENANTS_TABLE} (tenant) VALUES ($1);");
-    run_write(state, bluedb_sql::DEFAULT_TENANT, &ins, &[bluedb_rest::Param::Str(tenant.to_string())]).await
+    run_write(
+        state,
+        bluedb_sql::DEFAULT_TENANT,
+        &ins,
+        &[bluedb_rest::Param::Str(tenant.to_string())],
+    )
+    .await
 }
 
 /// Return all tenants that have at least one TTL index registered.
@@ -1607,8 +1667,7 @@ pub(crate) async fn list_ttl_tenants(state: &AppState) -> Result<Vec<String>, Ap
     let rows = match run_read_routed(state, bluedb_sql::DEFAULT_TENANT, &sql, &[]).await {
         Ok(r) => r,
         Err(ref e)
-            if e.message().contains("planning SQL")
-                || e.message().contains("table not found") =>
+            if e.message().contains("planning SQL") || e.message().contains("table not found") =>
         {
             return Ok(vec![]);
         }
@@ -1648,8 +1707,7 @@ pub(crate) async fn sweep_ttl(
         // Collection not yet sealed / not in Iceberg → fall through to the
         // GlueSQL path. If the table truly doesn't exist, we get 0 rows.
         Err(ref e)
-            if e.message().contains("planning SQL")
-                || e.message().contains("table not found") =>
+            if e.message().contains("planning SQL") || e.message().contains("table not found") =>
         {
             vec![]
         }
@@ -1689,7 +1747,9 @@ pub(crate) async fn sweep_ttl(
                     // Try date-only "YYYY-MM-DD".
                     if let Ok(nd) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
                         use chrono::TimeZone;
-                        chrono::Utc.from_utc_datetime(&nd.and_hms_opt(0, 0, 0).unwrap_or_default()).timestamp()
+                        chrono::Utc
+                            .from_utc_datetime(&nd.and_hms_opt(0, 0, 0).unwrap_or_default())
+                            .timestamp()
                     } else {
                         continue; // unparseable → skip
                     }
@@ -1725,8 +1785,7 @@ pub(crate) async fn sweep_all_ttl(state: &AppState, tenant: &str) -> Result<(), 
     let rows = match run_read_routed(state, tenant, &sql, &[]).await {
         Ok(r) => r,
         Err(ref e)
-            if e.message().contains("planning SQL")
-                || e.message().contains("table not found") =>
+            if e.message().contains("planning SQL") || e.message().contains("table not found") =>
         {
             return Ok(());
         }
@@ -1816,9 +1875,9 @@ fn try_compound_match(
     }
 
     // Find the first compound index whose component paths are all in the eq map.
-    let (ccol, paths) = cdefs.iter().find(|(_, paths)| {
-        paths.iter().all(|p| eq_map.contains_key(p))
-    })?;
+    let (ccol, paths) = cdefs
+        .iter()
+        .find(|(_, paths)| paths.iter().all(|p| eq_map.contains_key(p)))?;
 
     // Build the compound key value from the equality map (component order = index order).
     let parts: Vec<String> = paths
@@ -1844,8 +1903,12 @@ fn try_compound_match(
     let covered: std::collections::HashSet<&str> = paths.iter().map(|s| s.as_str()).collect();
     for (p, v) in &eq_map {
         if !covered.contains(p.as_str()) {
-            use bluedb_collections::filter::{Filter, Cmp};
-            let leftover = Filter::Cmp { path: p.clone(), op: Cmp::Eq, value: v.clone() };
+            use bluedb_collections::filter::{Cmp, Filter};
+            let leftover = Filter::Cmp {
+                path: p.clone(),
+                op: Cmp::Eq,
+                value: v.clone(),
+            };
             clauses.push(format!("({})", leftover.to_sql(params)));
         }
     }
@@ -1891,7 +1954,11 @@ fn try_multikey_match(
 
     // Only a single top-level equality node qualifies.
     let (path, value) = match filter {
-        Filter::Cmp { path, op: Cmp::Eq, value } => (path.as_str(), value),
+        Filter::Cmp {
+            path,
+            op: Cmp::Eq,
+            value,
+        } => (path.as_str(), value),
         _ => return None,
     };
 
@@ -1914,5 +1981,7 @@ fn try_multikey_match(
 
     // GlueSQL supports `IN (SELECT ...)` subqueries (verified via rewrite.rs).
     // `side` is the exact side-table name discovered from the storage schema.
-    Some(format!("_id IN (SELECT _id FROM {side} WHERE val = {placeholder})"))
+    Some(format!(
+        "_id IN (SELECT _id FROM {side} WHERE val = {placeholder})"
+    ))
 }

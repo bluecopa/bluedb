@@ -11,7 +11,9 @@ use tantivy::{Index, TantivyDocument};
 
 #[test]
 fn query_object_search_filtered_ids() {
-    let mapping = IndexMapping::new().keyword("_id").text("body", Analyzer::Default);
+    let mapping = IndexMapping::new()
+        .keyword("_id")
+        .text("body", Analyzer::Default);
     let schema = mapping.build_schema();
     let id_f = schema.get_field("_id").unwrap();
     let body_f = schema.get_field("body").unwrap();
@@ -41,13 +43,18 @@ fn query_object_search_filtered_ids() {
     )]));
 
     let ids = multi_split_search_query_filtered_ids(
-        &handles, query.as_ref(), 10, IdField(id_f), &tombstones,
+        &handles,
+        query.as_ref(),
+        10,
+        IdField(id_f),
+        &tombstones,
     )
     .unwrap();
     assert_eq!(ids.len(), 1);
     assert_eq!(ids[0].0, "a");
 
     let count =
-        multi_split_count_query_filtered(&handles, query.as_ref(), IdField(id_f), &tombstones).unwrap();
+        multi_split_count_query_filtered(&handles, query.as_ref(), IdField(id_f), &tombstones)
+            .unwrap();
     assert_eq!(count, 1);
 }

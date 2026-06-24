@@ -63,10 +63,12 @@ mod tests {
 
     #[test]
     fn detects_json_and_jsonb_columns() {
-        let c = create_of(
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, data JSON, meta JSONB, name TEXT)",
+        let c =
+            create_of("CREATE TABLE t (id INTEGER PRIMARY KEY, data JSON, meta JSONB, name TEXT)");
+        assert_eq!(
+            json_columns(&c),
+            vec!["data".to_string(), "meta".to_string()]
         );
-        assert_eq!(json_columns(&c), vec!["data".to_string(), "meta".to_string()]);
     }
 
     #[test]

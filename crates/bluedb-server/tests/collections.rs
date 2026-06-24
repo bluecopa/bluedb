@@ -17,7 +17,13 @@ const TTL: Duration = Duration::from_secs(30);
 const MARGIN: Duration = Duration::from_secs(5);
 
 fn node(node_id: &str, store: Arc<dyn ObjectStore>, lease: Arc<dyn LeaseProvider>) -> AppState {
-    let writer = Arc::new(WriterController::new(node_id, lease, Arc::new(SystemClock), TTL, MARGIN));
+    let writer = Arc::new(WriterController::new(
+        node_id,
+        lease,
+        Arc::new(SystemClock),
+        TTL,
+        MARGIN,
+    ));
     AppState::new(store, "bluedb", writer)
 }
 
@@ -71,7 +77,9 @@ async fn insert_single_doc_generates_id_and_returns_count() {
 
     assert_eq!(status, StatusCode::OK, "unexpected status: {body}");
 
-    let inserted_count = body["insertedCount"].as_i64().expect("insertedCount missing");
+    let inserted_count = body["insertedCount"]
+        .as_i64()
+        .expect("insertedCount missing");
     assert_eq!(inserted_count, 1);
 
     let ids = body["insertedIds"].as_array().expect("insertedIds missing");
@@ -254,7 +262,10 @@ async fn create_index_then_find_by_indexed_field_is_fresh() {
     .await;
     assert_eq!(s, StatusCode::OK, "createIndex: {body}");
     let index_name = body["name"].as_str().expect("name in response");
-    assert!(index_name.contains("status"), "expected status in index name, got {index_name}");
+    assert!(
+        index_name.contains("status"),
+        "expected status in index name, got {index_name}"
+    );
 
     // Step 3: insert two more docs after the index exists.
     let (s, body) = call(
@@ -352,7 +363,10 @@ async fn create_index_invalid_path_is_rejected_and_collection_intact() {
         Some(json!({ "keys": { "x) TEXT; DROP TABLE people; --": 1 } })),
     )
     .await;
-    assert!(s.is_client_error(), "expected 4xx for injection path, got {s}: {body}");
+    assert!(
+        s.is_client_error(),
+        "expected 4xx for injection path, got {s}: {body}"
+    );
 
     // The collection is intact: inserting another document must still succeed,
     // proving that no DROP TABLE was executed.
@@ -363,7 +377,11 @@ async fn create_index_invalid_path_is_rejected_and_collection_intact() {
         Some(json!({ "documents": [{ "name": "lin" }] })),
     )
     .await;
-    assert_eq!(s, StatusCode::OK, "insert after injection attempt should succeed: {body}");
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "insert after injection attempt should succeed: {body}"
+    );
     assert_eq!(body["insertedCount"].as_i64().unwrap(), 1);
 }
 
@@ -458,8 +476,14 @@ async fn update_with_upsert_inserts_when_no_match() {
     assert_eq!(s, StatusCode::OK, "upsert: {body}");
     assert_eq!(body["matchedCount"].as_i64().unwrap(), 0);
     assert_eq!(body["modifiedCount"].as_i64().unwrap(), 0);
-    let upserted_id = body["upsertedId"].as_str().expect("upsertedId should be a string");
-    assert_eq!(upserted_id.len(), 24, "expected 24-char id, got '{upserted_id}'");
+    let upserted_id = body["upsertedId"]
+        .as_str()
+        .expect("upsertedId should be a string");
+    assert_eq!(
+        upserted_id.len(),
+        24,
+        "expected 24-char id, got '{upserted_id}'"
+    );
 
     // find by the field set during upsert.
     let (s, body) = call(
@@ -539,7 +563,11 @@ async fn update_keeps_index_consistent() {
     .await;
     assert_eq!(s, StatusCode::OK, "find active: {body}");
     let docs = body["documents"].as_array().unwrap();
-    assert_eq!(docs.len(), 0, "expected 0 active docs; stale index? got: {body}");
+    assert_eq!(
+        docs.len(),
+        0,
+        "expected 0 active docs; stale index? got: {body}"
+    );
 }
 
 /// createIndex is idempotent — calling it twice on the same field succeeds and
@@ -673,7 +701,11 @@ async fn aggregate_sort_on_group_output_and_chained_project() {
     let docs = body["documents"].as_array().expect("documents array");
     assert_eq!(docs.len(), 2, "expected 2 groups, got: {body}");
     // Both groups sum to 40; sort is stable enough that EU (first inserted) leads.
-    assert_eq!(docs[0]["total"].as_f64().unwrap(), 40.0, "first total: {body}");
+    assert_eq!(
+        docs[0]["total"].as_f64().unwrap(),
+        40.0,
+        "first total: {body}"
+    );
 
     // $project then $addFields referencing the projected field `who`.
     let (s, body) = call(
@@ -690,7 +722,11 @@ async fn aggregate_sort_on_group_output_and_chained_project() {
     assert_eq!(s, StatusCode::OK, "project+addFields: {body}");
     for doc in body["documents"].as_array().expect("documents array") {
         assert_eq!(doc["who"].as_str().unwrap(), "EU", "who: {body}");
-        assert_eq!(doc["tag"].as_str().unwrap(), "EU", "tag mirrors who: {body}");
+        assert_eq!(
+            doc["tag"].as_str().unwrap(),
+            "EU",
+            "tag mirrors who: {body}"
+        );
     }
 }
 
@@ -826,7 +862,11 @@ async fn indexed_numeric_field_find_returns_correct_results() {
     .await;
     assert_eq!(s, StatusCode::OK, "find age=36: {body}");
     let docs = body["documents"].as_array().expect("documents array");
-    assert_eq!(docs.len(), 1, "indexed numeric field must return 1 doc for age=36, got: {body}");
+    assert_eq!(
+        docs.len(),
+        1,
+        "indexed numeric field must return 1 doc for age=36, got: {body}"
+    );
     assert_eq!(
         docs[0]["name"].as_str().unwrap_or(""),
         "ada",
@@ -843,7 +883,11 @@ async fn indexed_numeric_field_find_returns_correct_results() {
     .await;
     assert_eq!(s, StatusCode::OK, "find name=ada: {body}");
     let docs = body["documents"].as_array().expect("documents array");
-    assert_eq!(docs.len(), 1, "string-indexed field must return 1 doc, got: {body}");
+    assert_eq!(
+        docs.len(),
+        1,
+        "string-indexed field must return 1 doc, got: {body}"
+    );
 }
 
 /// `$unwind` of a JSON array field: the array `tags` is materialized into a real
@@ -889,13 +933,21 @@ async fn aggregate_unwind_array_field_then_group() {
 
     assert_eq!(status, StatusCode::OK, "aggregate failed: {body}");
     let docs = body["documents"].as_array().expect("documents array");
-    assert_eq!(docs.len(), 3, "expected 3 distinct tags (x,y,z), got: {body}");
+    assert_eq!(
+        docs.len(),
+        3,
+        "expected 3 distinct tags (x,y,z), got: {body}"
+    );
 
     // Sorted ascending by _id: x:1, y:2, z:1.
     assert_eq!(docs[0]["_id"].as_str().unwrap(), "x");
     assert_eq!(docs[0]["n"].as_i64().unwrap(), 1, "x count: {body}");
     assert_eq!(docs[1]["_id"].as_str().unwrap(), "y");
-    assert_eq!(docs[1]["n"].as_i64().unwrap(), 2, "y appears in both docs: {body}");
+    assert_eq!(
+        docs[1]["n"].as_i64().unwrap(),
+        2,
+        "y appears in both docs: {body}"
+    );
     assert_eq!(docs[2]["_id"].as_str().unwrap(), "z");
     assert_eq!(docs[2]["n"].as_i64().unwrap(), 1, "z count: {body}");
 }
@@ -950,7 +1002,11 @@ async fn lookup_nests_matched_docs_as_array() {
 
     assert_eq!(status, StatusCode::OK, "aggregate failed: {body}");
     let docs = body["documents"].as_array().expect("documents array");
-    assert_eq!(docs.len(), 1, "expected exactly the one o1 row, got: {body}");
+    assert_eq!(
+        docs.len(),
+        1,
+        "expected exactly the one o1 row, got: {body}"
+    );
 
     // The o1 row carries its own _id plus the matched customer under `customer`.
     assert_eq!(docs[0]["_id"].as_str().unwrap(), "o1", "left _id: {body}");
@@ -960,7 +1016,10 @@ async fn lookup_nests_matched_docs_as_array() {
         .as_array()
         .unwrap_or_else(|| panic!("`customer` must be a JSON array, got: {body}"));
     assert_eq!(customer.len(), 1, "one matched customer: {body}");
-    assert!(customer[0].is_object(), "array element must be an object: {body}");
+    assert!(
+        customer[0].is_object(),
+        "array element must be an object: {body}"
+    );
     assert_eq!(
         customer[0]["name"].as_str(),
         Some("Ada"),
@@ -1052,7 +1111,11 @@ async fn aggregate_unknown_stage_is_400() {
         Some(json!({ "pipeline": [ { "$bogus": {} } ] })),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "unknown stage should be 400");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "unknown stage should be 400"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1119,15 +1182,36 @@ async fn duplicate_id_returns_mongo_duplicate_key() {
     let body = json!({ "documents": [{ "_id": "dup", "x": 1 }] });
 
     // First insert — must succeed.
-    let (s1, b1) = call(&app, "POST", "/collections/dup_test/insert", Some(body.clone())).await;
+    let (s1, b1) = call(
+        &app,
+        "POST",
+        "/collections/dup_test/insert",
+        Some(body.clone()),
+    )
+    .await;
     assert_eq!(s1, StatusCode::OK, "first insert failed: {b1}");
 
     // Second insert of the same _id — must error with DuplicateKey.
     let (s2, b2) = call(&app, "POST", "/collections/dup_test/insert", Some(body)).await;
-    assert!(s2.is_client_error() || s2.is_server_error(), "expected error, got {s2}: {b2}");
-    assert_eq!(b2["ok"].as_i64().unwrap_or(1), 0, "expected ok:0, got: {b2}");
-    assert_eq!(b2["code"].as_i64().unwrap_or(0), 11000, "expected code 11000, got: {b2}");
-    assert_eq!(b2["codeName"].as_str().unwrap_or(""), "DuplicateKey", "expected DuplicateKey, got: {b2}");
+    assert!(
+        s2.is_client_error() || s2.is_server_error(),
+        "expected error, got {s2}: {b2}"
+    );
+    assert_eq!(
+        b2["ok"].as_i64().unwrap_or(1),
+        0,
+        "expected ok:0, got: {b2}"
+    );
+    assert_eq!(
+        b2["code"].as_i64().unwrap_or(0),
+        11000,
+        "expected code 11000, got: {b2}"
+    );
+    assert_eq!(
+        b2["codeName"].as_str().unwrap_or(""),
+        "DuplicateKey",
+        "expected DuplicateKey, got: {b2}"
+    );
 }
 
 /// Sending an unsupported MQL operator in a filter returns a MongoDB-shaped
@@ -1152,9 +1236,21 @@ async fn unsupported_operator_is_mongo_bad_value() {
         Some(json!({ "filter": { "x": { "$where": "1" } } })),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "expected 400, got {status}: {body}");
-    assert_eq!(body["ok"].as_i64().unwrap_or(1), 0, "expected ok:0, got: {body}");
-    assert_eq!(body["codeName"].as_str().unwrap_or(""), "BadValue", "expected BadValue, got: {body}");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "expected 400, got {status}: {body}"
+    );
+    assert_eq!(
+        body["ok"].as_i64().unwrap_or(1),
+        0,
+        "expected ok:0, got: {body}"
+    );
+    assert_eq!(
+        body["codeName"].as_str().unwrap_or(""),
+        "BadValue",
+        "expected BadValue, got: {body}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1201,7 +1297,8 @@ async fn numeric_indexed_field_is_fast_and_fresh() {
     assert_eq!(s, StatusCode::OK, "find age=36: {body}");
     let docs = body["documents"].as_array().expect("documents array");
     assert_eq!(
-        docs.len(), 1,
+        docs.len(),
+        1,
         "numeric fast path: expected 1 doc for age=36 (no seal), got: {body}"
     );
     assert_eq!(docs[0]["name"].as_str().unwrap(), "ada");
@@ -1217,7 +1314,8 @@ async fn numeric_indexed_field_is_fast_and_fresh() {
     assert_eq!(s, StatusCode::OK, "find age>=30: {body}");
     let docs = body["documents"].as_array().expect("documents array");
     assert_eq!(
-        docs.len(), 1,
+        docs.len(),
+        1,
         "numeric range fast path: expected 1 doc for age>=30, got: {body}"
     );
 }
@@ -1256,7 +1354,8 @@ async fn bool_indexed_field_is_fast() {
     assert_eq!(s, StatusCode::OK, "find active=true: {body}");
     let docs = body["documents"].as_array().expect("documents array");
     assert_eq!(
-        docs.len(), 1,
+        docs.len(),
+        1,
         "bool fast path: expected 1 doc for active=true (no seal), got: {body}"
     );
     assert_eq!(docs[0]["name"].as_str().unwrap(), "ada");
@@ -1303,7 +1402,10 @@ async fn numeric_index_queried_with_string_does_not_error() {
         "string query on numeric index must not 500, got {s}: {body}"
     );
     // Result may be 0 or 1 depending on routing; we only require no crash.
-    assert!(body["documents"].is_array(), "response must have documents array");
+    assert!(
+        body["documents"].is_array(),
+        "response must have documents array"
+    );
 }
 
 /// Numeric index unifies integer and whole-float encoding.
@@ -1362,7 +1464,8 @@ async fn numeric_index_unifies_int_and_float_encoding() {
     assert_eq!(s, StatusCode::OK, "find qty=6: {body}");
     let docs = body["documents"].as_array().expect("documents array");
     assert_eq!(
-        docs.len(), 1,
+        docs.len(),
+        1,
         "float-6.0 doc must be found by integer query {{qty:6}}, got: {body}"
     );
     assert_eq!(docs[0]["label"].as_str().unwrap(), "float-six");
@@ -1412,7 +1515,8 @@ async fn fractional_field_find_is_correct() {
     assert_eq!(s, StatusCode::OK, "find price=3.14: {body}");
     let docs = body["documents"].as_array().expect("documents array");
     assert_eq!(
-        docs.len(), 1,
+        docs.len(),
+        1,
         "fractional price query must return 1 doc (not silently empty), got: {body}"
     );
     assert_eq!(docs[0]["label"].as_str().unwrap(), "pi-price");
@@ -1483,7 +1587,11 @@ async fn compound_index_equality_is_fast_and_fresh() {
     .await;
     assert_eq!(s, StatusCode::OK, "find compound eq: {body}");
     let docs = body["documents"].as_array().expect("documents array");
-    assert_eq!(docs.len(), 1, "expected exactly 1 doc (EU/active), got: {body}");
+    assert_eq!(
+        docs.len(),
+        1,
+        "expected exactly 1 doc (EU/active), got: {body}"
+    );
     assert_eq!(
         docs[0]["n"].as_i64().unwrap_or(-1),
         1,
@@ -1534,7 +1642,11 @@ async fn compound_index_partial_filter_still_correct() {
     .await;
     assert_eq!(s, StatusCode::OK, "find region-only: {body}");
     let docs = body["documents"].as_array().expect("documents array");
-    assert_eq!(docs.len(), 2, "expected 2 docs for region=EU only, got: {body}");
+    assert_eq!(
+        docs.len(),
+        2,
+        "expected 2 docs for region=EU only, got: {body}"
+    );
 }
 
 /// Sorting on a nested document path (e.g. `{"addr.city": 1}`) must resolve the
@@ -1656,9 +1768,16 @@ async fn ttl_sweep_deletes_expired_docs() {
     .await;
     assert_eq!(status, StatusCode::OK, "find after sweep failed: {body}");
     let docs = body["documents"].as_array().expect("documents array");
-    assert_eq!(docs.len(), 1, "expected 1 doc remaining after sweep, got: {body}");
+    assert_eq!(
+        docs.len(),
+        1,
+        "expected 1 doc remaining after sweep, got: {body}"
+    );
     let remaining_id = docs[0].get("_id").and_then(Value::as_str).unwrap_or("");
-    assert_eq!(remaining_id, "new", "expected 'new' to survive, got: {docs:?}");
+    assert_eq!(
+        remaining_id, "new",
+        "expected 'new' to survive, got: {docs:?}"
+    );
 }
 
 /// Verify that a document with an ISO-8601 string timestamp is also swept.
@@ -1705,7 +1824,11 @@ async fn ttl_create_index_rejects_negative_seconds() {
         })),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "expected 400 for negative expireAfterSeconds, got: {body}");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "expected 400 for negative expireAfterSeconds, got: {body}"
+    );
 }
 
 /// Helper: read a string field that may have arrived as a JSON object's member
@@ -1878,7 +2001,11 @@ async fn multikey_stays_consistent_on_update_and_delete() {
     )
     .await;
     assert_eq!(s, StatusCode::OK, "update: {body}");
-    assert_eq!(body["modifiedCount"].as_i64().unwrap(), 1, "modifiedCount: {body}");
+    assert_eq!(
+        body["modifiedCount"].as_i64().unwrap(),
+        1,
+        "modifiedCount: {body}"
+    );
 
     // After update: find {tags:"x"} → 0 (doc_a no longer has x).
     let (s, body) = call(
@@ -1919,7 +2046,11 @@ async fn multikey_stays_consistent_on_update_and_delete() {
     )
     .await;
     assert_eq!(s, StatusCode::OK, "delete: {body}");
-    assert_eq!(body["deletedCount"].as_i64().unwrap(), 1, "deletedCount: {body}");
+    assert_eq!(
+        body["deletedCount"].as_i64().unwrap(),
+        1,
+        "deletedCount: {body}"
+    );
 
     // After delete: find {tags:"y"} → 0 (doc_a no longer has y, doc_b deleted).
     let (s, body) = call(
@@ -2093,7 +2224,11 @@ async fn ttl_sweep_works_on_non_default_tenant() {
     let status = response.status();
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    assert_eq!(status, StatusCode::OK, "createIndex on non-default tenant failed: {body}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "createIndex on non-default tenant failed: {body}"
+    );
 
     // Sweep using sweep_ttl_for_test on the "acme" tenant with now_epoch = 2000.
     let deleted = state
@@ -2118,9 +2253,16 @@ async fn ttl_sweep_works_on_non_default_tenant() {
     let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     assert_eq!(status, StatusCode::OK, "find after sweep failed: {body}");
     let docs = body["documents"].as_array().expect("documents array");
-    assert_eq!(docs.len(), 1, "expected 1 doc remaining after sweep, got: {body}");
+    assert_eq!(
+        docs.len(),
+        1,
+        "expected 1 doc remaining after sweep, got: {body}"
+    );
     let remaining_id = docs[0].get("_id").and_then(Value::as_str).unwrap_or("");
-    assert_eq!(remaining_id, "new", "expected 'new' to survive, got: {docs:?}");
+    assert_eq!(
+        remaining_id, "new",
+        "expected 'new' to survive, got: {docs:?}"
+    );
 }
 
 /// TTL createIndex on a non-default tenant is now accepted and registers the
@@ -2247,7 +2389,10 @@ async fn lookup_rejects_dotted_field() {
         })),
     )
     .await;
-    assert!(s.is_client_error(), "dotted localField must be rejected (4xx): {s} {body}");
+    assert!(
+        s.is_client_error(),
+        "dotted localField must be rejected (4xx): {s} {body}"
+    );
     assert_eq!(body["codeName"], "BadValue", "mongo codeName: {body}");
     let errmsg = body["errmsg"].as_str().unwrap_or("");
     assert!(
@@ -2272,7 +2417,10 @@ async fn lookup_rejects_dotted_field() {
         })),
     )
     .await;
-    assert!(s.is_client_error(), "dotted foreignField must be rejected (4xx): {s} {body}");
+    assert!(
+        s.is_client_error(),
+        "dotted foreignField must be rejected (4xx): {s} {body}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2317,7 +2465,8 @@ async fn multikey_scalar_field_is_indexed() {
     assert_eq!(s, StatusCode::OK, "find tags=x: {body}");
     let docs = body["documents"].as_array().expect("documents array");
     assert_eq!(
-        docs.len(), 1,
+        docs.len(),
+        1,
         "scalar 'tags:x' must be found by find {{tags:'x'}}, got: {body}"
     );
 
@@ -2331,7 +2480,11 @@ async fn multikey_scalar_field_is_indexed() {
     .await;
     assert_eq!(s, StatusCode::OK, "find tags=y: {body}");
     let docs = body["documents"].as_array().expect("documents array");
-    assert_eq!(docs.len(), 0, "tags:y must match 0 docs for scalar x, got: {body}");
+    assert_eq!(
+        docs.len(),
+        0,
+        "tags:y must match 0 docs for scalar x, got: {body}"
+    );
 }
 
 /// Regression for UAT-COLL-003: a unique single-field collection index must
@@ -2369,9 +2522,21 @@ async fn unique_single_field_index_rejects_duplicate() {
         Some(json!({ "documents": [{ "_id": "p2", "sku": "A-1", "tags": ["red"] }] })),
     )
     .await;
-    assert_eq!(s, StatusCode::CONFLICT, "duplicate should be 409, got {s}: {body}");
-    assert_eq!(body["code"].as_i64().unwrap(), 11000, "DuplicateKey code: {body}");
-    assert_eq!(body["codeName"].as_str().unwrap(), "DuplicateKey", "codeName: {body}");
+    assert_eq!(
+        s,
+        StatusCode::CONFLICT,
+        "duplicate should be 409, got {s}: {body}"
+    );
+    assert_eq!(
+        body["code"].as_i64().unwrap(),
+        11000,
+        "DuplicateKey code: {body}"
+    );
+    assert_eq!(
+        body["codeName"].as_str().unwrap(),
+        "DuplicateKey",
+        "codeName: {body}"
+    );
 
     // A distinct sku still inserts cleanly — uniqueness, not a blanket block.
     let (s, body) = call(

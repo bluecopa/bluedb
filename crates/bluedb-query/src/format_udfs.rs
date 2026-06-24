@@ -34,7 +34,9 @@ pub fn register(ctx: &mut datafusion::prelude::SessionContext) -> DfResult<()> {
 
     ctx.register_udf(Arc::new(ScalarUDF::new_from_impl(ToNumber::new())))?;
     ctx.register_udf(Arc::new(ScalarUDF::new_from_impl(Format::new())))?;
-    ctx.register_udf(Arc::new(ScalarUDF::new_from_impl(ToChar::new(builtin_to_char))))?;
+    ctx.register_udf(Arc::new(ScalarUDF::new_from_impl(ToChar::new(
+        builtin_to_char,
+    ))))?;
     Ok(())
 }
 
@@ -235,7 +237,9 @@ impl ScalarUDFImpl for ToChar {
         if !is_numeric(arg0) {
             return match &self.temporal {
                 Some(udf) => udf.invoke_with_args(args),
-                None => exec_err!("to_char: non-numeric argument and no temporal to_char available"),
+                None => {
+                    exec_err!("to_char: non-numeric argument and no temporal to_char available")
+                }
             };
         }
         let arrays = ColumnarValue::values_to_arrays(&args.args)?;
@@ -368,13 +372,19 @@ mod tests {
     #[tokio::test]
     async fn to_char_numeric_via_sql() {
         let ctx = ctx().await;
-        assert_eq!(one_string(&ctx, "SELECT to_char(1234.5, 'FM9,999.00')").await, "1,234.50");
+        assert_eq!(
+            one_string(&ctx, "SELECT to_char(1234.5, 'FM9,999.00')").await,
+            "1,234.50"
+        );
     }
 
     #[tokio::test]
     async fn format_via_sql() {
         let ctx = ctx().await;
-        assert_eq!(one_string(&ctx, "SELECT format('%s/%s', 'a', 'b')").await, "a/b");
+        assert_eq!(
+            one_string(&ctx, "SELECT format('%s/%s', 'a', 'b')").await,
+            "a/b"
+        );
     }
 
     #[tokio::test]

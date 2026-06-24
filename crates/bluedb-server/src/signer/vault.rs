@@ -10,7 +10,7 @@ use crate::AppError;
 
 pub(crate) struct VaultTransitSigner {
     client: reqwest::Client,
-    addr: String,  // e.g. https://vault.internal:8200
+    addr: String, // e.g. https://vault.internal:8200
     token: String,
     mount: String, // default "transit"
     key: String,   // transit key name
@@ -18,11 +18,22 @@ pub(crate) struct VaultTransitSigner {
 
 impl VaultTransitSigner {
     #[allow(dead_code)]
-    pub(crate) fn new(addr: String, token: String, mount: String, key: String) -> Result<Self, AppError> {
+    pub(crate) fn new(
+        addr: String,
+        token: String,
+        mount: String,
+        key: String,
+    ) -> Result<Self, AppError> {
         let client = reqwest::Client::builder()
             .build()
             .map_err(|e| AppError::internal(format!("vault http client: {e}")))?;
-        Ok(Self { client, addr, token, mount, key })
+        Ok(Self {
+            client,
+            addr,
+            token,
+            mount,
+            key,
+        })
     }
 
     pub(crate) fn key_id(&self) -> String {
@@ -77,7 +88,9 @@ fn parse_signature(v: &Value) -> Result<(u64, Vec<u8>), AppError> {
     // `vault:v<N>:<b64-DER>` — split into the three fixed fields.
     let parts: Vec<&str> = sig.splitn(3, ':').collect();
     if parts.len() != 3 || parts[0] != "vault" {
-        return Err(AppError::internal(format!("vault sign: unexpected signature format '{sig}'")));
+        return Err(AppError::internal(format!(
+            "vault sign: unexpected signature format '{sig}'"
+        )));
     }
     let version: u64 = parts[1]
         .strip_prefix('v')
@@ -105,7 +118,10 @@ fn parse_public_key(v: &Value) -> Result<(u64, String), AppError> {
 
 async fn parse_ok(resp: reqwest::Response) -> Result<Value, AppError> {
     let status = resp.status();
-    let body = resp.text().await.map_err(|e| AppError::internal(format!("vault read body: {e}")))?;
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| AppError::internal(format!("vault read body: {e}")))?;
     if !status.is_success() {
         return Err(AppError::internal(format!("vault {status}: {body}")));
     }
@@ -121,12 +137,18 @@ mod tests {
     fn parses_transit_sign_and_keys_responses() {
         let sign: Value =
             serde_json::from_str(r#"{"data":{"signature":"vault:v1:MEUCIQ=="}}"#).unwrap();
-        assert_eq!(parse_signature(&sign).unwrap(), (1, B64.decode("MEUCIQ==").unwrap()));
+        assert_eq!(
+            parse_signature(&sign).unwrap(),
+            (1, B64.decode("MEUCIQ==").unwrap())
+        );
 
         // A non-1 version is parsed from the `v<N>` segment.
         let signed_v7: Value =
             serde_json::from_str(r#"{"data":{"signature":"vault:v7:MEUCIQ=="}}"#).unwrap();
-        assert_eq!(parse_signature(&signed_v7).unwrap(), (7, B64.decode("MEUCIQ==").unwrap()));
+        assert_eq!(
+            parse_signature(&signed_v7).unwrap(),
+            (7, B64.decode("MEUCIQ==").unwrap())
+        );
 
         let keys: Value = serde_json::from_str(
             r#"{"data":{"latest_version":2,"keys":{"2":{"public_key":"-----BEGIN PUBLIC KEY-----\nABC\n-----END PUBLIC KEY-----"}}}}"#,
@@ -134,7 +156,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             parse_public_key(&keys).unwrap(),
-            (2, "-----BEGIN PUBLIC KEY-----\nABC\n-----END PUBLIC KEY-----".to_string())
+            (
+                2,
+                "-----BEGIN PUBLIC KEY-----\nABC\n-----END PUBLIC KEY-----".to_string()
+            )
         );
     }
 
@@ -147,8 +172,10 @@ mod tests {
     #[test]
     fn parse_public_key_rejects_missing_version() {
         // latest_version points at a key version that isn't present.
-        let bad: Value =
-            serde_json::from_str(r#"{"data":{"latest_version":3,"keys":{"2":{"public_key":"x"}}}}"#).unwrap();
+        let bad: Value = serde_json::from_str(
+            r#"{"data":{"latest_version":3,"keys":{"2":{"public_key":"x"}}}}"#,
+        )
+        .unwrap();
         assert!(parse_public_key(&bad).is_err());
     }
 }

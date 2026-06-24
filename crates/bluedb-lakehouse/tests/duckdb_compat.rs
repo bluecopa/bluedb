@@ -61,7 +61,9 @@ async fn duckdb_reads_self_authored_table_with_equality_deletes() {
         .unwrap();
 
     // Snapshot 1: insert id=1,2,3.
-    w.upsert(&[row(1, "a"), row(2, "b"), row(3, "c")]).await.unwrap();
+    w.upsert(&[row(1, "a"), row(2, "b"), row(3, "c")])
+        .await
+        .unwrap();
     w.commit_snapshot(3).await.unwrap();
     // Snapshot 2: update id=1 -> "x", delete id=2 (equality deletes).
     w.upsert(&[row(1, "x")]).await.unwrap();

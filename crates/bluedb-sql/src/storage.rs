@@ -98,8 +98,8 @@ use gluesql_core::data::{Key, Schema, SchemaIndex, SchemaIndexOrd, Value};
 use gluesql_core::error::Result as GlueResult;
 use gluesql_core::executor::evaluate_stateless;
 use gluesql_core::store::{
-    AlterTable, CustomFunction, CustomFunctionMut, DataRow, Index, IndexError, IndexMut, Metadata,
-    MetaIter, Planner, RowIter, Store, StoreMut, Transaction,
+    AlterTable, CustomFunction, CustomFunctionMut, DataRow, Index, IndexError, IndexMut, MetaIter,
+    Metadata, Planner, RowIter, Store, StoreMut, Transaction,
 };
 use serde::{Deserialize, Serialize};
 use slatedb::config::ScanOptions;
@@ -109,8 +109,8 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 use bluedb_storage::Substrate;
 
 use crate::cdc::{next_cdc_seq, CdcConfig, CdcEntry, CdcSeq};
-use crate::connection::CommitSeq;
 use crate::colcat::ColumnCatalog;
+use crate::connection::CommitSeq;
 use crate::error::SqlError;
 use crate::keyspace::{prefix_upper_bound, Keyspace, DEFAULT_TENANT, TAG_CDC};
 
@@ -372,7 +372,10 @@ impl SlateDbStorage {
     /// unobserved, non-mirrored commit pays nothing.
     fn wants_changes(&self, table: &str) -> bool {
         self.commit_observer.is_some()
-            || self.cdc.as_ref().is_some_and(|c| c.is_enabled(&self.tenant, table))
+            || self
+                .cdc
+                .as_ref()
+                .is_some_and(|c| c.is_enabled(&self.tenant, table))
     }
 
     /// Buffer a row change for the commit observer and/or the CDC log, when one
@@ -533,7 +536,10 @@ impl SlateDbStorage {
                 let mut iter = match end {
                     Some(end) => {
                         txn.snapshot
-                            .scan_with_options(start.to_vec()..end.to_vec(), &ScanOptions::default())
+                            .scan_with_options(
+                                start.to_vec()..end.to_vec(),
+                                &ScanOptions::default(),
+                            )
                             .await?
                     }
                     None => {
@@ -596,8 +602,7 @@ impl SlateDbStorage {
         let (start, end) = match cmp_value {
             None => (full_prefix.clone(), full_end),
             Some((op, value)) => {
-                let key =
-                    Key::try_from(value).map_err(|e| SqlError::IndexEval(e.to_string()))?;
+                let key = Key::try_from(value).map_err(|e| SqlError::IndexEval(e.to_string()))?;
                 let kbytes = key
                     .to_cmp_be_bytes()
                     .map_err(|e| SqlError::KeyEncode(e.to_string()))?;
@@ -707,9 +712,7 @@ impl SlateDbStorage {
     /// so bluedb-sql stores definitions here and inlines them on read. Public so
     /// the server's analytical (`/sql`) read path can inline views itself, since
     /// it bypasses the composite-PK pre-parse where views are otherwise expanded.
-    pub async fn read_views(
-        &self,
-    ) -> Result<std::collections::HashMap<String, String>, SqlError> {
+    pub async fn read_views(&self) -> Result<std::collections::HashMap<String, String>, SqlError> {
         let key = self.keyspace.views_key();
         Ok(match self.read_key(&key).await? {
             Some(bytes) => decode(&bytes)?,
@@ -814,7 +817,10 @@ impl SlateDbStorage {
     /// layer that hand-writes SQL-projection rows (e.g. `bluedb-ledger`) can build
     /// row keys by id, the same way the engine does.
     pub async fn resolve_table_id(&self, table_name: &str) -> Result<Option<u64>, SqlError> {
-        match self.read_key(&self.keyspace.tableid_key(table_name)).await? {
+        match self
+            .read_key(&self.keyspace.tableid_key(table_name))
+            .await?
+        {
             Some(bytes) => Ok(Some(decode_table_id(&bytes)?)),
             None => Ok(None),
         }
@@ -1116,7 +1122,8 @@ impl StoreMut for SlateDbStorage {
         let meta_key = self.keyspace.meta_key(&schema.table_name);
         if self.read_key(&meta_key).await?.is_none() {
             let micros = chrono::Utc::now().timestamp_micros();
-            self.write_key(meta_key, micros.to_be_bytes().to_vec()).await?;
+            self.write_key(meta_key, micros.to_be_bytes().to_vec())
+                .await?;
         }
         Ok(())
     }
@@ -1127,17 +1134,21 @@ impl StoreMut for SlateDbStorage {
         let table_id = self.table_id(table_name).await?;
         let rows = self.collect_rows(table_name).await?;
         for (key, row) in &rows {
-            self.apply_index_entries(table_name, key, row, false).await?;
+            self.apply_index_entries(table_name, key, row, false)
+                .await?;
         }
         for (key, _) in &rows {
             let storage_key = self.keyspace.row_key(table_id, key)?;
             self.delete_key(storage_key).await?;
         }
-        self.delete_key(self.keyspace.schema_key(table_name)).await?;
+        self.delete_key(self.keyspace.schema_key(table_name))
+            .await?;
         self.delete_key(self.keyspace.meta_key(table_name)).await?;
-        self.delete_key(self.keyspace.colcat_key(table_name)).await?;
+        self.delete_key(self.keyspace.colcat_key(table_name))
+            .await?;
         self.delete_key(self.keyspace.pkcat_key(table_name)).await?;
-        self.delete_key(self.keyspace.tableid_key(table_name)).await?;
+        self.delete_key(self.keyspace.tableid_key(table_name))
+            .await?;
         Ok(())
     }
 
@@ -1356,13 +1367,11 @@ impl Transaction for SlateDbStorage {
                     while let Some(kv) = iter.next().await.map_err(SqlError::from)? {
                         let existing: Key = decode(&kv.value)?;
                         if existing != chk.pk {
-                            return Err(
-                                SqlError::UniqueViolation(format!(
-                                    "duplicate entry for unique index '{}' on table '{}'",
-                                    chk.index_name, chk.table_name
-                                ))
-                                .into(),
-                            );
+                            return Err(SqlError::UniqueViolation(format!(
+                                "duplicate entry for unique index '{}' on table '{}'",
+                                chk.index_name, chk.table_name
+                            ))
+                            .into());
                         }
                     }
                 }
@@ -1464,8 +1473,8 @@ impl Index for SlateDbStorage {
         let (start, end) = match &cmp_value {
             None => (full_prefix.clone(), full_end.clone()),
             Some((op, value)) => {
-                let key = Key::try_from(value.clone())
-                    .map_err(|e| SqlError::IndexEval(e.to_string()))?;
+                let key =
+                    Key::try_from(value.clone()).map_err(|e| SqlError::IndexEval(e.to_string()))?;
                 // The value-bounded prefix: all entries for exactly this value.
                 let value_prefix = self
                     .keyspace
@@ -1729,10 +1738,7 @@ impl AlterTable for SlateDbStorage {
         // dropping it would orphan the lakehouse equality-delete identifier and
         // the sort order, and is meaningless for an index-organized table. Reject
         // it (mirrors the UPDATE-of-key-column non-goal).
-        let dropping_single_pk = column_defs[i]
-            .unique
-            .as_ref()
-            .is_some_and(|u| u.is_primary);
+        let dropping_single_pk = column_defs[i].unique.as_ref().is_some_and(|u| u.is_primary);
         let dropping_component = self
             .read_pk_catalog(table_name)
             .await?
@@ -1804,7 +1810,8 @@ impl AlterTable for SlateDbStorage {
         self.delete_key(old_schema_key).await?;
 
         let new_id_key = self.keyspace.tableid_key(new_table_name);
-        self.write_key(new_id_key, table_id.to_be_bytes().to_vec()).await?;
+        self.write_key(new_id_key, table_id.to_be_bytes().to_vec())
+            .await?;
         let old_id_key = self.keyspace.tableid_key(table_name);
         self.delete_key(old_id_key).await?;
 

@@ -47,13 +47,17 @@ struct Hll {
 
 impl Hll {
     fn new() -> Self {
-        Self { regs: vec![0u8; HLL_M] }
+        Self {
+            regs: vec![0u8; HLL_M],
+        }
     }
 
     fn add_str(&mut self, s: &str) {
         let h = hash64(s.as_bytes());
         let idx = (h >> (64 - HLL_P as u64)) as usize; // top p bits
-        let rank = ((h << HLL_P).leading_zeros() as u8).saturating_add(1).min(64 - HLL_P + 1);
+        let rank = ((h << HLL_P).leading_zeros() as u8)
+            .saturating_add(1)
+            .min(64 - HLL_P + 1);
         if rank > self.regs[idx] {
             self.regs[idx] = rank;
         }
@@ -95,7 +99,9 @@ impl Hll {
         if b.len() != 2 + HLL_M || b[0] != HLL_VERSION || b[1] != HLL_P {
             return None;
         }
-        Some(Hll { regs: b[2..].to_vec() })
+        Some(Hll {
+            regs: b[2..].to_vec(),
+        })
     }
 }
 
@@ -125,10 +131,16 @@ struct HllAgg {
 }
 impl HllAgg {
     fn build() -> Self {
-        Self { name: "hll_build", signature: Signature::any(1, Volatility::Immutable) }
+        Self {
+            name: "hll_build",
+            signature: Signature::any(1, Volatility::Immutable),
+        }
     }
     fn merge() -> Self {
-        Self { name: "hll_merge", signature: Signature::any(1, Volatility::Immutable) }
+        Self {
+            name: "hll_merge",
+            signature: Signature::any(1, Volatility::Immutable),
+        }
     }
 }
 impl AggregateUDFImpl for HllAgg {
@@ -145,10 +157,17 @@ impl AggregateUDFImpl for HllAgg {
         Ok(DataType::Binary)
     }
     fn accumulator(&self, _: AccumulatorArgs) -> DfResult<Box<dyn Accumulator>> {
-        Ok(Box::new(HllAccumulator { hll: Hll::new(), merges_sketches: self.name == "hll_merge" }))
+        Ok(Box::new(HllAccumulator {
+            hll: Hll::new(),
+            merges_sketches: self.name == "hll_merge",
+        }))
     }
     fn state_fields(&self, args: StateFieldsArgs) -> DfResult<Vec<FieldRef>> {
-        Ok(vec![Arc::new(Field::new(format!("{}_sketch", args.name), DataType::Binary, true))])
+        Ok(vec![Arc::new(Field::new(
+            format!("{}_sketch", args.name),
+            DataType::Binary,
+            true,
+        ))])
     }
 }
 
@@ -213,7 +232,9 @@ struct HllCount {
 }
 impl HllCount {
     fn new() -> Self {
-        Self { signature: Signature::any(1, Volatility::Immutable) }
+        Self {
+            signature: Signature::any(1, Volatility::Immutable),
+        }
     }
 }
 impl ScalarUDFImpl for HllCount {
@@ -235,7 +256,10 @@ impl ScalarUDFImpl for HllCount {
         let sketches = sketches.as_any().downcast_ref::<BinaryArray>().unwrap();
         let mut out = Int64Builder::with_capacity(args.number_rows);
         for row in 0..args.number_rows {
-            match (!sketches.is_null(row)).then(|| Hll::from_bytes(sketches.value(row))).flatten() {
+            match (!sketches.is_null(row))
+                .then(|| Hll::from_bytes(sketches.value(row)))
+                .flatten()
+            {
                 Some(h) => out.append_value(h.estimate() as i64),
                 None => out.append_null(),
             }
@@ -282,7 +306,9 @@ mod tests {
 
     #[tokio::test]
     async fn build_count_via_sql() {
-        let n = one_i64("SELECT hll_count(hll_build(c)) FROM (VALUES ('a'),('b'),('a'),('c')) t(c)").await;
+        let n =
+            one_i64("SELECT hll_count(hll_build(c)) FROM (VALUES ('a'),('b'),('a'),('c')) t(c)")
+                .await;
         assert_eq!(n, 3);
     }
 

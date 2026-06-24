@@ -48,8 +48,18 @@ async fn read_back(writer: &LakehouseWriter) -> BTreeMap<i64, String> {
         .unwrap();
     let mut out = BTreeMap::new();
     for batch in batches {
-        let ids = batch.column_by_name("id").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
-        let bodies = batch.column_by_name("body").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let bodies = batch
+            .column_by_name("body")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         for i in 0..batch.num_rows() {
             out.insert(ids.value(i), bodies.value(i).to_string());
         }
@@ -86,7 +96,10 @@ async fn incremental_compaction_preserves_merge_on_read() {
     w.compact_incremental(1 << 30, 4).await.unwrap();
 
     let after = read_back(&w).await;
-    assert_eq!(after, before, "merge-on-read result must be unchanged by compaction");
+    assert_eq!(
+        after, before,
+        "merge-on-read result must be unchanged by compaction"
+    );
     assert!(
         w.data_file_count().await.unwrap() < files_before,
         "incremental compaction should reduce the data-file count"
@@ -109,7 +122,10 @@ async fn major_after_incremental_reclaims_delete_files() {
 
     w.compact_incremental(1 << 30, 3).await.unwrap();
     // Incremental keeps delete files (a delete may still target a survivor).
-    assert!(w.delete_file_count().await.unwrap() > 0, "minor keeps deletes");
+    assert!(
+        w.delete_file_count().await.unwrap() > 0,
+        "minor keeps deletes"
+    );
 
     w.compact(3).await.unwrap(); // major: whole-table rewrite
     assert_eq!(

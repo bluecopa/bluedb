@@ -74,7 +74,9 @@ async fn pk_equality_takes_fast_path_and_skips_iceberg() {
     // id=3 lives only in the row store + CDC tail, NOT in Iceberg.
     dml(&db, &cdc, "INSERT INTO t VALUES (3, 30);").await;
 
-    let provider = BluedbTableProvider::try_new(eng.clone(), "t").await.unwrap();
+    let provider = BluedbTableProvider::try_new(eng.clone(), "t")
+        .await
+        .unwrap();
     let stats = provider.stats_handle();
     let ctx = SessionContext::new();
     ctx.register_table("t", Arc::new(provider)).unwrap();
@@ -111,7 +113,9 @@ async fn non_pk_filter_takes_merge_path() {
     eng.seal().await.unwrap();
     dml(&db, &cdc, "INSERT INTO t VALUES (3, 30);").await; // tail-only
 
-    let provider = BluedbTableProvider::try_new(eng.clone(), "t").await.unwrap();
+    let provider = BluedbTableProvider::try_new(eng.clone(), "t")
+        .await
+        .unwrap();
     let stats = provider.stats_handle();
     let ctx = SessionContext::new();
     ctx.register_table("t", Arc::new(provider)).unwrap();
@@ -140,5 +144,8 @@ async fn provider_rejects_pk_less_table() {
     let (db, _cdc, eng) = make_engine().await;
     ddl(&db, "CREATE TABLE nopk (a INTEGER, b INTEGER);").await;
     let result = BluedbTableProvider::try_new(eng.clone(), "nopk").await;
-    assert!(result.is_err(), "PK-less table must be rejected: {result:?}");
+    assert!(
+        result.is_err(),
+        "PK-less table must be rejected: {result:?}"
+    );
 }

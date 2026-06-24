@@ -35,7 +35,11 @@ async fn two_tenants_share_a_db_without_cross_reads() {
 
     // Same table name, same schema, different rows per tenant.
     for glue in [&mut alice, &mut bob] {
-        exec_one(glue, "CREATE TABLE acct (id INTEGER PRIMARY KEY, owner TEXT);").await;
+        exec_one(
+            glue,
+            "CREATE TABLE acct (id INTEGER PRIMARY KEY, owner TEXT);",
+        )
+        .await;
     }
     exec_one(&mut alice, "INSERT INTO acct VALUES (1, 'alice-row');").await;
     exec_one(&mut bob, "INSERT INTO acct VALUES (2, 'bob-row');").await;

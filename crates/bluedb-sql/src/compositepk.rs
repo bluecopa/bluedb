@@ -106,10 +106,7 @@ pub async fn prepare(
 /// re-parses the result), or `None` to pass the original SQL through unchanged.
 /// A `CREATE VIEW`/`DROP VIEW` statement is replaced by a benign `SELECT 0`
 /// (GlueSQL accepts it and returns a row, which the caller surfaces as success).
-async fn view_rewrite(
-    storage: &mut SlateDbStorage,
-    sql: &str,
-) -> Result<Option<String>, SqlError> {
+async fn view_rewrite(storage: &mut SlateDbStorage, sql: &str) -> Result<Option<String>, SqlError> {
     let dialect = GenericDialect {};
     let Ok(mut statements) = Parser::parse_sql(&dialect, sql) else {
         return Ok(None); // unparseable here → let the caller handle it
@@ -312,9 +309,9 @@ fn strip_composite_pk(
     create: &mut sqlparser::ast::CreateTable,
 ) -> Result<Option<PkCatalog>, SqlError> {
     // Find a table-level PRIMARY KEY with ≥2 columns.
-    let pk_pos = create.constraints.iter().position(|c| {
-        matches!(c, TableConstraint::PrimaryKey { columns, .. } if columns.len() >= 2)
-    });
+    let pk_pos = create.constraints.iter().position(
+        |c| matches!(c, TableConstraint::PrimaryKey { columns, .. } if columns.len() >= 2),
+    );
     let Some(pk_pos) = pk_pos else {
         return Ok(None);
     };
@@ -806,9 +803,10 @@ pub(crate) mod dml {
         } else {
             // Partial prefix: bound past/through the whole `(x, y, …, *)` range.
             match op {
-                BinaryOperator::Gt => {
-                    pk_cmp(BinaryOperator::GtEq, &prefix_upper_bound(&enc).unwrap_or(enc))
-                }
+                BinaryOperator::Gt => pk_cmp(
+                    BinaryOperator::GtEq,
+                    &prefix_upper_bound(&enc).unwrap_or(enc),
+                ),
                 BinaryOperator::GtEq => pk_cmp(BinaryOperator::GtEq, &enc),
                 BinaryOperator::Lt => pk_cmp(BinaryOperator::Lt, &enc),
                 BinaryOperator::LtEq => match prefix_upper_bound(&enc) {
@@ -994,8 +992,14 @@ mod tests {
         assert_eq!(catalog.columns, vec!["a", "b"]);
         let sql = stmt.to_string();
         // The composite constraint is gone; the surrogate is the PRIMARY KEY.
-        assert!(!sql.contains("PRIMARY KEY (a, b)"), "constraint not stripped: {sql}");
-        assert!(sql.contains("__bluedb_pk BYTEA NOT NULL PRIMARY KEY"), "surrogate missing: {sql}");
+        assert!(
+            !sql.contains("PRIMARY KEY (a, b)"),
+            "constraint not stripped: {sql}"
+        );
+        assert!(
+            sql.contains("__bluedb_pk BYTEA NOT NULL PRIMARY KEY"),
+            "surrogate missing: {sql}"
+        );
         // Component columns are forced NOT NULL.
         assert!(sql.contains("a INTEGER NOT NULL"));
         assert!(sql.contains("b TEXT NOT NULL"));
@@ -1031,26 +1035,55 @@ mod tests {
     fn insert_injects_surrogate_for_explicit_columns() {
         let (_, catalog) = create_with_composite();
         let mut insert = insert_of("INSERT INTO t (a, b, payload) VALUES (1, 'x', 'p')");
-        rewrite_insert(&mut insert, &catalog, &["a".into(), "b".into(), "payload".into()], &std::collections::HashMap::new(), &[]).unwrap();
+        rewrite_insert(
+            &mut insert,
+            &catalog,
+            &["a".into(), "b".into(), "payload".into()],
+            &std::collections::HashMap::new(),
+            &[],
+        )
+        .unwrap();
         let sql = Statement::Insert(insert).to_string();
-        assert!(sql.contains("__bluedb_pk"), "surrogate column not added: {sql}");
-        assert!(sql.contains("X'"), "surrogate value not a bytea literal: {sql}");
+        assert!(
+            sql.contains("__bluedb_pk"),
+            "surrogate column not added: {sql}"
+        );
+        assert!(
+            sql.contains("X'"),
+            "surrogate value not a bytea literal: {sql}"
+        );
     }
 
     #[test]
     fn insert_makes_positional_explicit() {
         let (_, catalog) = create_with_composite();
         let mut insert = insert_of("INSERT INTO t VALUES (1, 'x', 'p')");
-        rewrite_insert(&mut insert, &catalog, &["a".into(), "b".into(), "payload".into()], &std::collections::HashMap::new(), &[]).unwrap();
+        rewrite_insert(
+            &mut insert,
+            &catalog,
+            &["a".into(), "b".into(), "payload".into()],
+            &std::collections::HashMap::new(),
+            &[],
+        )
+        .unwrap();
         let sql = Statement::Insert(insert).to_string();
-        assert!(sql.contains("(a, b, payload, __bluedb_pk)"), "columns not made explicit: {sql}");
+        assert!(
+            sql.contains("(a, b, payload, __bluedb_pk)"),
+            "columns not made explicit: {sql}"
+        );
     }
 
     #[test]
     fn insert_rejects_missing_pk_component() {
         let (_, catalog) = create_with_composite();
         let mut insert = insert_of("INSERT INTO t (a, payload) VALUES (1, 'p')");
-        let err = rewrite_insert(&mut insert, &catalog, &["a".into(), "b".into(), "payload".into()], &std::collections::HashMap::new(), &[]);
+        let err = rewrite_insert(
+            &mut insert,
+            &catalog,
+            &["a".into(), "b".into(), "payload".into()],
+            &std::collections::HashMap::new(),
+            &[],
+        );
         assert!(err.is_err(), "missing PK component should be rejected");
     }
 
@@ -1069,8 +1102,14 @@ mod tests {
     fn literal_to_key_handles_ints_strings_bools_and_negatives() {
         assert_eq!(value_to_key(&lit("5"), &[], None).unwrap(), Key::I64(5));
         assert_eq!(value_to_key(&lit("-7"), &[], None).unwrap(), Key::I64(-7));
-        assert_eq!(value_to_key(&lit("'x'"), &[], None).unwrap(), Key::Str("x".into()));
-        assert_eq!(value_to_key(&lit("true"), &[], None).unwrap(), Key::Bool(true));
+        assert_eq!(
+            value_to_key(&lit("'x'"), &[], None).unwrap(),
+            Key::Str("x".into())
+        );
+        assert_eq!(
+            value_to_key(&lit("true"), &[], None).unwrap(),
+            Key::Bool(true)
+        );
         assert!(value_to_key(&lit("NULL"), &[], None).is_err());
     }
 
@@ -1080,15 +1119,28 @@ mod tests {
         };
         let user_cols = vec!["a".to_string(), "b".to_string(), "payload".to_string()];
         let mut stmt = parse_one(sql);
-        dml::rewrite(&mut stmt, &catalog, &user_cols, &std::collections::HashMap::new(), &[]).unwrap();
+        dml::rewrite(
+            &mut stmt,
+            &catalog,
+            &user_cols,
+            &std::collections::HashMap::new(),
+            &[],
+        )
+        .unwrap();
         stmt.to_string()
     }
 
     #[test]
     fn full_key_equality_becomes_a_point_predicate() {
         let sql = rewrite_query_sql("SELECT payload FROM t WHERE a = 1 AND b = 'x'");
-        assert!(sql.contains("__bluedb_pk = X'"), "not a point lookup: {sql}");
-        assert!(!sql.contains("a = 1"), "component predicate not consumed: {sql}");
+        assert!(
+            sql.contains("__bluedb_pk = X'"),
+            "not a point lookup: {sql}"
+        );
+        assert!(
+            !sql.contains("a = 1"),
+            "component predicate not consumed: {sql}"
+        );
     }
 
     #[test]
@@ -1101,14 +1153,20 @@ mod tests {
     #[test]
     fn non_pk_predicate_is_left_untouched() {
         let sql = rewrite_query_sql("SELECT a FROM t WHERE payload = 'p'");
-        assert!(sql.contains("payload = 'p'"), "residual predicate lost: {sql}");
+        assert!(
+            sql.contains("payload = 'p'"),
+            "residual predicate lost: {sql}"
+        );
         assert!(!sql.contains("__bluedb_pk"), "spurious rewrite: {sql}");
     }
 
     #[test]
     fn select_star_expands_to_user_columns() {
         let sql = rewrite_query_sql("SELECT * FROM t WHERE a = 1 AND b = 'x'");
-        assert!(sql.contains("SELECT a, b, payload"), "wildcard not expanded: {sql}");
+        assert!(
+            sql.contains("SELECT a, b, payload"),
+            "wildcard not expanded: {sql}"
+        );
         assert!(!sql.contains('*'), "wildcard remains: {sql}");
     }
 

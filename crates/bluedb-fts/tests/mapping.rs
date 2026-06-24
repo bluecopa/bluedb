@@ -42,10 +42,18 @@ async fn stemming_field_matches_inflections_keyword_is_exact() {
 
     // Store + reopen lazily.
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let db = Arc::new(Db::open("fts-mapping-test", object_store).await.expect("open db"));
-    db.put(SPLIT_KEY.as_bytes(), &split[..]).await.expect("put split");
+    let db = Arc::new(
+        Db::open("fts-mapping-test", object_store)
+            .await
+            .expect("open db"),
+    );
+    db.put(SPLIT_KEY.as_bytes(), &split[..])
+        .await
+        .expect("put split");
     let blob = Arc::new(SlateDbBlobStore::new(db));
-    let index = open_split_lazy(blob.clone(), SPLIT_KEY).await.expect("open split");
+    let index = open_split_lazy(blob.clone(), SPLIT_KEY)
+        .await
+        .expect("open split");
 
     // CRUCIAL: the lazily-opened index has only the default tokenizer manager;
     // register the mapping's analyzers before querying.
@@ -56,7 +64,11 @@ async fn stemming_field_matches_inflections_keyword_is_exact() {
     // Stemming: a query for "running" matches both "runs" (d1) and "run" (d2) —
     // all three regular inflections share the stem `run`.
     let running = multi_split_search(&handles, "running", &[body], 10).expect("search running");
-    assert_eq!(running.len(), 2, "stemmed body matches both 'runs' and 'run'");
+    assert_eq!(
+        running.len(),
+        2,
+        "stemmed body matches both 'runs' and 'run'"
+    );
 
     // The bare stem matches both as well (confirming the body terms were stored
     // stemmed, not raw).

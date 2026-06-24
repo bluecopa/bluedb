@@ -19,7 +19,13 @@ const TTL: Duration = Duration::from_secs(30);
 const MARGIN: Duration = Duration::from_secs(5);
 
 fn node(node_id: &str, store: Arc<dyn ObjectStore>, lease: Arc<dyn LeaseProvider>) -> AppState {
-    let writer = Arc::new(WriterController::new(node_id, lease, Arc::new(SystemClock), TTL, MARGIN));
+    let writer = Arc::new(WriterController::new(
+        node_id,
+        lease,
+        Arc::new(SystemClock),
+        TTL,
+        MARGIN,
+    ));
     AppState::new(store, "bluedb", writer)
 }
 
@@ -30,7 +36,12 @@ async fn app() -> Router {
     build_app(state)
 }
 
-async fn call(app: &Router, method: &str, uri: &str, json_body: Option<Value>) -> (StatusCode, Value) {
+async fn call(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    json_body: Option<Value>,
+) -> (StatusCode, Value) {
     let builder = Request::builder().method(method).uri(uri);
     let request = match json_body {
         Some(v) => builder
@@ -69,16 +80,34 @@ async fn create_table_and_dml_round_trip() {
         })),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "create table should succeed; body: {body}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "create table should succeed; body: {body}"
+    );
 
     // Insert a row via the DML surface to confirm the table exists.
-    let (status, body) = call(&app, "POST", "/tables/docs", Some(json!({ "id": 1, "body": "x" }))).await;
-    assert_eq!(status, StatusCode::OK, "insert should succeed; body: {body}");
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/tables/docs",
+        Some(json!({ "id": 1, "body": "x" })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "insert should succeed; body: {body}"
+    );
     assert_eq!(body, json!({ "inserted": 1 }));
 
     // Read the row back.
     let (status, body) = call(&app, "GET", "/tables/docs", None).await;
-    assert_eq!(status, StatusCode::OK, "select should succeed; body: {body}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "select should succeed; body: {body}"
+    );
     assert_eq!(body, json!([{ "id": 1, "body": "x" }]));
 }
 
@@ -111,7 +140,11 @@ async fn create_index_succeeds() {
         Some(json!({ "name": "idx_body", "columns": ["body"] })),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "create index should succeed; body: {body}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "create index should succeed; body: {body}"
+    );
 }
 
 /// 3. Drop an index.
@@ -146,7 +179,11 @@ async fn drop_index_succeeds() {
 
     // Drop the index.
     let (status, body) = call(&app, "DELETE", "/schema/tables/docs/indexes/idx_body", None).await;
-    assert_eq!(status, StatusCode::OK, "drop index should succeed; body: {body}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "drop index should succeed; body: {body}"
+    );
 }
 
 /// 4. Drop table makes the table gone.
@@ -170,16 +207,30 @@ async fn drop_table_removes_table() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    let (status, _) = call(&app, "POST", "/tables/docs", Some(json!({ "id": 1, "body": "hi" }))).await;
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/tables/docs",
+        Some(json!({ "id": 1, "body": "hi" })),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
 
     // Drop the table.
     let (status, body) = call(&app, "DELETE", "/schema/tables/docs", None).await;
-    assert_eq!(status, StatusCode::OK, "drop table should succeed; body: {body}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "drop table should succeed; body: {body}"
+    );
 
     // Afterwards, a SELECT on the gone table is a 404 (table not found).
     let (status, _) = call(&app, "GET", "/tables/docs", None).await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "select on dropped table should 404");
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "select on dropped table should 404"
+    );
 }
 
 /// 5a. Validation: malicious table name is rejected with 400, nothing executed.
@@ -197,8 +248,15 @@ async fn validation_rejects_malicious_table_name() {
         })),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "malicious name should be rejected; body: {body}");
-    assert!(body.get("error").is_some(), "should have error field; body: {body}");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "malicious name should be rejected; body: {body}"
+    );
+    assert!(
+        body.get("error").is_some(),
+        "should have error field; body: {body}"
+    );
 }
 
 /// 5b. Validation: malicious column type is rejected with 400, nothing executed.
@@ -216,10 +274,21 @@ async fn validation_rejects_malicious_column_type() {
         })),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "malicious type should be rejected; body: {body}");
-    assert!(body.get("error").is_some(), "should have error field; body: {body}");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "malicious type should be rejected; body: {body}"
+    );
+    assert!(
+        body.get("error").is_some(),
+        "should have error field; body: {body}"
+    );
 
     // Confirm the table was NOT created (a subsequent SELECT is 404, not 200).
     let (status, _) = call(&app, "GET", "/tables/safe_table", None).await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "table must not have been created");
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "table must not have been created"
+    );
 }

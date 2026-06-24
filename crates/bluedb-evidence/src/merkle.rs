@@ -47,12 +47,22 @@ pub(crate) fn leaf_hash(etype: &str, payload: &[u8], at: &str, edges: &[EdgeDelt
     }
     let mut sorted: Vec<&EdgeDelta> = edges.iter().collect();
     sorted.sort_by(|a, b| {
-        (&a.graph, &a.src, &a.dst, &a.etype, op_discriminant(&a.op))
-            .cmp(&(&b.graph, &b.src, &b.dst, &b.etype, op_discriminant(&b.op)))
+        (&a.graph, &a.src, &a.dst, &a.etype, op_discriminant(&a.op)).cmp(&(
+            &b.graph,
+            &b.src,
+            &b.dst,
+            &b.etype,
+            op_discriminant(&b.op),
+        ))
     });
     h.update((sorted.len() as u64).to_be_bytes());
     for e in sorted {
-        for field in [e.graph.as_bytes(), e.src.as_bytes(), e.dst.as_bytes(), e.etype.as_bytes()] {
+        for field in [
+            e.graph.as_bytes(),
+            e.src.as_bytes(),
+            e.dst.as_bytes(),
+            e.etype.as_bytes(),
+        ] {
             h.update((field.len() as u64).to_be_bytes());
             h.update(field);
         }
@@ -276,8 +286,17 @@ mod tests {
             for (level, index, hash) in f.push_emit(leaves[n]) {
                 let lo = (index as usize) << level;
                 let hi = lo + (1usize << level);
-                assert!(hi <= n + 1, "node (L{level},{index}) exceeds appended leaves at size {}", n + 1);
-                assert_eq!(hash, merkle_root(&leaves[lo..hi]), "node (L{level},{index}) wrong at size {}", n + 1);
+                assert!(
+                    hi <= n + 1,
+                    "node (L{level},{index}) exceeds appended leaves at size {}",
+                    n + 1
+                );
+                assert_eq!(
+                    hash,
+                    merkle_root(&leaves[lo..hi]),
+                    "node (L{level},{index}) wrong at size {}",
+                    n + 1
+                );
             }
         }
         // push (delegating) still yields the same root as the reference.
@@ -325,7 +344,12 @@ mod tests {
 
     /// Independent RFC 6962 inclusion verifier (Trillian formulation). Returns
     /// the reconstructed root; the caller compares to the trusted root.
-    fn root_from_inclusion(leaf: [u8; 32], index: usize, size: usize, proof: &[[u8; 32]]) -> Option<[u8; 32]> {
+    fn root_from_inclusion(
+        leaf: [u8; 32],
+        index: usize,
+        size: usize,
+        proof: &[[u8; 32]],
+    ) -> Option<[u8; 32]> {
         if index >= size {
             return None;
         }
@@ -436,7 +460,10 @@ mod tests {
         }
         let proof = &proof[start..];
         let mask = (first - 1) >> shift;
-        let hash1 = chain_border_right(chain_inner_right(seed, &proof[..inner], mask), &proof[inner..]);
+        let hash1 = chain_border_right(
+            chain_inner_right(seed, &proof[..inner], mask),
+            &proof[inner..],
+        );
         let hash2 = chain_border_right(chain_inner(seed, &proof[..inner], mask), &proof[inner..]);
         hash1 == root1 && hash2 == root2
     }

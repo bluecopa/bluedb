@@ -100,7 +100,14 @@ async fn signed_digest_verifies_end_to_end_and_rejects_replay() {
 
     // Two distinct verified chains so we can test cross-chain replay.
     for chain in ["chainA", "chainB"] {
-        let (s, _) = call(&app, "PUT", &format!("/evidence/{chain}"), Some(tenant), Some(json!({}))).await;
+        let (s, _) = call(
+            &app,
+            "PUT",
+            &format!("/evidence/{chain}"),
+            Some(tenant),
+            Some(json!({})),
+        )
+        .await;
         assert_eq!(s, StatusCode::OK);
         let (s, _) = call(
             &app,
@@ -123,20 +130,38 @@ async fn signed_digest_verifies_end_to_end_and_rejects_replay() {
     let (s, key) = call(&app, "GET", "/evidence/signing-key", Some(tenant), None).await;
     assert_eq!(s, StatusCode::OK, "signing-key: {key}");
     assert_eq!(key["alg"], "ES256");
-    assert!(key["key_version"].is_i64(), "signing-key carries key_version: {key}");
-    let pem = key["public_key"].as_str().expect("public_key pem").to_string();
+    assert!(
+        key["key_version"].is_i64(),
+        "signing-key carries key_version: {key}"
+    );
+    let pem = key["public_key"]
+        .as_str()
+        .expect("public_key pem")
+        .to_string();
     assert!(pem.contains("BEGIN PUBLIC KEY"), "SPKI PEM: {pem}");
 
     // --- signed digest for chainA ---
-    let (s, sa) = call(&app, "GET", "/evidence/chainA/digest/signed", Some(tenant), None).await;
+    let (s, sa) = call(
+        &app,
+        "GET",
+        "/evidence/chainA/digest/signed",
+        Some(tenant),
+        None,
+    )
+    .await;
     assert_eq!(s, StatusCode::OK, "digest/signed A: {sa}");
     assert_eq!(sa["size"], 3, "size: {sa}");
     assert_eq!(sa["alg"], "ES256");
     assert_eq!(sa["key_id"], "local-ephemeral");
-    assert!(sa["key_version"].is_i64(), "signed digest carries key_version: {sa}");
+    assert!(
+        sa["key_version"].is_i64(),
+        "signed digest carries key_version: {sa}"
+    );
     let root_a = sa["root_hash"].as_str().expect("root_hash");
     let ts_a = sa["timestamp"].as_i64().expect("timestamp");
-    let sig_a = B64.decode(sa["signature"].as_str().expect("signature")).expect("b64 sig");
+    let sig_a = B64
+        .decode(sa["signature"].as_str().expect("signature"))
+        .expect("b64 sig");
 
     // --- verify end-to-end: rebuild the canonical STH bytes + verify ---
     let payload_a = sth_payload(tenant, "chainA", 3, &hex_to_root(root_a), ts_a);
@@ -153,13 +178,23 @@ async fn signed_digest_verifies_end_to_end_and_rejects_replay() {
     );
 
     // --- and the genuine chainB signature verifies against chainB only ---
-    let (s, sb) = call(&app, "GET", "/evidence/chainB/digest/signed", Some(tenant), None).await;
+    let (s, sb) = call(
+        &app,
+        "GET",
+        "/evidence/chainB/digest/signed",
+        Some(tenant),
+        None,
+    )
+    .await;
     assert_eq!(s, StatusCode::OK, "digest/signed B: {sb}");
     let root_b = sb["root_hash"].as_str().unwrap();
     let ts_b = sb["timestamp"].as_i64().unwrap();
     let sig_b = B64.decode(sb["signature"].as_str().unwrap()).unwrap();
     let payload_b = sth_payload(tenant, "chainB", 3, &hex_to_root(root_b), ts_b);
-    assert!(verify_es256_der(&pem, &payload_b, &sig_b), "chainB signature must verify");
+    assert!(
+        verify_es256_der(&pem, &payload_b, &sig_b),
+        "chainB signature must verify"
+    );
     // chainB's signature must not verify against chainA's bytes either.
     assert!(
         !verify_es256_der(&pem, &payload_a, &sig_b),

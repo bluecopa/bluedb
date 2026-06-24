@@ -68,7 +68,10 @@ impl<'a> SchemaRegistry<'a> {
 
     /// Fetch one schema by table name, or `None` if it isn't registered.
     pub async fn get(&self, table_name: &str) -> Result<Option<Schema>, SqlError> {
-        self.storage.fetch_schema(table_name).await.map_err(into_sql)
+        self.storage
+            .fetch_schema(table_name)
+            .await
+            .map_err(into_sql)
     }
 
     /// Register a new schema, or replace an existing one with the same table
@@ -89,11 +92,7 @@ impl<'a> SchemaRegistry<'a> {
     /// * `NULL` only appears in `nullable` columns.
     ///
     /// A **schemaless** table (`column_defs == None`) accepts any row.
-    pub async fn validate_row(
-        &self,
-        table_name: &str,
-        row: &DataRow,
-    ) -> Result<(), SqlError> {
+    pub async fn validate_row(&self, table_name: &str, row: &DataRow) -> Result<(), SqlError> {
         let schema = self.get(table_name).await?.ok_or_else(|| {
             SqlError::SchemaValidation(format!("table not registered: {table_name}"))
         })?;

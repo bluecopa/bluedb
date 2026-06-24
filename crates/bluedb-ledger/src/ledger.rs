@@ -140,18 +140,30 @@ impl Ledger {
         let writer = self.substrate.require_writer()?;
 
         let now = self.clock.now_ns();
-        let batch_imported = specs.first().is_some_and(|a| a.flags.contains(AccountFlags::IMPORTED));
+        let batch_imported = specs
+            .first()
+            .is_some_and(|a| a.flags.contains(AccountFlags::IMPORTED));
         let mut ts = TimestampSource::new(get_watermark(&self.substrate, &self.keyspace).await?);
         let mut staged: HashMap<u128, Account> = HashMap::new();
         let mut accepted: Vec<Account> = Vec::new();
         let mut results = Vec::with_capacity(specs.len());
 
-        let linked: Vec<bool> = specs.iter().map(|a| a.flags.contains(AccountFlags::LINKED)).collect();
+        let linked: Vec<bool> = specs
+            .iter()
+            .map(|a| a.flags.contains(AccountFlags::LINKED))
+            .collect();
         for chain in chains(&linked) {
             // Fast path: an independent (single, non-linked) account.
             if chain.start == chain.end && !chain.open {
                 let r = self
-                    .stage_account(&specs[chain.start], batch_imported, now, &mut ts, &mut staged, &mut accepted)
+                    .stage_account(
+                        &specs[chain.start],
+                        batch_imported,
+                        now,
+                        &mut ts,
+                        &mut staged,
+                        &mut accepted,
+                    )
                     .await?;
                 results.push(r);
                 continue;
@@ -165,7 +177,14 @@ impl Ledger {
             if !chain.open {
                 for (pos, spec) in specs[chain.start..=chain.end].iter().enumerate() {
                     let r = self
-                        .stage_account(spec, batch_imported, now, &mut ts, &mut staged, &mut accepted)
+                        .stage_account(
+                            spec,
+                            batch_imported,
+                            now,
+                            &mut ts,
+                            &mut staged,
+                            &mut accepted,
+                        )
                         .await?;
                     let ok = matches!(r, R::Created | R::Exists);
                     chain_results.push(r);
@@ -182,7 +201,11 @@ impl Ledger {
                 for k in chain.start..=chain.end {
                     let pos = k - chain.start;
                     results.push(if chain.open {
-                        if k == chain.end { R::LinkedEventChainOpen } else { R::LinkedEventFailed }
+                        if k == chain.end {
+                            R::LinkedEventChainOpen
+                        } else {
+                            R::LinkedEventFailed
+                        }
                     } else if Some(pos) == offender {
                         chain_results[pos]
                     } else {
@@ -210,7 +233,8 @@ impl Ledger {
             batch.put(self.keyspace.account_key(a.id), &encode(a)?);
             if let Some(id) = accounts_id {
                 // Atomic SQL projection: mirror the account row in the same batch.
-                let (k, v) = accounts_tbl.encode_row(&sql_ks, id, &crate::projection::project_account(a))?;
+                let (k, v) =
+                    accounts_tbl.encode_row(&sql_ks, id, &crate::projection::project_account(a))?;
                 batch.put(k, &v);
             }
         }
@@ -223,7 +247,13 @@ impl Ledger {
         let wrote = !batch.is_empty();
         if wrote {
             writer
-                .write_with_options(batch, &WriteOptions { await_durable: false, ..Default::default() })
+                .write_with_options(
+                    batch,
+                    &WriteOptions {
+                        await_durable: false,
+                        ..Default::default()
+                    },
+                )
                 .await?;
         }
         drop(_lease);
@@ -287,13 +317,18 @@ impl Ledger {
     /// mutated accounts, accepted transfers, pending-state records, expiry-index
     /// churn, burned ids, and the watermark commit in one atomic batch. Requires
     /// the active writer.
-    pub async fn create_transfers(&self, transfers: &[Transfer]) -> Result<Vec<CreateTransferResult>> {
+    pub async fn create_transfers(
+        &self,
+        transfers: &[Transfer],
+    ) -> Result<Vec<CreateTransferResult>> {
         use CreateTransferResult as R;
         let _lease = self.write_lease.lock().await; // exclusive for the apply (released before the durable flush)
         let writer = self.substrate.require_writer()?; // fail fast on a replica
 
         let now = self.clock.now_ns();
-        let batch_imported = transfers.first().is_some_and(|t| t.flags.contains(TransferFlags::IMPORTED));
+        let batch_imported = transfers
+            .first()
+            .is_some_and(|t| t.flags.contains(TransferFlags::IMPORTED));
         let mut ts = TimestampSource::new(get_watermark(&self.substrate, &self.keyspace).await?);
         let mut state = ApplyState::default();
 
@@ -309,7 +344,10 @@ impl Ledger {
         let mut failed_ids: HashSet<u128> = HashSet::new();
         let mut results = Vec::with_capacity(transfers.len());
 
-        let linked: Vec<bool> = transfers.iter().map(|t| t.flags.contains(TransferFlags::LINKED)).collect();
+        let linked: Vec<bool> = transfers
+            .iter()
+            .map(|t| t.flags.contains(TransferFlags::LINKED))
+            .collect();
         for chain in chains(&linked) {
             let results_start = results.len();
             // Fast path: an independent (single, non-linked) transfer.
@@ -339,7 +377,13 @@ impl Ledger {
                     for (pos, t) in transfers[chain.start..=chain.end].iter().enumerate() {
                         let r = self
                             .process_transfer(
-                                t, batch_imported, now, &mut ts, &mut state, &mut staged, &mut accepted,
+                                t,
+                                batch_imported,
+                                now,
+                                &mut ts,
+                                &mut state,
+                                &mut staged,
+                                &mut accepted,
                                 &failed_ids,
                             )
                             .await?;
@@ -359,7 +403,11 @@ impl Ledger {
                     for k in chain.start..=chain.end {
                         let pos = k - chain.start;
                         results.push(if chain.open {
-                            if k == chain.end { R::LinkedEventChainOpen } else { R::LinkedEventFailed }
+                            if k == chain.end {
+                                R::LinkedEventChainOpen
+                            } else {
+                                R::LinkedEventFailed
+                            }
                         } else if Some(pos) == offender {
                             chain_results[pos]
                         } else {
@@ -406,8 +454,11 @@ impl Ledger {
                 batch.put(self.keyspace.account_key(*id), &encode(account)?);
                 if let Some(tid) = accounts_id {
                     // Atomic SQL projection: re-mirror the post-mutation account.
-                    let (k, v) =
-                        accounts_tbl.encode_row(&sql_ks, tid, &crate::projection::project_account(account))?;
+                    let (k, v) = accounts_tbl.encode_row(
+                        &sql_ks,
+                        tid,
+                        &crate::projection::project_account(account),
+                    )?;
                     batch.put(k, &v);
                 }
             }
@@ -416,7 +467,11 @@ impl Ledger {
             batch.put(self.keyspace.transfer_key(t.id), &encode(t)?);
             if let Some(tid) = transfers_id {
                 // Atomic SQL projection: mirror the transfer row in the same batch.
-                let (k, v) = transfers_tbl.encode_row(&sql_ks, tid, &crate::projection::project_transfer(t))?;
+                let (k, v) = transfers_tbl.encode_row(
+                    &sql_ks,
+                    tid,
+                    &crate::projection::project_transfer(t),
+                )?;
                 batch.put(k, &v);
             }
             // A new timed pending gets an expiry-index entry for the sweep.
@@ -426,7 +481,10 @@ impl Ledger {
             }
         }
         for (pending_id, status) in &state.resolved {
-            batch.put(self.keyspace.pending_state_key(*pending_id), &encode(status)?);
+            batch.put(
+                self.keyspace.pending_state_key(*pending_id),
+                &encode(status)?,
+            );
         }
         // Drop expiry-index entries for pendings resolved or swept this batch.
         for key in &state.expiry_removals {
@@ -449,7 +507,13 @@ impl Ledger {
         let wrote = !batch.is_empty();
         if wrote {
             writer
-                .write_with_options(batch, &WriteOptions { await_durable: false, ..Default::default() })
+                .write_with_options(
+                    batch,
+                    &WriteOptions {
+                        await_durable: false,
+                        ..Default::default()
+                    },
+                )
                 .await?;
         }
         drop(_lease); // release before the durable flush — this is what unblocks concurrency
@@ -518,11 +582,13 @@ impl Ledger {
             TransferOp::Post | TransferOp::Void => {
                 let post = matches!(op, TransferOp::Post);
                 // The referenced pending may be committed or staged this batch.
-                let pending = match get_transfer(&self.substrate, &self.keyspace, t.pending_id).await? {
-                    Some(p) => Some(p),
-                    None => staged.get(&t.pending_id).copied(),
-                };
-                self.stage_resolution(t, pending, post, now, imported_ts, last_ts, state).await?
+                let pending =
+                    match get_transfer(&self.substrate, &self.keyspace, t.pending_id).await? {
+                        Some(p) => Some(p),
+                        None => staged.get(&t.pending_id).copied(),
+                    };
+                self.stage_resolution(t, pending, post, now, imported_ts, last_ts, state)
+                    .await?
             }
         };
 
@@ -536,7 +602,10 @@ impl Ledger {
                     }
                     None => ts.next(now),
                 };
-                let applied = Transfer { timestamp, ..record };
+                let applied = Transfer {
+                    timestamp,
+                    ..record
+                };
                 staged.insert(applied.id, applied);
                 accepted.push(applied);
                 Ok(R::Created)
@@ -552,7 +621,9 @@ impl Ledger {
         for (key, pending_id) in scan_expired(&self.substrate, &self.keyspace, now).await? {
             // If it was already resolved, the index entry is stale — just drop it.
             if state.resolved.contains_key(&pending_id)
-                || get_pending_state(&self.substrate, &self.keyspace, pending_id).await?.is_some()
+                || get_pending_state(&self.substrate, &self.keyspace, pending_id)
+                    .await?
+                    .is_some()
             {
                 state.expiry_removals.push(key);
                 continue;
@@ -567,19 +638,27 @@ impl Ledger {
             let mut debit = self
                 .load_account(pending.debit_account_id, state)
                 .await?
-                .ok_or_else(|| anyhow::anyhow!("ledger invariant: expired pending debit account missing"))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!("ledger invariant: expired pending debit account missing")
+                })?;
             let mut credit = self
                 .load_account(pending.credit_account_id, state)
                 .await?
-                .ok_or_else(|| anyhow::anyhow!("ledger invariant: expired pending credit account missing"))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!("ledger invariant: expired pending credit account missing")
+                })?;
             debit.debits_pending = debit
                 .debits_pending
                 .checked_sub(pending.amount)
-                .ok_or_else(|| anyhow::anyhow!("ledger invariant: debits_pending underflow on expiry"))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!("ledger invariant: debits_pending underflow on expiry")
+                })?;
             credit.credits_pending = credit
                 .credits_pending
                 .checked_sub(pending.amount)
-                .ok_or_else(|| anyhow::anyhow!("ledger invariant: credits_pending underflow on expiry"))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!("ledger invariant: credits_pending underflow on expiry")
+                })?;
             // An expired closing pending reopens the account(s) it closed.
             if pending.flags.contains(TransferFlags::CLOSING_DEBIT) {
                 debit.flags = debit.flags.without(AccountFlags::CLOSED);
@@ -629,7 +708,13 @@ impl Ledger {
             return Ok(Err(R::TransferMustHaveTheSameLedgerAsAccounts));
         }
         // 54–57: imported-timestamp checks (regress / postdate accounts / timeout).
-        if let Some(code) = imported_transfer_checks(imported_ts, last_ts, debit.timestamp, credit.timestamp, t.timeout) {
+        if let Some(code) = imported_transfer_checks(
+            imported_ts,
+            last_ts,
+            debit.timestamp,
+            credit.timestamp,
+            t.timeout,
+        ) {
             return Ok(Err(code));
         }
         // 58 / 59: a closed account rejects new movements.
@@ -655,10 +740,18 @@ impl Ledger {
         // 64 / 65: total (pending + posted) overflow on each constrained side.
         // These also guard the unchecked `posted + pending` in the balance checks
         // below, making those adds panic-free.
-        if debit.debits_pending.checked_add(debit.debits_posted).is_none() {
+        if debit
+            .debits_pending
+            .checked_add(debit.debits_posted)
+            .is_none()
+        {
             return Ok(Err(R::OverflowsDebits));
         }
-        if credit.credits_pending.checked_add(credit.credits_posted).is_none() {
+        if credit
+            .credits_pending
+            .checked_add(credit.credits_posted)
+            .is_none()
+        {
             return Ok(Err(R::OverflowsCredits));
         }
 
@@ -672,12 +765,16 @@ impl Ledger {
         // proved these sums don't overflow.) A balancing side cannot trip its
         // own check (`amount` was reduced to fit); a non-balancing constrained
         // side is still hard-enforced here.
-        if debit.flags.contains(AccountFlags::DEBITS_MUST_NOT_EXCEED_CREDITS)
+        if debit
+            .flags
+            .contains(AccountFlags::DEBITS_MUST_NOT_EXCEED_CREDITS)
             && debit.debits_posted + debit.debits_pending > debit.credits_posted
         {
             return Ok(Err(R::ExceedsCredits));
         }
-        if credit.flags.contains(AccountFlags::CREDITS_MUST_NOT_EXCEED_DEBITS)
+        if credit
+            .flags
+            .contains(AccountFlags::CREDITS_MUST_NOT_EXCEED_DEBITS)
             && credit.credits_posted + credit.credits_pending > credit.debits_posted
         {
             return Ok(Err(R::ExceedsDebits));
@@ -720,7 +817,13 @@ impl Ledger {
             return Ok(Err(R::TransferMustHaveTheSameLedgerAsAccounts));
         }
         // 54–57: imported-timestamp checks (an imported pending must have timeout 0).
-        if let Some(code) = imported_transfer_checks(imported_ts, last_ts, debit.timestamp, credit.timestamp, t.timeout) {
+        if let Some(code) = imported_transfer_checks(
+            imported_ts,
+            last_ts,
+            debit.timestamp,
+            credit.timestamp,
+            t.timeout,
+        ) {
             return Ok(Err(code));
         }
         // 58 / 59: a closed account rejects new movements. (A closing pending's own
@@ -746,10 +849,18 @@ impl Ledger {
         };
         // 64 / 65: total (pending + posted) overflow; also guards the unchecked
         // adds in the balance checks below.
-        if debit.debits_pending.checked_add(debit.debits_posted).is_none() {
+        if debit
+            .debits_pending
+            .checked_add(debit.debits_posted)
+            .is_none()
+        {
             return Ok(Err(R::OverflowsDebits));
         }
-        if credit.credits_pending.checked_add(credit.credits_posted).is_none() {
+        if credit
+            .credits_pending
+            .checked_add(credit.credits_posted)
+            .is_none()
+        {
             return Ok(Err(R::OverflowsCredits));
         }
 
@@ -767,12 +878,16 @@ impl Ledger {
         }
 
         // 67 / 68: a reserved outflow is constrained exactly like a post.
-        if debit.flags.contains(AccountFlags::DEBITS_MUST_NOT_EXCEED_CREDITS)
+        if debit
+            .flags
+            .contains(AccountFlags::DEBITS_MUST_NOT_EXCEED_CREDITS)
             && debit.debits_posted + debit.debits_pending > debit.credits_posted
         {
             return Ok(Err(R::ExceedsCredits));
         }
-        if credit.flags.contains(AccountFlags::CREDITS_MUST_NOT_EXCEED_DEBITS)
+        if credit
+            .flags
+            .contains(AccountFlags::CREDITS_MUST_NOT_EXCEED_DEBITS)
             && credit.credits_posted + credit.credits_pending > credit.debits_posted
         {
             return Ok(Err(R::ExceedsDebits));
@@ -884,7 +999,13 @@ impl Ledger {
             .ok_or_else(|| anyhow::anyhow!("ledger invariant: pending credit account missing"))?;
 
         // 54–57: imported-timestamp checks (post/void have timeout 0).
-        if let Some(code) = imported_transfer_checks(imported_ts, last_ts, debit.timestamp, credit.timestamp, t.timeout) {
+        if let Some(code) = imported_transfer_checks(
+            imported_ts,
+            last_ts,
+            debit.timestamp,
+            credit.timestamp,
+            t.timeout,
+        ) {
             return Ok(Err(code));
         }
 
@@ -893,11 +1014,15 @@ impl Ledger {
         debit.debits_pending = debit
             .debits_pending
             .checked_sub(pending.amount)
-            .ok_or_else(|| anyhow::anyhow!("ledger invariant: debits_pending underflow on resolve"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("ledger invariant: debits_pending underflow on resolve")
+            })?;
         credit.credits_pending = credit
             .credits_pending
             .checked_sub(pending.amount)
-            .ok_or_else(|| anyhow::anyhow!("ledger invariant: credits_pending underflow on resolve"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("ledger invariant: credits_pending underflow on resolve")
+            })?;
         if post {
             // 62 / 63: posting the effective amount can overflow the posted bucket.
             debit.debits_posted = match debit.debits_posted.checked_add(effective) {
@@ -925,14 +1050,19 @@ impl Ledger {
         state.dirty.insert(credit.id);
         state.resolved.insert(
             pending.id,
-            if post { PendingStatus::Posted } else { PendingStatus::Voided },
+            if post {
+                PendingStatus::Posted
+            } else {
+                PendingStatus::Voided
+            },
         );
         // A timed pending resolved before expiry: drop its expiry-index entry so
         // the sweep won't touch it later.
         if pending.timeout != 0 {
-            state
-                .expiry_removals
-                .push(self.keyspace.expiry_key(expiry_of(pending.timestamp, pending.timeout), pending.id));
+            state.expiry_removals.push(
+                self.keyspace
+                    .expiry_key(expiry_of(pending.timestamp, pending.timeout), pending.id),
+            );
         }
 
         // Materialize the stored record: inherited fields filled from the pending,
@@ -943,9 +1073,21 @@ impl Ledger {
             amount: effective,
             ledger: pending.ledger,
             code: if t.code != 0 { t.code } else { pending.code },
-            user_data_128: if t.user_data_128 != 0 { t.user_data_128 } else { pending.user_data_128 },
-            user_data_64: if t.user_data_64 != 0 { t.user_data_64 } else { pending.user_data_64 },
-            user_data_32: if t.user_data_32 != 0 { t.user_data_32 } else { pending.user_data_32 },
+            user_data_128: if t.user_data_128 != 0 {
+                t.user_data_128
+            } else {
+                pending.user_data_128
+            },
+            user_data_64: if t.user_data_64 != 0 {
+                t.user_data_64
+            } else {
+                pending.user_data_64
+            },
+            user_data_32: if t.user_data_32 != 0 {
+                t.user_data_32
+            } else {
+                pending.user_data_32
+            },
             ..*t
         };
         Ok(Ok(materialized))
@@ -978,7 +1120,9 @@ struct TimestampSource {
 
 impl TimestampSource {
     fn new(persisted_watermark: u64) -> Self {
-        Self { last: persisted_watermark }
+        Self {
+            last: persisted_watermark,
+        }
     }
 
     /// The timestamp the next accepted event would get, without consuming it.
@@ -1071,8 +1215,14 @@ mod tests {
     }
 
     async fn setup_two_accounts(ledger: &Ledger) {
-        let r = ledger.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
-        assert_eq!(r, vec![CreateAccountResult::Created, CreateAccountResult::Created]);
+        let r = ledger
+            .create_accounts(&[acct(1, 7), acct(2, 7)])
+            .await
+            .unwrap();
+        assert_eq!(
+            r,
+            vec![CreateAccountResult::Created, CreateAccountResult::Created]
+        );
     }
 
     /// Many clients applying transfers concurrently (group-commit path: the
@@ -1120,12 +1270,21 @@ mod tests {
             sum_d += a.debits_posted;
             sum_c += a.credits_posted;
         }
-        assert_eq!(sum_d, sum_c, "debits and credits conserved under concurrency");
-        assert_eq!(sum_d, expected, "every concurrent transfer applied exactly once");
+        assert_eq!(
+            sum_d, sum_c,
+            "debits and credits conserved under concurrency"
+        );
+        assert_eq!(
+            sum_d, expected,
+            "every concurrent transfer applied exactly once"
+        );
         // Spot-check a transfer from each client landed (no lost writes).
         for t in 0..clients {
             let id = 1_000_000u128 * (t as u128 + 1);
-            assert!(ledger.lookup_transfer(id).await.unwrap().is_some(), "client {t}'s transfer durable");
+            assert!(
+                ledger.lookup_transfer(id).await.unwrap().is_some(),
+                "client {t}'s transfer durable"
+            );
         }
     }
 
@@ -1138,7 +1297,10 @@ mod tests {
         let ledger = Ledger::new(&database);
 
         setup_two_accounts(&ledger).await;
-        let r = ledger.create_transfers(&[xfer(10, 1, 2, 100)]).await.unwrap();
+        let r = ledger
+            .create_transfers(&[xfer(10, 1, 2, 100)])
+            .await
+            .unwrap();
         assert_eq!(r, vec![CreateTransferResult::Created]);
 
         // Read the projection back through a real GlueSQL connection on the
@@ -1151,7 +1313,9 @@ mod tests {
             .execute("SELECT debits_posted, credits_posted FROM ledger_accounts WHERE id = 1")
             .await
             .unwrap();
-        let Payload::Select { rows, .. } = &out[0] else { panic!("expected select") };
+        let Payload::Select { rows, .. } = &out[0] else {
+            panic!("expected select")
+        };
         assert_eq!(rows[0][0], SqlValue::U128(100));
         assert_eq!(rows[0][1], SqlValue::U128(0));
 
@@ -1160,7 +1324,9 @@ mod tests {
             .execute("SELECT SUM(debits_posted), SUM(credits_posted) FROM ledger_accounts")
             .await
             .unwrap();
-        let Payload::Select { rows, .. } = &out[0] else { panic!() };
+        let Payload::Select { rows, .. } = &out[0] else {
+            panic!()
+        };
         assert_eq!(rows[0][0], SqlValue::U128(100));
         assert_eq!(rows[0][0], rows[0][1]);
 
@@ -1169,7 +1335,9 @@ mod tests {
             .execute("SELECT amount, debit_account_id, credit_account_id FROM ledger_transfers WHERE id = 10")
             .await
             .unwrap();
-        let Payload::Select { rows, .. } = &out[0] else { panic!() };
+        let Payload::Select { rows, .. } = &out[0] else {
+            panic!()
+        };
         assert_eq!(rows[0][0], SqlValue::U128(100));
         assert_eq!(rows[0][1], SqlValue::U128(1));
         assert_eq!(rows[0][2], SqlValue::U128(2));
@@ -1200,10 +1368,18 @@ mod tests {
         // Make all four balance columns distinct across the two accounts:
         //   acct 1: debits_pending=30, debits_posted=100, credits_*=0
         //   acct 2: credits_pending=30, credits_posted=100, debits_*=0
-        let pending = Transfer::new(30, 1, 2, 30, 7).with_code(1).with_flags(TransferFlags::PENDING);
-        assert_eq!(ledger.create_transfers(&[pending]).await.unwrap(), vec![CreateTransferResult::Created]);
+        let pending = Transfer::new(30, 1, 2, 30, 7)
+            .with_code(1)
+            .with_flags(TransferFlags::PENDING);
+        assert_eq!(
+            ledger.create_transfers(&[pending]).await.unwrap(),
+            vec![CreateTransferResult::Created]
+        );
         let posted = Transfer::new(10, 1, 2, 100, 7).with_code(9);
-        assert_eq!(ledger.create_transfers(&[posted]).await.unwrap(), vec![CreateTransferResult::Created]);
+        assert_eq!(
+            ledger.create_transfers(&[posted]).await.unwrap(),
+            vec![CreateTransferResult::Created]
+        );
 
         let mut glue = Glue::new(database.connection());
 
@@ -1216,7 +1392,9 @@ mod tests {
             )
             .await
             .unwrap();
-        let Payload::Select { rows, .. } = &out[0] else { panic!() };
+        let Payload::Select { rows, .. } = &out[0] else {
+            panic!()
+        };
         assert_eq!(rows[0][0], SqlValue::U32(7), "ledger");
         assert_eq!(rows[0][1], SqlValue::U16(5), "code");
         assert_eq!(rows[0][2], SqlValue::U128(30), "debits_pending");
@@ -1232,7 +1410,9 @@ mod tests {
             .execute("SELECT debits_pending, debits_posted, credits_pending, credits_posted FROM ledger_accounts WHERE id = 2")
             .await
             .unwrap();
-        let Payload::Select { rows, .. } = &out[0] else { panic!() };
+        let Payload::Select { rows, .. } = &out[0] else {
+            panic!()
+        };
         assert_eq!(rows[0][0], SqlValue::U128(0), "acct2 debits_pending");
         assert_eq!(rows[0][1], SqlValue::U128(0), "acct2 debits_posted");
         assert_eq!(rows[0][2], SqlValue::U128(30), "acct2 credits_pending");
@@ -1247,7 +1427,9 @@ mod tests {
             )
             .await
             .unwrap();
-        let Payload::Select { rows, .. } = &out[0] else { panic!() };
+        let Payload::Select { rows, .. } = &out[0] else {
+            panic!()
+        };
         assert_eq!(rows[0][0], SqlValue::U128(1), "debit_account_id");
         assert_eq!(rows[0][1], SqlValue::U128(2), "credit_account_id");
         assert_eq!(rows[0][2], SqlValue::U128(100), "amount");
@@ -1267,15 +1449,22 @@ mod tests {
         setup_two_accounts(&ledger).await;
 
         // Pending reserve of 40, then post it.
-        let pending = Transfer::new(20, 1, 2, 40, 7).with_code(1).with_flags(TransferFlags::PENDING);
-        assert_eq!(ledger.create_transfers(&[pending]).await.unwrap(), vec![CreateTransferResult::Created]);
+        let pending = Transfer::new(20, 1, 2, 40, 7)
+            .with_code(1)
+            .with_flags(TransferFlags::PENDING);
+        assert_eq!(
+            ledger.create_transfers(&[pending]).await.unwrap(),
+            vec![CreateTransferResult::Created]
+        );
 
         let mut glue = Glue::new(database.connection());
         let out = glue
             .execute("SELECT debits_pending, debits_posted FROM ledger_accounts WHERE id = 1")
             .await
             .unwrap();
-        let Payload::Select { rows, .. } = &out[0] else { panic!() };
+        let Payload::Select { rows, .. } = &out[0] else {
+            panic!()
+        };
         assert_eq!(rows[0][0], SqlValue::U128(40), "pending reserved");
         assert_eq!(rows[0][1], SqlValue::U128(0));
 
@@ -1283,13 +1472,18 @@ mod tests {
             .with_code(1)
             .with_flags(TransferFlags::POST_PENDING_TRANSFER)
             .with_pending_id(20);
-        assert_eq!(ledger.create_transfers(&[post]).await.unwrap(), vec![CreateTransferResult::Created]);
+        assert_eq!(
+            ledger.create_transfers(&[post]).await.unwrap(),
+            vec![CreateTransferResult::Created]
+        );
 
         let out = glue
             .execute("SELECT debits_pending, debits_posted FROM ledger_accounts WHERE id = 1")
             .await
             .unwrap();
-        let Payload::Select { rows, .. } = &out[0] else { panic!() };
+        let Payload::Select { rows, .. } = &out[0] else {
+            panic!()
+        };
         assert_eq!(rows[0][0], SqlValue::U128(0), "pending released on post");
         assert_eq!(rows[0][1], SqlValue::U128(40), "posted");
     }
@@ -1312,20 +1506,31 @@ mod tests {
             acct(1, 7),
             acct(2, 7).with_flags(AccountFlags::DEBITS_MUST_NOT_EXCEED_CREDITS),
         ];
-        assert_eq!(ledger.create_accounts(&specs).await.unwrap(), vec![R::Created, R::Created]);
+        assert_eq!(
+            ledger.create_accounts(&specs).await.unwrap(),
+            vec![R::Created, R::Created]
+        );
 
         let a1 = ledger.lookup_account(1).await.unwrap().unwrap();
         assert_eq!(a1.ledger, 7);
         assert!(a1.timestamp > 0);
         assert_eq!(a1.debits_posted, 0);
         let a2 = ledger.lookup_account(2).await.unwrap().unwrap();
-        assert!(a2.flags.contains(AccountFlags::DEBITS_MUST_NOT_EXCEED_CREDITS));
+        assert!(a2
+            .flags
+            .contains(AccountFlags::DEBITS_MUST_NOT_EXCEED_CREDITS));
 
         // Re-creating id 1 identically is Exists; the original is untouched.
-        assert_eq!(ledger.create_accounts(&[acct(1, 7)]).await.unwrap(), vec![R::Exists]);
+        assert_eq!(
+            ledger.create_accounts(&[acct(1, 7)]).await.unwrap(),
+            vec![R::Exists]
+        );
         let a1b = ledger.lookup_account(1).await.unwrap().unwrap();
         assert_eq!(a1b.ledger, 7);
-        assert_eq!(a1b.timestamp, a1.timestamp, "existing account not overwritten");
+        assert_eq!(
+            a1b.timestamp, a1.timestamp,
+            "existing account not overwritten"
+        );
     }
 
     #[tokio::test]
@@ -1333,26 +1538,64 @@ mod tests {
         use CreateAccountResult as R;
         let db = writer_database().await;
         let l = Ledger::new(&db);
-        assert_eq!(l.create_accounts(&[Account::input(0, 7).with_code(1)]).await.unwrap(), vec![R::IdMustNotBeZero]);
-        assert_eq!(l.create_accounts(&[Account::input(u128::MAX, 7).with_code(1)]).await.unwrap(), vec![R::IdMustNotBeIntMax]);
-        assert_eq!(l.create_accounts(&[Account::input(1, 0).with_code(1)]).await.unwrap(), vec![R::LedgerMustNotBeZero]);
-        assert_eq!(l.create_accounts(&[Account::input(1, 7)]).await.unwrap(), vec![R::CodeMustNotBeZero]);
+        assert_eq!(
+            l.create_accounts(&[Account::input(0, 7).with_code(1)])
+                .await
+                .unwrap(),
+            vec![R::IdMustNotBeZero]
+        );
+        assert_eq!(
+            l.create_accounts(&[Account::input(u128::MAX, 7).with_code(1)])
+                .await
+                .unwrap(),
+            vec![R::IdMustNotBeIntMax]
+        );
+        assert_eq!(
+            l.create_accounts(&[Account::input(1, 0).with_code(1)])
+                .await
+                .unwrap(),
+            vec![R::LedgerMustNotBeZero]
+        );
+        assert_eq!(
+            l.create_accounts(&[Account::input(1, 7)]).await.unwrap(),
+            vec![R::CodeMustNotBeZero]
+        );
         let mut a = acct(1, 7);
         a.timestamp = 5;
-        assert_eq!(l.create_accounts(&[a]).await.unwrap(), vec![R::TimestampMustBeZero]);
+        assert_eq!(
+            l.create_accounts(&[a]).await.unwrap(),
+            vec![R::TimestampMustBeZero]
+        );
         let mut a = acct(1, 7);
         a.reserved = 9;
-        assert_eq!(l.create_accounts(&[a]).await.unwrap(), vec![R::ReservedField]);
+        assert_eq!(
+            l.create_accounts(&[a]).await.unwrap(),
+            vec![R::ReservedField]
+        );
         let mut a = acct(1, 7);
         a.debits_posted = 1;
-        assert_eq!(l.create_accounts(&[a]).await.unwrap(), vec![R::DebitsPostedMustBeZero]);
-        let me = acct(1, 7)
-            .with_flags(AccountFlags::DEBITS_MUST_NOT_EXCEED_CREDITS | AccountFlags::CREDITS_MUST_NOT_EXCEED_DEBITS);
-        assert_eq!(l.create_accounts(&[me]).await.unwrap(), vec![R::FlagsAreMutuallyExclusive]);
+        assert_eq!(
+            l.create_accounts(&[a]).await.unwrap(),
+            vec![R::DebitsPostedMustBeZero]
+        );
+        let me = acct(1, 7).with_flags(
+            AccountFlags::DEBITS_MUST_NOT_EXCEED_CREDITS
+                | AccountFlags::CREDITS_MUST_NOT_EXCEED_DEBITS,
+        );
+        assert_eq!(
+            l.create_accounts(&[me]).await.unwrap(),
+            vec![R::FlagsAreMutuallyExclusive]
+        );
         let resv = acct(1, 7).with_flags(AccountFlags(1 << 9));
-        assert_eq!(l.create_accounts(&[resv]).await.unwrap(), vec![R::ReservedFlag]);
+        assert_eq!(
+            l.create_accounts(&[resv]).await.unwrap(),
+            vec![R::ReservedFlag]
+        );
         // id-zero is reported before ledger/code checks (ordering).
-        assert_eq!(l.create_accounts(&[Account::input(0, 0)]).await.unwrap(), vec![R::IdMustNotBeZero]);
+        assert_eq!(
+            l.create_accounts(&[Account::input(0, 0)]).await.unwrap(),
+            vec![R::IdMustNotBeZero]
+        );
     }
 
     #[tokio::test]
@@ -1360,13 +1603,40 @@ mod tests {
         use CreateAccountResult as R;
         let db = writer_database().await;
         let l = Ledger::new(&db);
-        l.create_accounts(&[acct(1, 7).with_user_data_64(5)]).await.unwrap();
-        assert_eq!(l.create_accounts(&[acct(1, 7).with_user_data_64(5)]).await.unwrap(), vec![R::Exists]);
-        assert_eq!(l.create_accounts(&[acct(1, 7).with_user_data_64(6)]).await.unwrap(), vec![R::ExistsWithDifferentUserData64]);
-        assert_eq!(l.create_accounts(&[acct(1, 8).with_user_data_64(5)]).await.unwrap(), vec![R::ExistsWithDifferentLedger]);
-        assert_eq!(l.create_accounts(&[acct(1, 7).with_code(2).with_user_data_64(5)]).await.unwrap(), vec![R::ExistsWithDifferentCode]);
-        let diff_flags = acct(1, 7).with_user_data_64(5).with_flags(AccountFlags::DEBITS_MUST_NOT_EXCEED_CREDITS);
-        assert_eq!(l.create_accounts(&[diff_flags]).await.unwrap(), vec![R::ExistsWithDifferentFlags]);
+        l.create_accounts(&[acct(1, 7).with_user_data_64(5)])
+            .await
+            .unwrap();
+        assert_eq!(
+            l.create_accounts(&[acct(1, 7).with_user_data_64(5)])
+                .await
+                .unwrap(),
+            vec![R::Exists]
+        );
+        assert_eq!(
+            l.create_accounts(&[acct(1, 7).with_user_data_64(6)])
+                .await
+                .unwrap(),
+            vec![R::ExistsWithDifferentUserData64]
+        );
+        assert_eq!(
+            l.create_accounts(&[acct(1, 8).with_user_data_64(5)])
+                .await
+                .unwrap(),
+            vec![R::ExistsWithDifferentLedger]
+        );
+        assert_eq!(
+            l.create_accounts(&[acct(1, 7).with_code(2).with_user_data_64(5)])
+                .await
+                .unwrap(),
+            vec![R::ExistsWithDifferentCode]
+        );
+        let diff_flags = acct(1, 7)
+            .with_user_data_64(5)
+            .with_flags(AccountFlags::DEBITS_MUST_NOT_EXCEED_CREDITS);
+        assert_eq!(
+            l.create_accounts(&[diff_flags]).await.unwrap(),
+            vec![R::ExistsWithDifferentFlags]
+        );
     }
 
     #[tokio::test]
@@ -1378,7 +1648,10 @@ mod tests {
         let r = l.create_accounts(&[acct(1, 7), acct(1, 7)]).await.unwrap();
         assert_eq!(r, vec![R::Created, R::Exists]);
         // A differing field on the in-batch duplicate yields ExistsWith*.
-        let r = l.create_accounts(&[acct(2, 7), acct(2, 7).with_user_data_32(9)]).await.unwrap();
+        let r = l
+            .create_accounts(&[acct(2, 7), acct(2, 7).with_user_data_32(9)])
+            .await
+            .unwrap();
         assert_eq!(r, vec![R::Created, R::ExistsWithDifferentUserData32]);
     }
 
@@ -1389,7 +1662,13 @@ mod tests {
         let ledger = Ledger::new(&database);
         setup_two_accounts(&ledger).await;
 
-        assert_eq!(ledger.create_transfers(&[xfer(1000, 1, 2, 500)]).await.unwrap(), vec![R::Created]);
+        assert_eq!(
+            ledger
+                .create_transfers(&[xfer(1000, 1, 2, 500)])
+                .await
+                .unwrap(),
+            vec![R::Created]
+        );
 
         let debit = ledger.lookup_account(1).await.unwrap().unwrap();
         let credit = ledger.lookup_account(2).await.unwrap().unwrap();
@@ -1409,16 +1688,56 @@ mod tests {
         let l = Ledger::new(&db);
         setup_two_accounts(&l).await;
         // Distinct ids per assertion: a failed id is burned (id_already_failed).
-        assert_eq!(l.create_transfers(&[xfer(0, 1, 2, 5)]).await.unwrap(), vec![R::IdMustNotBeZero]);
-        assert_eq!(l.create_transfers(&[xfer(u128::MAX, 1, 2, 5)]).await.unwrap(), vec![R::IdMustNotBeIntMax]);
-        assert_eq!(l.create_transfers(&[xfer(1, 0, 2, 5)]).await.unwrap(), vec![R::DebitAccountIdMustNotBeZero]);
-        assert_eq!(l.create_transfers(&[xfer(2, 1, 1, 5)]).await.unwrap(), vec![R::AccountsMustBeDifferent]);
-        assert_eq!(l.create_transfers(&[xfer(3, 1, 2, 5).with_pending_id(9)]).await.unwrap(), vec![R::PendingIdMustBeZero]);
-        assert_eq!(l.create_transfers(&[Transfer::new(4, 1, 2, 5, 0).with_code(1)]).await.unwrap(), vec![R::LedgerMustNotBeZero]);
-        assert_eq!(l.create_transfers(&[Transfer::new(5, 1, 2, 5, 7)]).await.unwrap(), vec![R::CodeMustNotBeZero]);
-        assert_eq!(l.create_transfers(&[xfer(6, 1, 99, 5)]).await.unwrap(), vec![R::CreditAccountNotFound]);
-        assert_eq!(l.create_transfers(&[xfer(7, 99, 2, 5)]).await.unwrap(), vec![R::DebitAccountNotFound]);
-        assert_eq!(l.create_transfers(&[Transfer::new(8, 1, 2, 5, 8).with_code(1)]).await.unwrap(), vec![R::TransferMustHaveTheSameLedgerAsAccounts]);
+        assert_eq!(
+            l.create_transfers(&[xfer(0, 1, 2, 5)]).await.unwrap(),
+            vec![R::IdMustNotBeZero]
+        );
+        assert_eq!(
+            l.create_transfers(&[xfer(u128::MAX, 1, 2, 5)])
+                .await
+                .unwrap(),
+            vec![R::IdMustNotBeIntMax]
+        );
+        assert_eq!(
+            l.create_transfers(&[xfer(1, 0, 2, 5)]).await.unwrap(),
+            vec![R::DebitAccountIdMustNotBeZero]
+        );
+        assert_eq!(
+            l.create_transfers(&[xfer(2, 1, 1, 5)]).await.unwrap(),
+            vec![R::AccountsMustBeDifferent]
+        );
+        assert_eq!(
+            l.create_transfers(&[xfer(3, 1, 2, 5).with_pending_id(9)])
+                .await
+                .unwrap(),
+            vec![R::PendingIdMustBeZero]
+        );
+        assert_eq!(
+            l.create_transfers(&[Transfer::new(4, 1, 2, 5, 0).with_code(1)])
+                .await
+                .unwrap(),
+            vec![R::LedgerMustNotBeZero]
+        );
+        assert_eq!(
+            l.create_transfers(&[Transfer::new(5, 1, 2, 5, 7)])
+                .await
+                .unwrap(),
+            vec![R::CodeMustNotBeZero]
+        );
+        assert_eq!(
+            l.create_transfers(&[xfer(6, 1, 99, 5)]).await.unwrap(),
+            vec![R::CreditAccountNotFound]
+        );
+        assert_eq!(
+            l.create_transfers(&[xfer(7, 99, 2, 5)]).await.unwrap(),
+            vec![R::DebitAccountNotFound]
+        );
+        assert_eq!(
+            l.create_transfers(&[Transfer::new(8, 1, 2, 5, 8).with_code(1)])
+                .await
+                .unwrap(),
+            vec![R::TransferMustHaveTheSameLedgerAsAccounts]
+        );
     }
 
     #[tokio::test]
@@ -1428,7 +1747,10 @@ mod tests {
         let l = Ledger::new(&db);
         // Two accounts in DIFFERENT ledgers; transfer.ledger matches the debit's.
         l.create_accounts(&[acct(1, 7), acct(2, 8)]).await.unwrap();
-        assert_eq!(l.create_transfers(&[xfer(1, 1, 2, 5)]).await.unwrap(), vec![R::AccountsMustHaveTheSameLedger]);
+        assert_eq!(
+            l.create_transfers(&[xfer(1, 1, 2, 5)]).await.unwrap(),
+            vec![R::AccountsMustHaveTheSameLedger]
+        );
     }
 
     #[tokio::test]
@@ -1437,12 +1759,27 @@ mod tests {
         let db = writer_database().await;
         let l = Ledger::new(&db);
         setup_two_accounts(&l).await;
-        assert_eq!(l.create_transfers(&[xfer(7, 1, 2, 100)]).await.unwrap(), vec![R::Created]);
-        assert_eq!(l.create_transfers(&[xfer(7, 1, 2, 100)]).await.unwrap(), vec![R::Exists]);
-        assert_eq!(l.create_transfers(&[xfer(7, 1, 2, 101)]).await.unwrap(), vec![R::ExistsWithDifferentAmount]);
-        assert_eq!(l.create_transfers(&[xfer(7, 2, 1, 100)]).await.unwrap(), vec![R::ExistsWithDifferentDebitAccountId]);
+        assert_eq!(
+            l.create_transfers(&[xfer(7, 1, 2, 100)]).await.unwrap(),
+            vec![R::Created]
+        );
+        assert_eq!(
+            l.create_transfers(&[xfer(7, 1, 2, 100)]).await.unwrap(),
+            vec![R::Exists]
+        );
+        assert_eq!(
+            l.create_transfers(&[xfer(7, 1, 2, 101)]).await.unwrap(),
+            vec![R::ExistsWithDifferentAmount]
+        );
+        assert_eq!(
+            l.create_transfers(&[xfer(7, 2, 1, 100)]).await.unwrap(),
+            vec![R::ExistsWithDifferentDebitAccountId]
+        );
         // balances moved exactly once.
-        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_posted, 100);
+        assert_eq!(
+            l.lookup_account(1).await.unwrap().unwrap().debits_posted,
+            100
+        );
     }
 
     #[tokio::test]
@@ -1455,7 +1792,10 @@ mod tests {
         // (not the transitional NotImplementedYet, which no longer exists). Here
         // the first batch event is imported, so batch_imported=true; with no
         // user timestamp it fails the imported range check.
-        let r = l.create_transfers(&[xfer(1, 1, 2, 5).with_flags(TransferFlags::IMPORTED)]).await.unwrap();
+        let r = l
+            .create_transfers(&[xfer(1, 1, 2, 5).with_flags(TransferFlags::IMPORTED)])
+            .await
+            .unwrap();
         assert_eq!(r, vec![R::ImportedEventTimestampOutOfRange]);
     }
 
@@ -1464,7 +1804,10 @@ mod tests {
     /// Reserve `amount` (1 → 2, pending) and assert it succeeds.
     async fn reserve(l: &Ledger, id: u128, debit: u128, credit: u128, amount: u128) {
         let p = xfer(id, debit, credit, amount).with_flags(TransferFlags::PENDING);
-        assert_eq!(l.create_transfers(&[p]).await.unwrap(), vec![CreateTransferResult::Created]);
+        assert_eq!(
+            l.create_transfers(&[p]).await.unwrap(),
+            vec![CreateTransferResult::Created]
+        );
     }
 
     fn post(id: u128, pending_id: u128, amount: u128) -> Transfer {
@@ -1499,10 +1842,21 @@ mod tests {
         use CreateTransferResult as R;
         let db = writer_database().await;
         let l = Ledger::new(&db);
-        l.create_accounts(&[acct(1, 7).with_flags(AccountFlags::DEBITS_MUST_NOT_EXCEED_CREDITS), acct(2, 7)]).await.unwrap();
+        l.create_accounts(&[
+            acct(1, 7).with_flags(AccountFlags::DEBITS_MUST_NOT_EXCEED_CREDITS),
+            acct(2, 7),
+        ])
+        .await
+        .unwrap();
         let p = xfer(1, 1, 2, 50).with_flags(TransferFlags::PENDING);
-        assert_eq!(l.create_transfers(&[p]).await.unwrap(), vec![R::ExceedsCredits]);
-        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_pending, 0);
+        assert_eq!(
+            l.create_transfers(&[p]).await.unwrap(),
+            vec![R::ExceedsCredits]
+        );
+        assert_eq!(
+            l.lookup_account(1).await.unwrap().unwrap().debits_pending,
+            0
+        );
     }
 
     #[tokio::test]
@@ -1511,14 +1865,27 @@ mod tests {
         let l = Ledger::new(&db);
         setup_two_accounts(&l).await;
         reserve(&l, 500, 1, 2, 100).await;
-        assert_eq!(l.create_transfers(&[post(501, 500, AMOUNT_MAX)]).await.unwrap(), vec![CreateTransferResult::Created]);
+        assert_eq!(
+            l.create_transfers(&[post(501, 500, AMOUNT_MAX)])
+                .await
+                .unwrap(),
+            vec![CreateTransferResult::Created]
+        );
         let d = l.lookup_account(1).await.unwrap().unwrap();
         let c = l.lookup_account(2).await.unwrap().unwrap();
         assert_eq!((d.debits_pending, d.debits_posted), (0, 100));
         assert_eq!((c.credits_pending, c.credits_posted), (0, 100));
         // Stored post is materialized: inherited accounts/ledger + effective amount.
         let stored = l.lookup_transfer(501).await.unwrap().unwrap();
-        assert_eq!((stored.debit_account_id, stored.credit_account_id, stored.ledger, stored.amount), (1, 2, 7, 100));
+        assert_eq!(
+            (
+                stored.debit_account_id,
+                stored.credit_account_id,
+                stored.ledger,
+                stored.amount
+            ),
+            (1, 2, 7, 100)
+        );
     }
 
     #[tokio::test]
@@ -1527,10 +1894,17 @@ mod tests {
         let l = Ledger::new(&db);
         setup_two_accounts(&l).await;
         reserve(&l, 500, 1, 2, 100).await;
-        assert_eq!(l.create_transfers(&[post(501, 500, 60)]).await.unwrap(), vec![CreateTransferResult::Created]);
+        assert_eq!(
+            l.create_transfers(&[post(501, 500, 60)]).await.unwrap(),
+            vec![CreateTransferResult::Created]
+        );
         let d = l.lookup_account(1).await.unwrap().unwrap();
         let c = l.lookup_account(2).await.unwrap().unwrap();
-        assert_eq!((d.debits_pending, d.debits_posted), (0, 60), "remainder released, not posted");
+        assert_eq!(
+            (d.debits_pending, d.debits_posted),
+            (0, 60),
+            "remainder released, not posted"
+        );
         assert_eq!((c.credits_pending, c.credits_posted), (0, 60));
         assert_eq!(l.lookup_transfer(501).await.unwrap().unwrap().amount, 60);
     }
@@ -1542,8 +1916,15 @@ mod tests {
         let l = Ledger::new(&db);
         setup_two_accounts(&l).await;
         reserve(&l, 500, 1, 2, 100).await;
-        assert_eq!(l.create_transfers(&[post(501, 500, 101)]).await.unwrap(), vec![R::ExceedsPendingTransferAmount]);
-        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_pending, 100, "reservation untouched");
+        assert_eq!(
+            l.create_transfers(&[post(501, 500, 101)]).await.unwrap(),
+            vec![R::ExceedsPendingTransferAmount]
+        );
+        assert_eq!(
+            l.lookup_account(1).await.unwrap().unwrap().debits_pending,
+            100,
+            "reservation untouched"
+        );
         assert!(l.lookup_transfer(501).await.unwrap().is_none());
     }
 
@@ -1553,28 +1934,49 @@ mod tests {
         let l = Ledger::new(&db);
         setup_two_accounts(&l).await;
         reserve(&l, 500, 1, 2, 100).await;
-        assert_eq!(l.create_transfers(&[void(501, 500, 0)]).await.unwrap(), vec![CreateTransferResult::Created]);
+        assert_eq!(
+            l.create_transfers(&[void(501, 500, 0)]).await.unwrap(),
+            vec![CreateTransferResult::Created]
+        );
         let d = l.lookup_account(1).await.unwrap().unwrap();
-        assert_eq!((d.debits_pending, d.debits_posted), (0, 0), "released, nothing posted");
+        assert_eq!(
+            (d.debits_pending, d.debits_posted),
+            (0, 0),
+            "released, nothing posted"
+        );
         // Void with the exact pending amount also works.
         reserve(&l, 600, 1, 2, 40).await;
-        assert_eq!(l.create_transfers(&[void(601, 600, 40)]).await.unwrap(), vec![CreateTransferResult::Created]);
+        assert_eq!(
+            l.create_transfers(&[void(601, 600, 40)]).await.unwrap(),
+            vec![CreateTransferResult::Created]
+        );
     }
 
     #[tokio::test]
     async fn void_materialized_record_inherits_pending() {
         let db = writer_database().await;
         let l = Ledger::new(&db);
-        l.create_accounts(&[acct(1, 7).with_code(3), acct(2, 7).with_code(3)]).await.unwrap();
+        l.create_accounts(&[acct(1, 7).with_code(3), acct(2, 7).with_code(3)])
+            .await
+            .unwrap();
         // Reserve with code 3; void with all-zero inheritable fields.
         let mut p = xfer(500, 1, 2, 100).with_code(3);
         p.flags = TransferFlags::PENDING;
         l.create_transfers(&[p]).await.unwrap();
-        assert_eq!(l.create_transfers(&[void(501, 500, 0)]).await.unwrap(), vec![CreateTransferResult::Created]);
+        assert_eq!(
+            l.create_transfers(&[void(501, 500, 0)]).await.unwrap(),
+            vec![CreateTransferResult::Created]
+        );
         let stored = l.lookup_transfer(501).await.unwrap().unwrap();
         // Inherited accounts/ledger/code; amount materialized to the full pending amount.
         assert_eq!(
-            (stored.debit_account_id, stored.credit_account_id, stored.ledger, stored.code, stored.amount),
+            (
+                stored.debit_account_id,
+                stored.credit_account_id,
+                stored.ledger,
+                stored.code,
+                stored.amount
+            ),
             (1, 2, 7, 3, 100)
         );
     }
@@ -1590,13 +1992,32 @@ mod tests {
         let mut p = xfer(500, 1, 2, 100);
         p.flags = TransferFlags::PENDING;
         let res = l
-            .create_transfers(&[p, post(501, 500, AMOUNT_MAX), post(502, 500, AMOUNT_MAX), void(503, 500, 0)])
+            .create_transfers(&[
+                p,
+                post(501, 500, AMOUNT_MAX),
+                post(502, 500, AMOUNT_MAX),
+                void(503, 500, 0),
+            ])
             .await
             .unwrap();
-        assert_eq!(res, vec![R::Created, R::Created, R::PendingTransferAlreadyPosted, R::PendingTransferAlreadyPosted]);
+        assert_eq!(
+            res,
+            vec![
+                R::Created,
+                R::Created,
+                R::PendingTransferAlreadyPosted,
+                R::PendingTransferAlreadyPosted
+            ]
+        );
         // Settled exactly once.
-        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_posted, 100);
-        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_pending, 0);
+        assert_eq!(
+            l.lookup_account(1).await.unwrap().unwrap().debits_posted,
+            100
+        );
+        assert_eq!(
+            l.lookup_account(1).await.unwrap().unwrap().debits_pending,
+            0
+        );
     }
 
     #[tokio::test]
@@ -1606,8 +2027,14 @@ mod tests {
         let l = Ledger::new(&db);
         setup_two_accounts(&l).await;
         reserve(&l, 500, 1, 2, 100).await;
-        assert_eq!(l.create_transfers(&[void(501, 500, 99)]).await.unwrap(), vec![R::PendingTransferHasDifferentAmount]);
-        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_pending, 100);
+        assert_eq!(
+            l.create_transfers(&[void(501, 500, 99)]).await.unwrap(),
+            vec![R::PendingTransferHasDifferentAmount]
+        );
+        assert_eq!(
+            l.lookup_account(1).await.unwrap().unwrap().debits_pending,
+            100
+        );
     }
 
     #[tokio::test]
@@ -1615,20 +2042,31 @@ mod tests {
         use CreateTransferResult as R;
         let db = writer_database().await;
         let l = Ledger::new(&db);
-        l.create_accounts(&[acct(1, 7), acct(2, 7), acct(3, 7)]).await.unwrap();
+        l.create_accounts(&[acct(1, 7), acct(2, 7), acct(3, 7)])
+            .await
+            .unwrap();
         reserve(&l, 500, 1, 2, 100).await;
         // wrong (nonzero) debit account.
         let mut t = post(501, 500, AMOUNT_MAX);
         t.debit_account_id = 3;
-        assert_eq!(l.create_transfers(&[t]).await.unwrap(), vec![R::PendingTransferHasDifferentDebitAccountId]);
+        assert_eq!(
+            l.create_transfers(&[t]).await.unwrap(),
+            vec![R::PendingTransferHasDifferentDebitAccountId]
+        );
         // wrong ledger.
         let mut t = post(502, 500, AMOUNT_MAX);
         t.ledger = 8;
-        assert_eq!(l.create_transfers(&[t]).await.unwrap(), vec![R::PendingTransferHasDifferentLedger]);
+        assert_eq!(
+            l.create_transfers(&[t]).await.unwrap(),
+            vec![R::PendingTransferHasDifferentLedger]
+        );
         // wrong code.
         let mut t = post(503, 500, AMOUNT_MAX);
         t.code = 9;
-        assert_eq!(l.create_transfers(&[t]).await.unwrap(), vec![R::PendingTransferHasDifferentCode]);
+        assert_eq!(
+            l.create_transfers(&[t]).await.unwrap(),
+            vec![R::PendingTransferHasDifferentCode]
+        );
     }
 
     #[tokio::test]
@@ -1637,11 +2075,21 @@ mod tests {
         let db = writer_database().await;
         let l = Ledger::new(&db);
         setup_two_accounts(&l).await;
-        assert_eq!(l.create_transfers(&[post(501, 999, AMOUNT_MAX)]).await.unwrap(), vec![R::PendingTransferNotFound]);
+        assert_eq!(
+            l.create_transfers(&[post(501, 999, AMOUNT_MAX)])
+                .await
+                .unwrap(),
+            vec![R::PendingTransferNotFound]
+        );
         // A regular (non-pending) transfer cannot be posted. (Distinct post id 502
         // since id 501 was burned by the transient failure above.)
         l.create_transfers(&[xfer(600, 1, 2, 5)]).await.unwrap();
-        assert_eq!(l.create_transfers(&[post(502, 600, AMOUNT_MAX)]).await.unwrap(), vec![R::PendingTransferNotPending]);
+        assert_eq!(
+            l.create_transfers(&[post(502, 600, AMOUNT_MAX)])
+                .await
+                .unwrap(),
+            vec![R::PendingTransferNotPending]
+        );
     }
 
     #[tokio::test]
@@ -1651,15 +2099,33 @@ mod tests {
         let l = Ledger::new(&db);
         setup_two_accounts(&l).await;
         reserve(&l, 500, 1, 2, 100).await;
-        assert_eq!(l.create_transfers(&[post(501, 500, AMOUNT_MAX)]).await.unwrap(), vec![R::Created]);
+        assert_eq!(
+            l.create_transfers(&[post(501, 500, AMOUNT_MAX)])
+                .await
+                .unwrap(),
+            vec![R::Created]
+        );
         // posting again → already posted; voiding → already posted (state is terminal).
-        assert_eq!(l.create_transfers(&[post(502, 500, AMOUNT_MAX)]).await.unwrap(), vec![R::PendingTransferAlreadyPosted]);
-        assert_eq!(l.create_transfers(&[void(503, 500, 0)]).await.unwrap(), vec![R::PendingTransferAlreadyPosted]);
+        assert_eq!(
+            l.create_transfers(&[post(502, 500, AMOUNT_MAX)])
+                .await
+                .unwrap(),
+            vec![R::PendingTransferAlreadyPosted]
+        );
+        assert_eq!(
+            l.create_transfers(&[void(503, 500, 0)]).await.unwrap(),
+            vec![R::PendingTransferAlreadyPosted]
+        );
 
         // A voided pending reports already_voided.
         reserve(&l, 600, 1, 2, 10).await;
         l.create_transfers(&[void(601, 600, 0)]).await.unwrap();
-        assert_eq!(l.create_transfers(&[post(602, 600, AMOUNT_MAX)]).await.unwrap(), vec![R::PendingTransferAlreadyVoided]);
+        assert_eq!(
+            l.create_transfers(&[post(602, 600, AMOUNT_MAX)])
+                .await
+                .unwrap(),
+            vec![R::PendingTransferAlreadyVoided]
+        );
     }
 
     #[tokio::test]
@@ -1669,10 +2135,20 @@ mod tests {
         setup_two_accounts(&l).await;
         let mut p = xfer(500, 1, 2, 100);
         p.flags = TransferFlags::PENDING;
-        let res = l.create_transfers(&[p, post(501, 500, AMOUNT_MAX)]).await.unwrap();
-        assert_eq!(res, vec![CreateTransferResult::Created, CreateTransferResult::Created]);
+        let res = l
+            .create_transfers(&[p, post(501, 500, AMOUNT_MAX)])
+            .await
+            .unwrap();
+        assert_eq!(
+            res,
+            vec![CreateTransferResult::Created, CreateTransferResult::Created]
+        );
         let d = l.lookup_account(1).await.unwrap().unwrap();
-        assert_eq!((d.debits_pending, d.debits_posted), (0, 100), "settled within the batch");
+        assert_eq!(
+            (d.debits_pending, d.debits_posted),
+            (0, 100),
+            "settled within the batch"
+        );
     }
 
     #[tokio::test]
@@ -1682,13 +2158,29 @@ mod tests {
         let l = Ledger::new(&db);
         setup_two_accounts(&l).await;
         reserve(&l, 500, 1, 2, 100).await;
-        assert_eq!(l.create_transfers(&[post(501, 500, AMOUNT_MAX)]).await.unwrap(), vec![R::Created]);
+        assert_eq!(
+            l.create_transfers(&[post(501, 500, AMOUNT_MAX)])
+                .await
+                .unwrap(),
+            vec![R::Created]
+        );
         // Same submission (id 501, AMOUNT_MAX, inherited zeros) → Exists, not a mismatch.
-        assert_eq!(l.create_transfers(&[post(501, 500, AMOUNT_MAX)]).await.unwrap(), vec![R::Exists]);
+        assert_eq!(
+            l.create_transfers(&[post(501, 500, AMOUNT_MAX)])
+                .await
+                .unwrap(),
+            vec![R::Exists]
+        );
         // A differing explicit amount on the same id → mismatch.
-        assert_eq!(l.create_transfers(&[post(501, 500, 50)]).await.unwrap(), vec![R::ExistsWithDifferentAmount]);
+        assert_eq!(
+            l.create_transfers(&[post(501, 500, 50)]).await.unwrap(),
+            vec![R::ExistsWithDifferentAmount]
+        );
         // Balances moved exactly once.
-        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_posted, 100);
+        assert_eq!(
+            l.lookup_account(1).await.unwrap().unwrap().debits_posted,
+            100
+        );
     }
 
     // ---- Phase C: timeouts ----
@@ -1712,9 +2204,16 @@ mod tests {
         // Clock near the u64 ceiling so timestamp + timeout·1e9 overflows 2^63-1.
         let (l, _clk) = manual_ledger(&db, u64::MAX - 5);
         l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
-        let res = l.create_transfers(&[timed_pending(500, 1, 2, 100, u32::MAX)]).await.unwrap();
+        let res = l
+            .create_transfers(&[timed_pending(500, 1, 2, 100, u32::MAX)])
+            .await
+            .unwrap();
         assert_eq!(res, vec![R::OverflowsTimeout]);
-        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_pending, 0, "not reserved");
+        assert_eq!(
+            l.lookup_account(1).await.unwrap().unwrap().debits_pending,
+            0,
+            "not reserved"
+        );
     }
 
     #[tokio::test]
@@ -1722,16 +2221,29 @@ mod tests {
         let db = writer_database().await;
         let t0 = 1_000_000_000_000; // 1000s in ns
         let (l, clk) = manual_ledger(&db, t0);
-        l.create_accounts(&[acct(1, 7), acct(2, 7), acct(3, 7)]).await.unwrap();
+        l.create_accounts(&[acct(1, 7), acct(2, 7), acct(3, 7)])
+            .await
+            .unwrap();
         // Reserve with a 10s timeout → expires at t0 + 10e9.
-        assert_eq!(l.create_transfers(&[timed_pending(500, 1, 2, 100, 10)]).await.unwrap(), vec![CreateTransferResult::Created]);
-        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_pending, 100);
+        assert_eq!(
+            l.create_transfers(&[timed_pending(500, 1, 2, 100, 10)])
+                .await
+                .unwrap(),
+            vec![CreateTransferResult::Created]
+        );
+        assert_eq!(
+            l.lookup_account(1).await.unwrap().unwrap().debits_pending,
+            100
+        );
         // Advance past expiry, then trigger the sweep with an unrelated transfer.
         clk.store(t0 + 11_000_000_000, Ordering::SeqCst);
         l.create_transfers(&[xfer(600, 1, 3, 5)]).await.unwrap();
         let d = l.lookup_account(1).await.unwrap().unwrap();
         assert_eq!(d.debits_pending, 0, "expired reservation released");
-        assert_eq!(d.debits_posted, 5, "only the unrelated regular transfer posted");
+        assert_eq!(
+            d.debits_posted, 5,
+            "only the unrelated regular transfer posted"
+        );
     }
 
     #[tokio::test]
@@ -1740,12 +2252,20 @@ mod tests {
         let t0 = 1_000_000_000_000;
         let (l, clk) = manual_ledger(&db, t0);
         l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
-        l.create_transfers(&[timed_pending(500, 1, 2, 100, 10)]).await.unwrap();
+        l.create_transfers(&[timed_pending(500, 1, 2, 100, 10)])
+            .await
+            .unwrap();
         clk.store(t0 + 11_000_000_000, Ordering::SeqCst);
         // An empty batch still runs the sweep and must persist the release.
         l.create_transfers(&[]).await.unwrap();
-        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_pending, 0);
-        assert_eq!(l.lookup_account(2).await.unwrap().unwrap().credits_pending, 0);
+        assert_eq!(
+            l.lookup_account(1).await.unwrap().unwrap().debits_pending,
+            0
+        );
+        assert_eq!(
+            l.lookup_account(2).await.unwrap().unwrap().credits_pending,
+            0
+        );
     }
 
     #[tokio::test]
@@ -1755,10 +2275,17 @@ mod tests {
         let t0 = 1_000_000_000_000;
         let (l, clk) = manual_ledger(&db, t0);
         l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
-        l.create_transfers(&[timed_pending(500, 1, 2, 100, 10)]).await.unwrap();
+        l.create_transfers(&[timed_pending(500, 1, 2, 100, 10)])
+            .await
+            .unwrap();
         // Advance past expiry; the same call sweeps first, so the post sees Expired.
         clk.store(t0 + 11_000_000_000, Ordering::SeqCst);
-        assert_eq!(l.create_transfers(&[post(501, 500, AMOUNT_MAX)]).await.unwrap(), vec![R::PendingTransferExpired]);
+        assert_eq!(
+            l.create_transfers(&[post(501, 500, AMOUNT_MAX)])
+                .await
+                .unwrap(),
+            vec![R::PendingTransferExpired]
+        );
         // Reservation was released by the sweep; nothing posted.
         let d = l.lookup_account(1).await.unwrap().unwrap();
         assert_eq!((d.debits_pending, d.debits_posted), (0, 0));
@@ -1774,9 +2301,15 @@ mod tests {
         let (l, _clk) = manual_ledger(&db, t0);
         l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
         // 10s timeout → expiry ≈ ceiling + 5s, within u64 but past 2^63-1.
-        let res = l.create_transfers(&[timed_pending(500, 1, 2, 100, 10)]).await.unwrap();
+        let res = l
+            .create_transfers(&[timed_pending(500, 1, 2, 100, 10)])
+            .await
+            .unwrap();
         assert_eq!(res, vec![R::OverflowsTimeout]);
-        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_pending, 0);
+        assert_eq!(
+            l.lookup_account(1).await.unwrap().unwrap().debits_pending,
+            0
+        );
     }
 
     #[tokio::test]
@@ -1786,14 +2319,27 @@ mod tests {
         let (l, clk) = manual_ledger(&db, t0);
         l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
         // Two timed reservations 1→2 (compounding debits_pending on account 1).
-        l.create_transfers(&[timed_pending(500, 1, 2, 30, 10)]).await.unwrap();
-        l.create_transfers(&[timed_pending(501, 1, 2, 70, 10)]).await.unwrap();
-        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_pending, 100);
+        l.create_transfers(&[timed_pending(500, 1, 2, 30, 10)])
+            .await
+            .unwrap();
+        l.create_transfers(&[timed_pending(501, 1, 2, 70, 10)])
+            .await
+            .unwrap();
+        assert_eq!(
+            l.lookup_account(1).await.unwrap().unwrap().debits_pending,
+            100
+        );
         // Advance past both expiries; one sweep must release both.
         clk.store(t0 + 11_000_000_000, Ordering::SeqCst);
         l.create_transfers(&[]).await.unwrap();
-        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_pending, 0);
-        assert_eq!(l.lookup_account(2).await.unwrap().unwrap().credits_pending, 0);
+        assert_eq!(
+            l.lookup_account(1).await.unwrap().unwrap().debits_pending,
+            0
+        );
+        assert_eq!(
+            l.lookup_account(2).await.unwrap().unwrap().credits_pending,
+            0
+        );
     }
 
     #[tokio::test]
@@ -1802,15 +2348,29 @@ mod tests {
         let t0 = 1_000_000_000_000;
         let (l, clk) = manual_ledger(&db, t0);
         l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
-        l.create_transfers(&[timed_pending(500, 1, 2, 100, 10)]).await.unwrap();
+        l.create_transfers(&[timed_pending(500, 1, 2, 100, 10)])
+            .await
+            .unwrap();
         // Post before expiry (its index entry is removed).
-        assert_eq!(l.create_transfers(&[post(501, 500, AMOUNT_MAX)]).await.unwrap(), vec![CreateTransferResult::Created]);
-        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_posted, 100);
+        assert_eq!(
+            l.create_transfers(&[post(501, 500, AMOUNT_MAX)])
+                .await
+                .unwrap(),
+            vec![CreateTransferResult::Created]
+        );
+        assert_eq!(
+            l.lookup_account(1).await.unwrap().unwrap().debits_posted,
+            100
+        );
         // Advance past the old expiry and sweep: nothing to release, balances stable.
         clk.store(t0 + 11_000_000_000, Ordering::SeqCst);
         l.create_transfers(&[]).await.unwrap();
         let d = l.lookup_account(1).await.unwrap().unwrap();
-        assert_eq!((d.debits_pending, d.debits_posted), (0, 100), "no double release");
+        assert_eq!(
+            (d.debits_pending, d.debits_posted),
+            (0, 100),
+            "no double release"
+        );
     }
 
     #[tokio::test]
@@ -1819,12 +2379,23 @@ mod tests {
         let t0 = 1_000_000_000_000;
         let (l, clk) = manual_ledger(&db, t0);
         l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
-        l.create_transfers(&[xfer(500, 1, 2, 100).with_flags(TransferFlags::PENDING)]).await.unwrap();
+        l.create_transfers(&[xfer(500, 1, 2, 100).with_flags(TransferFlags::PENDING)])
+            .await
+            .unwrap();
         clk.store(t0 + 1_000_000_000_000, Ordering::SeqCst); // far in the future
         l.create_transfers(&[]).await.unwrap(); // sweep finds nothing
-        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_pending, 100, "untimed pending outstanding");
+        assert_eq!(
+            l.lookup_account(1).await.unwrap().unwrap().debits_pending,
+            100,
+            "untimed pending outstanding"
+        );
         // And it can still be posted.
-        assert_eq!(l.create_transfers(&[post(501, 500, AMOUNT_MAX)]).await.unwrap(), vec![CreateTransferResult::Created]);
+        assert_eq!(
+            l.create_transfers(&[post(501, 500, AMOUNT_MAX)])
+                .await
+                .unwrap(),
+            vec![CreateTransferResult::Created]
+        );
     }
 
     // ---- Phase D: linked chains ----
@@ -1866,12 +2437,18 @@ mod tests {
         let db = writer_database().await;
         let l = Ledger::new(&db);
         // A lone linked account (last batch event linked) → chain open.
-        let res = l.create_accounts(&[acct(1, 7).with_flags(AccountFlags::LINKED)]).await.unwrap();
+        let res = l
+            .create_accounts(&[acct(1, 7).with_flags(AccountFlags::LINKED)])
+            .await
+            .unwrap();
         assert_eq!(res, vec![R::LinkedEventChainOpen]);
         assert!(l.lookup_account(1).await.unwrap().is_none());
         // Two linked with no terminator → first LinkedEventFailed, last ChainOpen.
         let res = l
-            .create_accounts(&[acct(2, 7).with_flags(AccountFlags::LINKED), acct(3, 7).with_flags(AccountFlags::LINKED)])
+            .create_accounts(&[
+                acct(2, 7).with_flags(AccountFlags::LINKED),
+                acct(3, 7).with_flags(AccountFlags::LINKED),
+            ])
             .await
             .unwrap();
         assert_eq!(res, vec![R::LinkedEventFailed, R::LinkedEventChainOpen]);
@@ -1883,12 +2460,23 @@ mod tests {
         use CreateTransferResult as R;
         let db = writer_database().await;
         let l = Ledger::new(&db);
-        l.create_accounts(&[acct(1, 7), acct(2, 7), acct(3, 7)]).await.unwrap();
+        l.create_accounts(&[acct(1, 7), acct(2, 7), acct(3, 7)])
+            .await
+            .unwrap();
         // 1→2 (linked) then 2→3 (terminator): both apply.
-        let res = l.create_transfers(&[linked_xfer(10, 1, 2, 100), xfer(11, 2, 3, 40)]).await.unwrap();
+        let res = l
+            .create_transfers(&[linked_xfer(10, 1, 2, 100), xfer(11, 2, 3, 40)])
+            .await
+            .unwrap();
         assert_eq!(res, vec![R::Created, R::Created]);
-        assert_eq!(l.lookup_account(2).await.unwrap().unwrap().debits_posted, 40);
-        assert_eq!(l.lookup_account(2).await.unwrap().unwrap().credits_posted, 100);
+        assert_eq!(
+            l.lookup_account(2).await.unwrap().unwrap().debits_posted,
+            40
+        );
+        assert_eq!(
+            l.lookup_account(2).await.unwrap().unwrap().credits_posted,
+            100
+        );
     }
 
     #[tokio::test]
@@ -1898,11 +2486,17 @@ mod tests {
         let l = Ledger::new(&db);
         l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
         // t1 ok (1→2), t2 references a missing account → chain fails, t1 rolled back.
-        let res = l.create_transfers(&[linked_xfer(10, 1, 2, 100), xfer(11, 1, 99, 5)]).await.unwrap();
+        let res = l
+            .create_transfers(&[linked_xfer(10, 1, 2, 100), xfer(11, 1, 99, 5)])
+            .await
+            .unwrap();
         assert_eq!(res, vec![R::LinkedEventFailed, R::CreditAccountNotFound]);
         // t1's movement rolled back; nothing persisted.
         assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_posted, 0);
-        assert_eq!(l.lookup_account(2).await.unwrap().unwrap().credits_posted, 0);
+        assert_eq!(
+            l.lookup_account(2).await.unwrap().unwrap().credits_posted,
+            0
+        );
         assert!(l.lookup_transfer(10).await.unwrap().is_none());
         assert!(l.lookup_transfer(11).await.unwrap().is_none());
     }
@@ -1915,10 +2509,21 @@ mod tests {
         l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
         // t1 ok, t2 bad (missing acct 3), t3 terminator — t2 is the offender.
         let res = l
-            .create_transfers(&[linked_xfer(10, 1, 2, 50), linked_xfer(11, 2, 3, 10), xfer(12, 2, 1, 5)])
+            .create_transfers(&[
+                linked_xfer(10, 1, 2, 50),
+                linked_xfer(11, 2, 3, 10),
+                xfer(12, 2, 1, 5),
+            ])
             .await
             .unwrap();
-        assert_eq!(res, vec![R::LinkedEventFailed, R::CreditAccountNotFound, R::LinkedEventFailed]);
+        assert_eq!(
+            res,
+            vec![
+                R::LinkedEventFailed,
+                R::CreditAccountNotFound,
+                R::LinkedEventFailed
+            ]
+        );
         assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_posted, 0);
         assert_eq!(l.lookup_account(2).await.unwrap().unwrap().debits_posted, 0);
     }
@@ -1931,13 +2536,21 @@ mod tests {
         l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
         // indep ok | [t2(linked) ok, t3(bad)] chain fails | indep ok
         let batch = [
-            xfer(10, 1, 2, 10),                // independent → Created
-            linked_xfer(11, 1, 2, 20),         // chain start
-            xfer(12, 1, 99, 5),                // terminator, bad → CreditAccountNotFound
-            xfer(13, 2, 1, 7),                 // independent → Created
+            xfer(10, 1, 2, 10),        // independent → Created
+            linked_xfer(11, 1, 2, 20), // chain start
+            xfer(12, 1, 99, 5),        // terminator, bad → CreditAccountNotFound
+            xfer(13, 2, 1, 7),         // independent → Created
         ];
         let res = l.create_transfers(&batch).await.unwrap();
-        assert_eq!(res, vec![R::Created, R::LinkedEventFailed, R::CreditAccountNotFound, R::Created]);
+        assert_eq!(
+            res,
+            vec![
+                R::Created,
+                R::LinkedEventFailed,
+                R::CreditAccountNotFound,
+                R::Created
+            ]
+        );
         // Only the two independents applied: 1 debits 10 (+0 from chain), credits 7; 2 credits 10, debits 7.
         let a1 = l.lookup_account(1).await.unwrap().unwrap();
         let a2 = l.lookup_account(2).await.unwrap().unwrap();
@@ -1952,7 +2565,10 @@ mod tests {
         let l = Ledger::new(&db);
         l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
         // The FIRST member fails (offender=0); the terminator gets LinkedEventFailed.
-        let res = l.create_transfers(&[linked_xfer(10, 1, 99, 5), xfer(11, 1, 2, 5)]).await.unwrap();
+        let res = l
+            .create_transfers(&[linked_xfer(10, 1, 99, 5), xfer(11, 1, 2, 5)])
+            .await
+            .unwrap();
         assert_eq!(res, vec![R::CreditAccountNotFound, R::LinkedEventFailed]);
         assert!(l.lookup_transfer(11).await.unwrap().is_none());
         assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_posted, 0);
@@ -1965,7 +2581,12 @@ mod tests {
         let l = Ledger::new(&db);
         l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
         // A lone trailing LINKED transfer (no terminator) → chain open, not applied.
-        assert_eq!(l.create_transfers(&[linked_xfer(10, 1, 2, 5)]).await.unwrap(), vec![R::LinkedEventChainOpen]);
+        assert_eq!(
+            l.create_transfers(&[linked_xfer(10, 1, 2, 5)])
+                .await
+                .unwrap(),
+            vec![R::LinkedEventChainOpen]
+        );
         assert!(l.lookup_transfer(10).await.unwrap().is_none());
         assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_posted, 0);
     }
@@ -1977,9 +2598,13 @@ mod tests {
         let l = Ledger::new(&db);
         l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
         // reserve(linked) + post(terminator) committed atomically.
-        let mut reserve = xfer(10, 1, 2, 100).with_flags(TransferFlags::PENDING | TransferFlags::LINKED);
+        let mut reserve =
+            xfer(10, 1, 2, 100).with_flags(TransferFlags::PENDING | TransferFlags::LINKED);
         reserve.timeout = 0;
-        let res = l.create_transfers(&[reserve, post(11, 10, AMOUNT_MAX)]).await.unwrap();
+        let res = l
+            .create_transfers(&[reserve, post(11, 10, AMOUNT_MAX)])
+            .await
+            .unwrap();
         assert_eq!(res, vec![R::Created, R::Created]);
         let d = l.lookup_account(1).await.unwrap().unwrap();
         assert_eq!((d.debits_pending, d.debits_posted), (0, 100));
@@ -1990,13 +2615,24 @@ mod tests {
         use CreateTransferResult as R;
         let db = writer_database().await;
         let l = Ledger::new(&db);
-        l.create_accounts(&[acct(1, 7), acct(2, 7), acct(3, 7)]).await.unwrap();
+        l.create_accounts(&[acct(1, 7), acct(2, 7), acct(3, 7)])
+            .await
+            .unwrap();
         let batch = [linked_xfer(10, 1, 2, 100), xfer(11, 2, 3, 40)];
-        assert_eq!(l.create_transfers(&batch).await.unwrap(), vec![R::Created, R::Created]);
+        assert_eq!(
+            l.create_transfers(&batch).await.unwrap(),
+            vec![R::Created, R::Created]
+        );
         // Resubmit identical → both Exists; chain commits (no LinkedEventFailed).
-        assert_eq!(l.create_transfers(&batch).await.unwrap(), vec![R::Exists, R::Exists]);
+        assert_eq!(
+            l.create_transfers(&batch).await.unwrap(),
+            vec![R::Exists, R::Exists]
+        );
         // Balances unchanged (applied exactly once).
-        assert_eq!(l.lookup_account(2).await.unwrap().unwrap().credits_posted, 100);
+        assert_eq!(
+            l.lookup_account(2).await.unwrap().unwrap().credits_posted,
+            100
+        );
     }
 
     // ---- Phase G: imported events + id_already_failed ----
@@ -2008,12 +2644,21 @@ mod tests {
         let l = Ledger::new(&db);
         l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
         // Transient failure (credit account missing).
-        assert_eq!(l.create_transfers(&[xfer(5, 1, 99, 10)]).await.unwrap(), vec![R::CreditAccountNotFound]);
+        assert_eq!(
+            l.create_transfers(&[xfer(5, 1, 99, 10)]).await.unwrap(),
+            vec![R::CreditAccountNotFound]
+        );
         // Create the previously-missing account; the SAME id is now burned.
         l.create_accounts(&[acct(99, 7)]).await.unwrap();
-        assert_eq!(l.create_transfers(&[xfer(5, 1, 99, 10)]).await.unwrap(), vec![R::IdAlreadyFailed]);
+        assert_eq!(
+            l.create_transfers(&[xfer(5, 1, 99, 10)]).await.unwrap(),
+            vec![R::IdAlreadyFailed]
+        );
         // A NEW id with the same logical transfer succeeds.
-        assert_eq!(l.create_transfers(&[xfer(6, 1, 99, 10)]).await.unwrap(), vec![R::Created]);
+        assert_eq!(
+            l.create_transfers(&[xfer(6, 1, 99, 10)]).await.unwrap(),
+            vec![R::Created]
+        );
     }
 
     #[tokio::test]
@@ -2024,8 +2669,16 @@ mod tests {
         setup_two_accounts(&l).await;
         // A terminal (deterministic) failure does NOT burn the id — TB only burns
         // transient errors. A corrected retry of the same id therefore succeeds.
-        assert_eq!(l.create_transfers(&[Transfer::new(5, 1, 2, 10, 0).with_code(1)]).await.unwrap(), vec![R::LedgerMustNotBeZero]);
-        assert_eq!(l.create_transfers(&[xfer(5, 1, 2, 10)]).await.unwrap(), vec![R::Created]);
+        assert_eq!(
+            l.create_transfers(&[Transfer::new(5, 1, 2, 10, 0).with_code(1)])
+                .await
+                .unwrap(),
+            vec![R::LedgerMustNotBeZero]
+        );
+        assert_eq!(
+            l.create_transfers(&[xfer(5, 1, 2, 10)]).await.unwrap(),
+            vec![R::Created]
+        );
     }
 
     #[tokio::test]
@@ -2034,9 +2687,15 @@ mod tests {
         let db = writer_database().await;
         let l = Ledger::new(&db);
         setup_two_accounts(&l).await;
-        assert_eq!(l.create_transfers(&[xfer(5, 1, 2, 10)]).await.unwrap(), vec![R::Created]);
+        assert_eq!(
+            l.create_transfers(&[xfer(5, 1, 2, 10)]).await.unwrap(),
+            vec![R::Created]
+        );
         // A retry is Exists (committed), never id_already_failed.
-        assert_eq!(l.create_transfers(&[xfer(5, 1, 2, 10)]).await.unwrap(), vec![R::Exists]);
+        assert_eq!(
+            l.create_transfers(&[xfer(5, 1, 2, 10)]).await.unwrap(),
+            vec![R::Exists]
+        );
     }
 
     #[tokio::test]
@@ -2049,7 +2708,10 @@ mod tests {
         // second sees the in-batch burn → id_already_failed.
         let bad = xfer(5, 1, 99, 10); // credit account missing → transient
         let again = xfer(5, 1, 2, 10);
-        assert_eq!(l.create_transfers(&[bad, again]).await.unwrap(), vec![R::CreditAccountNotFound, R::IdAlreadyFailed]);
+        assert_eq!(
+            l.create_transfers(&[bad, again]).await.unwrap(),
+            vec![R::CreditAccountNotFound, R::IdAlreadyFailed]
+        );
     }
 
     #[tokio::test]
@@ -2060,12 +2722,21 @@ mod tests {
         l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
         // A failed chain: member 10 → linked_event_failed (NOT burned); the
         // offender 11 → CreditAccountNotFound (transient → burned).
-        let res = l.create_transfers(&[linked_xfer(10, 1, 2, 5), xfer(11, 1, 99, 5)]).await.unwrap();
+        let res = l
+            .create_transfers(&[linked_xfer(10, 1, 2, 5), xfer(11, 1, 99, 5)])
+            .await
+            .unwrap();
         assert_eq!(res, vec![R::LinkedEventFailed, R::CreditAccountNotFound]);
         // The offender's id is burned.
-        assert_eq!(l.create_transfers(&[xfer(11, 1, 2, 5)]).await.unwrap(), vec![R::IdAlreadyFailed]);
+        assert_eq!(
+            l.create_transfers(&[xfer(11, 1, 2, 5)]).await.unwrap(),
+            vec![R::IdAlreadyFailed]
+        );
         // The linked sibling's id is NOT burned — an unchained retry succeeds.
-        assert_eq!(l.create_transfers(&[xfer(10, 1, 2, 5)]).await.unwrap(), vec![R::Created]);
+        assert_eq!(
+            l.create_transfers(&[xfer(10, 1, 2, 5)]).await.unwrap(),
+            vec![R::Created]
+        );
     }
 
     #[tokio::test]
@@ -2078,7 +2749,10 @@ mod tests {
         a1.timestamp = 100;
         let mut a2 = acct(2, 7).with_flags(AccountFlags::IMPORTED);
         a2.timestamp = 200;
-        assert_eq!(l.create_accounts(&[a1, a2]).await.unwrap(), vec![R::Created, R::Created]);
+        assert_eq!(
+            l.create_accounts(&[a1, a2]).await.unwrap(),
+            vec![R::Created, R::Created]
+        );
         assert_eq!(l.lookup_account(1).await.unwrap().unwrap().timestamp, 100);
         assert_eq!(l.lookup_account(2).await.unwrap().unwrap().timestamp, 200);
     }
@@ -2092,18 +2766,30 @@ mod tests {
         let mut imp = acct(1, 7).with_flags(AccountFlags::IMPORTED);
         imp.timestamp = 100;
         let plain = acct(2, 7);
-        assert_eq!(l.create_accounts(&[imp, plain]).await.unwrap(), vec![R::Created, R::ImportedEventExpected]);
+        assert_eq!(
+            l.create_accounts(&[imp, plain]).await.unwrap(),
+            vec![R::Created, R::ImportedEventExpected]
+        );
         // Imported event in a non-imported batch.
         let mut imp2 = acct(3, 7).with_flags(AccountFlags::IMPORTED);
         imp2.timestamp = 50;
-        assert_eq!(l.create_accounts(&[acct(4, 7), imp2]).await.unwrap(), vec![R::Created, R::ImportedEventNotExpected]);
+        assert_eq!(
+            l.create_accounts(&[acct(4, 7), imp2]).await.unwrap(),
+            vec![R::Created, R::ImportedEventNotExpected]
+        );
         // Imported timestamp in the future (> now=1000).
         let mut future = acct(5, 7).with_flags(AccountFlags::IMPORTED);
         future.timestamp = 5_000;
-        assert_eq!(l.create_accounts(&[future]).await.unwrap(), vec![R::ImportedEventTimestampMustNotAdvance]);
+        assert_eq!(
+            l.create_accounts(&[future]).await.unwrap(),
+            vec![R::ImportedEventTimestampMustNotAdvance]
+        );
         // Imported timestamp 0 → out of range.
         let zero = acct(6, 7).with_flags(AccountFlags::IMPORTED);
-        assert_eq!(l.create_accounts(&[zero]).await.unwrap(), vec![R::ImportedEventTimestampOutOfRange]);
+        assert_eq!(
+            l.create_accounts(&[zero]).await.unwrap(),
+            vec![R::ImportedEventTimestampOutOfRange]
+        );
     }
 
     #[tokio::test]
@@ -2115,7 +2801,10 @@ mod tests {
         a1.timestamp = 500;
         let mut a2 = acct(2, 7).with_flags(AccountFlags::IMPORTED);
         a2.timestamp = 400; // regresses vs a1
-        assert_eq!(l.create_accounts(&[a1, a2]).await.unwrap(), vec![R::Created, R::ImportedEventTimestampMustNotRegress]);
+        assert_eq!(
+            l.create_accounts(&[a1, a2]).await.unwrap(),
+            vec![R::Created, R::ImportedEventTimestampMustNotRegress]
+        );
     }
 
     #[tokio::test]
@@ -2138,8 +2827,11 @@ mod tests {
         // Postdate-debit: ts must exceed the debit account's timestamp.
         let mut bad = xfer(11, 1, 2, 5).with_flags(TransferFlags::IMPORTED);
         bad.timestamp = 100; // == account 1's ts, also regresses vs 300
-        // Regress (54) is checked before postdate (55): ts 100 <= last 300 → regress.
-        assert_eq!(l.create_transfers(&[bad]).await.unwrap(), vec![R::ImportedEventTimestampMustNotRegress]);
+                             // Regress (54) is checked before postdate (55): ts 100 <= last 300 → regress.
+        assert_eq!(
+            l.create_transfers(&[bad]).await.unwrap(),
+            vec![R::ImportedEventTimestampMustNotRegress]
+        );
 
         // postdate via a fresh ledger position: ts above watermark but ≤ credit acct ts.
         let mut a3 = acct(3, 7).with_flags(AccountFlags::IMPORTED);
@@ -2147,14 +2839,21 @@ mod tests {
         l.create_accounts(&[a3]).await.unwrap();
         let mut pd = xfer(12, 1, 3, 5).with_flags(TransferFlags::IMPORTED);
         pd.timestamp = 4_000; // > watermark? watermark is now 5000 → regress first
-        // watermark is 5000 (a3), so ts 4000 regresses.
-        assert_eq!(l.create_transfers(&[pd]).await.unwrap(), vec![R::ImportedEventTimestampMustNotRegress]);
+                              // watermark is 5000 (a3), so ts 4000 regresses.
+        assert_eq!(
+            l.create_transfers(&[pd]).await.unwrap(),
+            vec![R::ImportedEventTimestampMustNotRegress]
+        );
 
         // imported transfer with a nonzero timeout → ImportedEventTimeoutMustBeZero.
-        let mut timed = xfer(13, 1, 2, 5).with_flags(TransferFlags::IMPORTED | TransferFlags::PENDING);
+        let mut timed =
+            xfer(13, 1, 2, 5).with_flags(TransferFlags::IMPORTED | TransferFlags::PENDING);
         timed.timestamp = 6_000;
         timed.timeout = 10;
-        assert_eq!(l.create_transfers(&[timed]).await.unwrap(), vec![R::ImportedEventTimeoutMustBeZero]);
+        assert_eq!(
+            l.create_transfers(&[timed]).await.unwrap(),
+            vec![R::ImportedEventTimeoutMustBeZero]
+        );
     }
 
     #[tokio::test]
@@ -2173,7 +2872,10 @@ mod tests {
         // Resubmitting the identical imported transfer → Exists (the existence
         // check fires before the imported timestamp checks, so no regress error).
         assert_eq!(l.create_transfers(&[t]).await.unwrap(), vec![R::Exists]);
-        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_posted, 50);
+        assert_eq!(
+            l.lookup_account(1).await.unwrap().unwrap().debits_posted,
+            50
+        );
     }
 
     #[tokio::test]
@@ -2184,12 +2886,21 @@ mod tests {
         setup_two_accounts(&l).await;
         let mut t = xfer(5, 1, 2, 10);
         t.timestamp = 123; // non-imported with a nonzero ts
-        assert_eq!(l.create_transfers(&[t]).await.unwrap(), vec![R::TimestampMustBeZero]);
+        assert_eq!(
+            l.create_transfers(&[t]).await.unwrap(),
+            vec![R::TimestampMustBeZero]
+        );
     }
 
     // ---- Phase F: closing transfers + closed accounts ----
 
-    fn closing_pending(id: u128, debit: u128, credit: u128, amount: u128, flags: TransferFlags) -> Transfer {
+    fn closing_pending(
+        id: u128,
+        debit: u128,
+        credit: u128,
+        amount: u128,
+        flags: TransferFlags,
+    ) -> Transfer {
         xfer(id, debit, credit, amount).with_flags(TransferFlags::PENDING | flags)
     }
 
@@ -2198,14 +2909,28 @@ mod tests {
         use CreateTransferResult as R;
         let db = writer_database().await;
         let l = Ledger::new(&db);
-        l.create_accounts(&[acct(1, 7), acct(2, 7), acct(3, 7)]).await.unwrap();
+        l.create_accounts(&[acct(1, 7), acct(2, 7), acct(3, 7)])
+            .await
+            .unwrap();
         // pending | closing_debit 1→2: reserves and closes account 1.
         let c = closing_pending(10, 1, 2, 50, TransferFlags::CLOSING_DEBIT);
         assert_eq!(l.create_transfers(&[c]).await.unwrap(), vec![R::Created]);
-        assert!(l.lookup_account(1).await.unwrap().unwrap().flags.contains(AccountFlags::CLOSED));
+        assert!(l
+            .lookup_account(1)
+            .await
+            .unwrap()
+            .unwrap()
+            .flags
+            .contains(AccountFlags::CLOSED));
         // New movements debiting OR crediting account 1 are rejected.
-        assert_eq!(l.create_transfers(&[xfer(11, 1, 3, 5)]).await.unwrap(), vec![R::DebitAccountAlreadyClosed]);
-        assert_eq!(l.create_transfers(&[xfer(12, 3, 1, 5)]).await.unwrap(), vec![R::CreditAccountAlreadyClosed]);
+        assert_eq!(
+            l.create_transfers(&[xfer(11, 1, 3, 5)]).await.unwrap(),
+            vec![R::DebitAccountAlreadyClosed]
+        );
+        assert_eq!(
+            l.create_transfers(&[xfer(12, 3, 1, 5)]).await.unwrap(),
+            vec![R::CreditAccountAlreadyClosed]
+        );
     }
 
     #[tokio::test]
@@ -2213,10 +2938,23 @@ mod tests {
         use CreateTransferResult as R;
         let db = writer_database().await;
         let l = Ledger::new(&db);
-        l.create_accounts(&[acct(1, 7), acct(2, 7), acct(3, 7)]).await.unwrap();
-        l.create_transfers(&[closing_pending(10, 1, 2, 50, TransferFlags::CLOSING_CREDIT)]).await.unwrap();
-        assert!(l.lookup_account(2).await.unwrap().unwrap().flags.contains(AccountFlags::CLOSED));
-        assert_eq!(l.create_transfers(&[xfer(11, 3, 2, 5)]).await.unwrap(), vec![R::CreditAccountAlreadyClosed]);
+        l.create_accounts(&[acct(1, 7), acct(2, 7), acct(3, 7)])
+            .await
+            .unwrap();
+        l.create_transfers(&[closing_pending(10, 1, 2, 50, TransferFlags::CLOSING_CREDIT)])
+            .await
+            .unwrap();
+        assert!(l
+            .lookup_account(2)
+            .await
+            .unwrap()
+            .unwrap()
+            .flags
+            .contains(AccountFlags::CLOSED));
+        assert_eq!(
+            l.create_transfers(&[xfer(11, 3, 2, 5)]).await.unwrap(),
+            vec![R::CreditAccountAlreadyClosed]
+        );
     }
 
     #[tokio::test]
@@ -2224,12 +2962,30 @@ mod tests {
         use CreateTransferResult as R;
         let db = writer_database().await;
         let l = Ledger::new(&db);
-        l.create_accounts(&[acct(1, 7), acct(2, 7), acct(3, 7)]).await.unwrap();
-        l.create_transfers(&[closing_pending(10, 1, 2, 50, TransferFlags::CLOSING_DEBIT)]).await.unwrap();
+        l.create_accounts(&[acct(1, 7), acct(2, 7), acct(3, 7)])
+            .await
+            .unwrap();
+        l.create_transfers(&[closing_pending(10, 1, 2, 50, TransferFlags::CLOSING_DEBIT)])
+            .await
+            .unwrap();
         // Post the closing pending → stays closed.
-        assert_eq!(l.create_transfers(&[post(11, 10, AMOUNT_MAX)]).await.unwrap(), vec![R::Created]);
-        assert!(l.lookup_account(1).await.unwrap().unwrap().flags.contains(AccountFlags::CLOSED));
-        assert_eq!(l.create_transfers(&[xfer(12, 1, 3, 5)]).await.unwrap(), vec![R::DebitAccountAlreadyClosed]);
+        assert_eq!(
+            l.create_transfers(&[post(11, 10, AMOUNT_MAX)])
+                .await
+                .unwrap(),
+            vec![R::Created]
+        );
+        assert!(l
+            .lookup_account(1)
+            .await
+            .unwrap()
+            .unwrap()
+            .flags
+            .contains(AccountFlags::CLOSED));
+        assert_eq!(
+            l.create_transfers(&[xfer(12, 1, 3, 5)]).await.unwrap(),
+            vec![R::DebitAccountAlreadyClosed]
+        );
     }
 
     #[tokio::test]
@@ -2238,13 +2994,33 @@ mod tests {
         let db = writer_database().await;
         let l = Ledger::new(&db);
         l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
-        l.create_transfers(&[closing_pending(10, 1, 2, 50, TransferFlags::CLOSING_DEBIT)]).await.unwrap();
-        assert!(l.lookup_account(1).await.unwrap().unwrap().flags.contains(AccountFlags::CLOSED));
+        l.create_transfers(&[closing_pending(10, 1, 2, 50, TransferFlags::CLOSING_DEBIT)])
+            .await
+            .unwrap();
+        assert!(l
+            .lookup_account(1)
+            .await
+            .unwrap()
+            .unwrap()
+            .flags
+            .contains(AccountFlags::CLOSED));
         // Void the closing pending → account reopened.
-        assert_eq!(l.create_transfers(&[void(11, 10, 0)]).await.unwrap(), vec![R::Created]);
-        assert!(!l.lookup_account(1).await.unwrap().unwrap().flags.contains(AccountFlags::CLOSED));
+        assert_eq!(
+            l.create_transfers(&[void(11, 10, 0)]).await.unwrap(),
+            vec![R::Created]
+        );
+        assert!(!l
+            .lookup_account(1)
+            .await
+            .unwrap()
+            .unwrap()
+            .flags
+            .contains(AccountFlags::CLOSED));
         // A regular transfer on account 1 now succeeds.
-        assert_eq!(l.create_transfers(&[xfer(12, 1, 2, 5)]).await.unwrap(), vec![R::Created]);
+        assert_eq!(
+            l.create_transfers(&[xfer(12, 1, 2, 5)]).await.unwrap(),
+            vec![R::Created]
+        );
     }
 
     #[tokio::test]
@@ -2257,12 +3033,27 @@ mod tests {
         let mut c = closing_pending(10, 1, 2, 50, TransferFlags::CLOSING_DEBIT);
         c.timeout = 10;
         l.create_transfers(&[c]).await.unwrap();
-        assert!(l.lookup_account(1).await.unwrap().unwrap().flags.contains(AccountFlags::CLOSED));
+        assert!(l
+            .lookup_account(1)
+            .await
+            .unwrap()
+            .unwrap()
+            .flags
+            .contains(AccountFlags::CLOSED));
         // Advance past expiry; sweep auto-voids → reopened.
         clk.store(t0 + 11_000_000_000, Ordering::SeqCst);
         l.create_transfers(&[]).await.unwrap();
-        assert!(!l.lookup_account(1).await.unwrap().unwrap().flags.contains(AccountFlags::CLOSED));
-        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_pending, 0);
+        assert!(!l
+            .lookup_account(1)
+            .await
+            .unwrap()
+            .unwrap()
+            .flags
+            .contains(AccountFlags::CLOSED));
+        assert_eq!(
+            l.lookup_account(1).await.unwrap().unwrap().debits_pending,
+            0
+        );
     }
 
     #[tokio::test]
@@ -2272,13 +3063,31 @@ mod tests {
         let l = Ledger::new(&db);
         l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
         // Reserve p1 (1→2) BEFORE closing.
-        l.create_transfers(&[xfer(10, 1, 2, 30).with_flags(TransferFlags::PENDING)]).await.unwrap();
+        l.create_transfers(&[xfer(10, 1, 2, 30).with_flags(TransferFlags::PENDING)])
+            .await
+            .unwrap();
         // Now close account 1 with a separate closing pending.
-        l.create_transfers(&[closing_pending(11, 1, 2, 5, TransferFlags::CLOSING_DEBIT)]).await.unwrap();
-        assert!(l.lookup_account(1).await.unwrap().unwrap().flags.contains(AccountFlags::CLOSED));
+        l.create_transfers(&[closing_pending(11, 1, 2, 5, TransferFlags::CLOSING_DEBIT)])
+            .await
+            .unwrap();
+        assert!(l
+            .lookup_account(1)
+            .await
+            .unwrap()
+            .unwrap()
+            .flags
+            .contains(AccountFlags::CLOSED));
         // Posting p1 (touching the now-closed account 1) is still allowed.
-        assert_eq!(l.create_transfers(&[post(12, 10, AMOUNT_MAX)]).await.unwrap(), vec![R::Created]);
-        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_posted, 30);
+        assert_eq!(
+            l.create_transfers(&[post(12, 10, AMOUNT_MAX)])
+                .await
+                .unwrap(),
+            vec![R::Created]
+        );
+        assert_eq!(
+            l.lookup_account(1).await.unwrap().unwrap().debits_posted,
+            30
+        );
     }
 
     #[tokio::test]
@@ -2286,14 +3095,47 @@ mod tests {
         let db = writer_database().await;
         let l = Ledger::new(&db);
         l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
-        let c = closing_pending(10, 1, 2, 50, TransferFlags::CLOSING_DEBIT | TransferFlags::CLOSING_CREDIT);
+        let c = closing_pending(
+            10,
+            1,
+            2,
+            50,
+            TransferFlags::CLOSING_DEBIT | TransferFlags::CLOSING_CREDIT,
+        );
         l.create_transfers(&[c]).await.unwrap();
-        assert!(l.lookup_account(1).await.unwrap().unwrap().flags.contains(AccountFlags::CLOSED));
-        assert!(l.lookup_account(2).await.unwrap().unwrap().flags.contains(AccountFlags::CLOSED));
+        assert!(l
+            .lookup_account(1)
+            .await
+            .unwrap()
+            .unwrap()
+            .flags
+            .contains(AccountFlags::CLOSED));
+        assert!(l
+            .lookup_account(2)
+            .await
+            .unwrap()
+            .unwrap()
+            .flags
+            .contains(AccountFlags::CLOSED));
         // Voiding that pending reopens BOTH accounts.
-        assert_eq!(l.create_transfers(&[void(11, 10, 0)]).await.unwrap(), vec![CreateTransferResult::Created]);
-        assert!(!l.lookup_account(1).await.unwrap().unwrap().flags.contains(AccountFlags::CLOSED));
-        assert!(!l.lookup_account(2).await.unwrap().unwrap().flags.contains(AccountFlags::CLOSED));
+        assert_eq!(
+            l.create_transfers(&[void(11, 10, 0)]).await.unwrap(),
+            vec![CreateTransferResult::Created]
+        );
+        assert!(!l
+            .lookup_account(1)
+            .await
+            .unwrap()
+            .unwrap()
+            .flags
+            .contains(AccountFlags::CLOSED));
+        assert!(!l
+            .lookup_account(2)
+            .await
+            .unwrap()
+            .unwrap()
+            .flags
+            .contains(AccountFlags::CLOSED));
     }
 
     #[tokio::test]
@@ -2303,12 +3145,30 @@ mod tests {
         let l = Ledger::new(&db);
         l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
         // Reserve p1 (1→2) before closing the CREDIT account (2).
-        l.create_transfers(&[xfer(10, 1, 2, 30).with_flags(TransferFlags::PENDING)]).await.unwrap();
-        l.create_transfers(&[closing_pending(11, 1, 2, 5, TransferFlags::CLOSING_CREDIT)]).await.unwrap();
-        assert!(l.lookup_account(2).await.unwrap().unwrap().flags.contains(AccountFlags::CLOSED));
+        l.create_transfers(&[xfer(10, 1, 2, 30).with_flags(TransferFlags::PENDING)])
+            .await
+            .unwrap();
+        l.create_transfers(&[closing_pending(11, 1, 2, 5, TransferFlags::CLOSING_CREDIT)])
+            .await
+            .unwrap();
+        assert!(l
+            .lookup_account(2)
+            .await
+            .unwrap()
+            .unwrap()
+            .flags
+            .contains(AccountFlags::CLOSED));
         // Posting p1 (account 2 is the closed credit side) is still allowed.
-        assert_eq!(l.create_transfers(&[post(12, 10, AMOUNT_MAX)]).await.unwrap(), vec![R::Created]);
-        assert_eq!(l.lookup_account(2).await.unwrap().unwrap().credits_posted, 30);
+        assert_eq!(
+            l.create_transfers(&[post(12, 10, AMOUNT_MAX)])
+                .await
+                .unwrap(),
+            vec![R::Created]
+        );
+        assert_eq!(
+            l.lookup_account(2).await.unwrap().unwrap().credits_posted,
+            30
+        );
     }
 
     #[tokio::test]
@@ -2318,7 +3178,10 @@ mod tests {
         let l = Ledger::new(&db);
         l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
         let res = l
-            .create_transfers(&[closing_pending(10, 1, 2, 50, TransferFlags::CLOSING_DEBIT), xfer(11, 1, 2, 5)])
+            .create_transfers(&[
+                closing_pending(10, 1, 2, 50, TransferFlags::CLOSING_DEBIT),
+                xfer(11, 1, 2, 5),
+            ])
             .await
             .unwrap();
         assert_eq!(res, vec![R::Created, R::DebitAccountAlreadyClosed]);
@@ -2335,7 +3198,15 @@ mod tests {
         c.flags = c.flags | TransferFlags::LINKED;
         let res = l.create_transfers(&[c, xfer(11, 1, 99, 5)]).await.unwrap();
         assert_eq!(res, vec![R::LinkedEventFailed, R::CreditAccountNotFound]);
-        assert!(!l.lookup_account(1).await.unwrap().unwrap().flags.contains(AccountFlags::CLOSED), "rolled back");
+        assert!(
+            !l.lookup_account(1)
+                .await
+                .unwrap()
+                .unwrap()
+                .flags
+                .contains(AccountFlags::CLOSED),
+            "rolled back"
+        );
     }
 
     #[tokio::test]
@@ -2343,15 +3214,22 @@ mod tests {
         use CreateTransferResult as R;
         let db = writer_database().await;
         let l = Ledger::new(&db);
-        l.create_accounts(&[acct(1, 7).with_flags(AccountFlags::CLOSED), acct(2, 7)]).await.unwrap();
-        assert_eq!(l.create_transfers(&[xfer(10, 1, 2, 5)]).await.unwrap(), vec![R::DebitAccountAlreadyClosed]);
+        l.create_accounts(&[acct(1, 7).with_flags(AccountFlags::CLOSED), acct(2, 7)])
+            .await
+            .unwrap();
+        assert_eq!(
+            l.create_transfers(&[xfer(10, 1, 2, 5)]).await.unwrap(),
+            vec![R::DebitAccountAlreadyClosed]
+        );
     }
 
     // ---- Phase E: balancing transfers ----
 
     /// Give `account` real `credits_posted` of `amount` by a posted `other → account`.
     async fn fund_credits(l: &Ledger, id: u128, other: u128, account: u128, amount: u128) {
-        l.create_transfers(&[xfer(id, other, account, amount)]).await.unwrap();
+        l.create_transfers(&[xfer(id, other, account, amount)])
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -2367,7 +3245,11 @@ mod tests {
         assert_eq!(l.create_transfers(&[bd]).await.unwrap(), vec![R::Created]);
         let a1 = l.lookup_account(1).await.unwrap().unwrap();
         assert_eq!(a1.debits_posted, 50, "reduced to credits_posted headroom");
-        assert_eq!(l.lookup_transfer(2).await.unwrap().unwrap().amount, 50, "records reduced amount");
+        assert_eq!(
+            l.lookup_transfer(2).await.unwrap().unwrap().amount,
+            50,
+            "records reduced amount"
+        );
     }
 
     #[tokio::test]
@@ -2390,10 +3272,13 @@ mod tests {
         l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
         // Give account 2 debits_posted = 30 (2 → 1).
         fund_credits(&l, 1, 2, 1, 30).await; // account 2 debits_posted = 30
-        // balancing_credit 1 → 2 of 100 transfers only 30 (credit headroom).
+                                             // balancing_credit 1 → 2 of 100 transfers only 30 (credit headroom).
         let bc = xfer(2, 1, 2, 100).with_flags(TransferFlags::BALANCING_CREDIT);
         l.create_transfers(&[bc]).await.unwrap();
-        assert_eq!(l.lookup_account(2).await.unwrap().unwrap().credits_posted, 30);
+        assert_eq!(
+            l.lookup_account(2).await.unwrap().unwrap().credits_posted,
+            30
+        );
         assert_eq!(l.lookup_transfer(2).await.unwrap().unwrap().amount, 30);
     }
 
@@ -2401,13 +3286,20 @@ mod tests {
     async fn balancing_both_flags_takes_min_headroom() {
         let db = writer_database().await;
         let l = Ledger::new(&db);
-        l.create_accounts(&[acct(1, 7), acct(2, 7), acct(3, 7)]).await.unwrap();
+        l.create_accounts(&[acct(1, 7), acct(2, 7), acct(3, 7)])
+            .await
+            .unwrap();
         // Account 1 credits_posted = 40 (debit headroom 40); account 2 debits_posted = 25 (credit headroom 25).
         fund_credits(&l, 1, 3, 1, 40).await; // 1.credits_posted = 40
         fund_credits(&l, 2, 2, 3, 25).await; // 2.debits_posted = 25
-        let b = xfer(3, 1, 2, 100).with_flags(TransferFlags::BALANCING_DEBIT | TransferFlags::BALANCING_CREDIT);
+        let b = xfer(3, 1, 2, 100)
+            .with_flags(TransferFlags::BALANCING_DEBIT | TransferFlags::BALANCING_CREDIT);
         l.create_transfers(&[b]).await.unwrap();
-        assert_eq!(l.lookup_transfer(3).await.unwrap().unwrap().amount, 25, "min(40, 25)");
+        assert_eq!(
+            l.lookup_transfer(3).await.unwrap().unwrap().amount,
+            25,
+            "min(40, 25)"
+        );
     }
 
     #[tokio::test]
@@ -2416,13 +3308,24 @@ mod tests {
         let l = Ledger::new(&db);
         l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
         fund_credits(&l, 1, 2, 1, 60).await; // 1.credits_posted = 60
-        // balancing_debit | pending of 100 reserves 60.
-        let bp = xfer(2, 1, 2, 100).with_flags(TransferFlags::BALANCING_DEBIT | TransferFlags::PENDING);
+                                             // balancing_debit | pending of 100 reserves 60.
+        let bp =
+            xfer(2, 1, 2, 100).with_flags(TransferFlags::BALANCING_DEBIT | TransferFlags::PENDING);
         l.create_transfers(&[bp]).await.unwrap();
-        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_pending, 60);
-        assert_eq!(l.lookup_transfer(2).await.unwrap().unwrap().amount, 60, "pending records reduced amount");
+        assert_eq!(
+            l.lookup_account(1).await.unwrap().unwrap().debits_pending,
+            60
+        );
+        assert_eq!(
+            l.lookup_transfer(2).await.unwrap().unwrap().amount,
+            60,
+            "pending records reduced amount"
+        );
         // Post the full reservation (60).
-        assert_eq!(l.create_transfers(&[post(3, 2, AMOUNT_MAX)]).await.unwrap(), vec![CreateTransferResult::Created]);
+        assert_eq!(
+            l.create_transfers(&[post(3, 2, AMOUNT_MAX)]).await.unwrap(),
+            vec![CreateTransferResult::Created]
+        );
         let a1 = l.lookup_account(1).await.unwrap().unwrap();
         assert_eq!((a1.debits_pending, a1.debits_posted), (0, 60));
     }
@@ -2447,9 +3350,16 @@ mod tests {
         // debits, so crediting it by 50 → ExceedsDebits (balancing_debit guards only
         // the debit side, not account 3's credit constraint).
         let bd = xfer(2, 1, 3, 100).with_flags(TransferFlags::BALANCING_DEBIT);
-        assert_eq!(l.create_transfers(&[bd]).await.unwrap(), vec![R::ExceedsDebits]);
+        assert_eq!(
+            l.create_transfers(&[bd]).await.unwrap(),
+            vec![R::ExceedsDebits]
+        );
         assert!(l.lookup_transfer(2).await.unwrap().is_none());
-        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_posted, 0, "nothing applied");
+        assert_eq!(
+            l.lookup_account(1).await.unwrap().unwrap().debits_posted,
+            0,
+            "nothing applied"
+        );
     }
 
     #[tokio::test]
@@ -2458,11 +3368,14 @@ mod tests {
         let l = Ledger::new(&db);
         l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
         fund_credits(&l, 1, 2, 1, 100).await; // 1.credits_posted = 100 (headroom 100)
-        // amount 30 < headroom 100 → no reduction, full 30 transfers.
+                                              // amount 30 < headroom 100 → no reduction, full 30 transfers.
         let bd = xfer(2, 1, 2, 30).with_flags(TransferFlags::BALANCING_DEBIT);
         l.create_transfers(&[bd]).await.unwrap();
         assert_eq!(l.lookup_transfer(2).await.unwrap().unwrap().amount, 30);
-        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_posted, 30);
+        assert_eq!(
+            l.lookup_account(1).await.unwrap().unwrap().debits_posted,
+            30
+        );
     }
 
     #[tokio::test]
@@ -2474,11 +3387,15 @@ mod tests {
         fund_credits(&l, 1, 2, 1, 50).await; // 1.credits_posted = 50
         let before = l.lookup_account(1).await.unwrap().unwrap().debits_posted;
         // [balancing_debit(linked, would reduce to 50), bad terminator] → chain fails.
-        let bd = xfer(2, 1, 2, 200).with_flags(TransferFlags::BALANCING_DEBIT | TransferFlags::LINKED);
+        let bd =
+            xfer(2, 1, 2, 200).with_flags(TransferFlags::BALANCING_DEBIT | TransferFlags::LINKED);
         let res = l.create_transfers(&[bd, xfer(3, 1, 99, 5)]).await.unwrap();
         assert_eq!(res, vec![R::LinkedEventFailed, R::CreditAccountNotFound]);
         // The balancing member's reduced movement was rolled back.
-        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_posted, before);
+        assert_eq!(
+            l.lookup_account(1).await.unwrap().unwrap().debits_posted,
+            before
+        );
         assert!(l.lookup_transfer(2).await.unwrap().is_none());
     }
 
@@ -2486,9 +3403,11 @@ mod tests {
     async fn conservation_with_balancing_reduction() {
         let db = writer_database().await;
         let l = Ledger::new(&db);
-        l.create_accounts(&[acct(1, 7), acct(2, 7), acct(3, 7)]).await.unwrap();
+        l.create_accounts(&[acct(1, 7), acct(2, 7), acct(3, 7)])
+            .await
+            .unwrap();
         fund_credits(&l, 1, 3, 1, 40).await; // 1.credits_posted = 40
-        // balancing_debit 1→2 of 1000 reduces to 40; both sides move the same 40.
+                                             // balancing_debit 1→2 of 1000 reduces to 40; both sides move the same 40.
         let bd = xfer(2, 1, 2, 1000).with_flags(TransferFlags::BALANCING_DEBIT);
         l.create_transfers(&[bd]).await.unwrap();
         let mut total_d = 0u128;
@@ -2498,7 +3417,10 @@ mod tests {
             total_d += a.debits_posted;
             total_c += a.credits_posted;
         }
-        assert_eq!(total_d, total_c, "Σdebits_posted == Σcredits_posted with a reduced transfer");
+        assert_eq!(
+            total_d, total_c,
+            "Σdebits_posted == Σcredits_posted with a reduced transfer"
+        );
     }
 
     #[tokio::test]
@@ -2509,7 +3431,8 @@ mod tests {
         l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
         fund_credits(&l, 1, 2, 1, 50).await;
         // [balancing_debit(linked, reduces to 50), terminator] both commit.
-        let bd = xfer(2, 1, 2, 200).with_flags(TransferFlags::BALANCING_DEBIT | TransferFlags::LINKED);
+        let bd =
+            xfer(2, 1, 2, 200).with_flags(TransferFlags::BALANCING_DEBIT | TransferFlags::LINKED);
         let res = l.create_transfers(&[bd, xfer(3, 2, 1, 5)]).await.unwrap();
         assert_eq!(res, vec![R::Created, R::Created]);
         assert_eq!(l.lookup_transfer(2).await.unwrap().unwrap().amount, 50);
@@ -2546,7 +3469,10 @@ mod tests {
         assert_eq!(a1.credits_posted, 30);
         assert_eq!(a2.credits_posted, 100);
         assert_eq!(a2.debits_posted, 30);
-        assert_eq!(a1.debits_posted + a2.debits_posted, a1.credits_posted + a2.credits_posted);
+        assert_eq!(
+            a1.debits_posted + a2.debits_posted,
+            a1.credits_posted + a2.credits_posted
+        );
     }
 
     #[tokio::test]
@@ -2557,9 +3483,28 @@ mod tests {
         setup_two_accounts(&ledger).await;
 
         let t = xfer(7, 1, 2, 100);
-        assert_eq!(ledger.create_transfers(&[t, t]).await.unwrap(), vec![R::Created, R::Exists]);
-        assert_eq!(ledger.lookup_account(1).await.unwrap().unwrap().debits_posted, 100);
-        assert_eq!(ledger.lookup_account(2).await.unwrap().unwrap().credits_posted, 100);
+        assert_eq!(
+            ledger.create_transfers(&[t, t]).await.unwrap(),
+            vec![R::Created, R::Exists]
+        );
+        assert_eq!(
+            ledger
+                .lookup_account(1)
+                .await
+                .unwrap()
+                .unwrap()
+                .debits_posted,
+            100
+        );
+        assert_eq!(
+            ledger
+                .lookup_account(2)
+                .await
+                .unwrap()
+                .unwrap()
+                .credits_posted,
+            100
+        );
     }
 
     #[tokio::test]
@@ -2570,9 +3515,20 @@ mod tests {
         setup_two_accounts(&ledger).await;
         ledger.create_transfers(&[xfer(1, 1, 2, 10)]).await.unwrap();
 
-        let r = ledger.create_transfers(&[xfer(2, 1, 2, u128::MAX)]).await.unwrap();
+        let r = ledger
+            .create_transfers(&[xfer(2, 1, 2, u128::MAX)])
+            .await
+            .unwrap();
         assert_eq!(r, vec![R::OverflowsDebitsPosted]);
-        assert_eq!(ledger.lookup_account(1).await.unwrap().unwrap().debits_posted, 10);
+        assert_eq!(
+            ledger
+                .lookup_account(1)
+                .await
+                .unwrap()
+                .unwrap()
+                .debits_posted,
+            10
+        );
         assert!(ledger.lookup_transfer(2).await.unwrap().is_none());
     }
 
@@ -2589,12 +3545,41 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(ledger.create_transfers(&[xfer(10, 1, 2, 100)]).await.unwrap(), vec![R::ExceedsCredits]);
-        assert_eq!(ledger.lookup_account(1).await.unwrap().unwrap().debits_posted, 0);
+        assert_eq!(
+            ledger
+                .create_transfers(&[xfer(10, 1, 2, 100)])
+                .await
+                .unwrap(),
+            vec![R::ExceedsCredits]
+        );
+        assert_eq!(
+            ledger
+                .lookup_account(1)
+                .await
+                .unwrap()
+                .unwrap()
+                .debits_posted,
+            0
+        );
 
-        assert_eq!(ledger.create_transfers(&[xfer(11, 2, 1, 100)]).await.unwrap(), vec![R::Created]);
-        assert_eq!(ledger.create_transfers(&[xfer(12, 1, 2, 100)]).await.unwrap(), vec![R::Created]);
-        assert_eq!(ledger.create_transfers(&[xfer(13, 1, 2, 1)]).await.unwrap(), vec![R::ExceedsCredits]);
+        assert_eq!(
+            ledger
+                .create_transfers(&[xfer(11, 2, 1, 100)])
+                .await
+                .unwrap(),
+            vec![R::Created]
+        );
+        assert_eq!(
+            ledger
+                .create_transfers(&[xfer(12, 1, 2, 100)])
+                .await
+                .unwrap(),
+            vec![R::Created]
+        );
+        assert_eq!(
+            ledger.create_transfers(&[xfer(13, 1, 2, 1)]).await.unwrap(),
+            vec![R::ExceedsCredits]
+        );
     }
 
     #[tokio::test]
@@ -2609,10 +3594,31 @@ mod tests {
             ])
             .await
             .unwrap();
-        assert_eq!(ledger.create_transfers(&[xfer(20, 1, 2, 100)]).await.unwrap(), vec![R::ExceedsDebits]);
-        assert_eq!(ledger.create_transfers(&[xfer(21, 2, 1, 100)]).await.unwrap(), vec![R::Created]);
-        assert_eq!(ledger.create_transfers(&[xfer(22, 1, 2, 100)]).await.unwrap(), vec![R::Created]);
-        assert_eq!(ledger.create_transfers(&[xfer(23, 1, 2, 1)]).await.unwrap(), vec![R::ExceedsDebits]);
+        assert_eq!(
+            ledger
+                .create_transfers(&[xfer(20, 1, 2, 100)])
+                .await
+                .unwrap(),
+            vec![R::ExceedsDebits]
+        );
+        assert_eq!(
+            ledger
+                .create_transfers(&[xfer(21, 2, 1, 100)])
+                .await
+                .unwrap(),
+            vec![R::Created]
+        );
+        assert_eq!(
+            ledger
+                .create_transfers(&[xfer(22, 1, 2, 100)])
+                .await
+                .unwrap(),
+            vec![R::Created]
+        );
+        assert_eq!(
+            ledger.create_transfers(&[xfer(23, 1, 2, 1)]).await.unwrap(),
+            vec![R::ExceedsDebits]
+        );
     }
 
     #[tokio::test]
@@ -2624,7 +3630,10 @@ mod tests {
         let original_ts = ledger.lookup_account(42).await.unwrap().unwrap().timestamp;
 
         // Every id already exists → all Exists, no write.
-        assert_eq!(ledger.create_accounts(&[acct(42, 1)]).await.unwrap(), vec![R::Exists]);
+        assert_eq!(
+            ledger.create_accounts(&[acct(42, 1)]).await.unwrap(),
+            vec![R::Exists]
+        );
         // Empty slice → no-op, no error.
         assert_eq!(ledger.create_accounts(&[]).await.unwrap(), vec![]);
 
@@ -2643,9 +3652,22 @@ mod tests {
             .unwrap();
 
         let mut id = 1000u128;
-        let pairs = [(1, 2, 100), (2, 3, 40), (3, 4, 25), (4, 1, 10), (1, 3, 7), (2, 4, 3)];
+        let pairs = [
+            (1, 2, 100),
+            (2, 3, 40),
+            (3, 4, 25),
+            (4, 1, 10),
+            (1, 3, 7),
+            (2, 4, 3),
+        ];
         for (d, c, amt) in pairs {
-            assert_eq!(ledger.create_transfers(&[xfer(id, d, c, amt)]).await.unwrap(), vec![CreateTransferResult::Created]);
+            assert_eq!(
+                ledger
+                    .create_transfers(&[xfer(id, d, c, amt)])
+                    .await
+                    .unwrap(),
+                vec![CreateTransferResult::Created]
+            );
             id += 1;
         }
 
@@ -2668,11 +3690,17 @@ mod tests {
         l.create_accounts(&[acct(1, 7), acct(2, 7)]).await.unwrap();
         let a1 = l.lookup_account(1).await.unwrap().unwrap();
         let a2 = l.lookup_account(2).await.unwrap().unwrap();
-        assert!(a1.timestamp > 0 && a2.timestamp > a1.timestamp, "unique + increasing within a batch");
+        assert!(
+            a1.timestamp > 0 && a2.timestamp > a1.timestamp,
+            "unique + increasing within a batch"
+        );
 
         l.create_transfers(&[xfer(10, 1, 2, 5)]).await.unwrap();
         let t = l.lookup_transfer(10).await.unwrap().unwrap();
-        assert!(t.timestamp > a2.timestamp, "watermark persists across calls (durable, monotonic)");
+        assert!(
+            t.timestamp > a2.timestamp,
+            "watermark persists across calls (durable, monotonic)"
+        );
 
         // A failed item applies nothing and must not break later monotonicity.
         l.create_transfers(&[xfer(11, 1, 99, 5)]).await.unwrap(); // CreditAccountNotFound
@@ -2696,12 +3724,24 @@ mod tests {
         .await
         .unwrap();
         // Give account 1 credits_posted = 100 (2 → 1).
-        assert_eq!(l.create_transfers(&[xfer(1, 2, 1, 100)]).await.unwrap(), vec![R::Created]);
+        assert_eq!(
+            l.create_transfers(&[xfer(1, 2, 1, 100)]).await.unwrap(),
+            vec![R::Created]
+        );
         // Debit exactly to the ceiling succeeds.
-        assert_eq!(l.create_transfers(&[xfer(2, 1, 2, 100)]).await.unwrap(), vec![R::Created]);
+        assert_eq!(
+            l.create_transfers(&[xfer(2, 1, 2, 100)]).await.unwrap(),
+            vec![R::Created]
+        );
         // One unit over is rejected; no mutation.
-        assert_eq!(l.create_transfers(&[xfer(3, 1, 2, 1)]).await.unwrap(), vec![R::ExceedsCredits]);
-        assert_eq!(l.lookup_account(1).await.unwrap().unwrap().debits_posted, 100);
+        assert_eq!(
+            l.create_transfers(&[xfer(3, 1, 2, 1)]).await.unwrap(),
+            vec![R::ExceedsCredits]
+        );
+        assert_eq!(
+            l.lookup_account(1).await.unwrap().unwrap().debits_posted,
+            100
+        );
     }
 
     #[tokio::test]
@@ -2713,17 +3753,23 @@ mod tests {
         // Seed credits_posted on account 2, then overflow it from a third account.
         l.create_accounts(&[acct(3, 7)]).await.unwrap();
         l.create_transfers(&[xfer(1, 1, 2, 10)]).await.unwrap(); // account 2 credits_posted = 10
-        let r = l.create_transfers(&[xfer(2, 3, 2, u128::MAX)]).await.unwrap();
+        let r = l
+            .create_transfers(&[xfer(2, 3, 2, u128::MAX)])
+            .await
+            .unwrap();
         assert_eq!(r, vec![R::OverflowsCreditsPosted]);
-        assert_eq!(l.lookup_account(2).await.unwrap().unwrap().credits_posted, 10);
+        assert_eq!(
+            l.lookup_account(2).await.unwrap().unwrap().credits_posted,
+            10
+        );
         assert!(l.lookup_transfer(2).await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn watermark_is_durable_across_reopen() {
-        use std::sync::Arc;
         use slatedb::object_store::memory::InMemory;
         use slatedb::Db;
+        use std::sync::Arc;
 
         // Same object store, two separate Db opens — the timestamp watermark must
         // survive a restart so timestamps stay strictly monotonic across it.
@@ -2740,10 +3786,17 @@ mod tests {
         let db2 = Arc::new(Db::open("ledger-reopen", store.clone()).await.unwrap());
         let database2 = Database::new(db2);
         let l2 = Ledger::new(&database2);
-        assert_eq!(l2.lookup_account(1).await.unwrap().unwrap().timestamp, ts_before, "record survived reopen");
+        assert_eq!(
+            l2.lookup_account(1).await.unwrap().unwrap().timestamp,
+            ts_before,
+            "record survived reopen"
+        );
         l2.create_accounts(&[acct(2, 7)]).await.unwrap();
         let ts_after = l2.lookup_account(2).await.unwrap().unwrap().timestamp;
-        assert!(ts_after > ts_before, "watermark survived reopen → still monotonic");
+        assert!(
+            ts_after > ts_before,
+            "watermark survived reopen → still monotonic"
+        );
     }
 
     #[tokio::test]
@@ -2776,10 +3829,19 @@ mod tests {
         let database2 = Database::new(db2);
         let l2 = Ledger::new(&database2);
         // All 20 acked transfers survived and balances are conserved.
-        assert_eq!(l2.lookup_account(1).await.unwrap().unwrap().debits_posted, 100);
-        assert_eq!(l2.lookup_account(2).await.unwrap().unwrap().credits_posted, 100);
+        assert_eq!(
+            l2.lookup_account(1).await.unwrap().unwrap().debits_posted,
+            100
+        );
+        assert_eq!(
+            l2.lookup_account(2).await.unwrap().unwrap().credits_posted,
+            100
+        );
         for i in 0..20u128 {
-            assert!(l2.lookup_transfer(100 + i).await.unwrap().is_some(), "transfer {i} durable across reopen");
+            assert!(
+                l2.lookup_transfer(100 + i).await.unwrap().is_some(),
+                "transfer {i} durable across reopen"
+            );
         }
     }
 }
@@ -2829,7 +3891,9 @@ mod throughput_bench {
     const N_ACCTS: u128 = 4;
 
     async fn setup(ledger: &Ledger) {
-        let accts: Vec<Account> = (1..=N_ACCTS).map(|id| Account::input(id, 7).with_code(1)).collect();
+        let accts: Vec<Account> = (1..=N_ACCTS)
+            .map(|id| Account::input(id, 7).with_code(1))
+            .collect();
         ledger.create_accounts(&accts).await.unwrap();
     }
 

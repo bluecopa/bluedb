@@ -61,7 +61,12 @@ pub fn parse_lakehouse_pragma(sql: &str) -> Option<LhPragma> {
     if let Some(rest) = body.split("lakehouse_mirror_table").nth(1) {
         let args = rest.trim().trim_start_matches('(').trim_end_matches(')');
         let mut parts = args.splitn(2, ',');
-        let name = parts.next()?.trim().trim_matches('\'').trim_matches('"').trim();
+        let name = parts
+            .next()?
+            .trim()
+            .trim_matches('\'')
+            .trim_matches('"')
+            .trim();
         let flag = parts.next()?;
         if name.is_empty() {
             return None;
@@ -145,13 +150,22 @@ mod tests {
     #[test]
     fn ignores_non_lakehouse_statements() {
         assert_eq!(parse_lakehouse_pragma("SELECT 1"), None);
-        assert_eq!(parse_lakehouse_pragma("PRAGMA default_null_order='first'"), None);
+        assert_eq!(
+            parse_lakehouse_pragma("PRAGMA default_null_order='first'"),
+            None
+        );
         assert_eq!(parse_lakehouse_pragma("INSERT INTO t VALUES (1)"), None);
     }
 
     #[test]
     fn rejects_unknown_values() {
-        assert_eq!(parse_lakehouse_pragma("PRAGMA lakehouse_mirror = maybe"), None);
-        assert_eq!(parse_lakehouse_pragma("PRAGMA lakehouse_mirror_table('docs', )"), None);
+        assert_eq!(
+            parse_lakehouse_pragma("PRAGMA lakehouse_mirror = maybe"),
+            None
+        );
+        assert_eq!(
+            parse_lakehouse_pragma("PRAGMA lakehouse_mirror_table('docs', )"),
+            None
+        );
     }
 }

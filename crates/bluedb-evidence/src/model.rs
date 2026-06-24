@@ -60,7 +60,10 @@ mod tests {
 
     #[test]
     fn frontier_roundtrips_through_postcard() {
-        let f = Frontier { size: 3, peaks: vec![[1u8; 32], [2u8; 32]] };
+        let f = Frontier {
+            size: 3,
+            peaks: vec![[1u8; 32], [2u8; 32]],
+        };
         let bytes = postcard::to_allocvec(&f).unwrap();
         let back: Frontier = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(f, back);

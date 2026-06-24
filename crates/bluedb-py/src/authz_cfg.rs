@@ -23,7 +23,9 @@ pub enum AuthzSpec {
 
 impl Default for AuthzSpec {
     fn default() -> Self {
-        AuthzSpec::DefaultSuperuser { token: DEFAULT_TOKEN.to_string() }
+        AuthzSpec::DefaultSuperuser {
+            token: DEFAULT_TOKEN.to_string(),
+        }
     }
 }
 
@@ -50,13 +52,14 @@ impl AuthzSpec {
                     .map(|(tok, items)| format!("{tok}={}", items.join(",")))
                     .collect::<Vec<_>>()
                     .join(";");
-                let authz = Authz::parse_env(&raw)
-                    .ok_or_else(|| anyhow::anyhow!("invalid authz map (unknown scope or empty tenant)"))?;
+                let authz = Authz::parse_env(&raw).ok_or_else(|| {
+                    anyhow::anyhow!("invalid authz map (unknown scope or empty tenant)")
+                })?;
                 Ok((Some(authz), None))
             }
             AuthzSpec::RawEnv(raw) => {
-                let authz = Authz::parse_env(raw)
-                    .ok_or_else(|| anyhow::anyhow!("invalid authz string"))?;
+                let authz =
+                    Authz::parse_env(raw).ok_or_else(|| anyhow::anyhow!("invalid authz string"))?;
                 Ok((Some(authz), None))
             }
         }
@@ -87,7 +90,10 @@ mod tests {
     fn map_builds_scoped_tokens_without_default() {
         let spec = AuthzSpec::Map(vec![
             ("reader".into(), vec!["data:read".into()]),
-            ("acme".into(), vec!["data:read".into(), "tenant:acme".into()]),
+            (
+                "acme".into(),
+                vec!["data:read".into(), "tenant:acme".into()],
+            ),
         ]);
         let (authz, token) = spec.resolve().unwrap();
         let a = authz.unwrap();

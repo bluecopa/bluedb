@@ -86,10 +86,18 @@ fn setexpr_to_sql(body: &SetExpr, counter: &mut u32) -> Option<String> {
             *counter += 1;
             let lsql = setexpr_to_sql(left, counter)?;
             let rsql = setexpr_to_sql(right, counter)?;
-            let keep_all = matches!(set_quantifier, SetQuantifier::All | SetQuantifier::AllByName);
+            let keep_all = matches!(
+                set_quantifier,
+                SetQuantifier::All | SetQuantifier::AllByName
+            );
             let distinct = if keep_all { "" } else { "DISTINCT " };
             // Unique aliases for this node so nested set ops don't collide.
-            let (l, r, d, u) = (format!("_l{id}"), format!("_r{id}"), format!("_d{id}"), format!("_u{id}"));
+            let (l, r, d, u) = (
+                format!("_l{id}"),
+                format!("_r{id}"),
+                format!("_d{id}"),
+                format!("_u{id}"),
+            );
 
             let sql = match op {
                 // INTERSECT/EXCEPT use an IN/NOT IN subquery, which GlueSQL only
@@ -226,7 +234,11 @@ mod tests {
         assert!(!out.to_uppercase().contains("UNION"), "got: {out}");
         assert!(out.contains("SERIES(2)"), "got: {out}");
         // One CASE per output column.
-        assert_eq!(out.to_uppercase().matches("CASE WHEN").count(), 2, "got: {out}");
+        assert_eq!(
+            out.to_uppercase().matches("CASE WHEN").count(),
+            2,
+            "got: {out}"
+        );
     }
 
     #[test]

@@ -32,7 +32,9 @@ pub(crate) async fn subtree_root(
         let rec = store::get_entry(substrate, ks, chain, (lo + 1) as i64)
             .await?
             .ok_or_else(|| err(format!("entry {} missing for proof", lo + 1)))?;
-        return rec.leaf_hash.ok_or_else(|| err(format!("entry {} has no leaf_hash", lo + 1)));
+        return rec
+            .leaf_hash
+            .ok_or_else(|| err(format!("entry {} has no leaf_hash", lo + 1)));
     }
     if n.is_power_of_two() && lo % n == 0 {
         let level = n.trailing_zeros() as u8;
@@ -112,7 +114,11 @@ async fn subproof(
 ) -> Result<Vec<[u8; 32]>, EvidenceError> {
     let n = hi - lo;
     if m == n {
-        return Ok(if b { Vec::new() } else { vec![subtree_root(substrate, ks, chain, lo, hi).await?] });
+        return Ok(if b {
+            Vec::new()
+        } else {
+            vec![subtree_root(substrate, ks, chain, lo, hi).await?]
+        });
     }
     let k = largest_pow2_lt(n as usize) as u64;
     if m <= k {
@@ -129,14 +135,16 @@ async fn subproof(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use crate::chain::{EntryInput, Evidence};
+    use crate::merkle;
     use bluedb_sql::Database;
     use slatedb::{object_store::memory::InMemory, Db};
-    use crate::chain::{Evidence, EntryInput};
-    use crate::merkle;
+    use std::sync::Arc;
 
     async fn db() -> Database {
-        let d = Db::open("proof-test", Arc::new(InMemory::new())).await.unwrap();
+        let d = Db::open("proof-test", Arc::new(InMemory::new()))
+            .await
+            .unwrap();
         Database::new(Arc::new(d))
     }
 
@@ -149,16 +157,39 @@ mod tests {
         let mut leaves: Vec<[u8; 32]> = Vec::new();
         for i in 0..64u32 {
             let payload = i.to_be_bytes().to_vec();
-            ev.append("c", vec![EntryInput { etype: "t".into(), payload: payload.clone(), at: String::new(), edges: vec![] }], None).await.unwrap();
+            ev.append(
+                "c",
+                vec![EntryInput {
+                    etype: "t".into(),
+                    payload: payload.clone(),
+                    at: String::new(),
+                    edges: vec![],
+                }],
+                None,
+            )
+            .await
+            .unwrap();
             leaves.push(merkle::leaf_hash("t", &payload, "", &[]));
             let size = leaves.len();
             for index in 0..size {
-                let got = inclusion(&substrate, &ks, "c", index as u64, size as u64).await.unwrap();
-                assert_eq!(got, merkle::inclusion_proof(&leaves[..size], index), "inclusion {index}/{size}");
+                let got = inclusion(&substrate, &ks, "c", index as u64, size as u64)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    got,
+                    merkle::inclusion_proof(&leaves[..size], index),
+                    "inclusion {index}/{size}"
+                );
             }
             for first in 1..=size {
-                let got = consistency(&substrate, &ks, "c", first as u64, size as u64).await.unwrap();
-                assert_eq!(got, merkle::consistency_proof(&leaves[..size], first), "consistency {first}->{size}");
+                let got = consistency(&substrate, &ks, "c", first as u64, size as u64)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    got,
+                    merkle::consistency_proof(&leaves[..size], first),
+                    "consistency {first}->{size}"
+                );
             }
         }
     }

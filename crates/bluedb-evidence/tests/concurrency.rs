@@ -1,6 +1,6 @@
+use bluedb_evidence::{EntryInput, Evidence};
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use bluedb_evidence::{EntryInput, Evidence};
 
 mod harness;
 

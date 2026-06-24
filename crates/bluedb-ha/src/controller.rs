@@ -124,7 +124,11 @@ impl WriterController {
     /// granted [`Lease`], or [`HaError::LeaseHeldByAnother`].
     pub async fn promote(&self) -> Result<Lease, HaError> {
         let now = self.clock.now_millis();
-        match self.provider.try_acquire(&self.node_id, self.ttl, now).await? {
+        match self
+            .provider
+            .try_acquire(&self.node_id, self.ttl, now)
+            .await?
+        {
             Some(lease) => {
                 self.set_active(&lease);
                 Ok(lease)
@@ -142,7 +146,11 @@ impl WriterController {
             None => return Ok(false),
         };
         let now = self.clock.now_millis();
-        match self.provider.renew(&self.node_id, epoch, self.ttl, now).await? {
+        match self
+            .provider
+            .renew(&self.node_id, epoch, self.ttl, now)
+            .await?
+        {
             Some(lease) => {
                 self.set_active(&lease);
                 Ok(true)
@@ -192,7 +200,11 @@ impl WriterController {
             node_id: self.node_id.clone(),
             role: if active { Role::Active } else { Role::Passive },
             epoch: if active { state.epoch } else { None },
-            lease_expires_at_millis: if active { Some(state.expires_at_millis) } else { None },
+            lease_expires_at_millis: if active {
+                Some(state.expires_at_millis)
+            } else {
+                None
+            },
         }
     }
 

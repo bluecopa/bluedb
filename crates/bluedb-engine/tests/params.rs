@@ -11,12 +11,17 @@ use slatedb::Db;
 async fn glue() -> Glue<SlateDbStorage> {
     let db = Db::open("t", Arc::new(InMemory::new())).await.unwrap();
     let mut g = Glue::new(SlateDbStorage::new(Arc::new(db)));
-    g.execute("CREATE TABLE docs (id INTEGER, body TEXT);").await.unwrap();
+    g.execute("CREATE TABLE docs (id INTEGER, body TEXT);")
+        .await
+        .unwrap();
     g
 }
 
 fn rows(p: Payload) -> Vec<Vec<Value>> {
-    match p { Payload::Select { rows, .. } => rows, other => panic!("not select: {other:?}") }
+    match p {
+        Payload::Select { rows, .. } => rows,
+        other => panic!("not select: {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -25,11 +30,18 @@ async fn insert_batch_then_query_with_params() {
     let req = InsertRequest {
         table: "docs".into(),
         columns: vec!["id".into(), "body".into()],
-        rows: vec![vec!["1".into(), "alpha".into()], vec!["2".into(), "beta".into()]],
+        rows: vec![
+            vec!["1".into(), "alpha".into()],
+            vec!["2".into(), "beta".into()],
+        ],
     };
     rest_sql::execute_insert_batch(&mut g, &req).await.unwrap();
 
-    let q = RestQuery { table: "docs".into(), filters: vec![Filter::new("id", Operator::Eq, "2")], ..Default::default() };
+    let q = RestQuery {
+        table: "docs".into(),
+        filters: vec![Filter::new("id", Operator::Eq, "2")],
+        ..Default::default()
+    };
     let out = rest_sql::execute_query(&mut g, &q).await.unwrap();
     let r = rows(out.into_iter().next().unwrap());
     assert_eq!(r.len(), 1);
@@ -47,7 +59,10 @@ async fn injection_payload_is_stored_as_data_not_executed() {
     };
     rest_sql::execute_insert_batch(&mut g, &req).await.unwrap();
 
-    let q = RestQuery { table: "docs".into(), ..Default::default() };
+    let q = RestQuery {
+        table: "docs".into(),
+        ..Default::default()
+    };
     let out = rest_sql::execute_query(&mut g, &q).await.unwrap();
     let r = rows(out.into_iter().next().unwrap());
     assert_eq!(r.len(), 1);
@@ -63,9 +78,15 @@ async fn delete_with_param() {
         rows: vec![vec!["1".into(), "x".into()], vec!["2".into(), "y".into()]],
     };
     rest_sql::execute_insert_batch(&mut g, &req).await.unwrap();
-    let d = DeleteRequest { table: "docs".into(), filters: vec![Filter::new("id", Operator::Eq, "1")] };
+    let d = DeleteRequest {
+        table: "docs".into(),
+        filters: vec![Filter::new("id", Operator::Eq, "1")],
+    };
     rest_sql::execute_delete(&mut g, &d).await.unwrap();
-    let q = RestQuery { table: "docs".into(), ..Default::default() };
+    let q = RestQuery {
+        table: "docs".into(),
+        ..Default::default()
+    };
     let out = rest_sql::execute_query(&mut g, &q).await.unwrap();
     let r = rows(out.into_iter().next().unwrap());
     assert_eq!(r.len(), 1);
@@ -84,7 +105,10 @@ async fn injection_payload_via_single_insert_is_data_not_executed() {
     // Single-row autocommit path (what the server uses for a single-object POST).
     rest_sql::execute_insert(&mut g, &req).await.unwrap();
 
-    let q = RestQuery { table: "docs".into(), ..Default::default() };
+    let q = RestQuery {
+        table: "docs".into(),
+        ..Default::default()
+    };
     let out = rest_sql::execute_query(&mut g, &q).await.unwrap();
     let r = rows(out.into_iter().next().unwrap());
     assert_eq!(r.len(), 1);

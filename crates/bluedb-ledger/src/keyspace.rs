@@ -24,7 +24,9 @@ pub(crate) struct LedgerKeyspace {
 
 impl LedgerKeyspace {
     pub(crate) fn new(tenant: &str) -> Self {
-        Self { ks: Keyspace::new(tenant) }
+        Self {
+            ks: Keyspace::new(tenant),
+        }
     }
 
     pub(crate) fn account_key(&self, id: u128) -> Vec<u8> {
@@ -36,7 +38,8 @@ impl LedgerKeyspace {
     }
 
     pub(crate) fn pending_state_key(&self, pending_id: u128) -> Vec<u8> {
-        self.ks.external_key(TAG_PENDING_STATE, &pending_id.to_be_bytes())
+        self.ks
+            .external_key(TAG_PENDING_STATE, &pending_id.to_be_bytes())
     }
 
     /// The single per-tenant key holding the monotonic timestamp watermark.
@@ -66,7 +69,8 @@ impl LedgerKeyspace {
     /// Exclusive scan upper bound covering exactly the entries with
     /// `expires_at <= now` (i.e. everything that has expired by `now`).
     pub(crate) fn expiry_scan_end(&self, now: u64) -> Vec<u8> {
-        self.ks.external_key(TAG_EXPIRY, &now.saturating_add(1).to_be_bytes())
+        self.ks
+            .external_key(TAG_EXPIRY, &now.saturating_add(1).to_be_bytes())
     }
 
     #[allow(dead_code)] // used by range scans in later plans (lookup-all / sweeps)
@@ -125,8 +129,14 @@ mod tests {
         assert!(ks.expiry_key(100, 5).starts_with(&ks.expiry_prefix()));
         // expiry_scan_end(now) excludes entries with expires_at > now, includes <= now.
         let end = ks.expiry_scan_end(100);
-        assert!(ks.expiry_key(100, u128::MAX) < end, "expires_at == now is included");
-        assert!(end <= ks.expiry_key(101, 0), "expires_at == now+1 is excluded");
+        assert!(
+            ks.expiry_key(100, u128::MAX) < end,
+            "expires_at == now is included"
+        );
+        assert!(
+            end <= ks.expiry_key(101, 0),
+            "expires_at == now+1 is excluded"
+        );
     }
 
     #[test]

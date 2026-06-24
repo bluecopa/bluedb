@@ -8,20 +8,31 @@ pub fn apply_projection(doc: &Value, projection: &Value) -> Value {
         Some(p) if !p.is_empty() => p,
         _ => return doc.clone(),
     };
-    let obj = match doc.as_object() { Some(o) => o, None => return doc.clone() };
+    let obj = match doc.as_object() {
+        Some(o) => o,
+        None => return doc.clone(),
+    };
     let inclusion = proj.values().any(truthy);
     let mut out = Map::new();
     if inclusion {
         let keep_id = proj.get("_id").map(truthy).unwrap_or(true);
-        if keep_id { if let Some(id) = obj.get("_id") { out.insert("_id".into(), id.clone()); } }
+        if keep_id {
+            if let Some(id) = obj.get("_id") {
+                out.insert("_id".into(), id.clone());
+            }
+        }
         for (k, v) in proj {
             if k != "_id" && truthy(v) {
-                if let Some(val) = obj.get(k) { out.insert(k.clone(), val.clone()); }
+                if let Some(val) = obj.get(k) {
+                    out.insert(k.clone(), val.clone());
+                }
             }
         }
     } else {
         out = obj.clone();
-        for k in proj.keys() { out.remove(k); }
+        for k in proj.keys() {
+            out.remove(k);
+        }
     }
     Value::Object(out)
 }

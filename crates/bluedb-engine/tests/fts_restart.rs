@@ -35,7 +35,11 @@ async fn query_ids(fts: &FtsEngine, database: &Database, sql: &str) -> Vec<i64> 
 async fn reopen_rebuilds_defs_and_reconnects_durable_splits() {
     // One SlateDB `Db` over InMemory is the persistent substrate; only the
     // FtsEngine's in-memory state is dropped between "boots".
-    let db = Arc::new(Db::open("fts-restart", Arc::new(InMemory::new())).await.unwrap());
+    let db = Arc::new(
+        Db::open("fts-restart", Arc::new(InMemory::new()))
+            .await
+            .unwrap(),
+    );
     let database = Database::new(db);
 
     let sql =
@@ -70,7 +74,11 @@ async fn reopen_rebuilds_defs_and_reconnects_durable_splits() {
         engine1.seal().await.unwrap();
 
         // Sanity: engine1 still serves the durable hit.
-        assert_eq!(query_ids(&engine1, &database, sql).await, vec![1], "boot 1: durable hit");
+        assert_eq!(
+            query_ids(&engine1, &database, sql).await,
+            vec![1],
+            "boot 1: durable hit"
+        );
 
         // Drop the engine: the in-memory live segment + def map are gone. The
         // durable splits + registry survive in the substrate.

@@ -65,7 +65,9 @@ impl Authz {
     /// token is denied.
     pub fn allows_tenant(&self, token: Option<&str>, tenant: &str) -> bool {
         let Some(tok) = token else { return false };
-        let Some(scopes) = self.tokens.get(tok) else { return false };
+        let Some(scopes) = self.tokens.get(tok) else {
+            return false;
+        };
         if scopes.contains(&Scope::Superuser) {
             return true;
         }

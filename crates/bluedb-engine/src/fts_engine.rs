@@ -39,10 +39,10 @@ use bluedb_rest::Param;
 use bluedb_sql::{CommitObserver, RowChange, SlateDbStorage};
 use bluedb_storage::{BlobStore, BlobStoreMut, SlateDbBlobStore, Substrate};
 use bytes::Bytes;
-use serde::{Deserialize, Serialize};
 use gluesql_core::data::{Key, Value as GValue};
 use gluesql_core::prelude::{Glue, Payload};
 use gluesql_core::store::{DataRow, Store};
+use serde::{Deserialize, Serialize};
 use tantivy::schema::Field;
 use tantivy::TantivyDocument;
 use tokio::task::JoinHandle;
@@ -283,12 +283,16 @@ impl FtsEngine {
         let ordinal = cols
             .iter()
             .position(|c| c.name == text_column)
-            .ok_or_else(|| {
-                EngineError::Rejected(format!("no column {text_column} on {table}"))
-            })?;
+            .ok_or_else(|| EngineError::Rejected(format!("no column {text_column} on {table}")))?;
 
-        let def =
-            self.build_index_def(table, text_column, pk_column, ordinal, analyzer, IndexKind::Fulltext)?;
+        let def = self.build_index_def(
+            table,
+            text_column,
+            pk_column,
+            ordinal,
+            analyzer,
+            IndexKind::Fulltext,
+        )?;
         self.install_def(table, def).await
     }
 
@@ -437,9 +441,7 @@ impl FtsEngine {
         let ordinal = cols
             .iter()
             .position(|c| c.name == text_column)
-            .ok_or_else(|| {
-                EngineError::Rejected(format!("no column {text_column} on {table}"))
-            })?;
+            .ok_or_else(|| EngineError::Rejected(format!("no column {text_column} on {table}")))?;
 
         // The analyzer is forced to `whitespace` inside `build_index_def` for a
         // Trigram kind; pass it through so the persisted echo records it.
@@ -524,10 +526,10 @@ impl FtsEngine {
             // The `@@` path resolves the FULLTEXT def for the column — a column may
             // also carry a Trigram def (used by the `LIKE` rewrite), which must not
             // answer a `@@` query.
-            match idx
-                .get(&pred.table)
-                .and_then(|v| v.iter().find(|d| d.column == pred.column && d.kind == IndexKind::Fulltext))
-            {
+            match idx.get(&pred.table).and_then(|v| {
+                v.iter()
+                    .find(|d| d.column == pred.column && d.kind == IndexKind::Fulltext)
+            }) {
                 Some(def) => (
                     def.segment.clone(),
                     def.durable.clone(),
@@ -544,7 +546,13 @@ impl FtsEngine {
         };
 
         let merged = union_hits(&segment, durable.as_deref(), durable_body_field, &pred).await?;
-        rewrite_fts_query(sql, &pk_column, &PrecomputedSearcher { hits: merged }, params).await
+        rewrite_fts_query(
+            sql,
+            &pk_column,
+            &PrecomputedSearcher { hits: merged },
+            params,
+        )
+        .await
     }
 
     /// The trigram-accelerated `LIKE '%lit%'` rewrite (Spec B §4.6). When `sql` is
@@ -560,10 +568,10 @@ impl FtsEngine {
         // Resolve the TRIGRAM def for (table, column). No trigram def → pass-through.
         let (segment, durable, durable_body_field, pk_column) = {
             let idx = self.indexes.read().unwrap();
-            match idx
-                .get(&pred.table)
-                .and_then(|v| v.iter().find(|d| d.column == pred.column && d.kind == IndexKind::Trigram))
-            {
+            match idx.get(&pred.table).and_then(|v| {
+                v.iter()
+                    .find(|d| d.column == pred.column && d.kind == IndexKind::Trigram)
+            }) {
                 Some(def) => (
                     def.segment.clone(),
                     def.durable.clone(),
@@ -668,7 +676,8 @@ impl FtsEngine {
                 // Re-add live docs (id = pk.to_string(), body), superseding any prior
                 // durable copy of that pk.
                 if !snapshot.docs.is_empty() {
-                    let old_ids: Vec<String> = snapshot.docs.iter().map(|(pk, _)| pk.to_string()).collect();
+                    let old_ids: Vec<String> =
+                        snapshot.docs.iter().map(|(pk, _)| pk.to_string()).collect();
                     let tantivy_docs: Vec<TantivyDocument> = snapshot
                         .docs
                         .iter()
@@ -679,7 +688,8 @@ impl FtsEngine {
 
                 // Tombstone the deleted pks in the durable tier.
                 if !snapshot.tombs.is_empty() {
-                    let dead: Vec<String> = snapshot.tombs.iter().map(|pk| pk.to_string()).collect();
+                    let dead: Vec<String> =
+                        snapshot.tombs.iter().map(|pk| pk.to_string()).collect();
                     durable.delete(dead).await?;
                 }
 
@@ -810,7 +820,11 @@ async fn union_hits(
 
     // Merge by descending score, then truncate. Disjoint pks (the covered-mask),
     // so no dedup needed.
-    hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     hits.truncate(UNION_LIMIT);
     Ok(hits)
 }
@@ -842,7 +856,11 @@ mod tests {
     /// — i.e. it registered an index whose pk_column is `id` without being told.
     #[tokio::test]
     async fn auto_resolves_pk_column_and_indexes() {
-        let db = Arc::new(Db::open("auto-pk", Arc::new(InMemory::new())).await.unwrap());
+        let db = Arc::new(
+            Db::open("auto-pk", Arc::new(InMemory::new()))
+                .await
+                .unwrap(),
+        );
         let database = Database::new(db);
         let fts = FtsEngine::new();
 
@@ -910,7 +928,11 @@ mod tests {
     /// A missing table is rejected (no schema to resolve a pk from).
     #[tokio::test]
     async fn rejects_missing_table() {
-        let db = Arc::new(Db::open("missing", Arc::new(InMemory::new())).await.unwrap());
+        let db = Arc::new(
+            Db::open("missing", Arc::new(InMemory::new()))
+                .await
+                .unwrap(),
+        );
         let database = Database::new(db);
         let fts = FtsEngine::new();
 
@@ -929,14 +951,26 @@ mod tests {
     /// by the trigram engine tests to observe substring matches before the Task-2
     /// `LIKE` rewrite exists. Searches the union of the trigram def's live segment
     /// and (if durable) its durable tier — so it sees matches across a seal.
-    async fn trigram_search(engine: &FtsEngine, table: &str, column: &str, literal: &str) -> Vec<i64> {
+    async fn trigram_search(
+        engine: &FtsEngine,
+        table: &str,
+        column: &str,
+        literal: &str,
+    ) -> Vec<i64> {
         let (segment, durable, durable_body_field) = {
             let idx = engine.indexes.read().unwrap();
             let def = idx
                 .get(table)
-                .and_then(|v| v.iter().find(|d| d.column == column && d.kind == IndexKind::Trigram))
+                .and_then(|v| {
+                    v.iter()
+                        .find(|d| d.column == column && d.kind == IndexKind::Trigram)
+                })
                 .expect("trigram def present");
-            (def.segment.clone(), def.durable.clone(), def.durable_body_field)
+            (
+                def.segment.clone(),
+                def.durable.clone(),
+                def.durable_body_field,
+            )
         };
         // A synthetic predicate carrying the trigramized query: Plain conjoins the
         // trigram tokens with AND, so every trigram must match (a substring superset).
@@ -1057,9 +1091,15 @@ mod tests {
             let idx = fts.indexes.read().unwrap();
             let def = idx
                 .get("docs")
-                .and_then(|v| v.iter().find(|d| d.column == "body" && d.kind == IndexKind::Trigram))
+                .and_then(|v| {
+                    v.iter()
+                        .find(|d| d.column == "body" && d.kind == IndexKind::Trigram)
+                })
                 .expect("trigram def present");
-            (def.segment.clone(), def.durable.clone().expect("durable trigram tier"))
+            (
+                def.segment.clone(),
+                def.durable.clone().expect("durable trigram tier"),
+            )
         };
 
         let snapshot = segment.snapshot_for_seal().unwrap();
@@ -1089,7 +1129,11 @@ mod tests {
     /// The live segment's covered set for `table.column` — used by the scheduler
     /// test to observe that a scheduled seal drained the live tier (a private-field
     /// reach the integration tests can't make).
-    fn covered_for(engine: &FtsEngine, table: &str, column: &str) -> std::collections::HashSet<i64> {
+    fn covered_for(
+        engine: &FtsEngine,
+        table: &str,
+        column: &str,
+    ) -> std::collections::HashSet<i64> {
         let idx = engine.indexes.read().unwrap();
         idx.get(table)
             .and_then(|defs| defs.iter().find(|d| d.column == column))
@@ -1106,7 +1150,11 @@ mod tests {
     async fn background_seal_scheduler_drains_live_into_durable() {
         use std::time::Duration;
 
-        let db = Arc::new(Db::open("seal-sched", Arc::new(InMemory::new())).await.unwrap());
+        let db = Arc::new(
+            Db::open("seal-sched", Arc::new(InMemory::new()))
+                .await
+                .unwrap(),
+        );
         let database = Database::new(db);
         let fts = FtsEngine::new_durable(database.substrate());
 

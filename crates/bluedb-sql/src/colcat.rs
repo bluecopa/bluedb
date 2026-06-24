@@ -67,9 +67,9 @@ impl ColumnCatalog {
             .slots
             .iter()
             .map(|&slot| {
-                vals.get(slot as usize).cloned().unwrap_or_else(|| {
-                    self.defaults.get(&slot).cloned().unwrap_or(Value::Null)
-                })
+                vals.get(slot as usize)
+                    .cloned()
+                    .unwrap_or_else(|| self.defaults.get(&slot).cloned().unwrap_or(Value::Null))
             })
             .collect();
         DataRow::Vec(logical)
@@ -109,7 +109,7 @@ mod tests {
     fn add_column_pads_old_rows_with_default() {
         let mut cat = ColumnCatalog::identity(2);
         cat.add_column(Value::I64(99)); // NOT NULL default
-        // An old row written before the add has only 2 physical values.
+                                        // An old row written before the add has only 2 physical values.
         let old = vec_row(&[1, 2]);
         assert_eq!(cat.to_logical(old), vec_row(&[1, 2, 99]));
     }

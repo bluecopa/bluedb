@@ -96,7 +96,8 @@ impl TransferFlags {
         if phase_count > 1 {
             return true;
         }
-        let balancing = self.contains(Self::BALANCING_DEBIT) || self.contains(Self::BALANCING_CREDIT);
+        let balancing =
+            self.contains(Self::BALANCING_DEBIT) || self.contains(Self::BALANCING_CREDIT);
         let closing = self.is_closing();
         if (post || void) && (balancing || closing) {
             return true;
@@ -205,7 +206,13 @@ pub struct Transfer {
 impl Transfer {
     /// A minimal posted transfer: id, debit, credit, amount, ledger; everything
     /// else default (set a nonzero `code` before creating).
-    pub fn new(id: u128, debit_account_id: u128, credit_account_id: u128, amount: u128, ledger: u32) -> Self {
+    pub fn new(
+        id: u128,
+        debit_account_id: u128,
+        credit_account_id: u128,
+        amount: u128,
+        ledger: u32,
+    ) -> Self {
         Self {
             id,
             debit_account_id,
@@ -434,11 +441,19 @@ pub(crate) fn chains(linked: &[bool]) -> Vec<Chain> {
         }
         if j < linked.len() {
             // linked[j] == false → terminator; chain is i..=j.
-            out.push(Chain { start: i, end: j, open: false });
+            out.push(Chain {
+                start: i,
+                end: j,
+                open: false,
+            });
             i = j + 1;
         } else {
             // ran off the end while still linked → open chain i..=len-1.
-            out.push(Chain { start: i, end: j - 1, open: true });
+            out.push(Chain {
+                start: i,
+                end: j - 1,
+                open: true,
+            });
             i = j;
         }
     }
@@ -647,14 +662,17 @@ pub(crate) fn validate_transfer_post_existence(t: &Transfer) -> Option<CreateTra
 
 /// Field-by-field comparison of an incoming transfer against the existing record
 /// with the same id (TB codes 12–23), in TB order.
-pub(crate) fn transfer_exists_result(incoming: &Transfer, existing: &Transfer) -> CreateTransferResult {
+pub(crate) fn transfer_exists_result(
+    incoming: &Transfer,
+    existing: &Transfer,
+) -> CreateTransferResult {
     use CreateTransferResult as R;
     use TransferFlags as F;
     // For a resolution (post/void), zero inheritable fields and the amount
     // sentinel (`AMOUNT_MAX` for post, `0` for void) were wildcards at apply time
     // and match the stored materialized value — so an identical retry is `Exists`.
-    let resolution =
-        incoming.flags.contains(F::POST_PENDING_TRANSFER) || incoming.flags.contains(F::VOID_PENDING_TRANSFER);
+    let resolution = incoming.flags.contains(F::POST_PENDING_TRANSFER)
+        || incoming.flags.contains(F::VOID_PENDING_TRANSFER);
 
     /// A field differs: for a resolution a zero incoming is a wildcard (inherited).
     fn differs<T: PartialEq + Default>(resolution: bool, inc: T, ex: T) -> bool {
@@ -674,16 +692,28 @@ pub(crate) fn transfer_exists_result(incoming: &Transfer, existing: &Transfer) -
     if incoming.timeout != existing.timeout {
         return R::ExistsWithDifferentTimeout;
     }
-    if differs(resolution, incoming.debit_account_id, existing.debit_account_id) {
+    if differs(
+        resolution,
+        incoming.debit_account_id,
+        existing.debit_account_id,
+    ) {
         return R::ExistsWithDifferentDebitAccountId;
     }
-    if differs(resolution, incoming.credit_account_id, existing.credit_account_id) {
+    if differs(
+        resolution,
+        incoming.credit_account_id,
+        existing.credit_account_id,
+    ) {
         return R::ExistsWithDifferentCreditAccountId;
     }
     // amount is special-cased because its resolution wildcard is a sentinel, not
     // zero: `AMOUNT_MAX` for a post (void's wildcard happens to be 0, so it could
     // use `differs`, but both are handled here for symmetry).
-    let amount_wildcard = if incoming.flags.contains(F::POST_PENDING_TRANSFER) { AMOUNT_MAX } else { 0 };
+    let amount_wildcard = if incoming.flags.contains(F::POST_PENDING_TRANSFER) {
+        AMOUNT_MAX
+    } else {
+        0
+    };
     let amount_differs = if resolution {
         incoming.amount != amount_wildcard && incoming.amount != existing.amount
     } else {
@@ -717,7 +747,10 @@ mod tests {
     #[test]
     fn account_flag_helpers() {
         assert!(AccountFlags(0b100_0000).has_reserved_bits()); // bit 6 undefined
-        assert!(!(AccountFlags::DEBITS_MUST_NOT_EXCEED_CREDITS | AccountFlags::HISTORY).has_reserved_bits());
+        assert!(
+            !(AccountFlags::DEBITS_MUST_NOT_EXCEED_CREDITS | AccountFlags::HISTORY)
+                .has_reserved_bits()
+        );
         assert!((AccountFlags::DEBITS_MUST_NOT_EXCEED_CREDITS
             | AccountFlags::CREDITS_MUST_NOT_EXCEED_DEBITS)
             .is_mutually_exclusive_violation());
@@ -730,7 +763,9 @@ mod tests {
     fn transfer_flag_matrix() {
         use TransferFlags as F;
         assert!((F::PENDING | F::POST_PENDING_TRANSFER).is_mutually_exclusive_violation());
-        assert!((F::POST_PENDING_TRANSFER | F::VOID_PENDING_TRANSFER).is_mutually_exclusive_violation());
+        assert!(
+            (F::POST_PENDING_TRANSFER | F::VOID_PENDING_TRANSFER).is_mutually_exclusive_violation()
+        );
         assert!((F::POST_PENDING_TRANSFER | F::BALANCING_DEBIT).is_mutually_exclusive_violation());
         assert!((F::VOID_PENDING_TRANSFER | F::CLOSING_DEBIT).is_mutually_exclusive_violation());
         assert!(!F::PENDING.is_mutually_exclusive_violation());
@@ -750,8 +785,14 @@ mod tests {
         let mut a = Account::input(1, 7).with_code(1);
         a.reserved = 1;
         assert_eq!(chk(&a), Some(R::ReservedField));
-        assert_eq!(chk(&Account::input(0, 7).with_code(1)), Some(R::IdMustNotBeZero));
-        assert_eq!(chk(&Account::input(u128::MAX, 7).with_code(1)), Some(R::IdMustNotBeIntMax));
+        assert_eq!(
+            chk(&Account::input(0, 7).with_code(1)),
+            Some(R::IdMustNotBeZero)
+        );
+        assert_eq!(
+            chk(&Account::input(u128::MAX, 7).with_code(1)),
+            Some(R::IdMustNotBeIntMax)
+        );
         assert_eq!(chk(&Account::input(1, 7).with_code(1)), None);
     }
 
@@ -760,16 +801,30 @@ mod tests {
         use CreateAccountResult as R;
         // Imported batch: a non-imported event → ImportedEventExpected.
         let plain = Account::input(1, 7).with_code(1);
-        assert_eq!(validate_account_pre_existence(&plain, true, 1_000), Some(R::ImportedEventExpected));
+        assert_eq!(
+            validate_account_pre_existence(&plain, true, 1_000),
+            Some(R::ImportedEventExpected)
+        );
         // Non-imported batch: an imported event → ImportedEventNotExpected.
-        let imp = Account::input(1, 7).with_code(1).with_flags(AccountFlags::IMPORTED);
-        assert_eq!(validate_account_pre_existence(&imp, false, 1_000), Some(R::ImportedEventNotExpected));
+        let imp = Account::input(1, 7)
+            .with_code(1)
+            .with_flags(AccountFlags::IMPORTED);
+        assert_eq!(
+            validate_account_pre_existence(&imp, false, 1_000),
+            Some(R::ImportedEventNotExpected)
+        );
         // Imported with timestamp 0 → out of range.
-        assert_eq!(validate_account_pre_existence(&imp, true, 1_000), Some(R::ImportedEventTimestampOutOfRange));
+        assert_eq!(
+            validate_account_pre_existence(&imp, true, 1_000),
+            Some(R::ImportedEventTimestampOutOfRange)
+        );
         // Imported timestamp in the future → must not advance.
         let mut future = imp;
         future.timestamp = 2_000;
-        assert_eq!(validate_account_pre_existence(&future, true, 1_000), Some(R::ImportedEventTimestampMustNotAdvance));
+        assert_eq!(
+            validate_account_pre_existence(&future, true, 1_000),
+            Some(R::ImportedEventTimestampMustNotAdvance)
+        );
         // Imported timestamp valid (0 < ts <= now) → passes pre-existence.
         let mut ok = imp;
         ok.timestamp = 500;
@@ -782,22 +837,47 @@ mod tests {
         use TransferFlags as F;
         // regular transfer must not carry a pending_id.
         let t = Transfer::new(1, 1, 2, 5, 7).with_code(1).with_pending_id(9);
-        assert_eq!(validate_transfer_post_existence(&t), Some(R::PendingIdMustBeZero));
+        assert_eq!(
+            validate_transfer_post_existence(&t),
+            Some(R::PendingIdMustBeZero)
+        );
         // post/void must carry one.
-        let t = Transfer::new(1, 1, 2, 5, 7).with_code(1).with_flags(F::POST_PENDING_TRANSFER);
-        assert_eq!(validate_transfer_post_existence(&t), Some(R::PendingIdMustNotBeZero));
+        let t = Transfer::new(1, 1, 2, 5, 7)
+            .with_code(1)
+            .with_flags(F::POST_PENDING_TRANSFER);
+        assert_eq!(
+            validate_transfer_post_existence(&t),
+            Some(R::PendingIdMustNotBeZero)
+        );
         // pending_id must differ from id.
-        let t = Transfer::new(9, 1, 2, 5, 7).with_code(1).with_flags(F::VOID_PENDING_TRANSFER).with_pending_id(9);
-        assert_eq!(validate_transfer_post_existence(&t), Some(R::PendingIdMustBeDifferent));
+        let t = Transfer::new(9, 1, 2, 5, 7)
+            .with_code(1)
+            .with_flags(F::VOID_PENDING_TRANSFER)
+            .with_pending_id(9);
+        assert_eq!(
+            validate_transfer_post_existence(&t),
+            Some(R::PendingIdMustBeDifferent)
+        );
         // closing must be pending.
-        let t = Transfer::new(1, 1, 2, 5, 7).with_code(1).with_flags(F::CLOSING_DEBIT);
-        assert_eq!(validate_transfer_post_existence(&t), Some(R::ClosingTransferMustBePending));
+        let t = Transfer::new(1, 1, 2, 5, 7)
+            .with_code(1)
+            .with_flags(F::CLOSING_DEBIT);
+        assert_eq!(
+            validate_transfer_post_existence(&t),
+            Some(R::ClosingTransferMustBePending)
+        );
         // timeout only on pending.
         let mut t = Transfer::new(1, 1, 2, 5, 7).with_code(1);
         t.timeout = 10;
-        assert_eq!(validate_transfer_post_existence(&t), Some(R::TimeoutReservedForPendingTransfer));
+        assert_eq!(
+            validate_transfer_post_existence(&t),
+            Some(R::TimeoutReservedForPendingTransfer)
+        );
         // clean regular transfer passes.
-        assert_eq!(validate_transfer_post_existence(&Transfer::new(1, 1, 2, 5, 7).with_code(1)), None);
+        assert_eq!(
+            validate_transfer_post_existence(&Transfer::new(1, 1, 2, 5, 7).with_code(1)),
+            None
+        );
     }
 
     #[test]
@@ -808,17 +888,29 @@ mod tests {
             x.timeout = timeout;
             x
         };
-        assert_eq!(classify(&Transfer::new(1, 1, 2, 5, 7).with_code(1)), TransferOp::Regular);
+        assert_eq!(
+            classify(&Transfer::new(1, 1, 2, 5, 7).with_code(1)),
+            TransferOp::Regular
+        );
         assert_eq!(classify(&t(F::PENDING, 0)), TransferOp::PendingReserve);
         assert_eq!(classify(&t(F::PENDING, 30)), TransferOp::PendingReserve); // pending+timeout handled in C
         assert_eq!(classify(&t(F::POST_PENDING_TRANSFER, 0)), TransferOp::Post);
         assert_eq!(classify(&t(F::VOID_PENDING_TRANSFER, 0)), TransferOp::Void);
         assert_eq!(classify(&t(F::LINKED, 0)), TransferOp::Regular); // LINKED is orthogonal
-        assert_eq!(classify(&t(F::LINKED | F::PENDING, 0)), TransferOp::PendingReserve);
+        assert_eq!(
+            classify(&t(F::LINKED | F::PENDING, 0)),
+            TransferOp::PendingReserve
+        );
         assert_eq!(classify(&t(F::BALANCING_DEBIT, 0)), TransferOp::Regular); // balancing is orthogonal
-        assert_eq!(classify(&t(F::BALANCING_CREDIT | F::PENDING, 0)), TransferOp::PendingReserve);
+        assert_eq!(
+            classify(&t(F::BALANCING_CREDIT | F::PENDING, 0)),
+            TransferOp::PendingReserve
+        );
         assert_eq!(classify(&t(F::IMPORTED, 0)), TransferOp::Regular); // imported is orthogonal
-        assert_eq!(classify(&t(F::PENDING | F::CLOSING_DEBIT, 0)), TransferOp::PendingReserve); // closing is a pending
+        assert_eq!(
+            classify(&t(F::PENDING | F::CLOSING_DEBIT, 0)),
+            TransferOp::PendingReserve
+        ); // closing is a pending
     }
 
     #[test]
@@ -844,13 +936,23 @@ mod tests {
 
     #[test]
     fn chains_grouping() {
-        let c = |s, e, o| Chain { start: s, end: e, open: o };
+        let c = |s, e, o| Chain {
+            start: s,
+            end: e,
+            open: o,
+        };
         assert_eq!(chains(&[]), vec![]);
         assert_eq!(chains(&[false]), vec![c(0, 0, false)]);
         assert_eq!(chains(&[true]), vec![c(0, 0, true)]); // lone open
         assert_eq!(chains(&[true, false]), vec![c(0, 1, false)]);
-        assert_eq!(chains(&[true, true, false, false]), vec![c(0, 2, false), c(3, 3, false)]);
-        assert_eq!(chains(&[false, true, true]), vec![c(0, 0, false), c(1, 2, true)]);
+        assert_eq!(
+            chains(&[true, true, false, false]),
+            vec![c(0, 2, false), c(3, 3, false)]
+        );
+        assert_eq!(
+            chains(&[false, true, true]),
+            vec![c(0, 0, false), c(1, 2, true)]
+        );
         assert_eq!(
             chains(&[true, false, true, false]),
             vec![c(0, 1, false), c(2, 3, false)]
@@ -867,7 +969,10 @@ mod tests {
         post.pending_id = 9;
         assert_eq!(validate_transfer_post_existence(&post), None);
         post.pending_id = 0;
-        assert_eq!(validate_transfer_post_existence(&post), Some(R::PendingIdMustNotBeZero));
+        assert_eq!(
+            validate_transfer_post_existence(&post),
+            Some(R::PendingIdMustNotBeZero)
+        );
     }
 
     #[test]
@@ -887,10 +992,16 @@ mod tests {
         // Retry with a differing explicit amount → ExistsWithDifferentAmount.
         let mut retry2 = retry;
         retry2.amount = 50;
-        assert_eq!(transfer_exists_result(&retry2, &stored), R::ExistsWithDifferentAmount);
+        assert_eq!(
+            transfer_exists_result(&retry2, &stored),
+            R::ExistsWithDifferentAmount
+        );
         // Retry with a differing explicit debit account → mismatch.
         let mut retry3 = retry;
         retry3.debit_account_id = 99;
-        assert_eq!(transfer_exists_result(&retry3, &stored), R::ExistsWithDifferentDebitAccountId);
+        assert_eq!(
+            transfer_exists_result(&retry3, &stored),
+            R::ExistsWithDifferentDebitAccountId
+        );
     }
 }

@@ -19,7 +19,11 @@ use slatedb::Db;
 
 async fn open_db() -> Arc<Db> {
     let store = Arc::new(InMemory::new());
-    Arc::new(Db::open("pk-range-test", store).await.expect("open slatedb"))
+    Arc::new(
+        Db::open("pk-range-test", store)
+            .await
+            .expect("open slatedb"),
+    )
 }
 
 fn select_rows(payload: Payload) -> Vec<Vec<Value>> {
@@ -60,7 +64,11 @@ async fn pk_range_routes_to_clustered_pseudo_index() {
     let db = open_db().await;
     {
         let mut glue = Glue::new(SlateDbStorage::new(Arc::clone(&db)));
-        exec(&mut glue, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);").await;
+        exec(
+            &mut glue,
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);",
+        )
+        .await;
     }
 
     // A PK *range* is routed to the clustered-PK pseudo-index (bounded scan).
@@ -83,7 +91,11 @@ async fn pk_range_routes_to_clustered_pseudo_index() {
 async fn pk_range_keyset_and_order_return_correct_rows() {
     let db = open_db().await;
     let mut glue = Glue::new(SlateDbStorage::new(Arc::clone(&db)));
-    exec(&mut glue, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);").await;
+    exec(
+        &mut glue,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);",
+    )
+    .await;
     for i in 1..=10 {
         exec(&mut glue, &format!("INSERT INTO t VALUES ({i}, 'r{i}');")).await;
     }
@@ -103,19 +115,31 @@ async fn pk_range_keyset_and_order_return_correct_rows() {
 
     // Closed range (BETWEEN → id >= 3 AND id <= 5).
     let rows = select_rows(
-        exec(&mut glue, "SELECT id FROM t WHERE id BETWEEN 3 AND 5 ORDER BY id;").await,
+        exec(
+            &mut glue,
+            "SELECT id FROM t WHERE id BETWEEN 3 AND 5 ORDER BY id;",
+        )
+        .await,
     );
     assert_eq!(ids(rows), vec![3, 4, 5]);
 
     // Keyset pagination: strictly-greater cursor, bounded page.
     let rows = select_rows(
-        exec(&mut glue, "SELECT id FROM t WHERE id > 4 ORDER BY id LIMIT 3;").await,
+        exec(
+            &mut glue,
+            "SELECT id FROM t WHERE id > 4 ORDER BY id LIMIT 3;",
+        )
+        .await,
     );
     assert_eq!(ids(rows), vec![5, 6, 7]);
 
     // Descending order over a range.
     let rows = select_rows(
-        exec(&mut glue, "SELECT id FROM t WHERE id >= 8 ORDER BY id DESC;").await,
+        exec(
+            &mut glue,
+            "SELECT id FROM t WHERE id >= 8 ORDER BY id DESC;",
+        )
+        .await,
     );
     assert_eq!(ids(rows), vec![10, 9, 8]);
 

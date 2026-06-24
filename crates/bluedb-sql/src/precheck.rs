@@ -59,7 +59,10 @@ fn select_has_window(select: &Select) -> bool {
         || select.having.as_ref().is_some_and(expr_has_window)
         || select.from.iter().any(|twj| {
             table_factor_has_window(&twj.relation)
-                || twj.joins.iter().any(|j| table_factor_has_window(&j.relation))
+                || twj
+                    .joins
+                    .iter()
+                    .any(|j| table_factor_has_window(&j.relation))
         })
 }
 
@@ -75,8 +78,12 @@ fn expr_has_window(expr: &Expr) -> bool {
             expr_has_window(expr)
         }
         Expr::Subquery(query)
-        | Expr::InSubquery { subquery: query, .. }
-        | Expr::Exists { subquery: query, .. } => query_has_window(query),
+        | Expr::InSubquery {
+            subquery: query, ..
+        }
+        | Expr::Exists {
+            subquery: query, ..
+        } => query_has_window(query),
         _ => false,
     }
 }

@@ -115,7 +115,10 @@ impl CdcConfig {
     /// caller that flips the default re-applies its explicit flags via
     /// [`Self::set_table`] (see the lakehouse engine).
     pub fn set_default(&self, tenant: &str, on: bool) {
-        self.defaults.write().unwrap().insert(tenant.to_string(), on);
+        self.defaults
+            .write()
+            .unwrap()
+            .insert(tenant.to_string(), on);
     }
 
     /// Should `(tenant, table)` be mirrored? `default_for(tenant) XOR override`.
@@ -293,7 +296,9 @@ mod tests {
         ]);
         let t = &collapsed["t"];
         assert_eq!(t.len(), 2);
-        assert!(matches!(&t[&Key::I64(1)], Some(DataRow::Vec(v)) if v == &[gluesql_core::data::Value::I64(99)]));
+        assert!(
+            matches!(&t[&Key::I64(1)], Some(DataRow::Vec(v)) if v == &[gluesql_core::data::Value::I64(99)])
+        );
         assert_eq!(t[&Key::I64(2)], None);
     }
 

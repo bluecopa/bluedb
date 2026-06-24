@@ -39,7 +39,12 @@ async fn search_across_two_splits_in_slatedb() {
         .build_with_hotcache(
             schema_a,
             vec![
-                doc(title, "ledger reconciliation", body, "match invoices financial"),
+                doc(
+                    title,
+                    "ledger reconciliation",
+                    body,
+                    "match invoices financial",
+                ),
                 doc(title, "payroll run", body, "salaries wages employees"),
             ],
         )
@@ -50,7 +55,12 @@ async fn search_across_two_splits_in_slatedb() {
         .build_with_hotcache(
             schema_b,
             vec![
-                doc(title, "quarterly revenue report", body, "revenue deferred financial"),
+                doc(
+                    title,
+                    "quarterly revenue report",
+                    body,
+                    "revenue deferred financial",
+                ),
                 doc(title, "audit notes", body, "controls testing samples"),
             ],
         )
@@ -75,9 +85,12 @@ async fn search_across_two_splits_in_slatedb() {
 
     let mut manifest = Manifest::new(INDEX_ID);
     manifest.push(meta_a).push(meta_b);
-    db.put(manifest.blob_key().as_bytes(), &manifest.to_bytes().unwrap())
-        .await
-        .expect("put manifest");
+    db.put(
+        manifest.blob_key().as_bytes(),
+        &manifest.to_bytes().unwrap(),
+    )
+    .await
+    .expect("put manifest");
 
     // ---- reload the manifest from SlateDB and open every split lazily ----
     let blob = Arc::new(SlateDbBlobStore::new(db));
@@ -154,9 +167,12 @@ async fn manifest_round_trips_through_slatedb() {
     manifest
         .push(SplitMeta::new("s1", 100, 4096, 3))
         .push(SplitMeta::new("s2", 50, 2048, 3).with_time_range(1, 99));
-    db.put(manifest.blob_key().as_bytes(), &manifest.to_bytes().unwrap())
-        .await
-        .expect("put manifest");
+    db.put(
+        manifest.blob_key().as_bytes(),
+        &manifest.to_bytes().unwrap(),
+    )
+    .await
+    .expect("put manifest");
 
     let blob = SlateDbBlobStore::new(db);
     let loaded = Manifest::load(&blob, &Manifest::blob_key_for("books-2026"))

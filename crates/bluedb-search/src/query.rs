@@ -30,7 +30,10 @@ impl std::fmt::Debug for CompiledQuery {
 pub fn compile_query(ss: &SearchSchema, q: &Value) -> Result<CompiledQuery> {
     let mut terms_by_field: HashMap<String, Vec<String>> = HashMap::new();
     let query = lower(ss, q, &mut terms_by_field)?;
-    Ok(CompiledQuery { query, terms_by_field })
+    Ok(CompiledQuery {
+        query,
+        terms_by_field,
+    })
 }
 
 fn obj<'a>(q: &'a Value, key: &str) -> Result<&'a serde_json::Map<String, Value>> {
@@ -69,7 +72,9 @@ fn match_text(leaf: &Value) -> Result<(&str, bool)> {
                 .unwrap_or(false);
             Ok((q, and))
         }
-        _ => Err(SearchError::BadRequest("match value must be a string or object".into())),
+        _ => Err(SearchError::BadRequest(
+            "match value must be a string or object".into(),
+        )),
     }
 }
 
@@ -99,7 +104,10 @@ fn lower(
     }
 }
 
-fn resolve_field<'a>(ss: &'a SearchSchema, name: &str) -> Result<&'a crate::mapping::ResolvedField> {
+fn resolve_field<'a>(
+    ss: &'a SearchSchema,
+    name: &str,
+) -> Result<&'a crate::mapping::ResolvedField> {
     ss.field(name)
         .ok_or_else(|| SearchError::UnmappedField(name.to_string()))
 }
@@ -113,7 +121,10 @@ fn lower_match(
     let resolved = resolve_field(ss, field_name)?;
     let (text, want_and) = match_text(leaf)?;
     let analyzed = ss.analyze(field_name, text)?;
-    terms.entry(field_name.clone()).or_default().extend(analyzed.clone());
+    terms
+        .entry(field_name.clone())
+        .or_default()
+        .extend(analyzed.clone());
 
     if analyzed.is_empty() {
         return Ok(Box::new(BooleanQuery::new(vec![])));
@@ -141,7 +152,10 @@ fn lower_phrase(
     let resolved = resolve_field(ss, field_name)?;
     let (text, _) = match_text(leaf)?;
     let analyzed = ss.analyze(field_name, text)?;
-    terms.entry(field_name.clone()).or_default().extend(analyzed.clone());
+    terms
+        .entry(field_name.clone())
+        .or_default()
+        .extend(analyzed.clone());
 
     if analyzed.len() < 2 {
         if let Some(t) = analyzed.into_iter().next() {
@@ -172,19 +186,24 @@ fn lower_term(
     };
     match resolved.kind {
         FieldKindInfo::Integer => {
-            let n = value
-                .as_i64()
-                .ok_or_else(|| SearchError::BadRequest(format!("term on numeric field [{field_name}] needs an integer")))?;
+            let n = value.as_i64().ok_or_else(|| {
+                SearchError::BadRequest(format!(
+                    "term on numeric field [{field_name}] needs an integer"
+                ))
+            })?;
             Ok(Box::new(TermQuery::new(
                 Term::from_field_i64(resolved.field, n),
                 IndexRecordOption::Basic,
             )))
         }
         FieldKindInfo::Text(_) | FieldKindInfo::Keyword => {
-            let s = value
-                .as_str()
-                .ok_or_else(|| SearchError::BadRequest(format!("term on field [{field_name}] needs a string")))?;
-            terms.entry(field_name.clone()).or_default().push(s.to_string());
+            let s = value.as_str().ok_or_else(|| {
+                SearchError::BadRequest(format!("term on field [{field_name}] needs a string"))
+            })?;
+            terms
+                .entry(field_name.clone())
+                .or_default()
+                .push(s.to_string());
             Ok(Box::new(TermQuery::new(
                 Term::from_field_text(resolved.field, s),
                 IndexRecordOption::Basic,
@@ -225,24 +244,42 @@ mod range {
     use crate::error::{Result, SearchError};
     use crate::mapping::{FieldKindInfo, SearchSchema};
 
-    fn bound_i64(m: &serde_json::Map<String, Value>, incl: &str, excl: &str, field: tantivy::schema::Field) -> Result<Bound<Term>> {
+    fn bound_i64(
+        m: &serde_json::Map<String, Value>,
+        incl: &str,
+        excl: &str,
+        field: tantivy::schema::Field,
+    ) -> Result<Bound<Term>> {
         if let Some(v) = m.get(incl) {
-            let n = v.as_i64().ok_or_else(|| SearchError::BadRequest("range bound must be an integer".into()))?;
+            let n = v
+                .as_i64()
+                .ok_or_else(|| SearchError::BadRequest("range bound must be an integer".into()))?;
             Ok(Bound::Included(Term::from_field_i64(field, n)))
         } else if let Some(v) = m.get(excl) {
-            let n = v.as_i64().ok_or_else(|| SearchError::BadRequest("range bound must be an integer".into()))?;
+            let n = v
+                .as_i64()
+                .ok_or_else(|| SearchError::BadRequest("range bound must be an integer".into()))?;
             Ok(Bound::Excluded(Term::from_field_i64(field, n)))
         } else {
             Ok(Bound::Unbounded)
         }
     }
 
-    fn bound_text(m: &serde_json::Map<String, Value>, incl: &str, excl: &str, field: tantivy::schema::Field) -> Result<Bound<Term>> {
+    fn bound_text(
+        m: &serde_json::Map<String, Value>,
+        incl: &str,
+        excl: &str,
+        field: tantivy::schema::Field,
+    ) -> Result<Bound<Term>> {
         if let Some(v) = m.get(incl) {
-            let s = v.as_str().ok_or_else(|| SearchError::BadRequest("range bound must be a string".into()))?;
+            let s = v
+                .as_str()
+                .ok_or_else(|| SearchError::BadRequest("range bound must be a string".into()))?;
             Ok(Bound::Included(Term::from_field_text(field, s)))
         } else if let Some(v) = m.get(excl) {
-            let s = v.as_str().ok_or_else(|| SearchError::BadRequest("range bound must be a string".into()))?;
+            let s = v
+                .as_str()
+                .ok_or_else(|| SearchError::BadRequest("range bound must be a string".into()))?;
             Ok(Bound::Excluded(Term::from_field_text(field, s)))
         } else {
             Ok(Bound::Unbounded)
@@ -297,7 +334,9 @@ mod boolean {
         terms: &mut HashMap<String, Vec<String>>,
         out: &mut Vec<(Occur, Box<dyn Query>)>,
     ) -> Result<()> {
-        let Some(v) = body.get(key) else { return Ok(()) };
+        let Some(v) = body.get(key) else {
+            return Ok(());
+        };
         let items: Vec<&Value> = match v {
             Value::Array(a) => a.iter().collect(),
             other => vec![other],
@@ -342,14 +381,19 @@ mod tests {
             "title": {"analyzer": "english"},
             "tag": {"type": "keyword"},
             "year": {"type": "integer"}
-        }})).unwrap();
+        }}))
+        .unwrap();
         compile(&m).unwrap()
     }
 
     #[test]
     fn match_collects_analyzed_terms() {
         let ss = schema();
-        let c = compile_query(&ss, &serde_json::json!({"match": {"title": "Running Dogs"}})).unwrap();
+        let c = compile_query(
+            &ss,
+            &serde_json::json!({"match": {"title": "Running Dogs"}}),
+        )
+        .unwrap();
         let terms = c.terms_by_field.get("title").unwrap();
         assert!(terms.contains(&"dog".to_string()) || terms.contains(&"dogs".to_string()));
         let _ = c.query;
@@ -359,13 +403,20 @@ mod tests {
     fn term_is_exact() {
         let ss = schema();
         let c = compile_query(&ss, &serde_json::json!({"term": {"tag": "rust"}})).unwrap();
-        assert_eq!(c.terms_by_field.get("tag").unwrap(), &vec!["rust".to_string()]);
+        assert_eq!(
+            c.terms_by_field.get("tag").unwrap(),
+            &vec!["rust".to_string()]
+        );
     }
 
     #[test]
     fn match_phrase_builds() {
         let ss = schema();
-        assert!(compile_query(&ss, &serde_json::json!({"match_phrase": {"title": "quick brown"}})).is_ok());
+        assert!(compile_query(
+            &ss,
+            &serde_json::json!({"match_phrase": {"title": "quick brown"}})
+        )
+        .is_ok());
     }
 
     #[test]
@@ -406,30 +457,44 @@ mod tests {
     #[test]
     fn range_on_integer_builds() {
         let ss = schema();
-        assert!(compile_query(&ss, &serde_json::json!({"range": {"year": {"gte": 2000, "lt": 2020}}})).is_ok());
+        assert!(compile_query(
+            &ss,
+            &serde_json::json!({"range": {"year": {"gte": 2000, "lt": 2020}}})
+        )
+        .is_ok());
     }
 
     #[test]
     fn range_on_keyword_builds() {
         let ss = schema();
-        assert!(compile_query(&ss, &serde_json::json!({"range": {"tag": {"gte": "a", "lte": "m"}}})).is_ok());
+        assert!(compile_query(
+            &ss,
+            &serde_json::json!({"range": {"tag": {"gte": "a", "lte": "m"}}})
+        )
+        .is_ok());
     }
 
     #[test]
     fn bool_merges_clauses_and_terms() {
         let ss = schema();
-        let c = compile_query(&ss, &serde_json::json!({"bool": {
-            "must": [{"match": {"title": "dog"}}],
-            "filter": [{"term": {"tag": "pets"}}],
-            "must_not": [{"term": {"tag": "draft"}}],
-            "should": [{"match": {"title": "park"}}]
-        }})).unwrap();
+        let c = compile_query(
+            &ss,
+            &serde_json::json!({"bool": {
+                "must": [{"match": {"title": "dog"}}],
+                "filter": [{"term": {"tag": "pets"}}],
+                "must_not": [{"term": {"tag": "draft"}}],
+                "should": [{"match": {"title": "park"}}]
+            }}),
+        )
+        .unwrap();
         assert!(c.terms_by_field.get("title").is_some());
     }
 
     #[test]
     fn range_on_text_field_errors() {
         let ss = schema();
-        assert!(compile_query(&ss, &serde_json::json!({"range": {"title": {"gte": "a"}}})).is_err());
+        assert!(
+            compile_query(&ss, &serde_json::json!({"range": {"title": {"gte": "a"}}})).is_err()
+        );
     }
 }

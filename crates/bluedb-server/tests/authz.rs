@@ -16,7 +16,10 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;
 use bluedb_ha::{LeaseProvider, LocalLeaseProvider, SystemClock, WriterController};
-use bluedb_server::{authz::{Authz, Scope}, build_app, AppState};
+use bluedb_server::{
+    authz::{Authz, Scope},
+    build_app, AppState,
+};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use slatedb::object_store::{memory::InMemory, ObjectStore};
@@ -26,7 +29,13 @@ const TTL: Duration = Duration::from_secs(30);
 const MARGIN: Duration = Duration::from_secs(5);
 
 fn node(node_id: &str, store: Arc<dyn ObjectStore>, lease: Arc<dyn LeaseProvider>) -> AppState {
-    let writer = Arc::new(WriterController::new(node_id, lease, Arc::new(SystemClock), TTL, MARGIN));
+    let writer = Arc::new(WriterController::new(
+        node_id,
+        lease,
+        Arc::new(SystemClock),
+        TTL,
+        MARGIN,
+    ));
     AppState::new(store, "bluedb", writer)
 }
 
@@ -82,7 +91,11 @@ async fn call(
 async fn get_table_no_token_is_401() {
     let app = make_app_authz().await;
     let (status, _) = call(&app, "GET", "/tables/t", None, None).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "no token should yield 401");
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "no token should yield 401"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -103,7 +116,11 @@ async fn get_table_with_read_token_reaches_handler() {
     assert_eq!(setup_status, StatusCode::OK, "setup failed");
 
     let (status, _) = call(&app, "GET", "/tables/t", None, Some("rotoken")).await;
-    assert_ne!(status, StatusCode::UNAUTHORIZED, "rotoken should not get 401");
+    assert_ne!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "rotoken should not get 401"
+    );
     assert_ne!(status, StatusCode::FORBIDDEN, "rotoken should not get 403");
 }
 
@@ -121,7 +138,11 @@ async fn insert_with_read_token_is_403() {
         Some("rotoken"),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "rotoken on insert should be 403");
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "rotoken on insert should be 403"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -149,8 +170,16 @@ async fn insert_with_write_token_reaches_handler() {
         Some("rwtoken"),
     )
     .await;
-    assert_ne!(status, StatusCode::UNAUTHORIZED, "rwtoken on insert should not be 401");
-    assert_ne!(status, StatusCode::FORBIDDEN, "rwtoken on insert should not be 403");
+    assert_ne!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "rwtoken on insert should not be 401"
+    );
+    assert_ne!(
+        status,
+        StatusCode::FORBIDDEN,
+        "rwtoken on insert should not be 403"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -167,7 +196,11 @@ async fn admin_sql_with_write_token_is_403() {
         Some("rwtoken"),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "rwtoken on /admin/sql should be 403");
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "rwtoken on /admin/sql should be 403"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -184,8 +217,16 @@ async fn admin_sql_with_super_token_reaches_handler() {
         Some("super"),
     )
     .await;
-    assert_ne!(status, StatusCode::UNAUTHORIZED, "super on /admin/sql should not be 401");
-    assert_ne!(status, StatusCode::FORBIDDEN, "super on /admin/sql should not be 403");
+    assert_ne!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "super on /admin/sql should not be 401"
+    );
+    assert_ne!(
+        status,
+        StatusCode::FORBIDDEN,
+        "super on /admin/sql should not be 403"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -195,6 +236,10 @@ async fn admin_sql_with_super_token_reaches_handler() {
 async fn health_is_public() {
     let app = make_app_authz().await;
     let (status, body) = call(&app, "GET", "/health", None, None).await;
-    assert_eq!(status, StatusCode::OK, "health should be 200 regardless of authz");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "health should be 200 regardless of authz"
+    );
     assert_eq!(body, json!({ "status": "ok" }));
 }

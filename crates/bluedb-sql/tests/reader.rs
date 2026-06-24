@@ -14,11 +14,19 @@ async fn replica_serves_reads_and_refuses_writes() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
 
     // Active writer creates the table + rows, then flushes for durability.
-    let writer_db = Arc::new(Db::open("bluedb-sql-ha", store.clone()).await.expect("open writer"));
+    let writer_db = Arc::new(
+        Db::open("bluedb-sql-ha", store.clone())
+            .await
+            .expect("open writer"),
+    );
     {
         let mut glue = Glue::new(Database::new(writer_db.clone()).connection());
-        glue.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);").await.unwrap();
-        glue.execute("INSERT INTO t VALUES (1, 'alice'), (2, 'bob');").await.unwrap();
+        glue.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);")
+            .await
+            .unwrap();
+        glue.execute("INSERT INTO t VALUES (1, 'alice'), (2, 'bob');")
+            .await
+            .unwrap();
     }
     writer_db.flush().await.expect("flush");
 
@@ -54,7 +62,10 @@ async fn replica_serves_reads_and_refuses_writes() {
 
     // A replica is read-only: both an autocommit write and an explicit BEGIN fail.
     assert!(
-        rglue.execute("INSERT INTO t VALUES (3, 'carol');").await.is_err(),
+        rglue
+            .execute("INSERT INTO t VALUES (3, 'carol');")
+            .await
+            .is_err(),
         "INSERT on a read replica must fail"
     );
     assert!(

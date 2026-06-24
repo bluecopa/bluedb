@@ -203,8 +203,12 @@ fn set_join_on(op: &mut JoinOperator, on: Expr) {
 fn fold_expr_subqueries(expr: &mut Expr, changed: &mut bool) {
     match expr {
         Expr::Subquery(query)
-        | Expr::InSubquery { subquery: query, .. }
-        | Expr::Exists { subquery: query, .. } => rewrite_query(query, changed),
+        | Expr::InSubquery {
+            subquery: query, ..
+        }
+        | Expr::Exists {
+            subquery: query, ..
+        } => rewrite_query(query, changed),
         Expr::Cast {
             kind,
             expr,
@@ -369,8 +373,14 @@ mod tests {
     fn folds_two_table_comma_join() {
         let out = rewrite_multitable("SELECT a.x FROM a, b WHERE a.id = b.id");
         assert!(out.contains("JOIN b"), "got: {out}");
-        assert!(out.to_uppercase().contains("ON TRUE") || out.contains("ON true"), "got: {out}");
-        assert!(!out.contains("FROM a, b"), "comma join should be gone: {out}");
+        assert!(
+            out.to_uppercase().contains("ON TRUE") || out.contains("ON true"),
+            "got: {out}"
+        );
+        assert!(
+            !out.contains("FROM a, b"),
+            "comma join should be gone: {out}"
+        );
     }
 
     #[test]
@@ -423,7 +433,10 @@ mod tests {
         ] {
             let out = rewrite_multitable(ddl).to_uppercase();
             assert!(out.contains("FLOAT"), "{ddl} -> {out}");
-            assert!(!out.contains("DOUBLE") && !out.contains("REAL"), "{ddl} -> {out}");
+            assert!(
+                !out.contains("DOUBLE") && !out.contains("REAL"),
+                "{ddl} -> {out}"
+            );
         }
     }
 
@@ -432,7 +445,10 @@ mod tests {
         for ddl in ["CREATE TABLE t (x UHUGEINT)", "CREATE TABLE t (x UBIGINT)"] {
             let out = rewrite_multitable(ddl).to_uppercase();
             assert!(out.contains("INT"), "{ddl} -> {out}");
-            assert!(!out.contains("HUGE") && !out.contains("UBIG"), "{ddl} -> {out}");
+            assert!(
+                !out.contains("HUGE") && !out.contains("UBIG"),
+                "{ddl} -> {out}"
+            );
         }
     }
 
@@ -440,7 +456,10 @@ mod tests {
     fn timestamp_precision_is_stripped() {
         let out = rewrite_multitable("CREATE TABLE t (x TIMESTAMP(6))").to_uppercase();
         assert!(out.contains("TIMESTAMP"), "got: {out}");
-        assert!(!out.contains("TIMESTAMP(6)") && !out.contains("(6)"), "got: {out}");
+        assert!(
+            !out.contains("TIMESTAMP(6)") && !out.contains("(6)"),
+            "got: {out}"
+        );
     }
 
     #[test]
@@ -467,10 +486,9 @@ mod tests {
 
     #[test]
     fn cast_type_normalized_inside_case() {
-        let out = rewrite_multitable(
-            "SELECT CASE WHEN x THEN CAST(y AS DOUBLE) ELSE NULL END FROM t",
-        )
-        .to_uppercase();
+        let out =
+            rewrite_multitable("SELECT CASE WHEN x THEN CAST(y AS DOUBLE) ELSE NULL END FROM t")
+                .to_uppercase();
         assert!(out.contains("FLOAT"), "got: {out}");
         assert!(!out.contains("DOUBLE"), "got: {out}");
     }
@@ -479,24 +497,41 @@ mod tests {
     fn folds_comma_join_inside_where_subquery() {
         // The set-op rewrite emits `... IN (SELECT ... FROM a, b ...)`; the inner
         // comma-join must fold too, or it reaches gluesql unfolded.
-        let out = rewrite_multitable("SELECT a FROM t1 WHERE a IN (SELECT b FROM t2, t3 WHERE x = y)");
-        assert!(out.contains("JOIN t3"), "inner comma-join should fold: {out}");
+        let out =
+            rewrite_multitable("SELECT a FROM t1 WHERE a IN (SELECT b FROM t2, t3 WHERE x = y)");
+        assert!(
+            out.contains("JOIN t3"),
+            "inner comma-join should fold: {out}"
+        );
     }
 
     #[test]
     fn normalizes_parameterized_types_in_create() {
-        let out =
-            rewrite_multitable("CREATE TABLE t (a DECIMAL(10,2), b INT(11), c BIGINT, d VARCHAR(20))");
+        let out = rewrite_multitable(
+            "CREATE TABLE t (a DECIMAL(10,2), b INT(11), c BIGINT, d VARCHAR(20))",
+        );
         let up = out.to_uppercase();
-        assert!(!up.contains("(10, 2)") && !up.contains("(11)") && !up.contains("(20)"), "params not stripped: {out}");
-        assert!(up.contains("DECIMAL") && up.contains("INTEGER") && up.contains("TEXT"), "got: {out}");
-        assert!(!up.contains("BIGINT"), "BIGINT should become INTEGER: {out}");
+        assert!(
+            !up.contains("(10, 2)") && !up.contains("(11)") && !up.contains("(20)"),
+            "params not stripped: {out}"
+        );
+        assert!(
+            up.contains("DECIMAL") && up.contains("INTEGER") && up.contains("TEXT"),
+            "got: {out}"
+        );
+        assert!(
+            !up.contains("BIGINT"),
+            "BIGINT should become INTEGER: {out}"
+        );
     }
 
     #[test]
     fn normalizes_cast_target_type() {
         let out = rewrite_multitable("SELECT CAST(x AS DECIMAL(10,2)) FROM t");
-        assert!(!out.contains("10, 2") && !out.contains("10,2"), "cast type param not stripped: {out}");
+        assert!(
+            !out.contains("10, 2") && !out.contains("10,2"),
+            "cast type param not stripped: {out}"
+        );
     }
 
     #[test]

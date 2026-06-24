@@ -31,7 +31,9 @@ async fn cannot_drop_single_pk_column() {
     exec(&mut g, "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)")
         .await
         .unwrap();
-    let err = exec(&mut g, "ALTER TABLE t DROP COLUMN id").await.unwrap_err();
+    let err = exec(&mut g, "ALTER TABLE t DROP COLUMN id")
+        .await
+        .unwrap_err();
     assert!(
         err.to_lowercase().contains("primary key"),
         "unexpected error: {err}"
@@ -49,7 +51,9 @@ async fn cannot_drop_composite_component_column() {
     )
     .await
     .unwrap();
-    let err = exec(&mut g, "ALTER TABLE t DROP COLUMN a").await.unwrap_err();
+    let err = exec(&mut g, "ALTER TABLE t DROP COLUMN a")
+        .await
+        .unwrap_err();
     assert!(
         err.to_lowercase().contains("primary key"),
         "unexpected error: {err}"

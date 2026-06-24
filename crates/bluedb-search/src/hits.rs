@@ -131,7 +131,10 @@ pub fn assemble(
         });
     }
     HitsBlock {
-        total: HitsTotal { value: total, relation: total_relation },
+        total: HitsTotal {
+            value: total,
+            relation: total_relation,
+        },
         max_score,
         hits,
     }
@@ -154,7 +157,14 @@ mod tests {
         sources.insert("a".to_string(), src("a", "Dogs", "good dogs"));
         sources.insert("b".to_string(), src("b", "Cats", "ok cats"));
         let out = assemble(
-            "pets", &ranked, 2, "eq", sources, &SourceSpec::Bool(true), &[], &HashMap::new(),
+            "pets",
+            &ranked,
+            2,
+            "eq",
+            sources,
+            &SourceSpec::Bool(true),
+            &[],
+            &HashMap::new(),
         );
         assert_eq!(out.total.value, 2);
         assert_eq!(out.max_score, Some(2.0));
@@ -168,7 +178,16 @@ mod tests {
         let ranked = vec![("a".to_string(), 1.0f32)];
         let mut sources = HashMap::new();
         sources.insert("a".to_string(), src("a", "x", "y"));
-        let out = assemble("c", &ranked, 1, "eq", sources, &SourceSpec::Bool(false), &[], &HashMap::new());
+        let out = assemble(
+            "c",
+            &ranked,
+            1,
+            "eq",
+            sources,
+            &SourceSpec::Bool(false),
+            &[],
+            &HashMap::new(),
+        );
         assert!(out.hits[0]._source.is_none());
     }
 
@@ -178,8 +197,14 @@ mod tests {
         let mut sources = HashMap::new();
         sources.insert("a".to_string(), src("a", "x", "y"));
         let out = assemble(
-            "c", &ranked, 1, "eq", sources,
-            &SourceSpec::Fields(vec!["title".into()]), &[], &HashMap::new(),
+            "c",
+            &ranked,
+            1,
+            "eq",
+            sources,
+            &SourceSpec::Fields(vec!["title".into()]),
+            &[],
+            &HashMap::new(),
         );
         let s = out.hits[0]._source.as_ref().unwrap();
         assert!(s.get("title").is_some());
@@ -194,8 +219,14 @@ mod tests {
         let mut terms = HashMap::new();
         terms.insert("body".to_string(), vec!["dogs".to_string()]);
         let out = assemble(
-            "c", &ranked, 1, "eq", sources, &SourceSpec::Bool(true),
-            &["body".to_string()], &terms,
+            "c",
+            &ranked,
+            1,
+            "eq",
+            sources,
+            &SourceSpec::Bool(true),
+            &["body".to_string()],
+            &terms,
         );
         let hl = out.hits[0].highlight.as_ref().unwrap();
         assert!(hl.get("body").unwrap()[0].contains("<em>dogs</em>"));
@@ -214,10 +245,19 @@ mod tests {
             src("a", "x", "A database built directly on object storage"),
         );
         let mut terms = HashMap::new();
-        terms.insert("body".to_string(), vec!["databas".to_string(), "storag".to_string()]);
+        terms.insert(
+            "body".to_string(),
+            vec!["databas".to_string(), "storag".to_string()],
+        );
         let out = assemble(
-            "c", &ranked, 1, "eq", sources, &SourceSpec::Bool(true),
-            &["body".to_string()], &terms,
+            "c",
+            &ranked,
+            1,
+            "eq",
+            sources,
+            &SourceSpec::Bool(true),
+            &["body".to_string()],
+            &terms,
         );
         let body_hl = &out.hits[0].highlight.as_ref().unwrap().get("body").unwrap()[0];
         assert!(body_hl.contains("<em>database</em>"), "got: {body_hl}");

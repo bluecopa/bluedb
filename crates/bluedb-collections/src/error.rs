@@ -14,8 +14,8 @@ impl MqlError {
     /// MongoDB error code (subset) for the `{ok:0, code, ...}` response shape.
     pub fn mongo_code(&self) -> i32 {
         match self {
-            MqlError::UnsupportedOperator(_) | MqlError::Malformed(_) => 2,   // BadValue
-            MqlError::UnsupportedStage(_) => 115,                              // CommandNotSupported
+            MqlError::UnsupportedOperator(_) | MqlError::Malformed(_) => 2, // BadValue
+            MqlError::UnsupportedStage(_) => 115,                           // CommandNotSupported
         }
     }
     pub fn mongo_code_name(&self) -> &'static str {

@@ -95,7 +95,11 @@ impl BluedbTableProvider {
             .data_type()
             .clone();
         // Hide the composite-PK surrogate from the user-facing schema.
-        let schema: SchemaRef = if full_schema.fields().iter().any(|f| f.name() == SURROGATE_PK) {
+        let schema: SchemaRef = if full_schema
+            .fields()
+            .iter()
+            .any(|f| f.name() == SURROGATE_PK)
+        {
             let fields: Vec<_> = full_schema
                 .fields()
                 .iter()
@@ -191,10 +195,7 @@ impl BluedbTableProvider {
                     .await
                     .map_err(|e| merge_err("current rows", e.to_string()))?
                     .ok_or_else(|| {
-                        DataFusionError::Execution(format!(
-                            "table '{}' does not exist",
-                            self.table
-                        ))
+                        DataFusionError::Execution(format!("table '{}' does not exist", self.table))
                     })?;
                 inner.register_table(
                     "__all",
