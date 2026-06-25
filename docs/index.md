@@ -109,9 +109,14 @@ to turn this into a node count: how many concurrent clients a node sustains, and
 the writes/sec that implies.
 
 *Method and caveat:* single node, local-disk (SSD) backend, `flush_interval=25 ms`,
-strong durability. Networked object storage (S3/GCS/Azure) adds its PUT latency on
-top of each flush, so read these as a local upper bound. A full object-store and
-multi-node characterization is in progress. Reproduce with
+strong durability. Read these as a local engine upper bound, not a customer sizing
+number. The current Civo UAT baseline through the public API and object-store
+backend is roughly linear to **~128 concurrent write clients**, with an observed
+ceiling of **~312 writes/sec** and p99 moving into seconds past the knee; an
+Iceberg-mirror-on sanity sweep in one tenant landed in the same range but
+saturated CPU at high concurrency. See
+**[Sizing & capacity](operations/sizing.md#current-civo-write-slo)** before using
+these numbers for deployment sizing. Reproduce the local lab benchmark with
 `cargo test --release -p bluedb-sql --test throughput_bench -- --ignored`.
 
 ## Start here
