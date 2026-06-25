@@ -40,6 +40,28 @@ enum Backend {
     LocalDisk,
 }
 
+#[derive(Clone, Copy)]
+enum TableShape {
+    AppendOnly,
+    PrimaryKey,
+}
+
+impl TableShape {
+    fn ddl(self) -> &'static str {
+        match self {
+            TableShape::AppendOnly => "CREATE TABLE t (id INTEGER, body TEXT);",
+            TableShape::PrimaryKey => "CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT);",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            TableShape::AppendOnly => "append-only",
+            TableShape::PrimaryKey => "primary-key",
+        }
+    }
+}
+
 impl Backend {
     fn label(self) -> &'static str {
         match self {
@@ -102,13 +124,11 @@ fn percentile(sorted: &[Duration], p: f64) -> Duration {
 /// Drive `concurrency` connections doing single-row autocommit INSERTs for
 /// `RUN_SECS`. All share one `Database`, so they group-commit. Records per-insert
 /// latency and returns throughput + percentiles.
-async fn run_load(db: Arc<Db>, concurrency: usize) -> LoadResult {
+async fn run_load(db: Arc<Db>, concurrency: usize, shape: TableShape) -> LoadResult {
     let database = Arc::new(Database::new(db));
     {
         let mut glue = Glue::new(database.connection());
-        glue.execute("CREATE TABLE t (id INTEGER, body TEXT);")
-            .await
-            .expect("create table");
+        glue.execute(shape.ddl()).await.expect("create table");
     }
 
     let start = Instant::now();
@@ -166,7 +186,38 @@ async fn concurrency_sweep() {
         );
         for c in [1usize, 2, 4, 8, 16, 32, 64, 128, 256] {
             let db = open_db(backend, Some(25)).await;
-            let r = run_load(db, c).await;
+            let r = run_load(db, c, TableShape::AppendOnly).await;
+            println!(
+                "{c:>12} | {:>12.1} | {:>8.2?} | {:>8.2?} | {:>8.2?}",
+                r.per_sec, r.p50, r.p99, r.p999
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "throughput bench; run with --ignored --nocapture"]
+async fn primary_key_concurrency_sweep() {
+    // Mirrors the user-facing HTTP schema regime: strict public tables must have
+    // a PRIMARY KEY. This isolates the keyed-insert uniqueness path from the
+    // append-only group-commit benchmark above.
+    for backend in [Backend::Memory, Backend::LocalDisk] {
+        println!(
+            "\n=== concurrency sweep · {} · table={} · flush_interval=25ms · await_durable=true ===",
+            backend.label(),
+            TableShape::PrimaryKey.label()
+        );
+        println!(
+            "{:>12} | {:>12} | {:>9} | {:>9} | {:>9}",
+            "concurrency", "inserts/sec", "p50", "p99", "p99.9"
+        );
+        println!(
+            "{:-<12}-+-{:-<12}-+-{:-<9}-+-{:-<9}-+-{:-<9}",
+            "", "", "", "", ""
+        );
+        for c in [1usize, 2, 4, 8, 16, 32, 64, 128, 256] {
+            let db = open_db(backend, Some(25)).await;
+            let r = run_load(db, c, TableShape::PrimaryKey).await;
             println!(
                 "{c:>12} | {:>12.1} | {:>8.2?} | {:>8.2?} | {:>8.2?}",
                 r.per_sec, r.p50, r.p99, r.p999
@@ -190,7 +241,7 @@ async fn flush_interval_sweep() {
     println!("{:-<16}-+-{:-<12}-+-{:-<9}-+-{:-<9}", "", "", "", "");
     for ms in [100u64, 50, 25, 10] {
         let db = open_db(Backend::LocalDisk, Some(ms)).await;
-        let r = run_load(db, concurrency).await;
+        let r = run_load(db, concurrency, TableShape::AppendOnly).await;
         println!(
             "{:>14}ms | {:>12.1} | {:>8.2?} | {:>8.2?}",
             ms, r.per_sec, r.p50, r.p99
