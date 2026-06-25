@@ -120,6 +120,14 @@ impl WriterController {
         &self.node_id
     }
 
+    /// Observe the current live lease holder without attempting to acquire it.
+    ///
+    /// Routers use this to resolve the active writer for request forwarding.
+    pub async fn current_lease(&self) -> Result<Option<Lease>, HaError> {
+        let now = self.clock.now_millis();
+        Ok(self.provider.current(now).await?)
+    }
+
     /// Try to become the Active writer by acquiring the lease. Returns the
     /// granted [`Lease`], or [`HaError::LeaseHeldByAnother`].
     pub async fn promote(&self) -> Result<Lease, HaError> {

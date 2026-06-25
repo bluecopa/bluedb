@@ -6,7 +6,10 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;
-use bluedb_ha::{LeaseProvider, LocalLeaseProvider, SystemClock, WriterController};
+use bluedb_ha::{
+    InMemoryNodeRegistry, LeaseProvider, LocalLeaseProvider, NodeRegistry, SystemClock,
+    WriterController,
+};
 use bluedb_server::{build_app, AppState};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
@@ -643,6 +646,87 @@ async fn failover_new_writer_sees_prior_data_and_can_write() {
         .0,
         StatusCode::SERVICE_UNAVAILABLE
     );
+}
+
+#[tokio::test]
+async fn passive_node_forwards_schema_and_data_writes_to_active_writer() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let lease: Arc<dyn LeaseProvider> = Arc::new(LocalLeaseProvider::new());
+    let registry: Arc<dyn NodeRegistry> =
+        Arc::new(InMemoryNodeRegistry::new(Duration::from_secs(60)));
+
+    let writer = node("writer", store.clone(), lease.clone())
+        .with_node_registry(registry.clone())
+        .with_admin_sql_enabled(true);
+    writer.promote().await.expect("writer promotes");
+
+    let writer_app = build_app(writer.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind writer listener");
+    let addr = listener.local_addr().expect("writer listener addr");
+    registry
+        .heartbeat("writer", &format!("http://{addr}"))
+        .await
+        .expect("register writer URL");
+    let server_app = writer_app.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, server_app)
+            .await
+            .expect("writer server");
+    });
+    tokio::task::yield_now().await;
+
+    let passive = node("passive", store.clone(), lease).with_node_registry(registry);
+    let passive_app = build_app(passive);
+
+    let (status, body) = call(
+        &passive_app,
+        "POST",
+        "/schema/tables",
+        Some(json!({
+            "name": "forwarded_users",
+            "columns": [
+                { "name": "id", "type": "INTEGER", "primaryKey": true },
+                { "name": "name", "type": "TEXT", "nullable": false }
+            ],
+            "indexes": [
+                { "name": "forwarded_users_name", "columns": ["name"] }
+            ]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body,
+        json!({
+            "created": true,
+            "table": "forwarded_users",
+            "created_indexes": ["forwarded_users_name"]
+        })
+    );
+
+    let (status, body) = call(
+        &passive_app,
+        "POST",
+        "/tables/forwarded_users",
+        Some(json!({ "id": 1, "name": "alice" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!({ "inserted": 1 }));
+
+    let (status, body) = call(
+        &writer_app,
+        "GET",
+        "/tables/forwarded_users?select=id,name&order=name.asc",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!([{ "id": 1, "name": "alice" }]));
+
+    server.abort();
 }
 
 #[tokio::test]

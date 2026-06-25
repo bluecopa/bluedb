@@ -150,6 +150,21 @@ fn ttl_millis(ttl: Duration) -> i64 {
 
 #[async_trait]
 impl LeaseProvider for PostgresLeaseProvider {
+    async fn current(&self, now_millis: i64) -> Result<Option<Lease>> {
+        let row = self
+            .live()
+            .await?
+            .query_opt(
+                "SELECT holder, epoch, expires_at_millis \
+                 FROM bluedb_lease \
+                 WHERE resource = $1 AND expires_at_millis > $2",
+                &[&self.resource, &now_millis],
+            )
+            .await
+            .context("lease current")?;
+        Ok(row.as_ref().map(Self::row_to_lease))
+    }
+
     async fn try_acquire(
         &self,
         holder: &str,

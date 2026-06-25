@@ -64,6 +64,13 @@ impl K8sLeaseProvider {
 
 #[async_trait]
 impl LeaseProvider for K8sLeaseProvider {
+    async fn current(&self, now_millis: i64) -> Result<Option<Lease>> {
+        let Some(lease) = self.get_lease().await? else {
+            return Ok(None);
+        };
+        Ok(lease_to_grant(&lease).filter(|grant| grant.expires_at_millis > now_millis))
+    }
+
     async fn try_acquire(
         &self,
         holder: &str,
