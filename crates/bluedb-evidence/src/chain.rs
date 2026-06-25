@@ -92,8 +92,13 @@ impl Evidence {
     /// exists with a different mode, returns [`EvidenceError::ChainModeConflict`].
     pub async fn create_chain(&self, chain: &str, verified: bool) -> Result<(), EvidenceError> {
         let _lease = self.write_lease.lock().await;
-        let writer = self.substrate.require_writer().map_err(|_| EvidenceError::NotWriter)?;
-        if let Some(existing) = store::get_chain_meta(&self.substrate, &self.keyspace, chain).await? {
+        let writer = self
+            .substrate
+            .require_writer()
+            .map_err(|_| EvidenceError::NotWriter)?;
+        if let Some(existing) =
+            store::get_chain_meta(&self.substrate, &self.keyspace, chain).await?
+        {
             if existing.verified != verified {
                 return Err(EvidenceError::ChainModeConflict(chain.to_string()));
             }
@@ -105,7 +110,13 @@ impl Evidence {
             &store::encode(&ChainMeta { verified })?,
         );
         writer
-            .write_with_options(batch, &WriteOptions { await_durable: false, ..Default::default() })
+            .write_with_options(
+                batch,
+                &WriteOptions {
+                    await_durable: false,
+                    ..Default::default()
+                },
+            )
             .await
             .map_err(Self::storage_err)?;
         drop(_lease);
@@ -134,14 +145,23 @@ impl Evidence {
             // Fix 1: fold edges into the fingerprint.
             h.update((e.edges.len() as u64).to_be_bytes());
             for ed in &e.edges {
-                for field in [ed.graph.as_bytes(), ed.src.as_bytes(), ed.dst.as_bytes(), ed.etype.as_bytes()] {
+                for field in [
+                    ed.graph.as_bytes(),
+                    ed.src.as_bytes(),
+                    ed.dst.as_bytes(),
+                    ed.etype.as_bytes(),
+                ] {
                     h.update((field.len() as u64).to_be_bytes());
                     h.update(field);
                 }
                 h.update(ed.weight.to_be_bytes());
                 let discriminant: u8 = match &ed.op {
-                    crate::model::EdgeOp::Upsert { merge: crate::model::Merge::Set } => 0,
-                    crate::model::EdgeOp::Upsert { merge: crate::model::Merge::Max } => 1,
+                    crate::model::EdgeOp::Upsert {
+                        merge: crate::model::Merge::Set,
+                    } => 0,
+                    crate::model::EdgeOp::Upsert {
+                        merge: crate::model::Merge::Max,
+                    } => 1,
                     crate::model::EdgeOp::Delete => 2,
                 };
                 h.update([discriminant]);
@@ -172,24 +192,30 @@ impl Evidence {
     ) -> Result<Appended, EvidenceError> {
         // Fix 4: short-circuit an empty append — no lease, no write, no flush.
         if entries.is_empty() {
-            return Ok(Appended { base_seq: self.head(chain).await?, seqs: Vec::new() });
+            return Ok(Appended {
+                base_seq: self.head(chain).await?,
+                seqs: Vec::new(),
+            });
         }
 
         let _lease = self.write_lease.lock().await;
-        let writer = self.substrate.require_writer().map_err(|_| EvidenceError::NotWriter)?;
+        let writer = self
+            .substrate
+            .require_writer()
+            .map_err(|_| EvidenceError::NotWriter)?;
 
-        let existing_meta =
-            store::get_chain_meta(&self.substrate, &self.keyspace, chain).await?;
+        let existing_meta = store::get_chain_meta(&self.substrate, &self.keyspace, chain).await?;
         let fp = Self::fingerprint(&entries);
 
         // Idempotency check: if we have seen this key before, either replay or
         // reject (conflict).
         if let Some(key) = idem_key {
-            if let Some(rec) =
-                store::get_idem(&self.substrate, &self.keyspace, chain, key).await?
-            {
+            if let Some(rec) = store::get_idem(&self.substrate, &self.keyspace, chain, key).await? {
                 if rec.fingerprint == fp {
-                    return Ok(Appended { base_seq: rec.base_seq, seqs: rec.seqs });
+                    return Ok(Appended {
+                        base_seq: rec.base_seq,
+                        seqs: rec.seqs,
+                    });
                 }
                 return Err(EvidenceError::IdemConflict);
             }
@@ -239,7 +265,8 @@ impl Evidence {
         if !all_edges.is_empty() {
             let mut overlay: HashMap<Vec<u8>, Option<i64>> = HashMap::new();
             for d in &all_edges {
-                apply_edge_delta(&self.substrate, &self.keyspace, &mut batch, &mut overlay, d).await?;
+                apply_edge_delta(&self.substrate, &self.keyspace, &mut batch, &mut overlay, d)
+                    .await?;
             }
         }
 
@@ -263,18 +290,31 @@ impl Evidence {
 
         // Persist the idempotency record if requested.
         if let Some(key) = idem_key {
-            let rec = IdemRecord { base_seq: base, seqs: seqs.clone(), fingerprint: fp };
+            let rec = IdemRecord {
+                base_seq: base,
+                seqs: seqs.clone(),
+                fingerprint: fp,
+            };
             batch.put(self.keyspace.idem_key(chain, key), &store::encode(&rec)?);
         }
 
         writer
-            .write_with_options(batch, &WriteOptions { await_durable: false, ..Default::default() })
+            .write_with_options(
+                batch,
+                &WriteOptions {
+                    await_durable: false,
+                    ..Default::default()
+                },
+            )
             .await
             .map_err(Self::storage_err)?;
         drop(_lease);
         writer.flush().await.map_err(Self::storage_err)?;
 
-        Ok(Appended { base_seq: base, seqs })
+        Ok(Appended {
+            base_seq: base,
+            seqs,
+        })
     }
 
     // ---- Reads ----
@@ -325,12 +365,14 @@ impl Evidence {
         // Fix 5: check cap BEFORE fetching the next kv so we never pull an
         // extra SlateDB read once the cap is reached.
         while out.len() < cap {
-            let Some(kv) = iter.next().await.map_err(Self::storage_err)? else { break };
+            let Some(kv) = iter.next().await.map_err(Self::storage_err)? else {
+                break;
+            };
             let key = kv.key.as_ref();
             // The seq is the last 8 bytes of the key.
-            let tail: [u8; 8] = key[key.len() - 8..]
-                .try_into()
-                .map_err(|_| Self::storage_err("entry key too short: expected trailing 8-byte seq"))?;
+            let tail: [u8; 8] = key[key.len() - 8..].try_into().map_err(|_| {
+                Self::storage_err("entry key too short: expected trailing 8-byte seq")
+            })?;
             let seq = i64::from_be_bytes(tail);
             let rec: EntryRecord = store::decode(&kv.value)?;
             out.push((seq, rec));
@@ -355,8 +397,14 @@ impl Evidence {
     pub async fn digest(&self, chain: &str) -> Result<Digest, EvidenceError> {
         self.require_verified(chain).await?;
         match store::get_frontier(&self.substrate, &self.keyspace, chain).await? {
-            Some(f) => Ok(Digest { size: f.size, root: f.root() }),
-            None => Ok(Digest { size: 0, root: crate::merkle::empty_root() }),
+            Some(f) => Ok(Digest {
+                size: f.size,
+                root: f.root(),
+            }),
+            None => Ok(Digest {
+                size: 0,
+                root: crate::merkle::empty_root(),
+            }),
         }
     }
 
@@ -399,7 +447,11 @@ impl Evidence {
             size as u64,
         )
         .await?;
-        Ok(InclusionProof { seq, size, audit_path })
+        Ok(InclusionProof {
+            seq,
+            size,
+            audit_path,
+        })
     }
 
     /// Consistency proof between sizes `first` and `second` (second defaults to
@@ -426,7 +478,11 @@ impl Evidence {
             second as u64,
         )
         .await?;
-        Ok(ConsistencyProof { first, second, proof })
+        Ok(ConsistencyProof {
+            first,
+            second,
+            proof,
+        })
     }
 
     // ---- Erasure ----
@@ -437,16 +493,28 @@ impl Evidence {
     /// Idempotent. 404 if the entry is absent. Caller must hold `schema:admin`.
     pub async fn redact(&self, chain: &str, seq: i64) -> Result<(), EvidenceError> {
         let _lease = self.write_lease.lock().await;
-        let writer = self.substrate.require_writer().map_err(|_| EvidenceError::NotWriter)?;
+        let writer = self
+            .substrate
+            .require_writer()
+            .map_err(|_| EvidenceError::NotWriter)?;
         let mut rec = store::get_entry(&self.substrate, &self.keyspace, chain, seq)
             .await?
-            .ok_or(EvidenceError::EntryNotFound { chain: chain.to_string(), seq })?;
+            .ok_or(EvidenceError::EntryNotFound {
+                chain: chain.to_string(),
+                seq,
+            })?;
         rec.payload = Vec::new();
         rec.redacted = true;
         let mut batch = WriteBatch::new();
         batch.put(self.keyspace.entry_key(chain, seq), &store::encode(&rec)?);
         writer
-            .write_with_options(batch, &WriteOptions { await_durable: false, ..Default::default() })
+            .write_with_options(
+                batch,
+                &WriteOptions {
+                    await_durable: false,
+                    ..Default::default()
+                },
+            )
             .await
             .map_err(Self::storage_err)?;
         drop(_lease);
@@ -472,7 +540,10 @@ impl Evidence {
         retract_edges: bool,
     ) -> Result<(), EvidenceError> {
         let _lease = self.write_lease.lock().await;
-        let writer = self.substrate.require_writer().map_err(|_| EvidenceError::NotWriter)?;
+        let writer = self
+            .substrate
+            .require_writer()
+            .map_err(|_| EvidenceError::NotWriter)?;
         let verified = store::get_chain_meta(&self.substrate, &self.keyspace, chain)
             .await?
             .map(|m| m.verified)
@@ -482,7 +553,10 @@ impl Evidence {
         }
         let rec = store::get_entry(&self.substrate, &self.keyspace, chain, seq)
             .await?
-            .ok_or(EvidenceError::EntryNotFound { chain: chain.to_string(), seq })?;
+            .ok_or(EvidenceError::EntryNotFound {
+                chain: chain.to_string(),
+                seq,
+            })?;
 
         let mut batch = WriteBatch::new();
         batch.delete(self.keyspace.entry_key(chain, seq));
@@ -499,12 +573,25 @@ impl Evidence {
                     etype: e.etype.clone(),
                     op: crate::model::EdgeOp::Delete,
                 };
-                apply_edge_delta(&self.substrate, &self.keyspace, &mut batch, &mut overlay, &d).await?;
+                apply_edge_delta(
+                    &self.substrate,
+                    &self.keyspace,
+                    &mut batch,
+                    &mut overlay,
+                    &d,
+                )
+                .await?;
             }
         }
 
         writer
-            .write_with_options(batch, &WriteOptions { await_durable: false, ..Default::default() })
+            .write_with_options(
+                batch,
+                &WriteOptions {
+                    await_durable: false,
+                    ..Default::default()
+                },
+            )
             .await
             .map_err(Self::storage_err)?;
         drop(_lease);
@@ -516,12 +603,14 @@ impl Evidence {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use bluedb_sql::Database;
     use slatedb::{object_store::memory::InMemory, Db};
+    use std::sync::Arc;
 
     async fn db() -> Database {
-        let d = Db::open("chain-test", Arc::new(InMemory::new())).await.unwrap();
+        let d = Db::open("chain-test", Arc::new(InMemory::new()))
+            .await
+            .unwrap();
         Database::new(Arc::new(d))
     }
 
@@ -538,9 +627,18 @@ mod tests {
         let mut leaves: Vec<[u8; 32]> = Vec::new();
         for i in 0..16u8 {
             let payload = vec![i];
-            ev.append("c", vec![EntryInput { etype: "t".into(), payload: payload.clone(), at: String::new(), edges: vec![] }], None)
-                .await
-                .unwrap();
+            ev.append(
+                "c",
+                vec![EntryInput {
+                    etype: "t".into(),
+                    payload: payload.clone(),
+                    at: String::new(),
+                    edges: vec![],
+                }],
+                None,
+            )
+            .await
+            .unwrap();
             leaves.push(crate::merkle::leaf_hash("t", &payload, "", &[]));
             let size = leaves.len() as u64;
             // Check every complete subtree fully inside [0, size).
@@ -556,7 +654,9 @@ mod tests {
                     let got = store::get_merkle_node(&substrate, &ks, "c", level, index)
                         .await
                         .unwrap()
-                        .unwrap_or_else(|| panic!("node (L{level},{index}) missing at size {size}"));
+                        .unwrap_or_else(|| {
+                            panic!("node (L{level},{index}) missing at size {size}")
+                        });
                     assert_eq!(
                         got,
                         crate::merkle::merkle_root(&leaves[lo..hi]),

@@ -98,10 +98,7 @@ where
 
     Ok(match DeletedRepr::deserialize(deserializer)? {
         DeletedRepr::Map(m) => m,
-        DeletedRepr::Legacy(ids) => ids
-            .into_iter()
-            .map(|id| (id, LEGACY_DELETED_AT))
-            .collect(),
+        DeletedRepr::Legacy(ids) => ids.into_iter().map(|id| (id, LEGACY_DELETED_AT)).collect(),
     })
 }
 
@@ -239,10 +236,7 @@ impl Tombstones {
     }
 
     /// Load tombstones for `index_id` using the conventional blob key.
-    pub async fn load_for<B: BlobStore + ?Sized>(
-        blob: &B,
-        index_id: &str,
-    ) -> anyhow::Result<Self> {
+    pub async fn load_for<B: BlobStore + ?Sized>(blob: &B, index_id: &str) -> anyhow::Result<Self> {
         Self::load(blob, &Self::blob_key_for(index_id)).await
     }
 }

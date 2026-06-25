@@ -76,11 +76,16 @@ async fn prepare_and_run(
     let rewritten = bluedb_sql::prepare_composite_pk(&mut glue.storage, sql, &param_values(params))
         .await
         .map_err(|e| EngineError::Sql(e.into()))?;
-    Ok(glue.execute_with_params(&rewritten, literals(params)).await?)
+    Ok(glue
+        .execute_with_params(&rewritten, literals(params))
+        .await?)
 }
 
 /// Execute a typed [`RestQuery`] (`SELECT`) with bound parameters.
-pub async fn execute_query(glue: &mut Glue<SlateDbStorage>, query: &RestQuery) -> Result<Vec<Payload>> {
+pub async fn execute_query(
+    glue: &mut Glue<SlateDbStorage>,
+    query: &RestQuery,
+) -> Result<Vec<Payload>> {
     let (sql, params) = query.to_sql_with_params()?;
     prepare_and_run(glue, &sql, &params).await
 }
@@ -99,7 +104,10 @@ pub async fn execute_query_str(
 /// transaction). A multi-row `req` is therefore **not atomic**. The server
 /// uses this only for single-object POSTs (one row); array bodies go through
 /// [`execute_insert_batch`] for atomicity.
-pub async fn execute_insert(glue: &mut Glue<SlateDbStorage>, req: &InsertRequest) -> Result<Vec<Payload>> {
+pub async fn execute_insert(
+    glue: &mut Glue<SlateDbStorage>,
+    req: &InsertRequest,
+) -> Result<Vec<Payload>> {
     let (stmts, params) = req.row_statements_with_params()?;
     let sql = format!("{};", stmts.join("; "));
     prepare_and_run(glue, &sql, &params).await
@@ -118,13 +126,19 @@ pub async fn execute_insert_batch(
 }
 
 /// Execute an [`UpdateRequest`] with bound parameters.
-pub async fn execute_update(glue: &mut Glue<SlateDbStorage>, req: &UpdateRequest) -> Result<Vec<Payload>> {
+pub async fn execute_update(
+    glue: &mut Glue<SlateDbStorage>,
+    req: &UpdateRequest,
+) -> Result<Vec<Payload>> {
     let (sql, params) = req.to_sql_with_params()?;
     prepare_and_run(glue, &sql, &params).await
 }
 
 /// Execute a [`DeleteRequest`] with bound parameters.
-pub async fn execute_delete(glue: &mut Glue<SlateDbStorage>, req: &DeleteRequest) -> Result<Vec<Payload>> {
+pub async fn execute_delete(
+    glue: &mut Glue<SlateDbStorage>,
+    req: &DeleteRequest,
+) -> Result<Vec<Payload>> {
     let (sql, params) = req.to_sql_with_params()?;
     prepare_and_run(glue, &sql, &params).await
 }
@@ -142,7 +156,8 @@ pub async fn execute_sql(
     allow_arbitrary: bool,
 ) -> Result<Vec<Payload>> {
     if !allow_arbitrary {
-        let parsed = parse(sql).map_err(|e: gluesql_core::error::Error| EngineError::Rejected(e.to_string()))?;
+        let parsed = parse(sql)
+            .map_err(|e: gluesql_core::error::Error| EngineError::Rejected(e.to_string()))?;
         if parsed.len() != 1 {
             return Err(EngineError::Rejected(format!(
                 "exactly one statement required, got {}",
@@ -159,7 +174,8 @@ pub async fn execute_sql(
         );
         if !is_dml {
             return Err(EngineError::Rejected(
-                "only SELECT/INSERT/UPDATE/DELETE allowed on /sql; use /admin/sql for DDL".to_string(),
+                "only SELECT/INSERT/UPDATE/DELETE allowed on /sql; use /admin/sql for DDL"
+                    .to_string(),
             ));
         }
     }

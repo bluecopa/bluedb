@@ -143,8 +143,7 @@ impl IndexWriter {
         drop(index); // index borrows dir; drop before dir falls out of scope
 
         let generation = manifest.max_generation() + 1;
-        let split_meta =
-            SplitMeta::new(split_id, num_docs, split_bytes.len() as u64, generation);
+        let split_meta = SplitMeta::new(split_id, num_docs, split_bytes.len() as u64, generation);
         let blob_key = split_meta.blob_key(&manifest.index_id);
         manifest.push(split_meta.clone());
 

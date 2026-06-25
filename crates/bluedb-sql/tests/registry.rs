@@ -52,7 +52,10 @@ async fn register_then_get_and_list() {
     let mut storage = new_storage().await;
     let mut registry = SchemaRegistry::new(&mut storage);
 
-    assert!(registry.get("users").await.unwrap().is_none(), "absent before register");
+    assert!(
+        registry.get("users").await.unwrap().is_none(),
+        "absent before register"
+    );
     assert!(registry.list().await.unwrap().is_empty());
 
     registry.register(&users_schema()).await.expect("register");
@@ -73,7 +76,10 @@ async fn validate_row_accepts_a_conforming_row() {
     registry.register(&users_schema()).await.unwrap();
 
     let ok = DataRow::Vec(vec![Value::I64(1), Value::Str("alice".to_owned())]);
-    registry.validate_row("users", &ok).await.expect("conforming row validates");
+    registry
+        .validate_row("users", &ok)
+        .await
+        .expect("conforming row validates");
 }
 
 #[tokio::test]
@@ -83,14 +89,20 @@ async fn validate_row_rejects_column_count_mismatch() {
     registry.register(&users_schema()).await.unwrap();
 
     let too_few = DataRow::Vec(vec![Value::I64(1)]);
-    assert!(registry.validate_row("users", &too_few).await.is_err(), "1 value, 2 columns");
+    assert!(
+        registry.validate_row("users", &too_few).await.is_err(),
+        "1 value, 2 columns"
+    );
 
     let too_many = DataRow::Vec(vec![
         Value::I64(1),
         Value::Str("a".to_owned()),
         Value::Str("extra".to_owned()),
     ]);
-    assert!(registry.validate_row("users", &too_many).await.is_err(), "3 values, 2 columns");
+    assert!(
+        registry.validate_row("users", &too_many).await.is_err(),
+        "3 values, 2 columns"
+    );
 }
 
 #[tokio::test]
@@ -100,7 +112,10 @@ async fn validate_row_rejects_type_mismatch() {
     registry.register(&users_schema()).await.unwrap();
 
     // id column is INT; a string there is a type error.
-    let bad = DataRow::Vec(vec![Value::Str("not-an-int".to_owned()), Value::Str("a".to_owned())]);
+    let bad = DataRow::Vec(vec![
+        Value::Str("not-an-int".to_owned()),
+        Value::Str("a".to_owned()),
+    ]);
     assert!(registry.validate_row("users", &bad).await.is_err());
 }
 
@@ -111,7 +126,10 @@ async fn validate_row_rejects_null_in_non_nullable_column() {
     registry.register(&users_schema()).await.unwrap();
 
     let bad = DataRow::Vec(vec![Value::Null, Value::Str("a".to_owned())]);
-    assert!(registry.validate_row("users", &bad).await.is_err(), "NULL into NOT NULL id");
+    assert!(
+        registry.validate_row("users", &bad).await.is_err(),
+        "NULL into NOT NULL id"
+    );
 }
 
 #[tokio::test]
@@ -120,7 +138,10 @@ async fn validate_row_rejects_unregistered_table() {
     let registry = SchemaRegistry::new(&mut storage);
 
     let row = DataRow::Vec(vec![Value::I64(1)]);
-    assert!(registry.validate_row("ghost", &row).await.is_err(), "unregistered table");
+    assert!(
+        registry.validate_row("ghost", &row).await.is_err(),
+        "unregistered table"
+    );
 }
 
 #[tokio::test]
@@ -140,7 +161,10 @@ async fn schemaless_table_accepts_any_row() {
     registry.register(&schemaless).await.unwrap();
 
     let anything = DataRow::Vec(vec![Value::I64(1), Value::Str("whatever".to_owned())]);
-    registry.validate_row("docs", &anything).await.expect("schemaless accepts any row");
+    registry
+        .validate_row("docs", &anything)
+        .await
+        .expect("schemaless accepts any row");
 }
 
 #[tokio::test]
@@ -159,6 +183,14 @@ async fn register_replaces_existing_schema() {
     registry.register(&replacement).await.unwrap();
 
     let got = registry.get("users").await.unwrap().unwrap();
-    assert_eq!(got.column_defs.unwrap().len(), 3, "replaced with the 3-column schema");
-    assert_eq!(registry.list().await.unwrap().len(), 1, "still one table named users");
+    assert_eq!(
+        got.column_defs.unwrap().len(),
+        3,
+        "replaced with the 3-column schema"
+    );
+    assert_eq!(
+        registry.list().await.unwrap().len(),
+        1,
+        "still one table named users"
+    );
 }

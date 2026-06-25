@@ -20,12 +20,12 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use arrow_array::builder::FixedSizeBinaryBuilder;
 use arrow_array::{
     ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
     Int32Array, Int64Array, LargeBinaryArray, RecordBatch, StringArray, Time64MicrosecondArray,
     TimestampMicrosecondArray,
 };
-use arrow_array::builder::FixedSizeBinaryBuilder;
 use arrow_schema::{DataType as ArrowDataType, TimeUnit};
 use bytes::Bytes;
 use chrono::Timelike;
@@ -92,7 +92,16 @@ impl LakehouseWriter {
         pk_field_id: i32,
     ) -> Result<Self> {
         let file_io = FileIO::new_with_fs();
-        Self::open(file_io, root, namespace, table, schema, pk_field_id, &[pk_field_id]).await
+        Self::open(
+            file_io,
+            root,
+            namespace,
+            table,
+            schema,
+            pk_field_id,
+            &[pk_field_id],
+        )
+        .await
     }
 
     /// Open the table at `<root>/<namespace>/<table>`: load it from
@@ -338,8 +347,10 @@ impl LakehouseWriter {
         // *projected* schema (just the PK), not the full table schema.
         let batch = self.keys_to_delete_batch(keys)?;
         let config = EqualityDeleteWriterConfig::new(vec![self.pk_field_id], self.schema.clone())?;
-        let parquet =
-            ParquetWriterBuilder::new(WriterProperties::builder().build(), self.projected_pk_schema()?);
+        let parquet = ParquetWriterBuilder::new(
+            WriterProperties::builder().build(),
+            self.projected_pk_schema()?,
+        );
         let rolling = RollingFileWriterBuilder::new_with_default_file_size(
             parquet,
             self.file_io.clone(),
@@ -436,7 +447,9 @@ impl LakehouseWriter {
             return Ok(0);
         };
         let metadata_ref = Arc::new(self.metadata.clone());
-        let list = snapshot.load_manifest_list(&self.file_io, &metadata_ref).await?;
+        let list = snapshot
+            .load_manifest_list(&self.file_io, &metadata_ref)
+            .await?;
         let mut count = 0;
         for mf in list.entries() {
             let manifest = mf.load_manifest(&self.file_io).await?;
@@ -459,10 +472,7 @@ impl LakehouseWriter {
     /// manifest-list `.avro`; the real table metadata is untouched. It is the
     /// building block for incremental compaction: rewrite a cohort's *current*
     /// rows without scanning (or disturbing) the rest of the table.
-    async fn scan_manifest_subset(
-        &self,
-        manifests: Vec<ManifestFile>,
-    ) -> Result<Vec<RecordBatch>> {
+    async fn scan_manifest_subset(&self, manifests: Vec<ManifestFile>) -> Result<Vec<RecordBatch>> {
         use futures::TryStreamExt;
 
         let snapshot_id = fresh_snapshot_id(&self.metadata);
@@ -526,7 +536,9 @@ impl LakehouseWriter {
             return Ok((Vec::new(), Vec::new()));
         };
         let metadata_ref = Arc::new(self.metadata.clone());
-        let list = snapshot.load_manifest_list(&self.file_io, &metadata_ref).await?;
+        let list = snapshot
+            .load_manifest_list(&self.file_io, &metadata_ref)
+            .await?;
         let mut data = Vec::new();
         let mut deletes = Vec::new();
         for mf in list.entries() {
@@ -588,7 +600,9 @@ impl LakehouseWriter {
             return Ok(0);
         };
         let metadata_ref = Arc::new(self.metadata.clone());
-        let list = snapshot.load_manifest_list(&self.file_io, &metadata_ref).await?;
+        let list = snapshot
+            .load_manifest_list(&self.file_io, &metadata_ref)
+            .await?;
         let mut count = 0;
         for mf in list.entries() {
             let manifest = mf.load_manifest(&self.file_io).await?;
@@ -1019,12 +1033,8 @@ fn build_arrow_column(arrow_dt: &ArrowDataType, cells: &[&Value]) -> Result<Arra
                 })
                 .collect::<BooleanArray>(),
         ),
-        ArrowDataType::Int32 => {
-            Arc::new(cells.iter().map(|v| to_i32(v)).collect::<Int32Array>())
-        }
-        ArrowDataType::Int64 => {
-            Arc::new(cells.iter().map(|v| to_i64(v)).collect::<Int64Array>())
-        }
+        ArrowDataType::Int32 => Arc::new(cells.iter().map(|v| to_i32(v)).collect::<Int32Array>()),
+        ArrowDataType::Int64 => Arc::new(cells.iter().map(|v| to_i64(v)).collect::<Int64Array>()),
         ArrowDataType::Float32 => Arc::new(
             cells
                 .iter()
@@ -1112,9 +1122,7 @@ fn build_arrow_column(arrow_dt: &ArrowDataType, cells: &[&Value]) -> Result<Arra
                 cells
                     .iter()
                     .map(|v| match v {
-                        Value::Date(d) => {
-                            Some(d.signed_duration_since(epoch).num_days() as i32)
-                        }
+                        Value::Date(d) => Some(d.signed_duration_since(epoch).num_days() as i32),
                         _ => None,
                     })
                     .collect::<Date32Array>(),
@@ -1122,46 +1130,37 @@ fn build_arrow_column(arrow_dt: &ArrowDataType, cells: &[&Value]) -> Result<Arra
         }
         // iceberg-rust maps Iceberg `timestamp` to Arrow `Timestamp(Microsecond, None)`.
         // gluesql stores NaiveDateTime; we compute microseconds since Unix epoch.
-        ArrowDataType::Timestamp(TimeUnit::Microsecond, None) => {
-            Arc::new(
-                cells
-                    .iter()
-                    .map(|v| match v {
-                        Value::Timestamp(dt) => {
-                            let secs = dt.and_utc().timestamp();
-                            let subsec_micros = dt.and_utc().timestamp_subsec_micros() as i64;
-                            secs.checked_mul(1_000_000)
-                                .and_then(|s| s.checked_add(subsec_micros))
-                        }
-                        _ => None,
-                    })
-                    .collect::<TimestampMicrosecondArray>(),
-            )
-        }
+        ArrowDataType::Timestamp(TimeUnit::Microsecond, None) => Arc::new(
+            cells
+                .iter()
+                .map(|v| match v {
+                    Value::Timestamp(dt) => {
+                        let secs = dt.and_utc().timestamp();
+                        let subsec_micros = dt.and_utc().timestamp_subsec_micros() as i64;
+                        secs.checked_mul(1_000_000)
+                            .and_then(|s| s.checked_add(subsec_micros))
+                    }
+                    _ => None,
+                })
+                .collect::<TimestampMicrosecondArray>(),
+        ),
         // iceberg-rust maps Iceberg `time` to Arrow `Time64(Microsecond)`.
         // gluesql stores NaiveTime; microseconds since midnight.
-        ArrowDataType::Time64(TimeUnit::Microsecond) => {
-            Arc::new(
-                cells
-                    .iter()
-                    .map(|v| match v {
-                        Value::Time(t) => {
-                            let h = t.hour() as i64;
-                            let m = t.minute() as i64;
-                            let s = t.second() as i64;
-                            let micros = t.nanosecond() as i64 / 1_000;
-                            Some(
-                                h * 3_600_000_000
-                                    + m * 60_000_000
-                                    + s * 1_000_000
-                                    + micros,
-                            )
-                        }
-                        _ => None,
-                    })
-                    .collect::<Time64MicrosecondArray>(),
-            )
-        }
+        ArrowDataType::Time64(TimeUnit::Microsecond) => Arc::new(
+            cells
+                .iter()
+                .map(|v| match v {
+                    Value::Time(t) => {
+                        let h = t.hour() as i64;
+                        let m = t.minute() as i64;
+                        let s = t.second() as i64;
+                        let micros = t.nanosecond() as i64 / 1_000;
+                        Some(h * 3_600_000_000 + m * 60_000_000 + s * 1_000_000 + micros)
+                    }
+                    _ => None,
+                })
+                .collect::<Time64MicrosecondArray>(),
+        ),
         // iceberg-rust maps Iceberg `uuid` to Arrow `FixedSizeBinary(16)`.
         // gluesql stores a u128; we write its 16 big-endian bytes.
         ArrowDataType::FixedSizeBinary(16) => {
@@ -1244,8 +1243,18 @@ mod scoped_scan_spike {
         use arrow_array::{Int64Array, StringArray};
         let mut out = std::collections::BTreeMap::new();
         for b in batches {
-            let ids = b.column_by_name("id").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
-            let bodies = b.column_by_name("body").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+            let ids = b
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let bodies = b
+                .column_by_name("body")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
             for i in 0..b.num_rows() {
                 out.insert(ids.value(i), bodies.value(i).to_string());
             }
@@ -1271,11 +1280,16 @@ mod scoped_scan_spike {
         w.commit_snapshot(3).await.unwrap();
 
         // Full merged state is {1:"A", 2:"b"}.
-        let full = rows_of(&w.scan_manifest_subset({
-            let (mut d, mut del) = w.live_manifest_files().await.unwrap();
-            d.append(&mut del);
-            d
-        }).await.unwrap()).await;
+        let full = rows_of(
+            &w.scan_manifest_subset({
+                let (mut d, mut del) = w.live_manifest_files().await.unwrap();
+                d.append(&mut del);
+                d
+            })
+            .await
+            .unwrap(),
+        )
+        .await;
         assert_eq!(full.get(&1).map(String::as_str), Some("A"));
         assert_eq!(full.get(&2).map(String::as_str), Some("b"));
 
@@ -1300,7 +1314,9 @@ mod scoped_scan_spike {
 #[cfg(test)]
 mod reconcile_tests {
     use super::reconcile_schema;
-    use iceberg::spec::{NestedField, NestedFieldRef, PrimitiveType, Schema as IcebergSchema, Type};
+    use iceberg::spec::{
+        NestedField, NestedFieldRef, PrimitiveType, Schema as IcebergSchema, Type,
+    };
 
     fn field(id: i32, name: &str, req: bool) -> NestedField {
         let ty = Type::Primitive(PrimitiveType::String);
@@ -1341,7 +1357,11 @@ mod reconcile_tests {
         let cur = schema(1, vec![field(1, "id", true), field(2, "a", false)]);
         let des = schema(
             1,
-            vec![field(1, "id", true), field(2, "a", false), field(3, "c", false)],
+            vec![
+                field(1, "id", true),
+                field(2, "a", false),
+                field(3, "c", false),
+            ],
         );
         let out = reconcile_schema(&cur, &des).unwrap().unwrap();
         assert_eq!(
@@ -1355,7 +1375,11 @@ mod reconcile_tests {
         // current [id(1), a(2), b(3)] → desired drops `a` → [id(1), b(3)].
         let cur = schema(
             1,
-            vec![field(1, "id", true), field(2, "a", false), field(3, "b", false)],
+            vec![
+                field(1, "id", true),
+                field(2, "a", false),
+                field(3, "b", false),
+            ],
         );
         let des = schema(1, vec![field(1, "id", true), field(3, "b", false)]);
         let out = reconcile_schema(&cur, &des).unwrap().unwrap();

@@ -66,7 +66,10 @@ pub(crate) struct SearchEngine {
 
 impl SearchEngine {
     pub(crate) fn empty() -> Arc<Self> {
-        Arc::new(Self { blob: None, indexes: RwLock::new(HashMap::new()) })
+        Arc::new(Self {
+            blob: None,
+            indexes: RwLock::new(HashMap::new()),
+        })
     }
 
     pub(crate) fn new_durable(substrate: Substrate) -> Arc<Self> {
@@ -87,10 +90,9 @@ impl SearchEngine {
         coll: &str,
         ss: &SearchSchema,
     ) -> Result<Arc<FtsIndex>, AppError> {
-        let blob = self
-            .blob
-            .clone()
-            .ok_or_else(|| AppError::service_unavailable("search writes require the active writer"))?;
+        let blob = self.blob.clone().ok_or_else(|| {
+            AppError::service_unavailable("search writes require the active writer")
+        })?;
         let key = (tenant.to_string(), coll.to_string());
         {
             let r = self.indexes.read().await;
@@ -113,7 +115,6 @@ impl SearchEngine {
             .await
             .remove(&(tenant.to_string(), coll.to_string()));
     }
-
 }
 
 /// Build an HTTP error from a `bluedb_search::SearchError` (ES-style: 400 for
@@ -211,7 +212,9 @@ pub(crate) async fn get_mapping(
         Ok(rows) => rows,
         Err(_) => return Ok(None),
     };
-    let Some(row) = rows.into_iter().next() else { return Ok(None) };
+    let Some(row) = rows.into_iter().next() else {
+        return Ok(None);
+    };
     let json = row.get("mapping").and_then(Value::as_str).unwrap_or("");
     if json.is_empty() {
         return Ok(None);
@@ -239,7 +242,11 @@ pub(crate) async fn list_mapped_collections(
     };
     Ok(rows
         .into_iter()
-        .filter_map(|r| r.get("collection").and_then(Value::as_str).map(str::to_string))
+        .filter_map(|r| {
+            r.get("collection")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
         .collect())
 }
 
@@ -278,7 +285,9 @@ pub(crate) fn doc_to_tantivy(
     let id_resolved = ss.field(ID_FIELD)?;
     td.add_text(id_resolved.field, id);
     for name in spec.fields.keys() {
-        let Some(resolved) = ss.field(name) else { continue };
+        let Some(resolved) = ss.field(name) else {
+            continue;
+        };
         let Some(v) = doc.get(name) else { continue };
         match resolved.kind {
             FieldKindInfo::Text(_) | FieldKindInfo::Keyword => {
@@ -313,7 +322,9 @@ pub(crate) async fn maintain_on_upsert(
     if docs.is_empty() {
         return Ok(());
     }
-    let Some(spec) = get_mapping(state, tenant, coll).await? else { return Ok(()) };
+    let Some(spec) = get_mapping(state, tenant, coll).await? else {
+        return Ok(());
+    };
     let ss = bluedb_search::mapping::compile(&spec).map_err(search_err)?;
     let engine = state.search().await;
     let idx = engine.index_for(tenant, coll, &ss).await?;
@@ -347,7 +358,9 @@ pub(crate) async fn maintain_on_delete(
     if ids.is_empty() {
         return Ok(());
     }
-    let Some(spec) = get_mapping(state, tenant, coll).await? else { return Ok(()) };
+    let Some(spec) = get_mapping(state, tenant, coll).await? else {
+        return Ok(());
+    };
     let ss = bluedb_search::mapping::compile(&spec).map_err(search_err)?;
     let engine = state.search().await;
     let idx = engine.index_for(tenant, coll, &ss).await?;
@@ -420,7 +433,9 @@ pub(crate) async fn create_search_index(
             .map_err(|e| AppError::internal(format!("backfill index: {e}")))?;
     }
 
-    Ok(Json(serde_json::json!({"acknowledged": true, "backfilled": backfilled})))
+    Ok(Json(
+        serde_json::json!({"acknowledged": true, "backfilled": backfilled}),
+    ))
 }
 
 /// `GET /collections/{coll}/searchIndex` — describe the persisted mapping.
@@ -456,8 +471,8 @@ pub(crate) async fn search(
     let coll = ident(&coll)?.to_string();
     let started = Instant::now();
 
-    let req: bluedb_search::model::SearchRequest =
-        serde_json::from_value(body).map_err(|e| AppError::bad_request(format!("bad search body: {e}")))?;
+    let req: bluedb_search::model::SearchRequest = serde_json::from_value(body)
+        .map_err(|e| AppError::bad_request(format!("bad search body: {e}")))?;
 
     if req.from.saturating_add(req.size) > MAX_RESULT_WINDOW {
         return Err(AppError::bad_request(format!(
@@ -486,7 +501,12 @@ pub(crate) async fn search(
         } else {
             match ss.field(&sc.field).map(|r| r.kind) {
                 Some(FieldKindInfo::Integer) => idx
-                    .search_query_sorted_ids(compiled.query.as_ref(), &sc.field, sc.descending, page)
+                    .search_query_sorted_ids(
+                        compiled.query.as_ref(),
+                        &sc.field,
+                        sc.descending,
+                        page,
+                    )
                     .await
                     .map_err(|e| AppError::internal(format!("search: {e}")))?,
                 _ => {
@@ -508,13 +528,13 @@ pub(crate) async fn search(
         .map_err(|e| AppError::internal(format!("count: {e}")))?;
     // The count is capped per split (see `bluedb_fts::search::COUNT_CAP`); a
     // dedup'd total at the cap is a lower bound, surfaced ES-style as `"gte"`.
-    let total_relation = if total >= bluedb_fts::search::COUNT_CAP { "gte" } else { "eq" };
+    let total_relation = if total >= bluedb_fts::search::COUNT_CAP {
+        "gte"
+    } else {
+        "eq"
+    };
 
-    let page_slice: Vec<(String, f32)> = ranked
-        .into_iter()
-        .skip(req.from)
-        .take(req.size)
-        .collect();
+    let page_slice: Vec<(String, f32)> = ranked.into_iter().skip(req.from).take(req.size).collect();
 
     let sources = if matches!(req.source, bluedb_search::model::SourceSpec::Bool(false)) {
         HashMap::new()
@@ -538,7 +558,9 @@ pub(crate) async fn search(
         timed_out: false,
         hits: block,
     };
-    Ok(Json(serde_json::to_value(resp).map_err(|e| AppError::internal(e.to_string()))?))
+    Ok(Json(
+        serde_json::to_value(resp).map_err(|e| AppError::internal(e.to_string()))?,
+    ))
 }
 
 /// Fetch `_source` JSON for the ranked ids, returning id -> doc.
@@ -556,7 +578,10 @@ async fn fetch_sources(
         "SELECT _id, doc FROM \"{coll}\" WHERE _id IN ({});",
         placeholders.join(", ")
     );
-    let params: Vec<Value> = ranked.iter().map(|(id, _)| Value::String(id.clone())).collect();
+    let params: Vec<Value> = ranked
+        .iter()
+        .map(|(id, _)| Value::String(id.clone()))
+        .collect();
     let rows = crate::collections::run_read_routed_for_mutation(state, tenant, &sql, &params)
         .await
         .unwrap_or_default();
@@ -583,7 +608,9 @@ pub(crate) async fn sweep_all_tenants_compaction(state: &AppState) -> Result<(),
     }
     for tenant in list_search_tenants(state).await? {
         for coll in list_mapped_collections(state, &tenant).await? {
-            let Some(spec) = get_mapping(state, &tenant, &coll).await? else { continue };
+            let Some(spec) = get_mapping(state, &tenant, &coll).await? else {
+                continue;
+            };
             let ss = match bluedb_search::mapping::compile(&spec) {
                 Ok(ss) => ss,
                 Err(_) => continue,

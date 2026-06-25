@@ -384,7 +384,10 @@ impl Keyspace {
     /// `>= TAG_EXTERNAL_BASE` so it cannot collide with bluedb-sql's own
     /// namespaces; this is asserted.
     pub fn external_key(&self, tag: u8, suffix: &[u8]) -> Vec<u8> {
-        assert!(tag >= TAG_EXTERNAL_BASE, "external tag must be >= TAG_EXTERNAL_BASE");
+        assert!(
+            tag >= TAG_EXTERNAL_BASE,
+            "external tag must be >= TAG_EXTERNAL_BASE"
+        );
         let mut key = self.tagged(tag, suffix.len());
         key.extend_from_slice(suffix);
         key
@@ -393,7 +396,10 @@ impl Keyspace {
     /// The shared prefix of every key in external namespace `tag`
     /// (`<tenant> <tag>`), for range scans. `tag` must be `>= TAG_EXTERNAL_BASE`.
     pub fn external_prefix(&self, tag: u8) -> Vec<u8> {
-        assert!(tag >= TAG_EXTERNAL_BASE, "external tag must be >= TAG_EXTERNAL_BASE");
+        assert!(
+            tag >= TAG_EXTERNAL_BASE,
+            "external tag must be >= TAG_EXTERNAL_BASE"
+        );
         self.tagged(tag, 0)
     }
 }
@@ -443,7 +449,7 @@ mod tests {
         let t = ks.data_prefix(1);
         let t2 = ks.data_prefix(2);
         assert!(!t2.starts_with(&t));
-        let t_row = ks.row_key(1,&Key::I64(99)).unwrap();
+        let t_row = ks.row_key(1, &Key::I64(99)).unwrap();
         let t2_prefix = ks.data_prefix(2);
         assert!(!t_row.starts_with(&t2_prefix));
     }
@@ -454,10 +460,10 @@ mod tests {
         // Integer keys: byte order of row keys must match numeric order,
         // including across the sign boundary.
         let mut keys: Vec<Key> = vec![Key::I64(100), Key::I64(-5), Key::I64(0), Key::I64(7)];
-        let mut encoded: Vec<Vec<u8>> = keys.iter().map(|k| ks.row_key(1,k).unwrap()).collect();
+        let mut encoded: Vec<Vec<u8>> = keys.iter().map(|k| ks.row_key(1, k).unwrap()).collect();
         encoded.sort();
         keys.sort();
-        let resorted: Vec<Vec<u8>> = keys.iter().map(|k| ks.row_key(1,k).unwrap()).collect();
+        let resorted: Vec<Vec<u8>> = keys.iter().map(|k| ks.row_key(1, k).unwrap()).collect();
         assert_eq!(encoded, resorted);
     }
 
@@ -467,8 +473,8 @@ mod tests {
         let b = Keyspace::new("bob");
         // Same table name, same pk, but the encoded keys differ and neither is
         // a prefix of the other.
-        let ka = a.row_key(1,&Key::I64(1)).unwrap();
-        let kb = b.row_key(1,&Key::I64(1)).unwrap();
+        let ka = a.row_key(1, &Key::I64(1)).unwrap();
+        let kb = b.row_key(1, &Key::I64(1)).unwrap();
         assert_ne!(ka, kb);
         assert!(!ka.starts_with(&b.data_prefix(1)));
         assert!(!kb.starts_with(&a.data_prefix(1)));
@@ -482,19 +488,19 @@ mod tests {
         let ks = ks();
         // Same indexed value, different pks → ordered by pk.
         let e1 = ks
-            .index_entry_key(1, "i",&Key::I64(5), &Key::I64(1))
+            .index_entry_key(1, "i", &Key::I64(5), &Key::I64(1))
             .unwrap();
         let e2 = ks
-            .index_entry_key(1, "i",&Key::I64(5), &Key::I64(2))
+            .index_entry_key(1, "i", &Key::I64(5), &Key::I64(2))
             .unwrap();
         assert!(e1 < e2);
         // Different indexed values → ordered by value first.
         let e3 = ks
-            .index_entry_key(1, "i",&Key::I64(6), &Key::I64(1))
+            .index_entry_key(1, "i", &Key::I64(6), &Key::I64(1))
             .unwrap();
         assert!(e2 < e3);
         // Every entry for value 5 falls under the value prefix.
-        let vp = ks.index_value_prefix(1, "i",&Key::I64(5)).unwrap();
+        let vp = ks.index_value_prefix(1, "i", &Key::I64(5)).unwrap();
         assert!(e1.starts_with(&vp));
         assert!(e2.starts_with(&vp));
         assert!(!e3.starts_with(&vp));
@@ -511,7 +517,7 @@ mod tests {
         let encoded: Vec<Vec<u8>> = values
             .iter()
             .map(|v| {
-                ks.index_entry_key(1, "i",&Key::Str((*v).to_owned()), &Key::I64(1))
+                ks.index_entry_key(1, "i", &Key::Str((*v).to_owned()), &Key::I64(1))
                     .unwrap()
             })
             .collect();
@@ -534,16 +540,16 @@ mod tests {
         // prevent that: an "ab" entry must NOT start with "a"'s value prefix,
         // and vice versa.
         let a_prefix = ks
-            .index_value_prefix(1, "i",&Key::Str("a".to_owned()))
+            .index_value_prefix(1, "i", &Key::Str("a".to_owned()))
             .unwrap();
         let ab_prefix = ks
-            .index_value_prefix(1, "i",&Key::Str("ab".to_owned()))
+            .index_value_prefix(1, "i", &Key::Str("ab".to_owned()))
             .unwrap();
         let ab_entry = ks
-            .index_entry_key(1, "i",&Key::Str("ab".to_owned()), &Key::I64(1))
+            .index_entry_key(1, "i", &Key::Str("ab".to_owned()), &Key::I64(1))
             .unwrap();
         let a_entry = ks
-            .index_entry_key(1, "i",&Key::Str("a".to_owned()), &Key::I64(1))
+            .index_entry_key(1, "i", &Key::Str("a".to_owned()), &Key::I64(1))
             .unwrap();
         assert!(!ab_prefix.starts_with(&a_prefix));
         assert!(!ab_entry.starts_with(&a_prefix));
@@ -560,22 +566,22 @@ mod tests {
         // Byte strings containing 0x00 must still sort correctly and stay
         // prefix-free: [0x00] vs [0x00, 0x00] vs [0x01].
         let v0 = ks
-            .index_entry_key(1, "i",&Key::Bytea(vec![0x00]), &Key::I64(1))
+            .index_entry_key(1, "i", &Key::Bytea(vec![0x00]), &Key::I64(1))
             .unwrap();
         let v00 = ks
-            .index_entry_key(1, "i",&Key::Bytea(vec![0x00, 0x00]), &Key::I64(1))
+            .index_entry_key(1, "i", &Key::Bytea(vec![0x00, 0x00]), &Key::I64(1))
             .unwrap();
         let v1 = ks
-            .index_entry_key(1, "i",&Key::Bytea(vec![0x01]), &Key::I64(1))
+            .index_entry_key(1, "i", &Key::Bytea(vec![0x01]), &Key::I64(1))
             .unwrap();
         assert!(v0 < v00);
         assert!(v00 < v1);
         // [0x00] is a byte-prefix of [0x00,0x00]; the value prefix must not be.
         let p0 = ks
-            .index_value_prefix(1, "i",&Key::Bytea(vec![0x00]))
+            .index_value_prefix(1, "i", &Key::Bytea(vec![0x00]))
             .unwrap();
         let p00 = ks
-            .index_value_prefix(1, "i",&Key::Bytea(vec![0x00, 0x00]))
+            .index_value_prefix(1, "i", &Key::Bytea(vec![0x00, 0x00]))
             .unwrap();
         assert!(!p00.starts_with(&p0));
     }
@@ -610,6 +616,9 @@ mod tests {
         let a = ks.external_key(TAG_EXTERNAL_BASE, &1u128.to_be_bytes());
         let b = ks.external_key(TAG_EXTERNAL_BASE, &2u128.to_be_bytes());
         let big = ks.external_key(TAG_EXTERNAL_BASE, &u128::MAX.to_be_bytes());
-        assert!(a < b && b < big, "big-endian u128 suffixes sort numerically");
+        assert!(
+            a < b && b < big,
+            "big-endian u128 suffixes sort numerically"
+        );
     }
 }

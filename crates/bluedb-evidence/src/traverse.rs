@@ -33,15 +33,23 @@ async fn scan_adjacency(
     let mut iter = view.scan_range(&start, end.as_deref()).await?;
     let mut out = Vec::new();
     let plen = prefix.len();
-    while let Some(kv) = iter.next().await.map_err(|e| EvidenceError::Storage(anyhow::anyhow!("{e}")))? {
+    while let Some(kv) = iter
+        .next()
+        .await
+        .map_err(|e| EvidenceError::Storage(anyhow::anyhow!("{e}")))?
+    {
         let key = kv.key.as_ref();
         let tail = &key[plen..];
         let w = {
-            let arr: [u8; 8] = tail.get(0..8).ok_or_else(|| {
-                EvidenceError::Storage(anyhow::anyhow!("adjacency key too short for weight"))
-            })?.try_into().map_err(|_| {
-                EvidenceError::Storage(anyhow::anyhow!("adjacency key too short for weight"))
-            })?;
+            let arr: [u8; 8] = tail
+                .get(0..8)
+                .ok_or_else(|| {
+                    EvidenceError::Storage(anyhow::anyhow!("adjacency key too short for weight"))
+                })?
+                .try_into()
+                .map_err(|_| {
+                    EvidenceError::Storage(anyhow::anyhow!("adjacency key too short for weight"))
+                })?;
             weight_from_obe(&arr)
         };
         let mut p = 8usize;
@@ -56,7 +64,11 @@ async fn scan_adjacency(
 fn read_lp(buf: &[u8], pos: &mut usize) -> Result<String, EvidenceError> {
     let err = || EvidenceError::Storage(anyhow::anyhow!("malformed adjacency key segment"));
     let len = {
-        let arr: [u8; 4] = buf.get(*pos..*pos + 4).ok_or_else(err)?.try_into().map_err(|_| err())?;
+        let arr: [u8; 4] = buf
+            .get(*pos..*pos + 4)
+            .ok_or_else(err)?
+            .try_into()
+            .map_err(|_| err())?;
         u32::from_be_bytes(arr) as usize
     };
     *pos += 4;
@@ -102,10 +114,12 @@ async fn expand_level(
     floor: i64,
     directed: bool,
 ) -> Result<Vec<String>, EvidenceError> {
-    let mut set: tokio::task::JoinSet<Result<Vec<String>, EvidenceError>> = tokio::task::JoinSet::new();
+    let mut set: tokio::task::JoinSet<Result<Vec<String>, EvidenceError>> =
+        tokio::task::JoinSet::new();
     let mut iter = nodes.iter();
 
-    let spawn_one = |set: &mut tokio::task::JoinSet<Result<Vec<String>, EvidenceError>>, node: &str| {
+    let spawn_one = |set: &mut tokio::task::JoinSet<Result<Vec<String>, EvidenceError>>,
+                     node: &str| {
         // Each task clones the pinned view (an Arc bump); every clone shares the
         // same snapshot seq, so the whole level reads one consistent cut.
         let view = view.clone();
@@ -119,7 +133,12 @@ async fn expand_level(
                 .map(|(v, _, _)| v)
                 .collect();
             if !directed {
-                ns.extend(in_neighbors(&view, &ks, &g, &n, floor).await?.into_iter().map(|(v, _, _)| v));
+                ns.extend(
+                    in_neighbors(&view, &ks, &g, &n, floor)
+                        .await?
+                        .into_iter()
+                        .map(|(v, _, _)| v),
+                );
             }
             Ok(ns)
         });
@@ -198,7 +217,10 @@ pub(crate) async fn widest_path(
     directed: bool,
 ) -> Result<WidestPath, EvidenceError> {
     if from == to {
-        return Ok(WidestPath { connected: true, bottleneck: None });
+        return Ok(WidestPath {
+            connected: true,
+            bottleneck: None,
+        });
     }
     // best[node] = best-known bottleneck to reach `node`. Source has +inf.
     let mut best: HashMap<String, i64> = HashMap::new();
@@ -212,7 +234,10 @@ pub(crate) async fn widest_path(
             continue; // stale heap entry
         }
         if u == to {
-            return Ok(WidestPath { connected: true, bottleneck: Some(bw) });
+            return Ok(WidestPath {
+                connected: true,
+                bottleneck: Some(bw),
+            });
         }
         let mut edges = out_neighbors(view, ks, graph, &u, i64::MIN).await?;
         if !directed {
@@ -226,20 +251,25 @@ pub(crate) async fn widest_path(
             }
         }
     }
-    Ok(WidestPath { connected: false, bottleneck: None })
+    Ok(WidestPath {
+        connected: false,
+        bottleneck: None,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use crate::graph::{EdgeRef, EdgeUpsert, Graph};
+    use crate::model::Merge;
     use bluedb_sql::Database;
     use slatedb::{object_store::memory::InMemory, Db};
-    use crate::graph::{Graph, EdgeRef, EdgeUpsert};
-    use crate::model::Merge;
+    use std::sync::Arc;
 
     async fn db() -> Database {
-        let d = Db::open("trav-unit", Arc::new(InMemory::new())).await.unwrap();
+        let d = Db::open("trav-unit", Arc::new(InMemory::new()))
+            .await
+            .unwrap();
         Database::new(Arc::new(d))
     }
 
@@ -247,30 +277,60 @@ mod tests {
     async fn out_neighbors_ascending_and_floor_filter() {
         let database = db().await;
         let g = Graph::new(&database, "_");
-        g.upsert("g", &[
-            EdgeUpsert { src: "A".into(), dst: "B".into(), weight: 2, etype: "x".into() },
-            EdgeUpsert { src: "A".into(), dst: "B".into(), weight: 9, etype: "y".into() },
-            EdgeUpsert { src: "A".into(), dst: "C".into(), weight: 5, etype: String::new() },
-        ], Merge::Set).await.unwrap();
+        g.upsert(
+            "g",
+            &[
+                EdgeUpsert {
+                    src: "A".into(),
+                    dst: "B".into(),
+                    weight: 2,
+                    etype: "x".into(),
+                },
+                EdgeUpsert {
+                    src: "A".into(),
+                    dst: "B".into(),
+                    weight: 9,
+                    etype: "y".into(),
+                },
+                EdgeUpsert {
+                    src: "A".into(),
+                    dst: "C".into(),
+                    weight: 5,
+                    etype: String::new(),
+                },
+            ],
+            Merge::Set,
+        )
+        .await
+        .unwrap();
 
         let view = database.substrate().read_view().await.unwrap();
         let ks = EvidenceKeyspace::new("_");
         let all = out_neighbors(&view, &ks, "g", "A", i64::MIN).await.unwrap();
-        assert_eq!(all, vec![
-            ("B".to_string(), 2, "x".to_string()),
-            ("C".to_string(), 5, "".to_string()),
-            ("B".to_string(), 9, "y".to_string()),
-        ]);
+        assert_eq!(
+            all,
+            vec![
+                ("B".to_string(), 2, "x".to_string()),
+                ("C".to_string(), 5, "".to_string()),
+                ("B".to_string(), 9, "y".to_string()),
+            ]
+        );
         let hi = out_neighbors(&view, &ks, "g", "A", 5).await.unwrap();
-        assert_eq!(hi, vec![
-            ("C".to_string(), 5, "".to_string()),
-            ("B".to_string(), 9, "y".to_string()),
-        ]);
+        assert_eq!(
+            hi,
+            vec![
+                ("C".to_string(), 5, "".to_string()),
+                ("B".to_string(), 9, "y".to_string()),
+            ]
+        );
         let inb = in_neighbors(&view, &ks, "g", "B", i64::MIN).await.unwrap();
-        assert_eq!(inb, vec![
-            ("A".to_string(), 2, "x".to_string()),
-            ("A".to_string(), 9, "y".to_string()),
-        ]);
+        assert_eq!(
+            inb,
+            vec![
+                ("A".to_string(), 2, "x".to_string()),
+                ("A".to_string(), 9, "y".to_string()),
+            ]
+        );
     }
 
     /// A `ReadView` pinned before a write must not observe that write across any
@@ -283,27 +343,55 @@ mod tests {
         let database = db().await;
         let g = Graph::new(&database, "_");
         let ks = EvidenceKeyspace::new("_");
-        g.upsert("g", &[
-            EdgeUpsert { src: "A".into(), dst: "B".into(), weight: 1, etype: String::new() },
-        ], Merge::Set).await.unwrap();
+        g.upsert(
+            "g",
+            &[EdgeUpsert {
+                src: "A".into(),
+                dst: "B".into(),
+                weight: 1,
+                etype: String::new(),
+            }],
+            Merge::Set,
+        )
+        .await
+        .unwrap();
 
         // Pin the cut: {A→B}.
         let pinned = database.substrate().read_view().await.unwrap();
-        assert!(pinned.snapshot_seq().is_some(), "writer view must be a true snapshot");
+        assert!(
+            pinned.snapshot_seq().is_some(),
+            "writer view must be a true snapshot"
+        );
 
         // Mutate after pinning.
-        g.upsert("g", &[
-            EdgeUpsert { src: "B".into(), dst: "C".into(), weight: 1, etype: String::new() },
-        ], Merge::Set).await.unwrap();
+        g.upsert(
+            "g",
+            &[EdgeUpsert {
+                src: "B".into(),
+                dst: "C".into(),
+                weight: 1,
+                etype: String::new(),
+            }],
+            Merge::Set,
+        )
+        .await
+        .unwrap();
 
         // The pinned view never sees B→C, so C is unreachable through it.
-        let seen = reachable(&pinned, &ks, "g", &["A".to_string()], i64::MIN, true).await.unwrap();
+        let seen = reachable(&pinned, &ks, "g", &["A".to_string()], i64::MIN, true)
+            .await
+            .unwrap();
         assert_eq!(seen, vec!["A".to_string(), "B".to_string()]);
 
         // A fresh view (taken now) sees the new edge.
         let fresh = database.substrate().read_view().await.unwrap();
-        let seen_now = reachable(&fresh, &ks, "g", &["A".to_string()], i64::MIN, true).await.unwrap();
-        assert_eq!(seen_now, vec!["A".to_string(), "B".to_string(), "C".to_string()]);
+        let seen_now = reachable(&fresh, &ks, "g", &["A".to_string()], i64::MIN, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            seen_now,
+            vec!["A".to_string(), "B".to_string(), "C".to_string()]
+        );
     }
 
     /// The Jepsen graph-swap invariant, in miniature. Config A = {R→A, A→Z};
@@ -318,26 +406,54 @@ mod tests {
         let database = db().await;
         let g = Graph::new(&database, "_");
         let ks = EvidenceKeyspace::new("_");
-        let e = |s: &str, d: &str| EdgeUpsert { src: s.into(), dst: d.into(), weight: 1, etype: String::new() };
-        let r = |s: &str, d: &str| EdgeRef { src: s.into(), dst: d.into(), etype: String::new() };
+        let e = |s: &str, d: &str| EdgeUpsert {
+            src: s.into(),
+            dst: d.into(),
+            weight: 1,
+            etype: String::new(),
+        };
+        let r = |s: &str, d: &str| EdgeRef {
+            src: s.into(),
+            dst: d.into(),
+            etype: String::new(),
+        };
 
         // Seed config A.
-        g.mutate("g", &[e("R", "A"), e("A", "Z")], &[], Merge::Set).await.unwrap();
+        g.mutate("g", &[e("R", "A"), e("A", "Z")], &[], Merge::Set)
+            .await
+            .unwrap();
 
         // Pin a view on config A, then atomically swap A → B.
         let pinned = database.substrate().read_view().await.unwrap();
-        g.mutate("g", &[e("R", "B"), e("B", "Z")], &[r("R", "A"), r("A", "Z")], Merge::Set).await.unwrap();
+        g.mutate(
+            "g",
+            &[e("R", "B"), e("B", "Z")],
+            &[r("R", "A"), r("A", "Z")],
+            Merge::Set,
+        )
+        .await
+        .unwrap();
 
         // The pinned snapshot still sees config A in full — Z reachable.
         let from_r = vec!["R".to_string()];
-        let pre = reachable(&pinned, &ks, "g", &from_r, i64::MIN, true).await.unwrap();
+        let pre = reachable(&pinned, &ks, "g", &from_r, i64::MIN, true)
+            .await
+            .unwrap();
         assert_eq!(pre, vec!["A".to_string(), "R".to_string(), "Z".to_string()]);
-        assert!(pre.contains(&"Z".to_string()), "sink must stay reachable on the pinned cut");
+        assert!(
+            pre.contains(&"Z".to_string()),
+            "sink must stay reachable on the pinned cut"
+        );
 
         // A fresh view sees config B in full (the swap was all-or-nothing) — Z
         // still reachable, never the torn {R, A}.
         let fresh = database.substrate().read_view().await.unwrap();
-        let post = reachable(&fresh, &ks, "g", &from_r, i64::MIN, true).await.unwrap();
-        assert_eq!(post, vec!["B".to_string(), "R".to_string(), "Z".to_string()]);
+        let post = reachable(&fresh, &ks, "g", &from_r, i64::MIN, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            post,
+            vec!["B".to_string(), "R".to_string(), "Z".to_string()]
+        );
     }
 }

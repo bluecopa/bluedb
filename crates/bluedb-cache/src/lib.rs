@@ -54,11 +54,11 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use foyer::{HybridCache, HybridCacheBuilder};
 use futures::stream::BoxStream;
+use object_store::{path::Path as OsPath, Attributes};
 use object_store::{
     GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as OsResult,
 };
-use object_store::{path::Path as OsPath, Attributes};
 
 // ---------------------------------------------------------------------------
 // Type aliases
@@ -196,11 +196,7 @@ impl ObjectStore for CachingObjectStore {
         Ok(bytes)
     }
 
-    async fn get_ranges(
-        &self,
-        location: &OsPath,
-        ranges: &[Range<u64>],
-    ) -> OsResult<Vec<Bytes>> {
+    async fn get_ranges(&self, location: &OsPath, ranges: &[Range<u64>]) -> OsResult<Vec<Bytes>> {
         // Per-range cache lookups so each immutable slice is cached individually.
         let mut out = Vec::with_capacity(ranges.len());
         for r in ranges {
@@ -423,11 +419,7 @@ mod tests {
             self.inner.get(location).await
         }
 
-        async fn get_opts(
-            &self,
-            location: &OsPath,
-            options: GetOptions,
-        ) -> OsResult<GetResult> {
+        async fn get_opts(&self, location: &OsPath, options: GetOptions) -> OsResult<GetResult> {
             if !options.head && options.range.is_none() {
                 self.gets.fetch_add(1, Ordering::Relaxed);
             } else if options.range.is_some() {
@@ -459,10 +451,7 @@ mod tests {
             self.inner.list(prefix)
         }
 
-        async fn list_with_delimiter(
-            &self,
-            prefix: Option<&OsPath>,
-        ) -> OsResult<ListResult> {
+        async fn list_with_delimiter(&self, prefix: Option<&OsPath>) -> OsResult<ListResult> {
             self.inner.list_with_delimiter(prefix).await
         }
 
@@ -500,9 +489,7 @@ mod tests {
     // Helper: build a DRAM-only CachingObjectStore wrapping a CountingStore
     // -----------------------------------------------------------------------
 
-    async fn make_caching(
-        counting: Arc<CountingStore>,
-    ) -> CachingObjectStore {
+    async fn make_caching(counting: Arc<CountingStore>) -> CachingObjectStore {
         CachingObjectStoreBuilder::new(counting as Arc<dyn ObjectStore>)
             .dram_bytes(4 * 1024 * 1024) // 4 MiB is plenty for tests
             .build()
@@ -523,7 +510,11 @@ mod tests {
         let path: OsPath = "data/file.parquet".into();
         let payload = Bytes::from_static(b"parquet-bytes-for-testing");
         counting
-            .put_opts(&path, PutPayload::from(payload.clone()), PutOptions::default())
+            .put_opts(
+                &path,
+                PutPayload::from(payload.clone()),
+                PutOptions::default(),
+            )
             .await
             .unwrap();
 
@@ -560,7 +551,11 @@ mod tests {
         let path: OsPath = "data/columns.parquet".into();
         let content = Bytes::from(vec![0u8; 1024]);
         counting
-            .put_opts(&path, PutPayload::from(content.clone()), PutOptions::default())
+            .put_opts(
+                &path,
+                PutPayload::from(content.clone()),
+                PutOptions::default(),
+            )
             .await
             .unwrap();
 
@@ -571,11 +566,19 @@ mod tests {
 
         // First range get — MISS.
         let slice1 = caching.get_range(&path, range.clone()).await.unwrap();
-        assert_eq!(slice1, content.slice(100..200), "first range: bytes must match");
+        assert_eq!(
+            slice1,
+            content.slice(100..200),
+            "first range: bytes must match"
+        );
 
         // Second range get — HIT; no new inner call.
         let slice2 = caching.get_range(&path, range.clone()).await.unwrap();
-        assert_eq!(slice2, content.slice(100..200), "second range: bytes must match");
+        assert_eq!(
+            slice2,
+            content.slice(100..200),
+            "second range: bytes must match"
+        );
 
         assert_eq!(
             counting.get_ranges(),
@@ -601,11 +604,19 @@ mod tests {
         let bytes_b = Bytes::from(vec![0xbb_u8; 512]);
 
         counting
-            .put_opts(&path_a, PutPayload::from(bytes_a.clone()), PutOptions::default())
+            .put_opts(
+                &path_a,
+                PutPayload::from(bytes_a.clone()),
+                PutOptions::default(),
+            )
             .await
             .unwrap();
         counting
-            .put_opts(&path_b, PutPayload::from(bytes_b.clone()), PutOptions::default())
+            .put_opts(
+                &path_b,
+                PutPayload::from(bytes_b.clone()),
+                PutOptions::default(),
+            )
             .await
             .unwrap();
 

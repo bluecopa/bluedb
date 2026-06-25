@@ -56,9 +56,7 @@ async fn make_cached_engine() -> (
     let stats = caching.stats();
     let caching_arc: Arc<dyn ObjectStore> = Arc::new(caching);
 
-    let db = Database::new(Arc::new(
-        Db::open("bluedb", slatedb_store).await.unwrap(),
-    ));
+    let db = Database::new(Arc::new(Db::open("bluedb", slatedb_store).await.unwrap()));
     let cdc = CdcConfig::default();
 
     // LakehouseEngine uses the CachingObjectStore for all Iceberg I/O.

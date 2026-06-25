@@ -71,7 +71,11 @@ fn feature_key(msg: &str) -> String {
         return format!("unsupported data type: {base}(n)");
     }
     if let Some(stmt) = rest.strip_prefix("unsupported statement: ") {
-        let kw = stmt.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
+        let kw = stmt
+            .split_whitespace()
+            .take(2)
+            .collect::<Vec<_>>()
+            .join(" ");
         return format!("unsupported statement: {kw}");
     }
     rest.to_string()
@@ -346,15 +350,29 @@ async fn main() -> anyhow::Result<()> {
     println!("files: {}   (parse errors: {parse_errors})", files.len());
     println!("scored records (statements + queries): {scored}");
     println!();
-    println!("  ENGINE-ACCEPTED  {accepted:>6}  ({:.1}%)   <- ran without engine error (reliable)", pct(accepted, scored));
-    println!("  ENGINE-REJECTED  {rejected:>6}  ({:.1}%)   (real feature gaps)", pct(rejected, scored));
+    println!(
+        "  ENGINE-ACCEPTED  {accepted:>6}  ({:.1}%)   <- ran without engine error (reliable)",
+        pct(accepted, scored)
+    );
+    println!(
+        "  ENGINE-REJECTED  {rejected:>6}  ({:.1}%)   (real feature gaps)",
+        pct(rejected, scored)
+    );
     println!("      unsupported  {:>6}", t.unsupported);
     println!("      other errors {:>6}", t.other);
-    println!("  CASCADE          {:>6}  ({:.1}%)   (downstream of a failed setup stmt — excluded above)", t.cascade, pct(t.cascade, scored));
+    println!(
+        "  CASCADE          {:>6}  ({:.1}%)   (downstream of a failed setup stmt — excluded above)",
+        t.cascade,
+        pct(t.cascade, scored)
+    );
     println!();
     println!("  of accepted (output comparison — lower bound, rendering still minimal):");
     println!("      PASS         {:>6}", t.pass);
-    println!("      WRONG-RESULT {:>6}  ({wrong_hashed} hashed / {} literal)", t.wrong, t.wrong - wrong_hashed);
+    println!(
+        "      WRONG-RESULT {:>6}  ({wrong_hashed} hashed / {} literal)",
+        t.wrong,
+        t.wrong - wrong_hashed
+    );
     println!("=======================================================");
 
     // The read-path-only figure: score QUERY records, exclude cascades (queries
@@ -396,7 +414,10 @@ async fn main() -> anyhow::Result<()> {
             println!("  {count:>5}  {key}");
         }
         if ranked.len() > 30 {
-            println!("  ... and {} more distinct read-path rejections", ranked.len() - 30);
+            println!(
+                "  ... and {} more distinct read-path rejections",
+                ranked.len() - 30
+            );
         }
     }
 

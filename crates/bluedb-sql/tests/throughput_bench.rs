@@ -62,7 +62,8 @@ async fn open_db(backend: Backend, flush_ms: Option<u64>) -> Arc<Db> {
             // PID + seq keeps each Db's dir unique *across* runs too (a bare seq
             // restarts at 0 each process and would reopen a prior run's tables).
             let seq = DIR_SEQ.fetch_add(1, Ordering::Relaxed);
-            let dir = std::env::temp_dir().join(format!("bluedb-bench-{}-{seq}", std::process::id()));
+            let dir =
+                std::env::temp_dir().join(format!("bluedb-bench-{}-{seq}", std::process::id()));
             std::fs::create_dir_all(&dir).expect("create bench dir");
             Arc::new(LocalFileSystem::new_with_prefix(&dir).expect("local fs"))
         }
@@ -72,7 +73,11 @@ async fn open_db(backend: Backend, flush_ms: Option<u64>) -> Arc<Db> {
         Some(ms) => {
             let mut settings = Settings::default();
             settings.flush_interval = Some(Duration::from_millis(ms));
-            Db::builder("bench", store).with_settings(settings).build().await.expect("open w/ settings")
+            Db::builder("bench", store)
+                .with_settings(settings)
+                .build()
+                .await
+                .expect("open w/ settings")
         }
     };
     Arc::new(db)
@@ -101,7 +106,9 @@ async fn run_load(db: Arc<Db>, concurrency: usize) -> LoadResult {
     let database = Arc::new(Database::new(db));
     {
         let mut glue = Glue::new(database.connection());
-        glue.execute("CREATE TABLE t (id INTEGER, body TEXT);").await.expect("create table");
+        glue.execute("CREATE TABLE t (id INTEGER, body TEXT);")
+            .await
+            .expect("create table");
     }
 
     let start = Instant::now();
@@ -115,7 +122,9 @@ async fn run_load(db: Arc<Db>, concurrency: usize) -> LoadResult {
             let mut n: u64 = 0;
             while Instant::now() < deadline {
                 let id = (w as u64) * 1_000_000_000 + n;
-                let sql = format!("INSERT INTO t (id, body) VALUES ({id}, 'lorem ipsum dolor sit amet');");
+                let sql = format!(
+                    "INSERT INTO t (id, body) VALUES ({id}, 'lorem ipsum dolor sit amet');"
+                );
                 let t0 = Instant::now();
                 glue.execute(&sql).await.expect("insert");
                 lats.push(t0.elapsed());
@@ -147,8 +156,14 @@ async fn concurrency_sweep() {
             "\n=== concurrency sweep · {} · flush_interval=25ms (bluedb default) · await_durable=true ===",
             backend.label()
         );
-        println!("{:>12} | {:>12} | {:>9} | {:>9} | {:>9}", "concurrency", "inserts/sec", "p50", "p99", "p99.9");
-        println!("{:-<12}-+-{:-<12}-+-{:-<9}-+-{:-<9}-+-{:-<9}", "", "", "", "", "");
+        println!(
+            "{:>12} | {:>12} | {:>9} | {:>9} | {:>9}",
+            "concurrency", "inserts/sec", "p50", "p99", "p99.9"
+        );
+        println!(
+            "{:-<12}-+-{:-<12}-+-{:-<9}-+-{:-<9}-+-{:-<9}",
+            "", "", "", "", ""
+        );
         for c in [1usize, 2, 4, 8, 16, 32, 64, 128, 256] {
             let db = open_db(backend, Some(25)).await;
             let r = run_load(db, c).await;
@@ -168,12 +183,18 @@ async fn flush_interval_sweep() {
         "\n=== flush_interval sweep · local-disk · concurrency={concurrency} · await_durable=true ===\n\
          (shorter interval = higher throughput, at the cost of more object-store PUTs)"
     );
-    println!("{:>16} | {:>12} | {:>9} | {:>9}", "flush_interval", "inserts/sec", "p50", "p99");
+    println!(
+        "{:>16} | {:>12} | {:>9} | {:>9}",
+        "flush_interval", "inserts/sec", "p50", "p99"
+    );
     println!("{:-<16}-+-{:-<12}-+-{:-<9}-+-{:-<9}", "", "", "", "");
     for ms in [100u64, 50, 25, 10] {
         let db = open_db(Backend::LocalDisk, Some(ms)).await;
         let r = run_load(db, concurrency).await;
-        println!("{:>14}ms | {:>12.1} | {:>8.2?} | {:>8.2?}", ms, r.per_sec, r.p50, r.p99);
+        println!(
+            "{:>14}ms | {:>12.1} | {:>8.2?} | {:>8.2?}",
+            ms, r.per_sec, r.p50, r.p99
+        );
     }
 }
 
@@ -195,10 +216,16 @@ async fn durability_microbench() {
         let start = Instant::now();
         for i in 0..N {
             let key = format!("k{i:08}");
-            db.put_with_options(key.as_bytes(), b"lorem ipsum dolor sit amet", &put, &wo).await.expect("put");
+            db.put_with_options(key.as_bytes(), b"lorem ipsum dolor sit amet", &put, &wo)
+                .await
+                .expect("put");
         }
         let elapsed = start.elapsed();
-        println!("{label:>22} | {:>12.1} | {:>13.2?}", N as f64 / elapsed.as_secs_f64(), elapsed / N as u32);
+        println!(
+            "{label:>22} | {:>12.1} | {:>13.2?}",
+            N as f64 / elapsed.as_secs_f64(),
+            elapsed / N as u32
+        );
         if !await_durable {
             db.flush().await.expect("flush");
         }

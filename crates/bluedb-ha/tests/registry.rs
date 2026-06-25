@@ -29,7 +29,10 @@ async fn heartbeat_makes_a_node_live_and_resolvable() {
     // Now live + resolvable.
     let live = reg.live_nodes().await.unwrap();
     assert_eq!(live, vec![("a".to_string(), "http://a:8080".to_string())]);
-    assert_eq!(reg.url_for("a").await.unwrap(), Some("http://a:8080".to_string()));
+    assert_eq!(
+        reg.url_for("a").await.unwrap(),
+        Some("http://a:8080".to_string())
+    );
     // Unknown node stays unresolvable.
     assert_eq!(reg.url_for("ghost").await.unwrap(), None);
 }
@@ -41,7 +44,10 @@ async fn entry_past_ttl_is_not_live() {
 
     clock.set(9_999);
     assert_eq!(reg.live_nodes().await.unwrap().len(), 1, "within TTL");
-    assert_eq!(reg.url_for("a").await.unwrap(), Some("http://a:8080".to_string()));
+    assert_eq!(
+        reg.url_for("a").await.unwrap(),
+        Some("http://a:8080".to_string())
+    );
 
     // Strictly past the TTL window → no longer live (and url_for hides it).
     clock.set(10_001);
@@ -95,5 +101,8 @@ async fn multi_node_tracks_each_independently() {
     let live = reg.live_nodes().await.unwrap();
     assert_eq!(live, vec![("b".to_string(), "http://b:8080".to_string())]);
     assert_eq!(reg.url_for("a").await.unwrap(), None);
-    assert_eq!(reg.url_for("b").await.unwrap(), Some("http://b:8080".to_string()));
+    assert_eq!(
+        reg.url_for("b").await.unwrap(),
+        Some("http://b:8080".to_string())
+    );
 }

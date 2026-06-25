@@ -71,12 +71,16 @@ impl Debug for ObjStoreFactory {
 // live handle through serde.
 impl Serialize for ObjStoreFactory {
     fn serialize<S: Serializer>(&self, _s: S) -> Result<S::Ok, S::Error> {
-        Err(serde::ser::Error::custom("ObjStoreFactory is not serializable"))
+        Err(serde::ser::Error::custom(
+            "ObjStoreFactory is not serializable",
+        ))
     }
 }
 impl<'de> Deserialize<'de> for ObjStoreFactory {
     fn deserialize<D: Deserializer<'de>>(_d: D) -> Result<Self, D::Error> {
-        Err(serde::de::Error::custom("ObjStoreFactory is not deserializable"))
+        Err(serde::de::Error::custom(
+            "ObjStoreFactory is not deserializable",
+        ))
     }
 }
 
@@ -108,12 +112,16 @@ impl Debug for ObjStoreStorage {
 }
 impl Serialize for ObjStoreStorage {
     fn serialize<S: Serializer>(&self, _s: S) -> Result<S::Ok, S::Error> {
-        Err(serde::ser::Error::custom("ObjStoreStorage is not serializable"))
+        Err(serde::ser::Error::custom(
+            "ObjStoreStorage is not serializable",
+        ))
     }
 }
 impl<'de> Deserialize<'de> for ObjStoreStorage {
     fn deserialize<D: Deserializer<'de>>(_d: D) -> Result<Self, D::Error> {
-        Err(serde::de::Error::custom("ObjStoreStorage is not deserializable"))
+        Err(serde::de::Error::custom(
+            "ObjStoreStorage is not deserializable",
+        ))
     }
 }
 
@@ -146,7 +154,10 @@ impl Storage for ObjStoreStorage {
     }
 
     async fn write(&self, path: &str, bs: Bytes) -> IceResult<()> {
-        self.store.put(&self.key(path), bs.into()).await.map_err(os_err)?;
+        self.store
+            .put(&self.key(path), bs.into())
+            .await
+            .map_err(os_err)?;
         Ok(())
     }
 
@@ -202,7 +213,10 @@ struct ObjRead {
 #[async_trait]
 impl FileRead for ObjRead {
     async fn read(&self, range: Range<u64>) -> IceResult<Bytes> {
-        self.store.get_range(&self.path, range).await.map_err(os_err)
+        self.store
+            .get_range(&self.path, range)
+            .await
+            .map_err(os_err)
     }
 }
 

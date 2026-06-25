@@ -134,10 +134,7 @@ impl Manifest {
     }
 
     /// Load a manifest for `index_id` using the conventional blob key.
-    pub async fn load_for<B: BlobStore + ?Sized>(
-        blob: &B,
-        index_id: &str,
-    ) -> anyhow::Result<Self> {
+    pub async fn load_for<B: BlobStore + ?Sized>(blob: &B, index_id: &str) -> anyhow::Result<Self> {
         Self::load(blob, &Self::blob_key_for(index_id)).await
     }
 }
@@ -149,16 +146,23 @@ mod tests {
     #[test]
     fn round_trip_serialize_deserialize() {
         let mut m = Manifest::new("recon-2026");
-        m.push(SplitMeta::new("split-001", 10, 4096, 1))
-            .push(SplitMeta::new("split-002", 5, 2048, 1).with_time_range(1_700_000_000, 1_700_100_000));
+        m.push(SplitMeta::new("split-001", 10, 4096, 1)).push(
+            SplitMeta::new("split-002", 5, 2048, 1).with_time_range(1_700_000_000, 1_700_100_000),
+        );
 
         let bytes = m.to_bytes().expect("serialize");
         let back = Manifest::from_bytes(&bytes).expect("deserialize");
 
         assert_eq!(back, m);
         assert_eq!(back.num_docs(), 15);
-        assert_eq!(back.splits[1].time_range, Some((1_700_000_000, 1_700_100_000)));
-        assert_eq!(back.splits[0].blob_key("recon-2026"), "indexes/recon-2026/splits/split-001.split");
+        assert_eq!(
+            back.splits[1].time_range,
+            Some((1_700_000_000, 1_700_100_000))
+        );
+        assert_eq!(
+            back.splits[0].blob_key("recon-2026"),
+            "indexes/recon-2026/splits/split-001.split"
+        );
         assert_eq!(m.blob_key(), "indexes/recon-2026/manifest.json");
     }
 }

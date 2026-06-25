@@ -19,7 +19,9 @@ use slatedb::object_store::memory::InMemory;
 use slatedb::Db;
 
 async fn make_db(name: &str) -> Database {
-    Database::new(Arc::new(Db::open(name, Arc::new(InMemory::new())).await.unwrap()))
+    Database::new(Arc::new(
+        Db::open(name, Arc::new(InMemory::new())).await.unwrap(),
+    ))
 }
 
 async fn engine(root: &str, db: Database, cdc: CdcConfig) -> LakehouseEngine {
@@ -126,7 +128,11 @@ async fn add_column_appears_in_mirror() {
             c_by_id.insert(ids.value(i), (!cs.is_null(i)).then(|| cs.value(i)));
         }
     }
-    assert_eq!(c_by_id.get(&1), Some(&None), "old row has NULL for added column");
+    assert_eq!(
+        c_by_id.get(&1),
+        Some(&None),
+        "old row has NULL for added column"
+    );
     assert_eq!(c_by_id.get(&2), Some(&Some(7)), "new row carries c=7");
 }
 
@@ -141,11 +147,19 @@ async fn drop_column_removed_without_misalignment() {
 
     {
         let mut g = Glue::new(db.connection_serialized());
-        exec(&mut g, "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b TEXT)").await;
+        exec(
+            &mut g,
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b TEXT)",
+        )
+        .await;
     }
     {
         let mut g = Glue::new(db.connection_with_cdc(cdc.clone()));
-        exec(&mut g, "INSERT INTO t (id, a, b) VALUES (1, 'aval', 'keep')").await;
+        exec(
+            &mut g,
+            "INSERT INTO t (id, a, b) VALUES (1, 'aval', 'keep')",
+        )
+        .await;
     }
     eng.seal().await.unwrap();
 
@@ -248,7 +262,11 @@ async fn composite_pk_after_drop_column_reads_via_lakehouse() {
         let mut g = Glue::new(db.connection_serialized());
         // Composite PK (org_id, user_id) → hidden __bluedb_pk surrogate.
         exec(&mut g, "CREATE TABLE m (org_id INTEGER, user_id INTEGER, role TEXT, age INTEGER, PRIMARY KEY (org_id, user_id))").await;
-        exec(&mut g, "INSERT INTO m (org_id, user_id, role, age) VALUES (1, 7, 'owner', 40)").await;
+        exec(
+            &mut g,
+            "INSERT INTO m (org_id, user_id, role, age) VALUES (1, 7, 'owner', 40)",
+        )
+        .await;
         // ADD then DROP frees a slot, exercising the id-collision path.
         exec(&mut g, "ALTER TABLE m ADD COLUMN nickname TEXT").await;
         exec(&mut g, "ALTER TABLE m RENAME COLUMN nickname TO handle").await;
@@ -266,18 +284,29 @@ async fn composite_pk_after_drop_column_reads_via_lakehouse() {
         assert_eq!(batch.num_rows(), 1, "one row ({label})");
         // The bug errored before the row could be materialized at all; reaching
         // here with the role column present is the regression assertion.
-        assert!(batch.column_by_name("role").is_some(), "role column ({label})");
+        assert!(
+            batch.column_by_name("role").is_some(),
+            "role column ({label})"
+        );
     }
 
     // The surrogate stays Binary (LargeBinary in Arrow) across the evolve.
     let schema = eng.fetch_schema("m").await.unwrap();
-    let arrow = eng.writer_for("m", &schema, &[]).await.unwrap().arrow_schema().unwrap();
+    let arrow = eng
+        .writer_for("m", &schema, &[])
+        .await
+        .unwrap()
+        .arrow_schema()
+        .unwrap();
     let pk_field = arrow
         .field_with_name("__bluedb_pk")
         .expect("surrogate column present");
     use arrow_schema::DataType;
     assert!(
-        matches!(pk_field.data_type(), DataType::LargeBinary | DataType::Binary),
+        matches!(
+            pk_field.data_type(),
+            DataType::LargeBinary | DataType::Binary
+        ),
         "surrogate stays binary, got {:?}",
         pk_field.data_type()
     );

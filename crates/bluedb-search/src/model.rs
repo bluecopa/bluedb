@@ -51,11 +51,15 @@ impl<'de> Deserialize<'de> for SortClause {
     {
         match Value::deserialize(d)? {
             // Bare field name defaults to ascending, matching Elasticsearch.
-            Value::String(field) => Ok(SortClause { field, descending: false }),
+            Value::String(field) => Ok(SortClause {
+                field,
+                descending: false,
+            }),
             Value::Object(map) => {
-                let (field, dir) = map.into_iter().next().ok_or_else(|| {
-                    serde::de::Error::custom("empty sort clause")
-                })?;
+                let (field, dir) = map
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| serde::de::Error::custom("empty sort clause"))?;
                 let descending = match dir {
                     Value::String(s) => s.eq_ignore_ascii_case("desc"),
                     Value::Object(o) => o

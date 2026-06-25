@@ -256,18 +256,22 @@ fn where_is_point_bounded(pk_cols: &HashSet<String>, expr: &Expr) -> bool {
                 }
             }
             // pk = literal  (either side)
-            Expr::BinaryOp { left, op: BinaryOperator::Eq, right }
-                if is_pk(left, pk_cols) && column_of(right).is_none() =>
-            {
-                return true
-            }
-            Expr::BinaryOp { left, op: BinaryOperator::Eq, right }
-                if is_pk(right, pk_cols) && column_of(left).is_none() =>
-            {
-                return true
-            }
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::Eq,
+                right,
+            } if is_pk(left, pk_cols) && column_of(right).is_none() => return true,
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::Eq,
+                right,
+            } if is_pk(right, pk_cols) && column_of(left).is_none() => return true,
             // pk IN (literal, …)
-            Expr::InList { expr, negated: false, .. } if is_pk(expr, pk_cols) => return true,
+            Expr::InList {
+                expr,
+                negated: false,
+                ..
+            } if is_pk(expr, pk_cols) => return true,
             _ => {}
         }
     }
@@ -276,7 +280,9 @@ fn where_is_point_bounded(pk_cols: &HashSet<String>, expr: &Expr) -> bool {
 
 /// Is `expr` a bare reference to a primary-key column?
 fn is_pk(expr: &Expr, pk_cols: &HashSet<String>) -> bool {
-    column_of(expr).as_deref().is_some_and(|c| pk_cols.contains(c))
+    column_of(expr)
+        .as_deref()
+        .is_some_and(|c| pk_cols.contains(c))
 }
 
 fn conjunct_hits_index(
@@ -291,17 +297,27 @@ fn conjunct_hits_index(
             (is_indexable(left, indexable) && column_of(right).is_none())
                 || (is_indexable(right, indexable) && column_of(left).is_none())
         }
-        Expr::Between { expr, negated: false, .. } => is_indexable(expr, indexable),
-        Expr::InList { expr, negated: false, .. } => is_indexable(expr, indexable),
+        Expr::Between {
+            expr,
+            negated: false,
+            ..
+        } => is_indexable(expr, indexable),
+        Expr::InList {
+            expr,
+            negated: false,
+            ..
+        } => is_indexable(expr, indexable),
         // `<pk> IN (SELECT <one col> FROM <one table> WHERE <indexed conjunct>)`.
         // PK membership is itself an index lookup, and the subquery must be
         // index-served on its *own* table — so the whole shape is bounded. Any
         // looser shape (negated, non-PK left, complex/joined subquery, or a
         // subquery WHERE that scans a non-indexed column) is rejected. See
         // [`in_subquery_hits_index`].
-        Expr::InSubquery { expr, subquery, negated: false } => {
-            in_subquery_hits_index(schema_map, pk_cols, expr, subquery)
-        }
+        Expr::InSubquery {
+            expr,
+            subquery,
+            negated: false,
+        } => in_subquery_hits_index(schema_map, pk_cols, expr, subquery),
         _ => false,
     }
 }
@@ -350,10 +366,7 @@ fn in_subquery_hits_index(
     };
 
     // Plain single-table SELECT: no joins, no GROUP BY, no HAVING.
-    if !select.from.joins.is_empty()
-        || !select.group_by.is_empty()
-        || select.having.is_some()
-    {
+    if !select.from.joins.is_empty() || !select.group_by.is_empty() || select.having.is_some() {
         return false;
     }
 
@@ -367,7 +380,10 @@ fn in_subquery_hits_index(
     }
 
     // The subquery must read exactly one *named base table* we can resolve.
-    let TableFactor::Table { name: sub_table, .. } = &select.from.relation else {
+    let TableFactor::Table {
+        name: sub_table, ..
+    } = &select.from.relation
+    else {
         return false; // derived subquery / series / dictionary — reject.
     };
     let Some(sub_schema) = schema_map.get(sub_table) else {
@@ -445,7 +461,11 @@ fn create_index_ddl(table: &str, column: &str) -> String {
 /// Split a boolean expression on its top-level `AND`s.
 fn split_and(expr: &Expr) -> Vec<&Expr> {
     match expr {
-        Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
             let mut out = split_and(left);
             out.extend(split_and(right));
             out
@@ -465,7 +485,11 @@ fn scan_err(table: &str, unindexed: &[String]) -> Error {
     }
     match cols.first() {
         Some(first) => {
-            let list = cols.iter().map(|c| format!("`{c}`")).collect::<Vec<_>>().join(", ");
+            let list = cols
+                .iter()
+                .map(|c| format!("`{c}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
             Error::StorageMsg(format!(
                 "{pfx} query on `{table}` filters only non-indexed column(s) {list} — \
                  this would scan the whole table (a LIMIT can't bound a post-scan filter). \
@@ -544,7 +568,10 @@ mod tests {
     }
 
     fn map(schemas: Vec<Schema>) -> SchemaMap {
-        schemas.into_iter().map(|s| (s.table_name.clone(), s)).collect()
+        schemas
+            .into_iter()
+            .map(|s| (s.table_name.clone(), s))
+            .collect()
     }
 
     /// Run the guardrail and return the (possibly rewritten) statement.
@@ -556,7 +583,9 @@ mod tests {
 
     /// The `LIMIT` of a (rewritten) single SELECT, if any.
     fn limit_of(stmt: &Statement) -> Option<u64> {
-        let Statement::Query(q) = stmt else { return None };
+        let Statement::Query(q) = stmt else {
+            return None;
+        };
         q.limit.as_ref().and_then(super::literal_u64)
     }
 
@@ -619,7 +648,11 @@ mod tests {
 
     #[test]
     fn predicate_on_secondary_index_is_allowed() {
-        let m = map(vec![schema("t", &[("id", true), ("email", false)], &["email"])]);
+        let m = map(vec![schema(
+            "t",
+            &[("id", true), ("email", false)],
+            &["email"],
+        )]);
         assert!(run(&m, "SELECT * FROM t WHERE email = 'a@b.c'").is_ok());
     }
 
@@ -701,7 +734,11 @@ mod tests {
         let side_idx: &[&str] = if side_val_indexed { &["val"] } else { &[] };
         map(vec![
             schema("t", &[("_id", true), ("doc", false)], &[]),
-            schema("t__mk_tags", &[("rid", true), ("_id", false), ("val", false)], side_idx),
+            schema(
+                "t__mk_tags",
+                &[("rid", true), ("_id", false), ("val", false)],
+                side_idx,
+            ),
         ])
     }
 
@@ -711,8 +748,11 @@ mod tests {
         // side table HAS an index on `val` → genuinely index-served → not capped,
         // not rejected (stays on the GlueSQL fast path).
         let m = collection_with_side_table(true);
-        let stmt = run(&m, "SELECT doc FROM t WHERE _id IN (SELECT _id FROM t__mk_tags WHERE val = 'x')")
-            .expect("PK-IN-(indexed subquery) is index-served, must be accepted");
+        let stmt = run(
+            &m,
+            "SELECT doc FROM t WHERE _id IN (SELECT _id FROM t__mk_tags WHERE val = 'x')",
+        )
+        .expect("PK-IN-(indexed subquery) is index-served, must be accepted");
         assert_eq!(limit_of(&stmt), None, "index-served reads are not capped");
     }
 
@@ -724,7 +764,11 @@ mod tests {
         // index-served on its own table.
         let m = collection_with_side_table(false);
         assert!(
-            run(&m, "SELECT doc FROM t WHERE _id IN (SELECT _id FROM t__mk_tags WHERE val = 'x')").is_err(),
+            run(
+                &m,
+                "SELECT doc FROM t WHERE _id IN (SELECT _id FROM t__mk_tags WHERE val = 'x')"
+            )
+            .is_err(),
             "PK-IN-(non-indexed subquery) is a side-table scan — must be rejected"
         );
     }
@@ -735,7 +779,11 @@ mod tests {
         // when the subquery itself is indexed.
         let m = collection_with_side_table(true);
         assert!(
-            run(&m, "SELECT doc FROM t WHERE _id NOT IN (SELECT _id FROM t__mk_tags WHERE val = 'x')").is_err(),
+            run(
+                &m,
+                "SELECT doc FROM t WHERE _id NOT IN (SELECT _id FROM t__mk_tags WHERE val = 'x')"
+            )
+            .is_err(),
             "NOT IN (SELECT …) must still be rejected"
         );
     }
@@ -747,7 +795,11 @@ mod tests {
         // though the subquery is indexed.
         let m = collection_with_side_table(true);
         assert!(
-            run(&m, "SELECT doc FROM t WHERE doc IN (SELECT _id FROM t__mk_tags WHERE val = 'x')").is_err(),
+            run(
+                &m,
+                "SELECT doc FROM t WHERE doc IN (SELECT _id FROM t__mk_tags WHERE val = 'x')"
+            )
+            .is_err(),
             "<non-pk> IN (SELECT …) must be rejected"
         );
     }
@@ -758,7 +810,11 @@ mod tests {
         // though the side table is indexed on `val`.
         let m = collection_with_side_table(true);
         assert!(
-            run(&m, "SELECT doc FROM t WHERE _id IN (SELECT _id FROM t__mk_tags)").is_err(),
+            run(
+                &m,
+                "SELECT doc FROM t WHERE _id IN (SELECT _id FROM t__mk_tags)"
+            )
+            .is_err(),
             "PK-IN-(unfiltered subquery) is a full side-table scan — must be rejected"
         );
     }
@@ -769,7 +825,11 @@ mod tests {
         // indexed) → reject. Here only the outer table is in the map.
         let m = map(vec![schema("t", &[("_id", true), ("doc", false)], &[])]);
         assert!(
-            run(&m, "SELECT doc FROM t WHERE _id IN (SELECT _id FROM mystery WHERE val = 'x')").is_err(),
+            run(
+                &m,
+                "SELECT doc FROM t WHERE _id IN (SELECT _id FROM mystery WHERE val = 'x')"
+            )
+            .is_err(),
             "PK-IN-(unresolvable subquery table) must be rejected"
         );
     }

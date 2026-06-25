@@ -47,7 +47,10 @@ async fn guarded_connection_bounds_bare_scan_instead_of_rejecting() {
     let mut user = Glue::new(database.connection_guarded());
     // A WHERE-less SELECT is not rejected — it is auto-bounded to a PK-ordered
     // prefix. With only 2 rows it returns both.
-    let out = user.execute("SELECT * FROM t").await.expect("bare scan is bounded, not rejected");
+    let out = user
+        .execute("SELECT * FROM t")
+        .await
+        .expect("bare scan is bounded, not rejected");
     assert_eq!(row_count(&out), 2);
 }
 
@@ -57,7 +60,11 @@ async fn guarded_connection_caps_large_scan_at_100() {
     seed(&database, 150).await;
     let mut user = Glue::new(database.connection_guarded());
     let out = user.execute("SELECT * FROM t").await.unwrap();
-    assert_eq!(row_count(&out), CAP, "an unfiltered scan is capped at the ceiling");
+    assert_eq!(
+        row_count(&out),
+        CAP,
+        "an unfiltered scan is capped at the ceiling"
+    );
 }
 
 #[tokio::test]
@@ -66,7 +73,11 @@ async fn guarded_connection_clamps_a_larger_explicit_limit() {
     seed(&database, 150).await;
     let mut user = Glue::new(database.connection_guarded());
     let out = user.execute("SELECT * FROM t LIMIT 500").await.unwrap();
-    assert_eq!(row_count(&out), CAP, "an explicit LIMIT above the ceiling is clamped");
+    assert_eq!(
+        row_count(&out),
+        CAP,
+        "an explicit LIMIT above the ceiling is clamped"
+    );
 }
 
 #[tokio::test]
@@ -84,7 +95,9 @@ async fn guarded_connection_rejects_non_indexed_filter() {
     seed(&database, 2).await;
     let mut user = Glue::new(database.connection_guarded());
     assert!(
-        user.execute("SELECT * FROM t WHERE name = 'n1'").await.is_err(),
+        user.execute("SELECT * FROM t WHERE name = 'n1'")
+            .await
+            .is_err(),
         "a filter on a non-indexed column can't be bounded by a LIMIT — must be rejected"
     );
 }

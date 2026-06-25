@@ -64,15 +64,28 @@ impl EmbeddedServer {
 
         // Mirror mode: a temp warehouse dir kept alive on this (caller) side so
         // `Drop` cleans it; the runtime thread builds a LocalFileSystem over its path.
-        let warehouse = if cfg.mirror { Some(tempfile::tempdir()?) } else { None };
+        let warehouse = if cfg.mirror {
+            Some(tempfile::tempdir()?)
+        } else {
+            None
+        };
         let warehouse_path = warehouse.as_ref().map(|d| d.path().to_path_buf());
 
-        let EmbeddedConfig { db_path, admin_sql, evidence_signing, flush_interval_ms, .. } = cfg;
+        let EmbeddedConfig {
+            db_path,
+            admin_sql,
+            evidence_signing,
+            flush_interval_ms,
+            ..
+        } = cfg;
 
         let thread = std::thread::Builder::new()
             .name("bluedb-testkit".into())
             .spawn(move || {
-                let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+                let rt = match tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                {
                     Ok(rt) => rt,
                     Err(e) => {
                         let _ = ready_tx.send(Err(e.into()));
@@ -109,11 +122,17 @@ impl EmbeddedServer {
                         // locations; default mirroring on for every tenant.
                         let abs = match std::fs::canonicalize(p) {
                             Ok(a) => a,
-                            Err(e) => { let _ = ready_tx.send(Err(e.into())); return; }
+                            Err(e) => {
+                                let _ = ready_tx.send(Err(e.into()));
+                                return;
+                            }
                         };
                         let fs = match LocalFileSystem::new_with_prefix(&abs) {
                             Ok(f) => Arc::new(f),
-                            Err(e) => { let _ = ready_tx.send(Err(e.into())); return; }
+                            Err(e) => {
+                                let _ = ready_tx.send(Err(e.into()));
+                                return;
+                            }
                         };
                         state = state
                             .with_lakehouse_object_store(fs)
@@ -185,7 +204,9 @@ impl EmbeddedServer {
 
     /// The local warehouse directory (mirror mode), else `None`.
     pub fn warehouse_path(&self) -> Option<String> {
-        self.warehouse.as_ref().map(|d| d.path().display().to_string())
+        self.warehouse
+            .as_ref()
+            .map(|d| d.path().display().to_string())
     }
 
     /// Signal graceful shutdown and join the runtime thread. Idempotent.
@@ -213,10 +234,16 @@ mod tests {
     fn health_is_public_and_ports_are_isolated() {
         let a = EmbeddedServer::start(EmbeddedConfig::default()).unwrap();
         let b = EmbeddedServer::start(EmbeddedConfig::default()).unwrap();
-        assert_ne!(a.base_url(), b.base_url(), "each instance binds its own port");
+        assert_ne!(
+            a.base_url(),
+            b.base_url(),
+            "each instance binds its own port"
+        );
 
         // /health requires no token even with auth on.
-        let resp = ureq::get(&format!("{}/health", a.base_url())).call().unwrap();
+        let resp = ureq::get(&format!("{}/health", a.base_url()))
+            .call()
+            .unwrap();
         assert_eq!(resp.status(), 200);
     }
 
@@ -257,7 +284,11 @@ mod tests {
 
     #[test]
     fn mirror_mode_seals_and_serves_file_uris_with_type_fidelity() {
-        let s = EmbeddedServer::start(EmbeddedConfig { mirror: true, ..Default::default() }).unwrap();
+        let s = EmbeddedServer::start(EmbeddedConfig {
+            mirror: true,
+            ..Default::default()
+        })
+        .unwrap();
         let bearer = format!("Bearer {}", s.token().unwrap());
         let sql = |body: &str| {
             ureq::post(&format!("{}/admin/sql", s.base_url()))
@@ -266,31 +297,50 @@ mod tests {
                 .send_string(body)
                 .unwrap()
         };
-        sql(r#"{"sql":"CREATE TABLE t (id INTEGER PRIMARY KEY, amt DECIMAL(10,2), d DATE, ts TIMESTAMP, uid UUID)"}"#);
-        sql(r#"{"sql":"INSERT INTO t VALUES (1, 9.99, DATE '2026-01-01', TIMESTAMP '2026-01-01 00:00:00', GENERATE_UUID())"}"#);
+        sql(
+            r#"{"sql":"CREATE TABLE t (id INTEGER PRIMARY KEY, amt DECIMAL(10,2), d DATE, ts TIMESTAMP, uid UUID)"}"#,
+        );
+        sql(
+            r#"{"sql":"INSERT INTO t VALUES (1, 9.99, DATE '2026-01-01', TIMESTAMP '2026-01-01 00:00:00', GENERATE_UUID())"}"#,
+        );
 
         s.seal().expect("seal");
 
-        let body = ureq::get(&format!("{}/catalog/v1/namespaces/default/tables/t", s.base_url()))
-            .set("Authorization", &bearer)
-            .call()
-            .unwrap()
-            .into_string()
-            .unwrap();
+        let body = ureq::get(&format!(
+            "{}/catalog/v1/namespaces/default/tables/t",
+            s.base_url()
+        ))
+        .set("Authorization", &bearer)
+        .call()
+        .unwrap()
+        .into_string()
+        .unwrap();
         let meta: serde_json::Value = serde_json::from_str(&body).unwrap();
-        let loc = meta["metadata-location"].as_str().expect("metadata-location");
-        assert!(loc.starts_with("file://"), "loadTable URI must be file://, got {loc}");
+        let loc = meta["metadata-location"]
+            .as_str()
+            .expect("metadata-location");
+        assert!(
+            loc.starts_with("file://"),
+            "loadTable URI must be file://, got {loc}"
+        );
         // Type fidelity: the Iceberg schema reports uuid + decimal + date + timestamp.
         let fields = meta["metadata"]["schemas"][0]["fields"].to_string();
         for ty in ["uuid", "decimal", "date", "timestamp"] {
-            assert!(fields.contains(ty), "{ty} type must survive into the mirror: {fields}");
+            assert!(
+                fields.contains(ty),
+                "{ty} type must survive into the mirror: {fields}"
+            );
         }
         assert!(!s.warehouse_path().unwrap().is_empty());
     }
 
     #[test]
     fn watermark_header_and_underscore_tenant_namespace() {
-        let s = EmbeddedServer::start(EmbeddedConfig { mirror: true, ..Default::default() }).unwrap();
+        let s = EmbeddedServer::start(EmbeddedConfig {
+            mirror: true,
+            ..Default::default()
+        })
+        .unwrap();
         let bearer = format!("Bearer {}", s.token().unwrap());
         let tenant = "ws1_sol2_copa_collection_v2";
         ureq::post(&format!("{}/admin/sql", s.base_url()))
@@ -305,14 +355,23 @@ mod tests {
             .set("Content-Type", "application/json")
             .send_string(r#"{"id":1}"#)
             .unwrap();
-        assert!(w.header("X-Bluedb-Watermark").is_some(), "write must surface a watermark");
+        assert!(
+            w.header("X-Bluedb-Watermark").is_some(),
+            "write must surface a watermark"
+        );
         s.seal().unwrap();
-        let body = ureq::get(&format!("{}/catalog/v1/namespaces/{tenant}/tables", s.base_url()))
-            .set("Authorization", &bearer)
-            .call()
-            .unwrap()
-            .into_string()
-            .unwrap();
-        assert!(body.contains("\"name\":\"t\""), "namespace==tenant lists the table: {body}");
+        let body = ureq::get(&format!(
+            "{}/catalog/v1/namespaces/{tenant}/tables",
+            s.base_url()
+        ))
+        .set("Authorization", &bearer)
+        .call()
+        .unwrap()
+        .into_string()
+        .unwrap();
+        assert!(
+            body.contains("\"name\":\"t\""),
+            "namespace==tenant lists the table: {body}"
+        );
     }
 }

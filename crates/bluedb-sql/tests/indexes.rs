@@ -27,7 +27,9 @@ async fn new_glue() -> Glue<SlateDbStorage> {
 }
 
 async fn exec(glue: &mut Glue<SlateDbStorage>, sql: &str) {
-    glue.execute(sql).await.unwrap_or_else(|e| panic!("execute `{sql}`: {e}"));
+    glue.execute(sql)
+        .await
+        .unwrap_or_else(|e| panic!("execute `{sql}`: {e}"));
 }
 
 /// Scan `index` directly and return the `name` column (col 1) of each row, in
@@ -60,7 +62,11 @@ async fn index_names(
 /// CREATE TABLE + INSERT names of deliberately *different lengths*, then index.
 async fn glue_with_string_index() -> Glue<SlateDbStorage> {
     let mut glue = new_glue().await;
-    exec(&mut glue, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);").await;
+    exec(
+        &mut glue,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);",
+    )
+    .await;
     // 'a' < 'aa' < 'b' < 'z' < 'zzz' lexically — but 'a'(len1),'aa'(len2),'zzz'(len3)
     // would mis-sort under a length-prefixed value encoding.
     exec(
@@ -78,7 +84,11 @@ async fn index_scan_orders_strings_across_lengths() {
 
     // Ascending: must be lexical order regardless of encoded length.
     let asc = index_names(&glue, "t", "idx_name", Some(true), None).await;
-    assert_eq!(asc, vec!["a", "aa", "b", "z", "zzz"], "order-preserving across lengths");
+    assert_eq!(
+        asc,
+        vec!["a", "aa", "b", "z", "zzz"],
+        "order-preserving across lengths"
+    );
 
     // None defaults to ascending.
     let none = index_names(&glue, "t", "idx_name", None, None).await;
@@ -94,27 +104,74 @@ async fn index_scan_range_and_eq_bounds() {
     let glue = glue_with_string_index().await;
     let s = |x: &str| Value::Str(x.to_owned());
 
-    let gt = index_names(&glue, "t", "idx_name", Some(true), Some((IndexOperator::Gt, s("b")))).await;
+    let gt = index_names(
+        &glue,
+        "t",
+        "idx_name",
+        Some(true),
+        Some((IndexOperator::Gt, s("b"))),
+    )
+    .await;
     assert_eq!(gt, vec!["z", "zzz"], "name > 'b'");
 
-    let gte = index_names(&glue, "t", "idx_name", Some(true), Some((IndexOperator::GtEq, s("b")))).await;
+    let gte = index_names(
+        &glue,
+        "t",
+        "idx_name",
+        Some(true),
+        Some((IndexOperator::GtEq, s("b"))),
+    )
+    .await;
     assert_eq!(gte, vec!["b", "z", "zzz"], "name >= 'b'");
 
-    let lt = index_names(&glue, "t", "idx_name", Some(true), Some((IndexOperator::Lt, s("b")))).await;
+    let lt = index_names(
+        &glue,
+        "t",
+        "idx_name",
+        Some(true),
+        Some((IndexOperator::Lt, s("b"))),
+    )
+    .await;
     assert_eq!(lt, vec!["a", "aa"], "name < 'b'");
 
-    let lte = index_names(&glue, "t", "idx_name", Some(true), Some((IndexOperator::LtEq, s("aa")))).await;
+    let lte = index_names(
+        &glue,
+        "t",
+        "idx_name",
+        Some(true),
+        Some((IndexOperator::LtEq, s("aa"))),
+    )
+    .await;
     assert_eq!(lte, vec!["a", "aa"], "name <= 'aa'");
 
-    let eq = index_names(&glue, "t", "idx_name", Some(true), Some((IndexOperator::Eq, s("aa")))).await;
-    assert_eq!(eq, vec!["aa"], "name = 'aa' (and not 'a', which is a byte-prefix)");
+    let eq = index_names(
+        &glue,
+        "t",
+        "idx_name",
+        Some(true),
+        Some((IndexOperator::Eq, s("aa"))),
+    )
+    .await;
+    assert_eq!(
+        eq,
+        vec!["aa"],
+        "name = 'aa' (and not 'a', which is a byte-prefix)"
+    );
 }
 
 #[tokio::test]
 async fn index_on_integer_column_scans_in_numeric_order() {
     let mut glue = new_glue().await;
-    exec(&mut glue, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, age INTEGER);").await;
-    exec(&mut glue, "INSERT INTO t VALUES (1,'a',40),(2,'b',-5),(3,'c',0),(4,'d',7);").await;
+    exec(
+        &mut glue,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, age INTEGER);",
+    )
+    .await;
+    exec(
+        &mut glue,
+        "INSERT INTO t VALUES (1,'a',40),(2,'b',-5),(3,'c',0),(4,'d',7);",
+    )
+    .await;
     exec(&mut glue, "CREATE INDEX idx_age ON t (age);").await;
 
     // Drain the index ordered by age and read back the names in age order,
@@ -165,13 +222,21 @@ async fn drop_index_removes_all_entries() {
     let mut glue = glue_with_string_index().await;
 
     // Sanity: entries exist before the drop.
-    assert_eq!(index_names(&glue, "t", "idx_name", Some(true), None).await.len(), 5);
+    assert_eq!(
+        index_names(&glue, "t", "idx_name", Some(true), None)
+            .await
+            .len(),
+        5
+    );
 
     exec(&mut glue, "DROP INDEX t.idx_name;").await;
 
     // After DROP, the index entry keyspace is empty.
     let names = index_names(&glue, "t", "idx_name", Some(true), None).await;
-    assert!(names.is_empty(), "DROP INDEX removed every entry, got {names:?}");
+    assert!(
+        names.is_empty(),
+        "DROP INDEX removed every entry, got {names:?}"
+    );
 
     // The table itself is unaffected (full scan still returns all rows).
     let payload = glue.execute("SELECT id FROM t;").await.expect("select");

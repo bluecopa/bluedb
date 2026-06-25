@@ -276,7 +276,10 @@ impl LakehouseManager {
         tenant: &str,
         table: &str,
     ) -> Result<Option<arrow_array::RecordBatch>> {
-        self.engine_for(tenant).await?.current_record_batch(table).await
+        self.engine_for(tenant)
+            .await?
+            .current_record_batch(table)
+            .await
     }
 
     /// Stop the background loops (called on demote; the next promote reopens).

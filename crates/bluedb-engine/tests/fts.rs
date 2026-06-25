@@ -31,7 +31,9 @@ fn doc(id_f: Field, id: &str, body_f: Field, body: &str) -> TantivyDocument {
 }
 
 async fn new_blob(name: &str) -> Arc<SlateDbBlobStore> {
-    let db = Db::open(name, Arc::new(InMemory::new())).await.expect("open slatedb");
+    let db = Db::open(name, Arc::new(InMemory::new()))
+        .await
+        .expect("open slatedb");
     Arc::new(SlateDbBlobStore::new(Arc::new(db)))
 }
 
@@ -48,22 +50,47 @@ fn eager_policy() -> CompactionPolicy {
 async fn append_search_delete_and_compact() {
     let (schema, id_f, body_f) = schema();
     let blob = new_blob("engine-fts-lifecycle").await;
-    let index = FtsIndex::new(INDEX_ID, blob.clone(), schema, IdField(id_f), eager_policy());
+    let index = FtsIndex::new(
+        INDEX_ID,
+        blob.clone(),
+        schema,
+        IdField(id_f),
+        eager_policy(),
+    );
     let fields = vec![body_f];
 
     // Three appends → three splits, all matching "financial".
-    index.append([doc(id_f, "a", body_f, "alpha financial")]).await.unwrap();
-    index.append([doc(id_f, "b", body_f, "beta financial")]).await.unwrap();
-    index.append([doc(id_f, "c", body_f, "gamma financial")]).await.unwrap();
-    assert_eq!(index.search("financial", &fields, 10).await.unwrap().len(), 3);
+    index
+        .append([doc(id_f, "a", body_f, "alpha financial")])
+        .await
+        .unwrap();
+    index
+        .append([doc(id_f, "b", body_f, "beta financial")])
+        .await
+        .unwrap();
+    index
+        .append([doc(id_f, "c", body_f, "gamma financial")])
+        .await
+        .unwrap();
+    assert_eq!(
+        index.search("financial", &fields, 10).await.unwrap().len(),
+        3
+    );
 
     // Logical delete of "b" hides it from search (still physically present).
     index.delete(["b"]).await.unwrap();
-    assert_eq!(index.search("financial", &fields, 10).await.unwrap().len(), 2);
+    assert_eq!(
+        index.search("financial", &fields, 10).await.unwrap().len(),
+        2
+    );
 
     // Policy fires (3 splits > max_splits 2): compaction folds all into one,
     // physically drops "b", and GCs the 3 superseded split blobs.
-    let summary = index.maybe_compact().await.unwrap().expect("policy should trigger compaction");
+    let summary = index
+        .maybe_compact()
+        .await
+        .unwrap()
+        .expect("policy should trigger compaction");
     assert_eq!(summary.superseded, 3, "all three input splits superseded");
     assert_eq!(summary.deleted_blobs, 3, "their blobs are GC'd");
 
@@ -72,9 +99,16 @@ async fn append_search_delete_and_compact() {
     assert_eq!(manifest.splits.len(), 1, "folded into one split");
 
     // Live docs survive, the deleted one is physically gone.
-    assert_eq!(index.search("financial", &fields, 10).await.unwrap().len(), 2);
+    assert_eq!(
+        index.search("financial", &fields, 10).await.unwrap().len(),
+        2
+    );
     assert_eq!(index.search("alpha", &fields, 10).await.unwrap().len(), 1);
-    assert_eq!(index.search("beta", &fields, 10).await.unwrap().len(), 0, "deleted 'b' physically dropped");
+    assert_eq!(
+        index.search("beta", &fields, 10).await.unwrap().len(),
+        0,
+        "deleted 'b' physically dropped"
+    );
 
     // Below threshold now (1 split, 0 tombstones) → no further compaction.
     assert!(index.maybe_compact().await.unwrap().is_none());
@@ -84,12 +118,27 @@ async fn append_search_delete_and_compact() {
 async fn search_ids_returns_id_score_pairs_excluding_deleted() {
     let (schema, id_f, body_f) = schema();
     let blob = new_blob("engine-fts-search-ids").await;
-    let index = FtsIndex::new(INDEX_ID, blob, schema, IdField(id_f), CompactionPolicy::default());
+    let index = FtsIndex::new(
+        INDEX_ID,
+        blob,
+        schema,
+        IdField(id_f),
+        CompactionPolicy::default(),
+    );
     let fields = vec![body_f];
 
-    index.append([doc(id_f, "2", body_f, "alpha financial")]).await.unwrap();
-    index.append([doc(id_f, "5", body_f, "beta financial")]).await.unwrap();
-    index.append([doc(id_f, "7", body_f, "gamma weather")]).await.unwrap();
+    index
+        .append([doc(id_f, "2", body_f, "alpha financial")])
+        .await
+        .unwrap();
+    index
+        .append([doc(id_f, "5", body_f, "beta financial")])
+        .await
+        .unwrap();
+    index
+        .append([doc(id_f, "7", body_f, "gamma weather")])
+        .await
+        .unwrap();
 
     let hits = index.search_ids("financial", &fields, 10).await.unwrap();
     let mut ids: Vec<&str> = hits.iter().map(|(id, _)| id.as_str()).collect();
@@ -110,28 +159,65 @@ async fn search_ids_returns_id_score_pairs_excluding_deleted() {
 async fn same_id_update_through_the_engine_is_an_in_place_replace() {
     let (schema, id_f, body_f) = schema();
     let blob = new_blob("engine-fts-update").await;
-    let index = FtsIndex::new(INDEX_ID, blob, schema, IdField(id_f), CompactionPolicy::default());
+    let index = FtsIndex::new(
+        INDEX_ID,
+        blob,
+        schema,
+        IdField(id_f),
+        CompactionPolicy::default(),
+    );
     let fields = vec![body_f];
 
-    index.append([doc(id_f, "x", body_f, "oldterm")]).await.unwrap();
-    index.update(["x"], [doc(id_f, "x", body_f, "newterm")]).await.unwrap();
+    index
+        .append([doc(id_f, "x", body_f, "oldterm")])
+        .await
+        .unwrap();
+    index
+        .update(["x"], [doc(id_f, "x", body_f, "newterm")])
+        .await
+        .unwrap();
 
-    assert_eq!(index.search("newterm", &fields, 10).await.unwrap().len(), 1, "new version live");
-    assert_eq!(index.search("oldterm", &fields, 10).await.unwrap().len(), 0, "old version hidden");
+    assert_eq!(
+        index.search("newterm", &fields, 10).await.unwrap().len(),
+        1,
+        "new version live"
+    );
+    assert_eq!(
+        index.search("oldterm", &fields, 10).await.unwrap().len(),
+        0,
+        "old version hidden"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn background_scheduler_compacts() {
     let (schema, id_f, body_f) = schema();
     let blob = new_blob("engine-fts-scheduler").await;
-    let index = Arc::new(FtsIndex::new(INDEX_ID, blob.clone(), schema, IdField(id_f), eager_policy()));
+    let index = Arc::new(FtsIndex::new(
+        INDEX_ID,
+        blob.clone(),
+        schema,
+        IdField(id_f),
+        eager_policy(),
+    ));
 
     // Three splits — over the policy's max.
-    index.append([doc(id_f, "a", body_f, "alpha")]).await.unwrap();
-    index.append([doc(id_f, "b", body_f, "beta")]).await.unwrap();
-    index.append([doc(id_f, "c", body_f, "gamma")]).await.unwrap();
+    index
+        .append([doc(id_f, "a", body_f, "alpha")])
+        .await
+        .unwrap();
+    index
+        .append([doc(id_f, "b", body_f, "beta")])
+        .await
+        .unwrap();
+    index
+        .append([doc(id_f, "c", body_f, "gamma")])
+        .await
+        .unwrap();
 
-    let handle = index.clone().spawn_compaction_scheduler(Duration::from_millis(20));
+    let handle = index
+        .clone()
+        .spawn_compaction_scheduler(Duration::from_millis(20));
 
     // Poll until the scheduler folds the 3 splits into 1 (bounded ~5s).
     let mut compacted = false;
@@ -144,5 +230,8 @@ async fn background_scheduler_compacts() {
         }
     }
     handle.abort();
-    assert!(compacted, "background scheduler should have compacted 3 splits into 1");
+    assert!(
+        compacted,
+        "background scheduler should have compacted 3 splits into 1"
+    );
 }

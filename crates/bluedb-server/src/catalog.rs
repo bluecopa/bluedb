@@ -23,9 +23,11 @@ use crate::{authz, AppError, AppState};
 
 /// The active mirror manager, or `503` on a passive node.
 async fn manager(state: &AppState) -> Result<Arc<LakehouseManager>, AppError> {
-    state.lakehouse().await.ok_or_else(|| AppError::service_unavailable(
-        "lakehouse catalog unavailable (node is not the active writer)",
-    ))
+    state.lakehouse().await.ok_or_else(|| {
+        AppError::service_unavailable(
+            "lakehouse catalog unavailable (node is not the active writer)",
+        )
+    })
 }
 
 /// `GET /catalog/v1/config` — catalog defaults/overrides (empty for v1).
@@ -49,7 +51,11 @@ pub(crate) async fn list_namespaces(
         .await
         .into_iter()
         // Only namespaces whose tenant this token is authorized for.
-        .filter(|ns| state.authorize_tenant(&headers, &tenant_for_namespace(ns)).is_ok())
+        .filter(|ns| {
+            state
+                .authorize_tenant(&headers, &tenant_for_namespace(ns))
+                .is_ok()
+        })
         .map(|ns| json!([ns]))
         .collect();
     Ok(Json(json!({ "namespaces": namespaces })))
@@ -76,7 +82,9 @@ pub(crate) async fn list_tables(
     state.authorize_tenant(&headers, &tenant_for_namespace(&ns))?;
     let mgr = manager(&state).await?;
     let Some(eng) = mgr.engine_for_namespace(&ns).await else {
-        return Err(AppError::not_found(format!("namespace '{ns}' is not mirrored")));
+        return Err(AppError::not_found(format!(
+            "namespace '{ns}' is not mirrored"
+        )));
     };
     let tables = eng
         .list_iceberg_tables()
@@ -100,7 +108,9 @@ pub(crate) async fn load_table(
     state.authorize_tenant(&headers, &tenant_for_namespace(&ns))?;
     let mgr = manager(&state).await?;
     let Some(eng) = mgr.engine_for_namespace(&ns).await else {
-        return Err(AppError::not_found(format!("namespace '{ns}' is not mirrored")));
+        return Err(AppError::not_found(format!(
+            "namespace '{ns}' is not mirrored"
+        )));
     };
     match eng
         .table_metadata_json(&table)

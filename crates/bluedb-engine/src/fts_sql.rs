@@ -178,8 +178,7 @@ pub(crate) fn extract_fts_predicate(
     sql: &str,
     params: &[serde_json::Value],
 ) -> Result<Option<FtsPredicate>> {
-    let mut stmts =
-        parse(sql).map_err(|e| EngineError::Rejected(format!("parse error: {e}")))?;
+    let mut stmts = parse(sql).map_err(|e| EngineError::Rejected(format!("parse error: {e}")))?;
     if stmts.len() != 1 {
         return Err(EngineError::Rejected(format!(
             "expected exactly 1 statement, got {}",
@@ -224,11 +223,9 @@ pub(crate) fn extract_fts_predicate(
         ));
     }
     let table = match &twj.relation {
-        TableFactor::Table { name, .. } => name
-            .0
-            .last()
-            .map(|i| i.value.clone())
-            .unwrap_or_default(),
+        TableFactor::Table { name, .. } => {
+            name.0.last().map(|i| i.value.clone()).unwrap_or_default()
+        }
         _ => {
             return Err(EngineError::Rejected(
                 "unsupported FTS query shape: FROM must be a plain table".into(),
@@ -490,8 +487,7 @@ pub async fn rewrite_fts_query(
     let hits = searcher.search(&predicate).await?;
 
     // Re-parse to get a mutable Statement we can rewrite.
-    let mut stmts =
-        parse(sql).map_err(|e| EngineError::Rejected(format!("parse error: {e}")))?;
+    let mut stmts = parse(sql).map_err(|e| EngineError::Rejected(format!("parse error: {e}")))?;
     let stmt = stmts.remove(0);
     let mut query = match stmt {
         Statement::Query(q) => q,
@@ -527,10 +523,7 @@ pub async fn rewrite_fts_query(
         for ob_expr in order_by.exprs.iter_mut() {
             if is_ts_rank(&ob_expr.expr) {
                 // Build CASE id WHEN 2 THEN 0 WHEN 5 THEN 1 ELSE len END
-                let conditions: Vec<Expr> = hits
-                    .iter()
-                    .map(|h| int_literal(h.pk))
-                    .collect();
+                let conditions: Vec<Expr> = hits.iter().map(|h| int_literal(h.pk)).collect();
                 let results: Vec<Expr> = (0..n as i64).map(int_literal).collect();
                 let case_expr = Expr::Case {
                     operand: Some(Box::new(pk_ident.clone())),
@@ -564,7 +557,10 @@ mod tests {
             .unwrap();
         assert_eq!(p.table, "docs");
         assert_eq!(p.column, "body");
-        assert_eq!(p.literal, "overdue", "one leading + one trailing % stripped");
+        assert_eq!(
+            p.literal, "overdue",
+            "one leading + one trailing % stripped"
+        );
     }
 
     #[test]
@@ -589,28 +585,40 @@ mod tests {
     #[test]
     fn extract_like_gated_cases_pass_through() {
         // < 3-char core → None.
-        assert!(extract_like_predicate("SELECT id FROM docs WHERE body LIKE '%ab%'")
-            .unwrap()
-            .is_none());
+        assert!(
+            extract_like_predicate("SELECT id FROM docs WHERE body LIKE '%ab%'")
+                .unwrap()
+                .is_none()
+        );
         // Internal wildcard in the core → None.
-        assert!(extract_like_predicate("SELECT id FROM docs WHERE body LIKE '%ov_rdue%'")
-            .unwrap()
-            .is_none());
-        assert!(extract_like_predicate("SELECT id FROM docs WHERE body LIKE '%over%due%'")
-            .unwrap()
-            .is_none());
+        assert!(
+            extract_like_predicate("SELECT id FROM docs WHERE body LIKE '%ov_rdue%'")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            extract_like_predicate("SELECT id FROM docs WHERE body LIKE '%over%due%'")
+                .unwrap()
+                .is_none()
+        );
         // Negated LIKE → None.
-        assert!(extract_like_predicate("SELECT id FROM docs WHERE body NOT LIKE '%overdue%'")
-            .unwrap()
-            .is_none());
+        assert!(
+            extract_like_predicate("SELECT id FROM docs WHERE body NOT LIKE '%overdue%'")
+                .unwrap()
+                .is_none()
+        );
         // No LIKE at all → None.
-        assert!(extract_like_predicate("SELECT id FROM docs WHERE status = 'open'")
-            .unwrap()
-            .is_none());
+        assert!(
+            extract_like_predicate("SELECT id FROM docs WHERE status = 'open'")
+                .unwrap()
+                .is_none()
+        );
         // Multi-table → None (pass-through, not error).
-        assert!(extract_like_predicate("SELECT id FROM a, b WHERE x LIKE '%overdue%'")
-            .unwrap()
-            .is_none());
+        assert!(
+            extract_like_predicate("SELECT id FROM a, b WHERE x LIKE '%overdue%'")
+                .unwrap()
+                .is_none()
+        );
     }
 
     // --- B3: rewrite_like_query ---
@@ -643,7 +651,10 @@ mod tests {
         // both the LIKE and the status condition preserved for gluesql.
         assert!(out.contains("id IN (7)"), "prefilter present: {out}");
         assert!(out.contains("body LIKE '%overdue%'"), "LIKE kept: {out}");
-        assert!(out.contains("status = 'open'"), "extra condition kept: {out}");
+        assert!(
+            out.contains("status = 'open'"),
+            "extra condition kept: {out}"
+        );
     }
 
     // --- Task 2: extract_fts_predicate ---
@@ -663,8 +674,7 @@ mod tests {
     fn extract_plain_tsquery_with_param_placeholder() {
         // Parameterized RHS: `plainto_tsquery($1)` resolves the query text from
         // params (the documented form) instead of requiring a string literal.
-        let sql =
-            "SELECT id FROM docs WHERE to_tsvector('english', body) @@ plainto_tsquery($1)";
+        let sql = "SELECT id FROM docs WHERE to_tsvector('english', body) @@ plainto_tsquery($1)";
         let params = vec![serde_json::json!("invoice overdue")];
         let pred = extract_fts_predicate(sql, &params).unwrap().unwrap();
         assert_eq!(pred.query, "invoice overdue");
@@ -675,8 +685,7 @@ mod tests {
     fn param_placeholder_without_params_is_rejected() {
         // No bound params → the placeholder can't resolve → unsupported shape
         // (rather than silently searching for the literal "$1").
-        let sql =
-            "SELECT id FROM docs WHERE to_tsvector('english', body) @@ plainto_tsquery($1)";
+        let sql = "SELECT id FROM docs WHERE to_tsvector('english', body) @@ plainto_tsquery($1)";
         assert!(extract_fts_predicate(sql, &[]).is_err());
     }
 
@@ -690,7 +699,8 @@ mod tests {
 
     #[test]
     fn extract_websearch_tsquery() {
-        let sql = "SELECT id FROM docs WHERE to_tsvector('english', body) @@ websearch_to_tsquery('x')";
+        let sql =
+            "SELECT id FROM docs WHERE to_tsvector('english', body) @@ websearch_to_tsquery('x')";
         let pred = extract_fts_predicate(sql, &[]).unwrap().unwrap();
         assert_eq!(pred.kind, TsQueryKind::Websearch);
         assert_eq!(pred.query, "x");
@@ -734,25 +744,46 @@ mod tests {
     #[tokio::test]
     async fn rewrite_basic_at_at() {
         let sql = "SELECT id FROM docs WHERE to_tsvector('english', body) @@ plainto_tsquery('q')";
-        let out = rewrite_fts_query(sql, "id", &FakeSearcher, &[]).await.unwrap().unwrap();
-        assert!(out.contains("id IN (2, 5)"), "expected IN clause, got: {out}");
+        let out = rewrite_fts_query(sql, "id", &FakeSearcher, &[])
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            out.contains("id IN (2, 5)"),
+            "expected IN clause, got: {out}"
+        );
         assert!(!out.contains("@@"), "@@  should be gone: {out}");
-        assert!(!out.contains("to_tsvector"), "to_tsvector should be gone: {out}");
+        assert!(
+            !out.contains("to_tsvector"),
+            "to_tsvector should be gone: {out}"
+        );
     }
 
     #[tokio::test]
     async fn rewrite_at_at_with_extra_condition() {
         let sql = "SELECT id FROM docs WHERE to_tsvector('english', body) @@ plainto_tsquery('q') AND status = 'open'";
-        let out = rewrite_fts_query(sql, "id", &FakeSearcher, &[]).await.unwrap().unwrap();
-        assert!(out.contains("id IN (2, 5)"), "expected IN clause, got: {out}");
-        assert!(out.contains("status"), "status condition should be kept: {out}");
+        let out = rewrite_fts_query(sql, "id", &FakeSearcher, &[])
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            out.contains("id IN (2, 5)"),
+            "expected IN clause, got: {out}"
+        );
+        assert!(
+            out.contains("status"),
+            "status condition should be kept: {out}"
+        );
         assert!(!out.contains("@@"), "@@ should be gone: {out}");
     }
 
     #[tokio::test]
     async fn rewrite_empty_hits_never_match() {
         let sql = "SELECT id FROM docs WHERE to_tsvector('english', body) @@ plainto_tsquery('q')";
-        let out = rewrite_fts_query(sql, "id", &EmptySearcher, &[]).await.unwrap().unwrap();
+        let out = rewrite_fts_query(sql, "id", &EmptySearcher, &[])
+            .await
+            .unwrap()
+            .unwrap();
         let low = out.to_lowercase();
         // Must be an index-served never-match (`pk IN (NULL)`), so the empty case
         // still satisfies the scan guardrail.
@@ -766,16 +797,24 @@ mod tests {
     #[tokio::test]
     async fn rewrite_ts_rank_replaced_by_case() {
         let sql = "SELECT id FROM docs WHERE to_tsvector('english', body) @@ plainto_tsquery('q') ORDER BY ts_rank(to_tsvector('english', body), plainto_tsquery('q')) DESC";
-        let out = rewrite_fts_query(sql, "id", &FakeSearcher, &[]).await.unwrap().unwrap();
+        let out = rewrite_fts_query(sql, "id", &FakeSearcher, &[])
+            .await
+            .unwrap()
+            .unwrap();
         let low = out.to_lowercase();
         assert!(!low.contains("ts_rank"), "ts_rank should be gone: {out}");
-        assert!(out.contains("CASE") || out.contains("case"), "CASE ordering should be present: {out}");
+        assert!(
+            out.contains("CASE") || out.contains("case"),
+            "CASE ordering should be present: {out}"
+        );
     }
 
     #[tokio::test]
     async fn rewrite_no_at_at_returns_none() {
         let sql = "SELECT * FROM docs WHERE status = 'open'";
-        let out = rewrite_fts_query(sql, "id", &FakeSearcher, &[]).await.unwrap();
+        let out = rewrite_fts_query(sql, "id", &FakeSearcher, &[])
+            .await
+            .unwrap();
         assert!(out.is_none());
     }
 }

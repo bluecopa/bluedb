@@ -37,15 +37,25 @@
 
 (defn base [node] (str "http://localhost:" (get ports node)))
 
+(def ^:private auth-token
+  (System/getenv "BLUEDB_JEPSEN_TOKEN"))
+
 (def ^:private short-opts
-  {:throw-exceptions false :socket-timeout 2000 :connection-timeout 1500})
+  (cond-> {:throw-exceptions false :socket-timeout 2000 :connection-timeout 1500}
+    (seq auth-token) (assoc :headers {"authorization" (str "Bearer " auth-token)})))
+
+(defn opts
+  "Base clj-http opts, including an Authorization header when
+  BLUEDB_JEPSEN_TOKEN is set."
+  [& kvs]
+  (apply assoc short-opts kvs))
 
 (defn status
   "GET /admin/status for one node, or nil if unreachable."
   [node]
   (try
     (let [r (http/get (str (base node) "/admin/status")
-                      (assoc short-opts :as :json))]
+                      (opts :as :json))]
       (when (= 200 (:status r)) (:body r)))
     (catch Exception _ nil)))
 

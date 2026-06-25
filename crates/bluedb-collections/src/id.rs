@@ -3,7 +3,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// A 24-hex-character ObjectId-like id: 4-byte big-endian seconds + 8 random bytes.
 /// The time prefix makes ids roughly creation-ordered (sortable as text).
 pub fn new_object_id() -> String {
-    let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as u32;
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as u32;
     let mut bytes = [0u8; 12];
     bytes[0..4].copy_from_slice(&secs.to_be_bytes());
     use rand::RngCore;
@@ -19,7 +22,9 @@ mod tests {
         let a = new_object_id();
         let b = new_object_id();
         assert_eq!(a.len(), 24, "{a}");
-        assert!(a.bytes().all(|c: u8| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(a
+            .bytes()
+            .all(|c: u8| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         assert_ne!(a, b);
     }
     #[test]
@@ -27,6 +32,9 @@ mod tests {
         let a = new_object_id();
         std::thread::sleep(std::time::Duration::from_millis(1100));
         let b = new_object_id();
-        assert!(a < b, "ObjectIds should be roughly time-ordered: {a} !< {b}");
+        assert!(
+            a < b,
+            "ObjectIds should be roughly time-ordered: {a} !< {b}"
+        );
     }
 }

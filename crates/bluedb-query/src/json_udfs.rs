@@ -37,7 +37,10 @@ use datafusion::logical_expr::{
 pub fn register(ctx: &mut datafusion::prelude::SessionContext) -> DfResult<()> {
     use datafusion::execution::FunctionRegistry;
 
-    let get = Arc::new(ScalarUDF::new_from_impl(JsonAccessor::new("json_get", Mode::Json)));
+    let get = Arc::new(ScalarUDF::new_from_impl(JsonAccessor::new(
+        "json_get",
+        Mode::Json,
+    )));
     let get_str = Arc::new(ScalarUDF::new_from_impl(JsonAccessor::new(
         "json_get_str",
         Mode::Text,
@@ -310,23 +313,41 @@ mod tests {
     #[test]
     fn extract_text_unquotes_strings_and_stringifies_scalars() {
         let json = r#"{"status":"active","n":3,"ok":true,"nested":{"a":1}}"#;
-        assert_eq!(extract(json, &Key::Field("status"), Mode::Text), Some("active".into()));
-        assert_eq!(extract(json, &Key::Field("n"), Mode::Text), Some("3".into()));
-        assert_eq!(extract(json, &Key::Field("ok"), Mode::Text), Some("true".into()));
+        assert_eq!(
+            extract(json, &Key::Field("status"), Mode::Text),
+            Some("active".into())
+        );
+        assert_eq!(
+            extract(json, &Key::Field("n"), Mode::Text),
+            Some("3".into())
+        );
+        assert_eq!(
+            extract(json, &Key::Field("ok"), Mode::Text),
+            Some("true".into())
+        );
         // An object as text is its compact JSON.
-        assert_eq!(extract(json, &Key::Field("nested"), Mode::Text), Some(r#"{"a":1}"#.into()));
+        assert_eq!(
+            extract(json, &Key::Field("nested"), Mode::Text),
+            Some(r#"{"a":1}"#.into())
+        );
     }
 
     #[test]
     fn extract_json_keeps_string_quotes() {
         let json = r#"{"status":"active"}"#;
-        assert_eq!(extract(json, &Key::Field("status"), Mode::Json), Some(r#""active""#.into()));
+        assert_eq!(
+            extract(json, &Key::Field("status"), Mode::Json),
+            Some(r#""active""#.into())
+        );
     }
 
     #[test]
     fn extract_array_index() {
         // Direct index on a top-level JSON array.
-        assert_eq!(extract("[10,20,30]", &Key::Index(1), Mode::Text), Some("20".into()));
+        assert_eq!(
+            extract("[10,20,30]", &Key::Index(1), Mode::Text),
+            Some("20".into())
+        );
     }
 
     #[test]
@@ -371,7 +392,9 @@ mod tests {
         // robust function form is used). The operator rewrite + UDF are what's
         // under test here.
         let df = ctx
-            .sql("SELECT id, data->>'status' AS status FROM docs WHERE (data->>'status') = 'active'")
+            .sql(
+                "SELECT id, data->>'status' AS status FROM docs WHERE (data->>'status') = 'active'",
+            )
             .await
             .expect("plan ->> query");
         let batches = df.collect().await.expect("run ->> query");

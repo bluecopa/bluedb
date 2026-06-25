@@ -60,8 +60,14 @@ impl Substrate {
     /// Point read of `key`, from the writer or the replica.
     pub async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         match self {
-            Self::Writer(db) => db.get(key).await.map_err(|err| anyhow!("slatedb get: {err}")),
-            Self::Reader(reader) => reader.get(key).await.map_err(|err| anyhow!("slatedb reader get: {err}")),
+            Self::Writer(db) => db
+                .get(key)
+                .await
+                .map_err(|err| anyhow!("slatedb get: {err}")),
+            Self::Reader(reader) => reader
+                .get(key)
+                .await
+                .map_err(|err| anyhow!("slatedb reader get: {err}")),
         }
     }
 
@@ -100,7 +106,10 @@ impl Substrate {
     pub async fn read_view(&self) -> Result<ReadView> {
         match self {
             Self::Writer(db) => {
-                let snapshot = db.snapshot().await.map_err(|err| anyhow!("slatedb snapshot: {err}"))?;
+                let snapshot = db
+                    .snapshot()
+                    .await
+                    .map_err(|err| anyhow!("slatedb snapshot: {err}"))?;
                 Ok(ReadView::Snapshot(snapshot))
             }
             Self::Reader(reader) => Ok(ReadView::Reader(reader.clone())),
@@ -110,8 +119,14 @@ impl Substrate {
     /// Close the underlying handle (writer or reader).
     pub async fn close(&self) -> Result<()> {
         match self {
-            Self::Writer(db) => db.close().await.map_err(|err| anyhow!("slatedb close: {err}")),
-            Self::Reader(reader) => reader.close().await.map_err(|err| anyhow!("slatedb reader close: {err}")),
+            Self::Writer(db) => db
+                .close()
+                .await
+                .map_err(|err| anyhow!("slatedb close: {err}")),
+            Self::Reader(reader) => reader
+                .close()
+                .await
+                .map_err(|err| anyhow!("slatedb reader close: {err}")),
         }
     }
 }
@@ -143,8 +158,14 @@ impl ReadView {
     /// Point read of `key` from the pinned view.
     pub async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         match self {
-            Self::Snapshot(snapshot) => snapshot.get(key).await.map_err(|err| anyhow!("slatedb snapshot get: {err}")),
-            Self::Reader(reader) => reader.get(key).await.map_err(|err| anyhow!("slatedb reader get: {err}")),
+            Self::Snapshot(snapshot) => snapshot
+                .get(key)
+                .await
+                .map_err(|err| anyhow!("slatedb snapshot get: {err}")),
+            Self::Reader(reader) => reader
+                .get(key)
+                .await
+                .map_err(|err| anyhow!("slatedb reader get: {err}")),
         }
     }
 

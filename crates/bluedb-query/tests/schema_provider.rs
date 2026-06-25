@@ -45,9 +45,22 @@ async fn schema_provider_resolves_join_without_explicit_registration() {
     let (db, cdc, eng) = make_engine().await;
     eng.enable_table("orders").await.unwrap();
     eng.enable_table("customers").await.unwrap();
-    ddl(&db, "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT);").await;
-    ddl(&db, "CREATE TABLE orders (id INTEGER PRIMARY KEY, amount INTEGER);").await;
-    dml(&db, &cdc, "INSERT INTO customers VALUES (1, 'alice'), (2, 'bob');").await;
+    ddl(
+        &db,
+        "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT);",
+    )
+    .await;
+    ddl(
+        &db,
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, amount INTEGER);",
+    )
+    .await;
+    dml(
+        &db,
+        &cdc,
+        "INSERT INTO customers VALUES (1, 'alice'), (2, 'bob');",
+    )
+    .await;
     dml(&db, &cdc, "INSERT INTO orders VALUES (1, 100), (2, 200);").await;
     eng.seal().await.unwrap();
     // Post-seal (tail-only) update — the resolved provider must surface it.
@@ -104,7 +117,11 @@ async fn schema_provider_resolves_join_without_explicit_registration() {
 async fn session_with_catalog_table_resolves_to_dataframe() {
     let (db, cdc, eng) = make_engine().await;
     eng.enable_table("orders").await.unwrap();
-    ddl(&db, "CREATE TABLE orders (id INTEGER PRIMARY KEY, amount INTEGER);").await;
+    ddl(
+        &db,
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, amount INTEGER);",
+    )
+    .await;
     dml(&db, &cdc, "INSERT INTO orders VALUES (1, 100), (2, 200);").await;
     eng.seal().await.unwrap();
 
@@ -113,5 +130,8 @@ async fn session_with_catalog_table_resolves_to_dataframe() {
     let df = ctx.table("orders").await.unwrap();
     let batches = df.limit(0, Some(1)).unwrap().collect().await.unwrap();
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(total, 1, "limit(1) returned one row from 'orders' DataFrame");
+    assert_eq!(
+        total, 1,
+        "limit(1) returned one row from 'orders' DataFrame"
+    );
 }

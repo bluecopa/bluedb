@@ -92,11 +92,10 @@
   body is JSON `{sql}`. Returns the ring response, or throws on connect/timeout."
   [node sql]
   (http/post (str (h/base node) "/admin/sql")
-             {:body (json/generate-string {:sql sql})
-              :content-type :json
-              :throw-exceptions false
-              :socket-timeout 8000
-              :connection-timeout 2000}))
+             (h/opts :body (json/generate-string {:sql sql})
+                     :content-type :json
+                     :socket-timeout 8000
+                     :connection-timeout 2000)))
 
 (defn- fill-reads
   "Map the micro-ops back over the per-statement payloads. `payloads` is the

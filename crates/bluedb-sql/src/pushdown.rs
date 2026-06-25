@@ -138,7 +138,10 @@ fn register_table(
 
 /// Unqualified column -> table position, only for column names unique across the
 /// involved tables (ambiguous names are skipped and stay in the `WHERE`).
-fn build_column_index(schema_map: &SchemaMap, tables: &[(String, usize)]) -> HashMap<String, usize> {
+fn build_column_index(
+    schema_map: &SchemaMap,
+    tables: &[(String, usize)],
+) -> HashMap<String, usize> {
     let mut seen: HashMap<String, (usize, usize)> = HashMap::new();
     for (table, pos) in tables {
         if let Some(schema) = schema_map.get(table) {
@@ -179,7 +182,12 @@ fn equijoin_target(
     col_pos: &HashMap<String, usize>,
 ) -> Option<(usize, Expr)> {
     let inner = unnest(conjunct);
-    if let Expr::BinaryOp { left, op: BinaryOperator::Eq, right } = inner {
+    if let Expr::BinaryOp {
+        left,
+        op: BinaryOperator::Eq,
+        right,
+    } = inner
+    {
         let p = col_position(left, table_pos, col_pos)?;
         let q = col_position(right, table_pos, col_pos)?;
         if p != q {
@@ -202,7 +210,11 @@ fn is_inner(join: &Join) -> bool {
 
 fn split_and(expr: Expr) -> Vec<Expr> {
     match expr {
-        Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
             let mut out = split_and(*left);
             out.extend(split_and(*right));
             out

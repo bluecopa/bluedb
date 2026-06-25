@@ -166,7 +166,11 @@ async fn graph_edge_auth_negatives() {
         Some(edge_body.clone()),
     )
     .await;
-    assert_eq!(s, StatusCode::FORBIDDEN, "read-only token on upsert: {s} {body}");
+    assert_eq!(
+        s,
+        StatusCode::FORBIDDEN,
+        "read-only token on upsert: {s} {body}"
+    );
 
     // 5b. PUT with a token whose tenant scope doesn't match → 403.
     let (s, body) = call(
@@ -178,7 +182,11 @@ async fn graph_edge_auth_negatives() {
         Some(edge_body.clone()),
     )
     .await;
-    assert_eq!(s, StatusCode::FORBIDDEN, "acme token on globex tenant: {s} {body}");
+    assert_eq!(
+        s,
+        StatusCode::FORBIDDEN,
+        "acme token on globex tenant: {s} {body}"
+    );
 
     // Sanity: the write token DOES work on its own tenant.
     let (s, body) = call(
@@ -190,19 +198,31 @@ async fn graph_edge_auth_negatives() {
         Some(edge_body),
     )
     .await;
-    assert_eq!(s, StatusCode::OK, "acme write token on acme tenant: {s} {body}");
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "acme write token on acme tenant: {s} {body}"
+    );
     assert_eq!(body["upserted"], 1, "upserted count: {body}");
 }
 
 #[tokio::test]
 async fn http_drop_graph_clears_edges() {
     let (_, app) = promoted(None).await;
-    let (s, _b) = call(&app, "PUT", "/graph/g/edges", Some("acme"), None, Some(json!({
-        "edges": [
-            {"src":"A","dst":"B","weight":5},
-            {"src":"B","dst":"C","weight":3}
-        ]
-    }))).await;
+    let (s, _b) = call(
+        &app,
+        "PUT",
+        "/graph/g/edges",
+        Some("acme"),
+        None,
+        Some(json!({
+            "edges": [
+                {"src":"A","dst":"B","weight":5},
+                {"src":"B","dst":"C","weight":3}
+            ]
+        })),
+    )
+    .await;
     assert_eq!(s, StatusCode::OK);
 
     let (s, body) = call(&app, "DELETE", "/graph/g", Some("acme"), None, None).await;
@@ -210,7 +230,15 @@ async fn http_drop_graph_clears_edges() {
     assert_eq!(body["dropped"], 2);
 
     // After drop, reachable from A sees only the seed (no edges left).
-    let (s, body) = call(&app, "POST", "/graph/g/reachable", Some("acme"), None, Some(json!({ "from": ["A"] }))).await;
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/graph/g/reachable",
+        Some("acme"),
+        None,
+        Some(json!({ "from": ["A"] })),
+    )
+    .await;
     assert_eq!(s, StatusCode::OK, "{body}");
     assert_eq!(body["nodes"], json!(["A"]));
 }
@@ -226,16 +254,52 @@ async fn http_drop_graph_auth_negatives() {
     let (_, app) = promoted(Some(authz)).await;
 
     // Read-only token on the drop route → 403.
-    let (s, body) = call(&app, "DELETE", "/graph/g", Some("acme"), Some("acmero"), None).await;
-    assert_eq!(s, StatusCode::FORBIDDEN, "read-only token on drop: {s} {body}");
+    let (s, body) = call(
+        &app,
+        "DELETE",
+        "/graph/g",
+        Some("acme"),
+        Some("acmero"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::FORBIDDEN,
+        "read-only token on drop: {s} {body}"
+    );
 
     // Write token whose tenant scope doesn't match the header → 403.
-    let (s, body) = call(&app, "DELETE", "/graph/g", Some("globex"), Some("acmerw"), None).await;
-    assert_eq!(s, StatusCode::FORBIDDEN, "acme token on globex tenant: {s} {body}");
+    let (s, body) = call(
+        &app,
+        "DELETE",
+        "/graph/g",
+        Some("globex"),
+        Some("acmerw"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::FORBIDDEN,
+        "acme token on globex tenant: {s} {body}"
+    );
 
     // Sanity: the write token works on its own tenant (empty graph → dropped:0).
-    let (s, body) = call(&app, "DELETE", "/graph/g", Some("acme"), Some("acmerw"), None).await;
-    assert_eq!(s, StatusCode::OK, "acme write token on acme tenant: {s} {body}");
+    let (s, body) = call(
+        &app,
+        "DELETE",
+        "/graph/g",
+        Some("acme"),
+        Some("acmerw"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "acme write token on acme tenant: {s} {body}"
+    );
     assert_eq!(body["dropped"], 0, "dropped count: {body}");
 }
 
@@ -288,7 +352,10 @@ async fn hard_delete_retract_edges_flag_over_http() {
     .await;
     assert_eq!(s, StatusCode::OK, "hard-delete retract=false: {s} {body}");
     assert_eq!(body["deleted"], true, "deleted: {body}");
-    assert_eq!(body["retract_edges"], false, "retract_edges echoed false: {body}");
+    assert_eq!(
+        body["retract_edges"], false,
+        "retract_edges echoed false: {body}"
+    );
 
     // Default (no query param) → 200, echoed retract_edges:true.
     let (s, body) = call(
@@ -302,7 +369,10 @@ async fn hard_delete_retract_edges_flag_over_http() {
     .await;
     assert_eq!(s, StatusCode::OK, "hard-delete default: {s} {body}");
     assert_eq!(body["deleted"], true, "deleted: {body}");
-    assert_eq!(body["retract_edges"], true, "retract_edges echoed true: {body}");
+    assert_eq!(
+        body["retract_edges"], true,
+        "retract_edges echoed true: {body}"
+    );
 }
 
 /// append-with-edges over HTTP: edges are framed into the verified `leaf_hash`,
@@ -383,9 +453,15 @@ async fn http_append_with_edges_affects_digest() {
     let same = digest("same").await;
 
     // edge changed the leaf hash ⇒ different root.
-    assert_ne!(with, without, "edge must change root_hash: with={with} without={without}");
+    assert_ne!(
+        with, without,
+        "edge must change root_hash: with={with} without={without}"
+    );
     // same edge ⇒ same hash.
-    assert_eq!(with, same, "same edge must yield same root_hash: with={with} same={same}");
+    assert_eq!(
+        with, same,
+        "same edge must yield same root_hash: with={with} same={same}"
+    );
 }
 
 /// append edge parse-error negatives → 400.
@@ -502,7 +578,10 @@ async fn http_reachable_and_widest_path() {
     .await;
     assert_eq!(s, StatusCode::OK, "{body}");
     assert_eq!(body["connected"], false);
-    assert!(body.get("bottleneck").is_none(), "no bottleneck when disconnected: {body}");
+    assert!(
+        body.get("bottleneck").is_none(),
+        "no bottleneck when disconnected: {body}"
+    );
 }
 
 /// Traversal reads require `data:read`; tenant scope must match the header.
@@ -527,7 +606,11 @@ async fn http_traversal_requires_read_scope() {
         Some(reach_body.clone()),
     )
     .await;
-    assert_eq!(s, StatusCode::FORBIDDEN, "no-scope token on reachable: {s} {body}");
+    assert_eq!(
+        s,
+        StatusCode::FORBIDDEN,
+        "no-scope token on reachable: {s} {body}"
+    );
 
     // A token whose tenant scope doesn't match the header → 403 (mirrors the
     // edge auth test). acmero CAN read, but only on acme — not globex.
@@ -540,7 +623,11 @@ async fn http_traversal_requires_read_scope() {
         Some(reach_body.clone()),
     )
     .await;
-    assert_eq!(s, StatusCode::FORBIDDEN, "acme read token on globex tenant: {s} {body}");
+    assert_eq!(
+        s,
+        StatusCode::FORBIDDEN,
+        "acme read token on globex tenant: {s} {body}"
+    );
 
     // Sanity: the read token DOES work on its own tenant.
     let (s, body) = call(
@@ -552,7 +639,11 @@ async fn http_traversal_requires_read_scope() {
         Some(reach_body),
     )
     .await;
-    assert_eq!(s, StatusCode::OK, "acme read token on acme tenant: {s} {body}");
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "acme read token on acme tenant: {s} {body}"
+    );
     // No edges upserted in authz mode → seed only.
     assert_eq!(body["nodes"], json!(["A"]), "seed-only reachable: {body}");
 }
@@ -585,8 +676,15 @@ async fn http_atomic_mutate_swaps_config() {
     let reach = |app: &Router| {
         let app = app.clone();
         async move {
-            call(&app, "POST", "/graph/g/reachable", Some("acme"), None,
-                 Some(json!({ "from": ["R"], "directed": true }))).await
+            call(
+                &app,
+                "POST",
+                "/graph/g/reachable",
+                Some("acme"),
+                None,
+                Some(json!({ "from": ["R"], "directed": true })),
+            )
+            .await
         }
     };
 
@@ -614,7 +712,11 @@ async fn http_atomic_mutate_swaps_config() {
     // Now exactly config B — Z still reachable, A gone. Never a torn {R} / {R,A}.
     let (s, body) = reach(&app).await;
     assert_eq!(s, StatusCode::OK, "{body}");
-    assert_eq!(body["nodes"], json!(["B", "R", "Z"]), "config B after swap: {body}");
+    assert_eq!(
+        body["nodes"],
+        json!(["B", "R", "Z"]),
+        "config B after swap: {body}"
+    );
 
     // Unknown merge mode → 400.
     let (s, _body) = call(

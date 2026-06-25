@@ -74,21 +74,21 @@
   [node graph target]
   (let [o (other target)]
     (http/post (str (h/base node) "/graph/" graph "/mutate")
-               {:throw-exceptions false :socket-timeout 8000 :connection-timeout 2000
-                :content-type :json
-                :body (json/generate-string
-                       {:upserts [{:src root :dst target :weight 1}
-                                  {:src target :dst sink :weight 1}]
-                        :deletes [{:src root :dst o}
-                                  {:src o :dst sink}]})})))
+               (h/opts :socket-timeout 8000 :connection-timeout 2000
+                       :content-type :json
+                       :body (json/generate-string
+                              {:upserts [{:src root :dst target :weight 1}
+                                         {:src target :dst sink :weight 1}]
+                               :deletes [{:src root :dst o}
+                                         {:src o :dst sink}]})))))
 
 (defn- reach!
   "Directed reachable from R."
   [node graph]
   (http/post (str (h/base node) "/graph/" graph "/reachable")
-             {:throw-exceptions false :socket-timeout 10000 :connection-timeout 2000
-              :content-type :json
-              :body (json/generate-string {:from [root] :directed true})}))
+             (h/opts :socket-timeout 10000 :connection-timeout 2000
+                     :content-type :json
+                     :body (json/generate-string {:from [root] :directed true}))))
 
 (defn- do-swap
   "Returns :ok / :passive / :failed / :timeout / :down."

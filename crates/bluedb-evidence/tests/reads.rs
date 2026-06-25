@@ -2,7 +2,12 @@ use bluedb_evidence::{EntryInput, Evidence};
 mod harness;
 
 fn e(t: &str) -> EntryInput {
-    EntryInput { etype: t.into(), payload: t.as_bytes().to_vec(), at: String::new(), edges: vec![] }
+    EntryInput {
+        etype: t.into(),
+        payload: t.as_bytes().to_vec(),
+        at: String::new(),
+        edges: vec![],
+    }
 }
 
 #[tokio::test]
@@ -12,7 +17,10 @@ async fn read_range_roundtrips_in_numeric_order_across_digit_boundary() {
     for i in 1..=1000 {
         ev.append("c", vec![e(&i.to_string())], None).await.unwrap();
     }
-    let all = ev.read_range("c", 1, ev.head("c").await.unwrap()).await.unwrap();
+    let all = ev
+        .read_range("c", 1, ev.head("c").await.unwrap())
+        .await
+        .unwrap();
     assert_eq!(all.len(), 1000);
     assert_eq!(all[8].1.payload, b"9");
     assert_eq!(all[9].1.payload, b"10");
@@ -60,7 +68,9 @@ async fn read_from_paging_reproduces_full_range() {
 async fn read_range_i64_max_hi_returns_all() {
     let db = harness::memory_db().await;
     let ev = Evidence::new(&db, "_");
-    ev.append("c", vec![e("first"), e("second")], None).await.unwrap();
+    ev.append("c", vec![e("first"), e("second")], None)
+        .await
+        .unwrap();
     let all = ev.read_range("c", 1, i64::MAX).await.unwrap();
     assert_eq!(all.len(), 2);
     assert_eq!(all[0].0, 1);

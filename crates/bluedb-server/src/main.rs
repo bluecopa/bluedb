@@ -17,8 +17,14 @@
 //!   - `BLUEDB_GCS_BUCKET` (+ `BLUEDB_GCS_SERVICE_ACCOUNT` path) — Google Cloud Storage.
 //!   - `BLUEDB_DATA_DIR` — local filesystem (single-node persistence).
 //!   - else — in-memory (ephemeral; single node only).
-//! - `BLUEDB_LEASE_PG_URL` — Postgres lease arbiter for multi-node election; if
-//!   unset, an in-process lease (single writer) is used.
+//! - Lease arbiter:
+//!   - `BLUEDB_LEASE_BACKEND` — `postgres`, `kubernetes`, or `local`. If unset,
+//!     `BLUEDB_LEASE_PG_URL` selects Postgres; otherwise an in-process lease
+//!     (single writer) is used.
+//!   - `BLUEDB_LEASE_PG_URL` — Postgres lease arbiter URL when using Postgres.
+//!   - `BLUEDB_K8S_LEASE_NAME` — Kubernetes Lease object name when using the
+//!     Kubernetes backend (default `bluedb-writer`). Uses `BLUEDB_K8S_NAMESPACE`
+//!     for the namespace (default `default`).
 //! - `BLUEDB_NODE_ID` (default `node-0`), `BLUEDB_LEASE_TTL_SECS` (15),
 //!   `BLUEDB_LEASE_MARGIN_SECS` (5).
 //! - `BLUEDB_ADVERTISE_ADDR` — this node's externally-reachable base URL (e.g.
@@ -115,7 +121,47 @@ fn parse_analytical_cache_bytes() -> usize {
 }
 
 fn env_secs(key: &str, default: u64) -> Duration {
-    Duration::from_secs(std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default))
+    Duration::from_secs(
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default),
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaseBackend {
+    Kubernetes,
+    Postgres,
+    Local,
+}
+
+fn select_lease_backend(
+    configured: Option<&str>,
+    pg_url: Option<&str>,
+) -> anyhow::Result<LeaseBackend> {
+    let configured = configured.map(str::trim).filter(|s| !s.is_empty());
+    match configured {
+        Some("kubernetes") | Some("k8s") => Ok(LeaseBackend::Kubernetes),
+        Some("postgres") | Some("pg") => {
+            if pg_url.is_some() {
+                Ok(LeaseBackend::Postgres)
+            } else {
+                anyhow::bail!("BLUEDB_LEASE_BACKEND=postgres requires BLUEDB_LEASE_PG_URL");
+            }
+        }
+        Some("local") | Some("in-process") | Some("inprocess") => Ok(LeaseBackend::Local),
+        Some(other) => anyhow::bail!(
+            "invalid BLUEDB_LEASE_BACKEND '{other}' (expected postgres, kubernetes, or local)"
+        ),
+        None => {
+            if pg_url.is_some() {
+                Ok(LeaseBackend::Postgres)
+            } else {
+                Ok(LeaseBackend::Local)
+            }
+        }
+    }
 }
 
 /// This node's externally-reachable base URL, published to the node registry.
@@ -137,7 +183,12 @@ fn coordinator_port(bind_addr: &str) -> u16 {
     std::env::var("BLUEDB_K8S_PORT")
         .ok()
         .and_then(|s| s.trim().parse::<u16>().ok())
-        .or_else(|| bind_addr.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()))
+        .or_else(|| {
+            bind_addr
+                .rsplit(':')
+                .next()
+                .and_then(|p| p.parse::<u16>().ok())
+        })
         .unwrap_or(8080)
 }
 
@@ -158,7 +209,8 @@ async fn build_node_registry(
         if bluedb_ha::in_cluster() {
             let namespace =
                 std::env::var("BLUEDB_K8S_NAMESPACE").unwrap_or_else(|_| "default".to_string());
-            let service = std::env::var("BLUEDB_K8S_SERVICE").unwrap_or_else(|_| "bluedb".to_string());
+            let service =
+                std::env::var("BLUEDB_K8S_SERVICE").unwrap_or_else(|_| "bluedb".to_string());
             let port = coordinator_port(_bind_addr);
             eprintln!(
                 "bluedb-server: node registry = kubernetes (service '{service}' in '{namespace}', port {port})"
@@ -179,6 +231,47 @@ async fn build_node_registry(
     // 3. In-memory — single-process default.
     eprintln!("bluedb-server: node registry = in-memory (single node)");
     Ok((Arc::new(InMemoryNodeRegistry::new(registry_ttl)), true))
+}
+
+async fn build_lease_provider(
+    backend: LeaseBackend,
+    pg_url: Option<&str>,
+    db_path: &str,
+) -> anyhow::Result<Arc<dyn LeaseProvider>> {
+    match backend {
+        LeaseBackend::Kubernetes => {
+            #[cfg(feature = "kubernetes")]
+            {
+                let namespace =
+                    std::env::var("BLUEDB_K8S_NAMESPACE").unwrap_or_else(|_| "default".to_string());
+                let name = std::env::var("BLUEDB_K8S_LEASE_NAME")
+                    .unwrap_or_else(|_| "bluedb-writer".to_string());
+                eprintln!(
+                    "bluedb-server: lease arbiter = kubernetes Lease '{name}' in namespace '{namespace}'"
+                );
+                Ok(Arc::new(
+                    bluedb_ha::K8sLeaseProvider::connect(namespace, name).await?,
+                ))
+            }
+            #[cfg(not(feature = "kubernetes"))]
+            {
+                anyhow::bail!(
+                    "BLUEDB_LEASE_BACKEND=kubernetes requires building bluedb-server with --features kubernetes"
+                );
+            }
+        }
+        LeaseBackend::Postgres => {
+            let url = pg_url.expect("Postgres backend must have pg_url after select_lease_backend");
+            eprintln!("bluedb-server: lease arbiter = postgres");
+            Ok(Arc::new(
+                PostgresLeaseProvider::connect(url, db_path.to_string()).await?,
+            ))
+        }
+        LeaseBackend::Local => {
+            eprintln!("bluedb-server: lease arbiter = in-process (single writer)");
+            Ok(Arc::new(LocalLeaseProvider::new()))
+        }
+    }
 }
 
 #[tokio::main]
@@ -213,19 +306,15 @@ async fn main() -> anyhow::Result<()> {
 
     // Read the Postgres URL once — shared by the lease arbiter AND the node
     // registry (the registry's bluedb_nodes table lives in the same Postgres).
-    let pg_url = std::env::var("BLUEDB_LEASE_PG_URL").ok().filter(|s| !s.trim().is_empty());
+    let pg_url = std::env::var("BLUEDB_LEASE_PG_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
 
-    // Lease arbiter: shared Postgres for real multi-node HA, else in-process.
-    let lease: Arc<dyn LeaseProvider> = match &pg_url {
-        Some(url) => {
-            eprintln!("bluedb-server: lease arbiter = postgres");
-            Arc::new(PostgresLeaseProvider::connect(url, db_path.clone()).await?)
-        }
-        None => {
-            eprintln!("bluedb-server: lease arbiter = in-process (single writer)");
-            Arc::new(LocalLeaseProvider::new())
-        }
-    };
+    let lease_backend = select_lease_backend(
+        std::env::var("BLUEDB_LEASE_BACKEND").ok().as_deref(),
+        pg_url.as_deref(),
+    )?;
+    let lease = build_lease_provider(lease_backend, pg_url.as_deref(), &db_path).await?;
 
     let node_id = std::env::var("BLUEDB_NODE_ID").unwrap_or_else(|_| "node-0".to_string());
     let ttl = env_secs("BLUEDB_LEASE_TTL_SECS", 15);
@@ -248,7 +337,10 @@ async fn main() -> anyhow::Result<()> {
     // `Arc::get_mut` succeeds.
     let bind_addr = std::env::var("BLUEDB_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let advertise = advertise_url(&bind_addr);
-    let registry_ttl = env_secs("BLUEDB_NODE_REGISTRY_TTL_SECS", ttl.as_secs().saturating_mul(3).max(1));
+    let registry_ttl = env_secs(
+        "BLUEDB_NODE_REGISTRY_TTL_SECS",
+        ttl.as_secs().saturating_mul(3).max(1),
+    );
     let (node_registry, needs_heartbeat) =
         build_node_registry(pg_url.as_deref(), registry_ttl, &bind_addr).await?;
 
@@ -313,4 +405,43 @@ async fn main() -> anyhow::Result<()> {
     eprintln!("bluedb-server: listening on http://{bind_addr}");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lease_backend_defaults_to_postgres_when_pg_url_is_set() {
+        assert_eq!(
+            select_lease_backend(None, Some("postgresql://localhost/bluedb")).unwrap(),
+            LeaseBackend::Postgres
+        );
+    }
+
+    #[test]
+    fn lease_backend_defaults_to_local_without_pg_url() {
+        assert_eq!(
+            select_lease_backend(None, None).unwrap(),
+            LeaseBackend::Local
+        );
+    }
+
+    #[test]
+    fn lease_backend_accepts_kubernetes_alias() {
+        assert_eq!(
+            select_lease_backend(Some("k8s"), Some("postgresql://localhost/bluedb")).unwrap(),
+            LeaseBackend::Kubernetes
+        );
+    }
+
+    #[test]
+    fn lease_backend_requires_pg_url_for_explicit_postgres() {
+        assert!(select_lease_backend(Some("postgres"), None).is_err());
+    }
+
+    #[test]
+    fn lease_backend_rejects_unknown_values() {
+        assert!(select_lease_backend(Some("zookeeper"), None).is_err());
+    }
 }

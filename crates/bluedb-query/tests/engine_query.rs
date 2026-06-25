@@ -20,9 +20,7 @@ use slatedb::Db;
 /// `InMemory` object store so no temp-dir or file-system I/O is required.
 async fn make_engine() -> (Database, CdcConfig, LakehouseEngine) {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let db = Database::new(Arc::new(
-        Db::open("bluedb", store.clone()).await.unwrap(),
-    ));
+    let db = Database::new(Arc::new(Db::open("bluedb", store.clone()).await.unwrap()));
     let cdc = CdcConfig::default();
     let file_io = object_store_file_io(store.clone(), "");
     let eng = LakehouseEngine::reopen(file_io, "lakehouse", "_", db.clone(), cdc.clone())
@@ -184,10 +182,7 @@ async fn aggregate_query_returns_correct_counts() {
     counts.sort();
     assert_eq!(
         counts,
-        vec![
-            ("fruit".to_string(), 4),
-            ("veg".to_string(), 1),
-        ],
+        vec![("fruit".to_string(), 4), ("veg".to_string(), 1),],
         "fruit=4, veg=1: {counts:?}"
     );
 }
@@ -206,7 +201,9 @@ async fn error_on_unsealed_table() {
     // We insert one row but do NOT seal.
     {
         let mut g = Glue::new(db.connection_with_cdc(cdc.clone()));
-        g.execute("INSERT INTO empty VALUES (1, 'x');").await.unwrap();
+        g.execute("INSERT INTO empty VALUES (1, 'x');")
+            .await
+            .unwrap();
     }
 
     let result = query_sql(&eng, "empty", "SELECT * FROM empty").await;
@@ -243,7 +240,10 @@ async fn decimal_and_date_columns_are_accessible() {
 
     let price_col = b.column_by_name("price").expect("price column");
     assert!(
-        price_col.as_any().downcast_ref::<Decimal128Array>().is_some(),
+        price_col
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .is_some(),
         "price must be Decimal128, got {:?}",
         price_col.data_type()
     );

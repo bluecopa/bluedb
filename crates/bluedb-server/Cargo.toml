@@ -10,9 +10,9 @@ name = "bluedb-server"
 path = "src/main.rs"
 
 [features]
-# Build the deployable binary with the Kubernetes-native node registry
-# (`K8sNodeRegistry`, via kube-rs). Off by default so the default/CI build never
-# pulls kube/k8s-openapi; turn on for the in-cluster image.
+# Build the deployable binary with the Kubernetes-native lease provider and node
+# registry (via kube-rs). Off by default so the default/CI build never pulls
+# kube/k8s-openapi; turn on for the in-cluster image.
 kubernetes = ["bluedb-ha/kubernetes"]
 
 [dependencies]

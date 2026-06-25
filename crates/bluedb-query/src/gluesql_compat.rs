@@ -25,7 +25,9 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, ArrayRef, Date32Array, Date32Builder, Float64Array, Int64Array};
+use datafusion::arrow::array::{
+    Array, ArrayRef, Date32Array, Date32Builder, Float64Array, Int64Array,
+};
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::temporal_conversions::date32_to_datetime;
@@ -53,7 +55,11 @@ pub fn register(ctx: &mut SessionContext) -> DfResult<()> {
     alias_agg(ctx, "var_samp", &["variance"])?;
     alias_agg(ctx, "stddev_samp", &["stdev"])?;
     alias_agg(ctx, "approx_distinct", &["approx_count_distinct"])?;
-    alias_agg(ctx, "approx_percentile_cont", &["approx_percentile", "approx_quantile"])?;
+    alias_agg(
+        ctx,
+        "approx_percentile_cont",
+        &["approx_percentile", "approx_quantile"],
+    )?;
 
     // Small reimplementations DataFusion has no built-in for.
     ctx.register_udf(Arc::new(ScalarUDF::new_from_impl(AddMonth::new())))?;
@@ -65,9 +71,16 @@ pub fn register(ctx: &mut SessionContext) -> DfResult<()> {
 
 /// Re-register a built-in scalar with extra invocation names.
 fn alias_scalar(ctx: &mut SessionContext, target: &str, aliases: &[&'static str]) -> DfResult<()> {
-    let udf = ctx.state().scalar_functions().get(target).cloned().ok_or_else(|| {
-        DataFusionError::Execution(format!("gluesql_compat: built-in scalar '{target}' missing"))
-    })?;
+    let udf = ctx
+        .state()
+        .scalar_functions()
+        .get(target)
+        .cloned()
+        .ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "gluesql_compat: built-in scalar '{target}' missing"
+            ))
+        })?;
     let aliased = (*udf).clone().with_aliases(aliases.iter().copied());
     ctx.register_udf(Arc::new(aliased))?;
     Ok(())
@@ -75,9 +88,16 @@ fn alias_scalar(ctx: &mut SessionContext, target: &str, aliases: &[&'static str]
 
 /// Re-register a built-in aggregate with extra invocation names.
 fn alias_agg(ctx: &mut SessionContext, target: &str, aliases: &[&'static str]) -> DfResult<()> {
-    let udf = ctx.state().aggregate_functions().get(target).cloned().ok_or_else(|| {
-        DataFusionError::Execution(format!("gluesql_compat: built-in aggregate '{target}' missing"))
-    })?;
+    let udf = ctx
+        .state()
+        .aggregate_functions()
+        .get(target)
+        .cloned()
+        .ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "gluesql_compat: built-in aggregate '{target}' missing"
+            ))
+        })?;
     let aliased = (*udf).clone().with_aliases(aliases.iter().copied());
     ctx.register_udaf(Arc::new(aliased))?;
     Ok(())
@@ -97,7 +117,9 @@ struct AddMonth {
 }
 impl AddMonth {
     fn new() -> Self {
-        Self { signature: Signature::any(2, Volatility::Immutable) }
+        Self {
+            signature: Signature::any(2, Volatility::Immutable),
+        }
     }
 }
 impl ScalarUDFImpl for AddMonth {
@@ -156,7 +178,9 @@ struct LastDay {
 }
 impl LastDay {
     fn new() -> Self {
-        Self { signature: Signature::any(1, Volatility::Immutable) }
+        Self {
+            signature: Signature::any(1, Volatility::Immutable),
+        }
     }
 }
 impl ScalarUDFImpl for LastDay {
@@ -213,7 +237,10 @@ struct NumBinary {
 }
 impl NumBinary {
     fn new(name: &'static str) -> Self {
-        Self { name, signature: Signature::any(2, Volatility::Immutable) }
+        Self {
+            name,
+            signature: Signature::any(2, Volatility::Immutable),
+        }
     }
 }
 impl ScalarUDFImpl for NumBinary {
@@ -281,29 +308,57 @@ mod tests {
         // rand() in [0,1); generate_uuid() is a 36-char hyphenated string.
         let r = one_f64("SELECT rand()").await;
         assert!((0.0..1.0).contains(&r));
-        assert_eq!(one_str("SELECT generate_uuid()").await.map(|s| s.len()), Some(36));
+        assert_eq!(
+            one_str("SELECT generate_uuid()").await.map(|s| s.len()),
+            Some(36)
+        );
     }
 
     #[tokio::test]
     async fn aggregate_aliases_resolve() {
         // variance/stdev are the sample statistics (PostgreSQL semantics).
         let v = one_f64("SELECT variance(c) FROM (VALUES (1.0),(2.0),(3.0)) t(c)").await;
-        assert!((v - 1.0).abs() < 1e-9, "sample variance of 1,2,3 is 1.0; got {v}");
+        assert!(
+            (v - 1.0).abs() < 1e-9,
+            "sample variance of 1,2,3 is 1.0; got {v}"
+        );
         let s = one_f64("SELECT stdev(c) FROM (VALUES (1.0),(2.0),(3.0)) t(c)").await;
-        assert!((s - 1.0).abs() < 1e-9, "sample stddev of 1,2,3 is 1.0; got {s}");
+        assert!(
+            (s - 1.0).abs() < 1e-9,
+            "sample stddev of 1,2,3 is 1.0; got {s}"
+        );
         // approximate-aggregate aliases plan and run.
         let n = one_f64("SELECT approx_count_distinct(c) FROM (VALUES (1),(1),(2),(3)) t(c)").await;
         assert_eq!(n, 3.0);
-        let p = one_f64("SELECT approx_quantile(c, 0.5) FROM (VALUES (1.0),(2.0),(3.0)) t(c)").await;
-        assert!((1.0..=3.0).contains(&p), "median estimate within range; got {p}");
+        let p =
+            one_f64("SELECT approx_quantile(c, 0.5) FROM (VALUES (1.0),(2.0),(3.0)) t(c)").await;
+        assert!(
+            (1.0..=3.0).contains(&p),
+            "median estimate within range; got {p}"
+        );
     }
 
     #[tokio::test]
     async fn reimplemented_functions() {
         // add_month clamps to the last valid day (Jan 31 + 1mo -> Feb 29, 2024).
-        assert_eq!(one_str("SELECT add_month(DATE '2024-01-31', 1)").await.as_deref(), Some("2024-02-29"));
-        assert_eq!(one_str("SELECT add_month(DATE '2024-03-15', -2)").await.as_deref(), Some("2024-01-15"));
-        assert_eq!(one_str("SELECT last_day(DATE '2024-02-10')").await.as_deref(), Some("2024-02-29"));
+        assert_eq!(
+            one_str("SELECT add_month(DATE '2024-01-31', 1)")
+                .await
+                .as_deref(),
+            Some("2024-02-29")
+        );
+        assert_eq!(
+            one_str("SELECT add_month(DATE '2024-03-15', -2)")
+                .await
+                .as_deref(),
+            Some("2024-01-15")
+        );
+        assert_eq!(
+            one_str("SELECT last_day(DATE '2024-02-10')")
+                .await
+                .as_deref(),
+            Some("2024-02-29")
+        );
         assert_eq!(one_f64("SELECT mod(7.0, 3.0)").await, 1.0);
         assert_eq!(one_f64("SELECT div(7.0, 3.0)").await, 2.0);
     }

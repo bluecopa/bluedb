@@ -8,8 +8,8 @@ use arrow_array::{Int64Array, RecordBatch, StringArray};
 use bluedb_lakehouse::writer::LakehouseWriter;
 use futures::TryStreamExt;
 use gluesql_core::data::Key;
-use gluesql_core::store::DataRow;
 use gluesql_core::data::Value;
+use gluesql_core::store::DataRow;
 use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
 /// `id BIGINT PRIMARY KEY, body TEXT` — field-ids 1 and 2, identifier = id.

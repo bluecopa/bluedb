@@ -17,11 +17,12 @@ pub fn derived_col(path: &str) -> String {
 /// and any derived index name contain only `[A-Za-z0-9_]`, so they are safe to
 /// interpolate into DDL.
 pub fn valid_path(path: &str) -> bool {
-    !path.is_empty() && path.split('.').all(|seg| {
-        let mut chars = seg.chars();
-        matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
-            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-    })
+    !path.is_empty()
+        && path.split('.').all(|seg| {
+            let mut chars = seg.chars();
+            matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
 }
 
 /// Extract `path` from `doc` as text (the value stored in the derived column).
@@ -392,10 +393,7 @@ mod tests {
     #[test]
     fn derive_typed_value_missing_path_is_none_for_all_types() {
         let doc = json!({"x": 1});
-        assert_eq!(
-            derive_typed_value(&doc, "missing", IndexType::Number),
-            None
-        );
+        assert_eq!(derive_typed_value(&doc, "missing", IndexType::Number), None);
         assert_eq!(derive_typed_value(&doc, "missing", IndexType::Bool), None);
         assert_eq!(derive_typed_value(&doc, "missing", IndexType::Text), None);
     }
@@ -406,18 +404,12 @@ mod tests {
 
     #[test]
     fn compound_col_simple_paths() {
-        assert_eq!(
-            compound_col(&["a".into(), "b".into()]),
-            "__cidxm_a__b"
-        );
+        assert_eq!(compound_col(&["a".into(), "b".into()]), "__cidxm_a__b");
     }
 
     #[test]
     fn compound_col_nested_path_dot_normalized() {
-        assert_eq!(
-            compound_col(&["x.y".into(), "z".into()]),
-            "__cidxm_x_y__z"
-        );
+        assert_eq!(compound_col(&["x.y".into(), "z".into()]), "__cidxm_x_y__z");
     }
 
     #[test]
@@ -434,10 +426,7 @@ mod tests {
 
     #[test]
     fn encode_compound_nul_separator() {
-        assert_eq!(
-            encode_compound(&["x".into(), "y".into()]),
-            "x\u{0}y"
-        );
+        assert_eq!(encode_compound(&["x".into(), "y".into()]), "x\u{0}y");
     }
 
     // ---------------------------------------------------------------------------
@@ -448,19 +437,13 @@ mod tests {
     fn compound_key_string_and_number() {
         let doc = json!({"a": "x", "b": 5});
         // number → text "5"
-        assert_eq!(
-            compound_key(&doc, &["a".into(), "b".into()]),
-            "x\u{0}5"
-        );
+        assert_eq!(compound_key(&doc, &["a".into(), "b".into()]), "x\u{0}5");
     }
 
     #[test]
     fn compound_key_missing_component_is_empty_part() {
         let doc = json!({"a": "x"});
         // "b" is absent → empty string component
-        assert_eq!(
-            compound_key(&doc, &["a".into(), "b".into()]),
-            "x\u{0}"
-        );
+        assert_eq!(compound_key(&doc, &["a".into(), "b".into()]), "x\u{0}");
     }
 }

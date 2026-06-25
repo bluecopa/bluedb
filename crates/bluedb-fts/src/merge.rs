@@ -132,8 +132,7 @@ impl Compactor {
         // that survive, which is what lets us prove we didn't accidentally keep
         // a dead doc, and to leave alone tombstones for ids in OTHER splits).
         let mut kept_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        let mut dropped_ids: std::collections::BTreeSet<String> =
-            std::collections::BTreeSet::new();
+        let mut dropped_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         let mut num_docs: u64 = 0;
 
         {
@@ -193,8 +192,12 @@ impl Compactor {
             .unwrap_or(0)
             + 1;
         let compacted_id = format!("compacted-{generation:06}");
-        let split_meta =
-            SplitMeta::new(&compacted_id, num_docs, split_bytes.len() as u64, generation);
+        let split_meta = SplitMeta::new(
+            &compacted_id,
+            num_docs,
+            split_bytes.len() as u64,
+            generation,
+        );
         let blob_key = split_meta.blob_key(&manifest.index_id);
 
         let mut new_manifest = Manifest::new(&manifest.index_id);

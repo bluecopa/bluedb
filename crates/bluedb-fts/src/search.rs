@@ -90,11 +90,7 @@ impl<'a> SplitHandle<'a> {
     /// [`SplitMeta`](crate::manifest::SplitMeta)). Use this for
     /// [`multi_split_search_filtered`] so generation-scoped deletes and
     /// last-write-wins dedup work correctly.
-    pub fn with_generation(
-        split_id: impl Into<String>,
-        generation: u64,
-        index: &'a Index,
-    ) -> Self {
+    pub fn with_generation(split_id: impl Into<String>, generation: u64, index: &'a Index) -> Self {
         Self {
             split_id: split_id.into(),
             generation,
@@ -475,7 +471,10 @@ pub fn multi_split_search_query_filtered_ids(
     for (split_ord, handle) in splits.iter().enumerate() {
         let reader = handle.index.reader()?;
         let searcher = reader.searcher();
-        let hits = searcher.search(query, &TopDocs::with_limit(per_split_limit).order_by_score())?;
+        let hits = searcher.search(
+            query,
+            &TopDocs::with_limit(per_split_limit).order_by_score(),
+        )?;
         for (score, doc_address) in hits {
             let stored: TantivyDocument = searcher.doc(doc_address)?;
             let id = id_field.extract(&stored).ok_or_else(|| {
@@ -488,7 +487,11 @@ pub fn multi_split_search_query_filtered_ids(
                 continue;
             }
             all.push(Candidate {
-                hit: MultiSplitHit { score, split_ord, doc_address },
+                hit: MultiSplitHit {
+                    score,
+                    split_ord,
+                    doc_address,
+                },
                 id,
                 generation: handle.generation,
             });
@@ -523,7 +526,10 @@ pub fn multi_split_search_query_filtered_ids(
         .map(|(_, c)| c)
         .collect();
     kept.sort_by(|a, b| cmp_hits(&a.hit, &b.hit));
-    let mut out: Vec<(String, f32)> = kept.into_iter().map(|c| (c.id.clone(), c.hit.score)).collect();
+    let mut out: Vec<(String, f32)> = kept
+        .into_iter()
+        .map(|c| (c.id.clone(), c.hit.score))
+        .collect();
     out.truncate(limit);
     Ok(out)
 }
@@ -594,8 +600,8 @@ pub fn multi_split_search_query_sorted_ids(
         // `Order` is `Copy`, so we can construct it inside the loop without
         // needing to clone.
         let order = if descending { Order::Desc } else { Order::Asc };
-        let collector = TopDocs::with_limit(per_split_limit)
-            .order_by_fast_field::<i64>(sort_field_name, order);
+        let collector =
+            TopDocs::with_limit(per_split_limit).order_by_fast_field::<i64>(sort_field_name, order);
         // `order_by_fast_field::<i64>` returns `Vec<(Option<i64>, DocAddress)>`
         // in this tantivy fork (rev 6270552).
         let hits = searcher.search(query, &collector)?;
@@ -605,7 +611,11 @@ pub fn multi_split_search_query_sorted_ids(
                 if tombstones.is_deleted_at(&id, handle.generation) {
                     continue;
                 }
-                all.push(Cand { id, sort: sort_val, generation: handle.generation });
+                all.push(Cand {
+                    id,
+                    sort: sort_val,
+                    generation: handle.generation,
+                });
             }
         }
     }
@@ -630,16 +640,18 @@ pub fn multi_split_search_query_sorted_ids(
     // Present-before-missing holds in BOTH directions: only the present/present
     // comparison is reversed for descending, so docs missing the sort field
     // always sort last regardless of direction (ES `missing: _last` default).
-    kept.sort_by(|a, b| {
-        match (a.sort, b.sort) {
-            (Some(x), Some(y)) => {
-                let c = x.cmp(&y);
-                if descending { c.reverse() } else { c }
+    kept.sort_by(|a, b| match (a.sort, b.sort) {
+        (Some(x), Some(y)) => {
+            let c = x.cmp(&y);
+            if descending {
+                c.reverse()
+            } else {
+                c
             }
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => std::cmp::Ordering::Equal,
         }
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
     });
     let mut out: Vec<(String, f32)> = kept.into_iter().map(|c| (c.id.clone(), 0.0f32)).collect();
     out.truncate(limit);

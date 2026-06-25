@@ -68,7 +68,10 @@ single node only).
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `BLUEDB_LEASE_PG_URL` | unset | Postgres lease arbiter for multi-node election. If unset, an in-process lease is used (single writer) |
+| `BLUEDB_LEASE_BACKEND` | unset | `postgres`, `kubernetes`, or `local`. If unset, `BLUEDB_LEASE_PG_URL` selects Postgres; otherwise an in-process lease is used (single writer) |
+| `BLUEDB_LEASE_PG_URL` | unset | Postgres lease arbiter URL for multi-node election when using the Postgres backend |
+| `BLUEDB_K8S_LEASE_NAME` | `bluedb-writer` | Kubernetes `coordination.k8s.io/Lease` object name when `BLUEDB_LEASE_BACKEND=kubernetes` |
+| `BLUEDB_K8S_NAMESPACE` | `default` | Kubernetes namespace for the Lease object and EndpointSlice registry |
 | `BLUEDB_LEASE_TTL_SECS` | `15` | Lease lifetime; bounds failover time |
 | `BLUEDB_LEASE_MARGIN_SECS` | `5` | Self-fence this far before lease expiry |
 

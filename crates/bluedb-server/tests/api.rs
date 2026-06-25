@@ -19,7 +19,13 @@ const MARGIN: Duration = Duration::from_secs(5);
 /// An [`AppState`] over a fresh in-memory store with its own (or a shared)
 /// lease provider.
 fn node(node_id: &str, store: Arc<dyn ObjectStore>, lease: Arc<dyn LeaseProvider>) -> AppState {
-    let writer = Arc::new(WriterController::new(node_id, lease, Arc::new(SystemClock), TTL, MARGIN));
+    let writer = Arc::new(WriterController::new(
+        node_id,
+        lease,
+        Arc::new(SystemClock),
+        TTL,
+        MARGIN,
+    ));
     AppState::new(store, "bluedb", writer)
 }
 
@@ -89,7 +95,11 @@ async fn call_full(
     if let Some(p) = prefer {
         builder = builder.header("prefer", p);
     }
-    let response = app.clone().oneshot(builder.body(Body::empty()).unwrap()).await.unwrap();
+    let response = app
+        .clone()
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
     let status = response.status();
     let headers = response.headers().clone();
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
@@ -141,7 +151,13 @@ async fn call_prefer(
 /// Send a parameterized statement to `POST /sql` (non-DDL only).
 #[allow(dead_code)]
 async fn sql_dml(app: &Router, statement: &str, params: serde_json::Value) -> (StatusCode, Value) {
-    call(app, "POST", "/sql", Some(json!({ "sql": statement, "params": params }))).await
+    call(
+        app,
+        "POST",
+        "/sql",
+        Some(json!({ "sql": statement, "params": params })),
+    )
+    .await
 }
 
 #[tokio::test]
@@ -193,7 +209,11 @@ async fn full_crud_round_trip() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, json!([{ "name": "alice" }]), "only alice (age 30 > 26)");
+    assert_eq!(
+        body,
+        json!([{ "name": "alice" }]),
+        "only alice (age 30 > 26)"
+    );
 
     // PATCH via query filter + JSON assignments.
     let (status, body) = call(
@@ -229,8 +249,11 @@ async fn bad_identifier_is_a_400() {
 #[tokio::test]
 async fn json_column_round_trips_as_real_json() {
     let app = app().await;
-    let (status, _) =
-        sql_admin(&app, "CREATE TABLE docs (id INTEGER PRIMARY KEY, data JSON);").await;
+    let (status, _) = sql_admin(
+        &app,
+        "CREATE TABLE docs (id INTEGER PRIMARY KEY, data JSON);",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
 
     // POST a row whose JSON column holds a real object (today this 400'd as
@@ -244,7 +267,10 @@ async fn json_column_round_trips_as_real_json() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, json!([row]));
     // Specifically, it must be an object — not the string "{\"k\":\"v\",...}".
-    assert!(body[0]["data"].is_object(), "data should be a JSON object: {body}");
+    assert!(
+        body[0]["data"].is_object(),
+        "data should be a JSON object: {body}"
+    );
 }
 
 #[tokio::test]
@@ -252,8 +278,13 @@ async fn arbitrary_and_json_filters_on_tables_route_to_analytical_engine() {
     let app = app().await;
 
     // Enable the Iceberg mirror so the analytical engine has the tenant's data.
-    let (status, _) = call(&app, "POST", "/sql",
-        Some(json!({"sql": "PRAGMA lakehouse_mirror = on"}))).await;
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "PRAGMA lakehouse_mirror = on"})),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
 
     let (status, _) = sql_admin(
@@ -264,7 +295,11 @@ async fn arbitrary_and_json_filters_on_tables_route_to_analytical_engine() {
     assert_eq!(status, StatusCode::OK);
 
     // Insert rows; `label` is NOT indexed, `data` is JSON.
-    for (id, label, status_field) in [(1, "alpha", "active"), (2, "beta", "idle"), (3, "alpha", "active")] {
+    for (id, label, status_field) in [
+        (1, "alpha", "active"),
+        (2, "beta", "idle"),
+        (3, "alpha", "active"),
+    ] {
         let (s, body) = call(
             &app,
             "POST",
@@ -277,8 +312,18 @@ async fn arbitrary_and_json_filters_on_tables_route_to_analytical_engine() {
 
     // A filter on the NON-indexed `label` 400s on the GlueSQL fast path (guardrail).
     // It must now route to the analytical engine and return rows (doc ask #4).
-    let (status, body) = call(&app, "GET", "/tables/items?label=eq.alpha&order=id.asc", None).await;
-    assert_eq!(status, StatusCode::OK, "label filter should route, got: {body}");
+    let (status, body) = call(
+        &app,
+        "GET",
+        "/tables/items?label=eq.alpha&order=id.asc",
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "label filter should route, got: {body}"
+    );
     let ids: Vec<i64> = body
         .as_array()
         .expect("rows")
@@ -289,12 +334,24 @@ async fn arbitrary_and_json_filters_on_tables_route_to_analytical_engine() {
 
     // A JSON-path filter also routes; `data` comes back as a real object. `>` is
     // percent-encoded as a conformant HTTP client would send it (`%3E%3E`).
-    let (status, body) =
-        call(&app, "GET", "/tables/items?data-%3E%3Estatus=eq.active&order=id.asc", None).await;
-    assert_eq!(status, StatusCode::OK, "json-path filter should route, got: {body}");
+    let (status, body) = call(
+        &app,
+        "GET",
+        "/tables/items?data-%3E%3Estatus=eq.active&order=id.asc",
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "json-path filter should route, got: {body}"
+    );
     let rows = body.as_array().expect("rows");
     assert_eq!(rows.len(), 2, "two active rows: {body}");
-    assert!(rows[0]["data"].is_object(), "data re-inflated to an object: {body}");
+    assert!(
+        rows[0]["data"].is_object(),
+        "data re-inflated to an object: {body}"
+    );
     assert_eq!(rows[0]["data"]["status"], json!("active"));
 
     // A PK point read still takes the GlueSQL fast path and works unchanged.
@@ -311,29 +368,61 @@ async fn prefer_representation_returns_affected_rows() {
     assert_eq!(status, StatusCode::OK);
 
     // INSERT + representation → the inserted row(s), not a count.
-    let (status, body) =
-        call_prefer(&app, "POST", "/tables/t", Some(json!({"id": 1, "label": "alpha"}))).await;
+    let (status, body) = call_prefer(
+        &app,
+        "POST",
+        "/tables/t",
+        Some(json!({"id": 1, "label": "alpha"})),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body, json!([{"id": 1, "label": "alpha"}]), "insert repr: {body}");
+    assert_eq!(
+        body,
+        json!([{"id": 1, "label": "alpha"}]),
+        "insert repr: {body}"
+    );
 
     // PATCH + representation → the updated row.
-    let (status, body) =
-        call_prefer(&app, "PATCH", "/tables/t?id=eq.1", Some(json!({"label": "beta"}))).await;
+    let (status, body) = call_prefer(
+        &app,
+        "PATCH",
+        "/tables/t?id=eq.1",
+        Some(json!({"label": "beta"})),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, json!([{"id": 1, "label": "beta"}]), "update repr: {body}");
+    assert_eq!(
+        body,
+        json!([{"id": 1, "label": "beta"}]),
+        "update repr: {body}"
+    );
 
     // DELETE + representation → the removed row (its pre-delete state).
     let (status, body) = call_prefer(&app, "DELETE", "/tables/t?id=eq.1", None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, json!([{"id": 1, "label": "beta"}]), "delete repr: {body}");
+    assert_eq!(
+        body,
+        json!([{"id": 1, "label": "beta"}]),
+        "delete repr: {body}"
+    );
 
     // The row is really gone.
     let (_, body) = call(&app, "GET", "/tables/t?id=eq.1", None).await;
     assert_eq!(body, json!([]), "row should be deleted: {body}");
 
     // Without the header, the count shape is unchanged.
-    let (_, body) = call(&app, "POST", "/tables/t", Some(json!({"id": 2, "label": "g"}))).await;
-    assert_eq!(body, json!({"inserted": 1}), "no-prefer insert still returns a count: {body}");
+    let (_, body) = call(
+        &app,
+        "POST",
+        "/tables/t",
+        Some(json!({"id": 2, "label": "g"})),
+    )
+    .await;
+    assert_eq!(
+        body,
+        json!({"inserted": 1}),
+        "no-prefer insert still returns a count: {body}"
+    );
 }
 
 #[tokio::test]
@@ -350,20 +439,40 @@ async fn count_exact_sets_content_range() {
     let app = app().await;
     sql_admin(&app, "CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT)").await;
     for id in 1..=5 {
-        let (s, _) = call(&app, "POST", "/tables/t", Some(json!({"id": id, "label": "x"}))).await;
+        let (s, _) = call(
+            &app,
+            "POST",
+            "/tables/t",
+            Some(json!({"id": id, "label": "x"})),
+        )
+        .await;
         assert_eq!(s, StatusCode::OK);
     }
 
     // A page of 2 with count=exact → Content-Range: 0-1/5.
-    let (status, headers, body) =
-        call_full(&app, "GET", "/tables/t?order=id.asc&limit=2", Some("count=exact")).await;
+    let (status, headers, body) = call_full(
+        &app,
+        "GET",
+        "/tables/t?order=id.asc&limit=2",
+        Some("count=exact"),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body.as_array().unwrap().len(), 2);
-    assert_eq!(content_range(&headers), Some("0-1/5".to_string()), "body: {body}");
+    assert_eq!(
+        content_range(&headers),
+        Some("0-1/5".to_string()),
+        "body: {body}"
+    );
 
     // Second page, offset 2 → 2-3/5.
-    let (_, headers, _) =
-        call_full(&app, "GET", "/tables/t?order=id.asc&limit=2&offset=2", Some("count=exact")).await;
+    let (_, headers, _) = call_full(
+        &app,
+        "GET",
+        "/tables/t?order=id.asc&limit=2&offset=2",
+        Some("count=exact"),
+    )
+    .await;
     assert_eq!(content_range(&headers), Some("2-3/5".to_string()));
 
     // Without the header, no Content-Range.
@@ -397,12 +506,25 @@ async fn schema_describe_and_inline_indexes() {
     let (status, body) = call(&app, "GET", "/schema/tables/people", None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let cols = body["columns"].as_array().expect("columns array");
-    let col = |n: &str| cols.iter().find(|c| c["name"] == n).cloned().unwrap_or(Value::Null);
+    let col = |n: &str| {
+        cols.iter()
+            .find(|c| c["name"] == n)
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
     assert_eq!(col("id")["primary_key"], json!(true), "{body}");
-    assert_eq!(col("id")["indexed"], json!(true), "pk is index-served: {body}");
+    assert_eq!(
+        col("id")["indexed"],
+        json!(true),
+        "pk is index-served: {body}"
+    );
     assert_eq!(col("email")["primary_key"], json!(false));
     assert_eq!(col("email")["indexed"], json!(true), "inline index: {body}");
-    assert_eq!(col("meta")["type"], json!("JSON"), "JSON column type reported: {body}");
+    assert_eq!(
+        col("meta")["type"],
+        json!("JSON"),
+        "JSON column type reported: {body}"
+    );
     assert_eq!(
         body["indexes"],
         json!([{"name": "people_email", "column": "email"}]),
@@ -461,11 +583,23 @@ async fn failover_new_writer_sees_prior_data_and_can_write() {
     a.promote().await.expect("a promotes");
     let app_a = build_app(a.clone());
     assert_eq!(
-        sql_admin(&app_a, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);").await.0,
+        sql_admin(
+            &app_a,
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);"
+        )
+        .await
+        .0,
         StatusCode::OK
     );
     assert_eq!(
-        call(&app_a, "POST", "/tables/t", Some(json!({ "id": 1, "v": 10 }))).await.1,
+        call(
+            &app_a,
+            "POST",
+            "/tables/t",
+            Some(json!({ "id": 1, "v": 10 }))
+        )
+        .await
+        .1,
         json!({ "inserted": 1 })
     );
 
@@ -478,17 +612,35 @@ async fn failover_new_writer_sees_prior_data_and_can_write() {
     // The NEW writer sees a's committed data...
     let (status, body) = call(&app_b, "GET", "/tables/t?order=id.asc", None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, json!([{ "id": 1, "v": 10 }]), "new writer inherited the data");
+    assert_eq!(
+        body,
+        json!([{ "id": 1, "v": 10 }]),
+        "new writer inherited the data"
+    );
 
     // ...and can write.
     assert_eq!(
-        call(&app_b, "POST", "/tables/t", Some(json!({ "id": 2, "v": 20 }))).await.1,
+        call(
+            &app_b,
+            "POST",
+            "/tables/t",
+            Some(json!({ "id": 2, "v": 20 }))
+        )
+        .await
+        .1,
         json!({ "inserted": 1 })
     );
 
     // The demoted node is now a read replica: writes are refused.
     assert_eq!(
-        call(&app_a, "POST", "/tables/t", Some(json!({ "id": 3, "v": 30 }))).await.0,
+        call(
+            &app_a,
+            "POST",
+            "/tables/t",
+            Some(json!({ "id": 3, "v": 30 }))
+        )
+        .await
+        .0,
         StatusCode::SERVICE_UNAVAILABLE
     );
 }
@@ -520,7 +672,11 @@ async fn promote_enables_writes_and_demote_disables_them() {
 
     let (status, body) = call(&app, "GET", "/tables/t?order=id.asc", None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, json!([{ "id": 1, "v": 10 }]), "reads continue while passive");
+    assert_eq!(
+        body,
+        json!([{ "id": 1, "v": 10 }]),
+        "reads continue while passive"
+    );
 }
 
 #[tokio::test]
@@ -534,8 +690,8 @@ async fn lease_held_but_writer_db_unbound_reports_passive_and_refuses_writes() {
     // increment finding under `kill`. "Active" must mean *lease held AND writer
     // Db bound*.
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let state = node("gap", store, Arc::new(LocalLeaseProvider::new()))
-        .with_admin_sql_enabled(true);
+    let state =
+        node("gap", store, Arc::new(LocalLeaseProvider::new())).with_admin_sql_enabled(true);
     // Take the lease at the controller level ONLY — deliberately skip
     // `AppState::promote`, which is what would bind the writer `Db`.
     state.writer().promote().await.expect("acquire lease");
@@ -555,17 +711,66 @@ async fn lease_held_but_writer_db_unbound_reports_passive_and_refuses_writes() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 }
 
+#[tokio::test]
+async fn ha_tick_releases_lease_when_active_controller_has_no_writer_db_bound() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let lease: Arc<dyn LeaseProvider> = Arc::new(LocalLeaseProvider::new());
+    let stuck = node("stuck", store.clone(), lease.clone()).with_admin_sql_enabled(true);
+
+    // Simulate a failed AppState::promote after the lease was acquired but before
+    // the writer Db was bound. This is the state Jepsen exposed in Kubernetes:
+    // the pod renews the Lease but /admin/status reports passive because
+    // writer_bound is false.
+    stuck
+        .writer()
+        .promote()
+        .await
+        .expect("controller acquires lease");
+    let stuck_app = build_app(stuck.clone());
+    let (status, body) = call(&stuck_app, "GET", "/admin/status", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["role"],
+        json!("passive"),
+        "lease-only active state must not count as writer"
+    );
+
+    stuck.ha_tick().await;
+
+    let successor = node("successor", store, lease).with_admin_sql_enabled(true);
+    successor
+        .promote()
+        .await
+        .expect("successor can promote after stuck node releases lease");
+    let successor_app = build_app(successor);
+    let (status, body) = call(&successor_app, "GET", "/admin/status", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["role"], json!("active"));
+}
+
 // --- new surface-enforcement tests ------------------------------------------
 
 /// `POST /sql` must reject DDL (CREATE TABLE) with 400.
 #[tokio::test]
 async fn sql_rejects_ddl_with_400() {
     let app = app().await;
-    let (status, body) =
-        call(&app, "POST", "/sql", Some(json!({ "sql": "CREATE TABLE t (id INTEGER PRIMARY KEY);" }))).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "DDL on /sql should be 400; body: {body}");
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({ "sql": "CREATE TABLE t (id INTEGER PRIMARY KEY);" })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "DDL on /sql should be 400; body: {body}"
+    );
     let err = body.get("error").expect("error field in body");
-    assert!(err.as_str().unwrap_or("").contains("not allowed"), "error should mention 'not allowed': {err}");
+    assert!(
+        err.as_str().unwrap_or("").contains("not allowed"),
+        "error should mention 'not allowed': {err}"
+    );
 }
 
 /// `POST /admin/sql` returns 404 when the admin flag is off (default).
@@ -573,9 +778,18 @@ async fn sql_rejects_ddl_with_400() {
 async fn admin_sql_disabled_returns_404() {
     // Build an app WITHOUT admin SQL enabled (the default).
     let app = make_app_opts(true, false).await;
-    let (status, body) =
-        call(&app, "POST", "/admin/sql", Some(json!({ "sql": "CREATE TABLE t (id INTEGER PRIMARY KEY);" }))).await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "admin/sql off → 404; body: {body}");
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/admin/sql",
+        Some(json!({ "sql": "CREATE TABLE t (id INTEGER PRIMARY KEY);" })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "admin/sql off → 404; body: {body}"
+    );
 }
 
 /// `POST /admin/sql` when enabled can run DDL successfully.
@@ -583,11 +797,24 @@ async fn admin_sql_disabled_returns_404() {
 async fn admin_sql_enabled_runs_ddl() {
     // app() already enables admin SQL.
     let app = app().await;
-    let (status, body) =
-        sql_admin(&app, "CREATE TABLE things (id INTEGER PRIMARY KEY, label TEXT);").await;
-    assert_eq!(status, StatusCode::OK, "DDL on /admin/sql should succeed; body: {body}");
+    let (status, body) = sql_admin(
+        &app,
+        "CREATE TABLE things (id INTEGER PRIMARY KEY, label TEXT);",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "DDL on /admin/sql should succeed; body: {body}"
+    );
     // Insert a row and read it back to confirm the table exists.
-    let (status, _) = call(&app, "POST", "/tables/things", Some(json!({ "id": 1, "label": "hello" }))).await;
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/tables/things",
+        Some(json!({ "id": 1, "label": "hello" })),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     let (status, body) = call(&app, "GET", "/tables/things", None).await;
     assert_eq!(status, StatusCode::OK);
@@ -671,7 +898,10 @@ async fn ledger_idempotent_and_error_result_codes() {
         Some(json!([{ "id": "11", "debit_account_id": "1", "credit_account_id": "999", "amount": "5", "ledger": 700, "code": 1 }])),
     )
     .await;
-    assert_eq!(body["results"][0]["result"], json!("credit_account_not_found"));
+    assert_eq!(
+        body["results"][0]["result"],
+        json!("credit_account_not_found")
+    );
 
     // Unknown account → 404.
     let (status, _) = call(&app, "GET", "/ledger/accounts/12345", None).await;
@@ -697,8 +927,12 @@ async fn ledger_projection_is_visible_through_sql_and_conserves() {
     .await;
 
     // The projection is queryable over /sql; u128 columns come back as strings.
-    let (status, body) =
-        sql_dml(&app, "SELECT debits_posted FROM ledger_accounts WHERE id = 1", json!([])).await;
+    let (status, body) = sql_dml(
+        &app,
+        "SELECT debits_posted FROM ledger_accounts WHERE id = 1",
+        json!([]),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body, json!([{ "debits_posted": "100" }]));
 
@@ -709,7 +943,10 @@ async fn ledger_projection_is_visible_through_sql_and_conserves() {
         json!([]),
     )
     .await;
-    assert_eq!(body[0]["d"], body[0]["c"], "debits and credits must balance: {body}");
+    assert_eq!(
+        body[0]["d"], body[0]["c"],
+        "debits and credits must balance: {body}"
+    );
 }
 
 #[tokio::test]
@@ -758,8 +995,10 @@ async fn glue_meta_tables_accept_predicates_and_order() {
         &app,
         "POST",
         "/sql",
-        Some(json!({ "sql": "SELECT OBJECT_NAME, OBJECT_TYPE FROM GLUE_OBJECTS \
-            WHERE OBJECT_NAME IN ('meta8', 'meta8_email') ORDER BY OBJECT_NAME" })),
+        Some(
+            json!({ "sql": "SELECT OBJECT_NAME, OBJECT_TYPE FROM GLUE_OBJECTS \
+            WHERE OBJECT_NAME IN ('meta8', 'meta8_email') ORDER BY OBJECT_NAME" }),
+        ),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "GLUE_OBJECTS IN+ORDER: {body}");
@@ -767,13 +1006,23 @@ async fn glue_meta_tables_accept_predicates_and_order() {
         .as_array()
         .expect("rows array")
         .iter()
-        .map(|r| (
-            r["OBJECT_NAME"].as_str().unwrap().to_string(),
-            r["OBJECT_TYPE"].as_str().unwrap().to_string(),
-        ))
+        .map(|r| {
+            (
+                r["OBJECT_NAME"].as_str().unwrap().to_string(),
+                r["OBJECT_TYPE"].as_str().unwrap().to_string(),
+            )
+        })
         .collect();
-    assert_eq!(types.get("meta8"), Some(&"TABLE".to_string()), "table row: {body}");
-    assert_eq!(types.get("meta8_email"), Some(&"INDEX".to_string()), "index row: {body}");
+    assert_eq!(
+        types.get("meta8"),
+        Some(&"TABLE".to_string()),
+        "table row: {body}"
+    );
+    assert_eq!(
+        types.get("meta8_email"),
+        Some(&"INDEX".to_string()),
+        "index row: {body}"
+    );
 
     // A plain equality predicate and a different GLUE_* table.
     let (s, _body) = call(
@@ -802,8 +1051,14 @@ async fn glue_meta_tables_accept_predicates_and_order() {
         .iter()
         .map(|r| r["INDEX_NAME"].as_str().unwrap().to_string())
         .collect();
-    assert!(names.contains(&"PRIMARY".to_string()), "PRIMARY row present: {names:?}");
-    assert!(names.contains(&"meta8_email".to_string()), "declared index present: {names:?}");
+    assert!(
+        names.contains(&"PRIMARY".to_string()),
+        "PRIMARY row present: {names:?}"
+    );
+    assert!(
+        names.contains(&"meta8_email".to_string()),
+        "declared index present: {names:?}"
+    );
 
     // The documented filter excludes PRIMARY to leave only user-declared indexes.
     let (s, body) = call(
@@ -821,7 +1076,11 @@ async fn glue_meta_tables_accept_predicates_and_order() {
         .iter()
         .map(|r| r["INDEX_NAME"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(names, vec!["meta8_email".to_string()], "only declared index: {names:?}");
+    assert_eq!(
+        names,
+        vec!["meta8_email".to_string()],
+        "only declared index: {names:?}"
+    );
 }
 
 /// Views: CREATE VIEW stores the definition; a SELECT through the view inlines
@@ -831,22 +1090,44 @@ async fn glue_meta_tables_accept_predicates_and_order() {
 #[tokio::test]
 async fn create_view_select_through_it_and_drop() {
     let app = app().await;
-    let (s, _) = sql_admin(&app, "CREATE TABLE vusers (id INTEGER PRIMARY KEY, name TEXT, active BOOLEAN)").await;
+    let (s, _) = sql_admin(
+        &app,
+        "CREATE TABLE vusers (id INTEGER PRIMARY KEY, name TEXT, active BOOLEAN)",
+    )
+    .await;
     assert_eq!(s, StatusCode::OK);
-    let (s, _) = sql_admin(&app, "INSERT INTO vusers VALUES (1, 'ada', true), (2, 'lin', false)").await;
+    let (s, _) = sql_admin(
+        &app,
+        "INSERT INTO vusers VALUES (1, 'ada', true), (2, 'lin', false)",
+    )
+    .await;
     assert_eq!(s, StatusCode::OK);
 
     // CREATE VIEW via /admin/sql.
-    let (s, body) = sql_admin(&app, "CREATE VIEW active_users AS SELECT id, name FROM vusers WHERE active = true").await;
+    let (s, body) = sql_admin(
+        &app,
+        "CREATE VIEW active_users AS SELECT id, name FROM vusers WHERE active = true",
+    )
+    .await;
     assert_eq!(s, StatusCode::OK, "CREATE VIEW: {body}");
 
     // Read through the view via the /sql data plane (DataFusion path).
-    let (s, body) = call(&app, "POST", "/sql", Some(json!({
-        "sql": "SELECT name FROM active_users ORDER BY id"
-    }))).await;
+    let (s, body) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({
+            "sql": "SELECT name FROM active_users ORDER BY id"
+        })),
+    )
+    .await;
     assert_eq!(s, StatusCode::OK, "select through view: {body}");
-    let names: Vec<String> = body.as_array().expect("rows")
-        .iter().map(|r| r["name"].as_str().unwrap().to_string()).collect();
+    let names: Vec<String> = body
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|r| r["name"].as_str().unwrap().to_string())
+        .collect();
     assert_eq!(names, vec!["ada".to_string()], "view filter: {body}");
 
     // Read through the view via /admin/sql (GlueSQL path) too.
@@ -856,7 +1137,13 @@ async fn create_view_select_through_it_and_drop() {
     // DROP VIEW, then the view is gone.
     let (s, body) = sql_admin(&app, "DROP VIEW active_users").await;
     assert_eq!(s, StatusCode::OK, "DROP VIEW: {body}");
-    let (s, _) = call(&app, "POST", "/sql", Some(json!({"sql": "SELECT name FROM active_users"}))).await;
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "SELECT name FROM active_users"})),
+    )
+    .await;
     assert!(s.as_u16() >= 400, "view gone after drop: status {s}");
 }
 
@@ -899,7 +1186,11 @@ async fn sql_serves_pk_point_read() {
     )
     .await;
     assert_eq!(s, StatusCode::OK, "pk point read: {body}");
-    assert_eq!(body, json!([{ "id": 2, "name": "beta" }]), "fresh PK read: {body}");
+    assert_eq!(
+        body,
+        json!([{ "id": 2, "name": "beta" }]),
+        "fresh PK read: {body}"
+    );
 }
 
 /// `/sql` serves a secondary-index equality read.
@@ -971,8 +1262,16 @@ async fn sql_indexed_range_order_by_indexed_column() {
         Some(json!({"sql": "SELECT id, score FROM sqlrange WHERE score >= $1 ORDER BY score ASC", "params": [20]})),
     )
     .await;
-    assert_eq!(s, StatusCode::OK, "indexed range + ORDER BY indexed: {body}");
-    assert_eq!(body, json!([{ "id": 1, "score": 20 }, { "id": 3, "score": 30 }]), "range mismatch: {body}");
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "indexed range + ORDER BY indexed: {body}"
+    );
+    assert_eq!(
+        body,
+        json!([{ "id": 1, "score": 20 }, { "id": 3, "score": 30 }]),
+        "range mismatch: {body}"
+    );
 
     // Regression: a prior `SET default_null_order = 'nulls_first'` (UAT-SQL-013)
     // injects an `IS_NULL(col)` ORDER BY term via rewrite_null_order, which the
@@ -994,8 +1293,16 @@ async fn sql_indexed_range_order_by_indexed_column() {
         Some(json!({"sql": "SELECT id, score FROM sqlrange WHERE score >= $1 ORDER BY score ASC", "params": [20]})),
     )
     .await;
-    assert_eq!(s, StatusCode::OK, "indexed ORDER BY after SET nulls_first must still pass: {body}");
-    assert_eq!(body, json!([{ "id": 1, "score": 20 }, { "id": 3, "score": 30 }]), "range after SET: {body}");
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "indexed ORDER BY after SET nulls_first must still pass: {body}"
+    );
+    assert_eq!(
+        body,
+        json!([{ "id": 1, "score": 20 }, { "id": 3, "score": 30 }]),
+        "range after SET: {body}"
+    );
 }
 
 /// `/sql` **rejects** a non-indexed filter with `400 NO_INDEX` (the flip), and
@@ -1011,7 +1318,11 @@ async fn sql_rejects_non_indexed_scan_with_no_index_code() {
         Some(json!({"sql": "SELECT id FROM tier WHERE score > 50"})),
     )
     .await;
-    assert_eq!(s, StatusCode::BAD_REQUEST, "non-indexed filter on /sql must 400: {body}");
+    assert_eq!(
+        s,
+        StatusCode::BAD_REQUEST,
+        "non-indexed filter on /sql must 400: {body}"
+    );
     assert_eq!(body["code"], json!("NO_INDEX"), "stable code: {body}");
     let msg = body["error"].as_str().unwrap_or("");
     assert!(msg.contains("`score`"), "error names the column: {msg}");
@@ -1036,8 +1347,12 @@ async fn query_serves_non_indexed_scan_and_aggregate() {
     )
     .await;
     assert_eq!(s, StatusCode::OK, "/query scan: {body}");
-    let names: Vec<&str> = body.as_array().unwrap().iter()
-        .map(|r| r["name"].as_str().unwrap()).collect();
+    let names: Vec<&str> = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["name"].as_str().unwrap())
+        .collect();
     assert_eq!(names, vec!["alpha", "gamma"], "score DESC: {body}");
 
     // An aggregate (GROUP BY) — only the analytical surface serves it.
@@ -1074,7 +1389,11 @@ async fn query_rejects_non_select() {
 #[tokio::test]
 async fn sql_set_default_null_order() {
     let app = app().await;
-    let (s, _) = sql_admin(&app, "CREATE TABLE nullord (id INTEGER PRIMARY KEY, v INTEGER);").await;
+    let (s, _) = sql_admin(
+        &app,
+        "CREATE TABLE nullord (id INTEGER PRIMARY KEY, v INTEGER);",
+    )
+    .await;
     assert_eq!(s, StatusCode::OK);
     let (s, _) = call(
         &app,
@@ -1128,9 +1447,12 @@ async fn sql_set_default_null_order() {
         Some(json!({"sql": "SET default_null_order = 'sideways'"})),
     )
     .await;
-    assert_eq!(s, StatusCode::BAD_REQUEST, "undocumented null-order value rejected");
+    assert_eq!(
+        s,
+        StatusCode::BAD_REQUEST,
+        "undocumented null-order value rejected"
+    );
 }
-
 
 /// `/query`, not a confusing `PARSE_ERROR` from GlueSQL (which can't parse the
 /// operator). JSON paths are an analytical-surface feature. UAT-SQL-004 shape.
@@ -1160,7 +1482,11 @@ async fn sql_rejects_json_path_with_no_index() {
         Some(json!({"sql": "SELECT id FROM jrow WHERE (data->>'status') = 'active'"})),
     )
     .await;
-    assert_eq!(s, StatusCode::BAD_REQUEST, "json-path on /sql must 400: {body}");
+    assert_eq!(
+        s,
+        StatusCode::BAD_REQUEST,
+        "json-path on /sql must 400: {body}"
+    );
     assert_eq!(body["code"], json!("NO_INDEX"), "stable code: {body}");
 
     // The same read on /query succeeds.
@@ -1198,7 +1524,11 @@ async fn sql_read_your_writes() {
     )
     .await;
     assert_eq!(s, StatusCode::OK, "ryw read: {body}");
-    assert_eq!(body, json!([{ "name": "new" }]), "freshly-written row is visible: {body}");
+    assert_eq!(
+        body,
+        json!([{ "name": "new" }]),
+        "freshly-written row is visible: {body}"
+    );
 }
 
 /// `RETURNING` on `/sql`: INSERT/UPDATE/DELETE return the affected rows, not a count.
@@ -1212,11 +1542,17 @@ async fn sql_returning_writes() {
         &app,
         "POST",
         "/sql",
-        Some(json!({"sql": "INSERT INTO tier VALUES (10, 'ten', 't@x.io', 10) RETURNING id, name"})),
+        Some(
+            json!({"sql": "INSERT INTO tier VALUES (10, 'ten', 't@x.io', 10) RETURNING id, name"}),
+        ),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "insert returning: {body}");
-    assert_eq!(body, json!([{ "id": 10, "name": "ten" }]), "RETURNING id,name: {body}");
+    assert_eq!(
+        body,
+        json!([{ "id": 10, "name": "ten" }]),
+        "RETURNING id,name: {body}"
+    );
 
     // UPDATE … RETURNING → the updated row (re-selected by the WHERE).
     let (s, body) = call(
@@ -1227,7 +1563,11 @@ async fn sql_returning_writes() {
     )
     .await;
     assert_eq!(s, StatusCode::OK, "update returning: {body}");
-    assert_eq!(body, json!([{ "id": 10, "score": 99 }]), "post-update row: {body}");
+    assert_eq!(
+        body,
+        json!([{ "id": 10, "score": 99 }]),
+        "post-update row: {body}"
+    );
 
     // DELETE … RETURNING → the row captured before deletion.
     let (s, body) = call(

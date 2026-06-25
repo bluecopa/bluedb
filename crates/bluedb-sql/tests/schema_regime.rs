@@ -46,7 +46,10 @@ async fn strict_allows_table_with_primary_key() {
     let res = user
         .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
         .await;
-    assert!(res.is_ok(), "schema'd table with a PK should be allowed: {res:?}");
+    assert!(
+        res.is_ok(),
+        "schema'd table with a PK should be allowed: {res:?}"
+    );
 }
 
 #[tokio::test]

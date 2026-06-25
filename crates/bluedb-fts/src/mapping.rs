@@ -21,9 +21,7 @@
 //! names, so registration is a no-op for them — but the API is uniform, and the
 //! moment a caller adds a truly custom analyzer it Just Works.)
 
-use tantivy::schema::{
-    Schema, TextFieldIndexing, TextOptions, FAST, INDEXED, STORED, STRING,
-};
+use tantivy::schema::{Schema, TextFieldIndexing, TextOptions, FAST, INDEXED, STORED, STRING};
 use tantivy::tokenizer::{
     Language, LowerCaser, SimpleTokenizer, Stemmer, TextAnalyzer, WhitespaceTokenizer,
 };
@@ -310,10 +308,7 @@ mod tests {
         let regs = mapping.tokenizer_registrations();
         assert_eq!(
             regs,
-            vec![
-                ("id".to_string(), "raw"),
-                ("body".to_string(), "en_stem"),
-            ],
+            vec![("id".to_string(), "raw"), ("body".to_string(), "en_stem"),],
             "only text fields contribute tokenizer registrations"
         );
     }

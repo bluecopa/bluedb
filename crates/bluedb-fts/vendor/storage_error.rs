@@ -107,7 +107,9 @@ pub type StorageResult<T> = Result<T, StorageError>;
 impl StorageError {
     /// Add some context to the wrapper error.
     pub fn add_context<C>(self, ctx: C) -> Self
-    where C: fmt::Display + Send + Sync + 'static {
+    where
+        C: fmt::Display + Send + Sync + 'static,
+    {
         StorageError {
             kind: self.kind,
             source: Arc::new(anyhow::anyhow!("{ctx}").context(self.source)),

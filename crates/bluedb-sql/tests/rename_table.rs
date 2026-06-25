@@ -68,7 +68,11 @@ async fn rename_table_preserves_rows_and_id() {
 async fn renamed_table_keeps_working_indexes() {
     let database = database().await;
     let mut c = Glue::new(database.connection());
-    exec(&mut c, "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT)").await;
+    exec(
+        &mut c,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT)",
+    )
+    .await;
     exec(&mut c, "CREATE INDEX t_email ON t (email)").await;
     exec(&mut c, "INSERT INTO t VALUES (1, 'a@b.c')").await;
     exec(&mut c, "ALTER TABLE t RENAME TO users").await;

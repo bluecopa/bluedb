@@ -90,8 +90,14 @@ pub(crate) async fn apply_edge_delta(
                 }
             }
             batch.put(canon.clone(), weight_obe(new_w));
-            batch.put(ks.graph_out_key(&d.graph, &d.src, new_w, &d.dst, &d.etype), MARK);
-            batch.put(ks.graph_in_key(&d.graph, &d.dst, new_w, &d.src, &d.etype), MARK);
+            batch.put(
+                ks.graph_out_key(&d.graph, &d.src, new_w, &d.dst, &d.etype),
+                MARK,
+            );
+            batch.put(
+                ks.graph_in_key(&d.graph, &d.dst, new_w, &d.src, &d.etype),
+                MARK,
+            );
             overlay.insert(canon, Some(new_w));
             weight_changed
         }
@@ -131,7 +137,10 @@ impl Graph {
             return Ok(0);
         }
         let _lease = self.write_lease.lock().await;
-        let writer = self.substrate.require_writer().map_err(|_| EvidenceError::NotWriter)?;
+        let writer = self
+            .substrate
+            .require_writer()
+            .map_err(|_| EvidenceError::NotWriter)?;
         let mut batch = WriteBatch::new();
         let mut overlay = HashMap::new();
         let mut changed = 0usize;
@@ -144,7 +153,15 @@ impl Graph {
                 etype: e.etype.clone(),
                 op: EdgeOp::Upsert { merge },
             };
-            if apply_edge_delta(&self.substrate, &self.keyspace, &mut batch, &mut overlay, &d).await? {
+            if apply_edge_delta(
+                &self.substrate,
+                &self.keyspace,
+                &mut batch,
+                &mut overlay,
+                &d,
+            )
+            .await?
+            {
                 changed += 1;
             }
         }
@@ -152,7 +169,13 @@ impl Graph {
             return Ok(changed);
         }
         writer
-            .write_with_options(batch, &WriteOptions { await_durable: false, ..Default::default() })
+            .write_with_options(
+                batch,
+                &WriteOptions {
+                    await_durable: false,
+                    ..Default::default()
+                },
+            )
             .await
             .map_err(Self::storage_err)?;
         drop(_lease);
@@ -169,7 +192,10 @@ impl Graph {
             return Ok(0);
         }
         let _lease = self.write_lease.lock().await;
-        let writer = self.substrate.require_writer().map_err(|_| EvidenceError::NotWriter)?;
+        let writer = self
+            .substrate
+            .require_writer()
+            .map_err(|_| EvidenceError::NotWriter)?;
         let mut batch = WriteBatch::new();
         let mut overlay = HashMap::new();
         let mut removed = 0usize;
@@ -182,7 +208,15 @@ impl Graph {
                 etype: e.etype.clone(),
                 op: EdgeOp::Delete,
             };
-            if apply_edge_delta(&self.substrate, &self.keyspace, &mut batch, &mut overlay, &d).await? {
+            if apply_edge_delta(
+                &self.substrate,
+                &self.keyspace,
+                &mut batch,
+                &mut overlay,
+                &d,
+            )
+            .await?
+            {
                 removed += 1;
             }
         }
@@ -190,7 +224,13 @@ impl Graph {
             return Ok(removed);
         }
         writer
-            .write_with_options(batch, &WriteOptions { await_durable: false, ..Default::default() })
+            .write_with_options(
+                batch,
+                &WriteOptions {
+                    await_durable: false,
+                    ..Default::default()
+                },
+            )
             .await
             .map_err(Self::storage_err)?;
         drop(_lease);
@@ -220,7 +260,10 @@ impl Graph {
             return Ok((0, 0));
         }
         let _lease = self.write_lease.lock().await;
-        let writer = self.substrate.require_writer().map_err(|_| EvidenceError::NotWriter)?;
+        let writer = self
+            .substrate
+            .require_writer()
+            .map_err(|_| EvidenceError::NotWriter)?;
         let mut batch = WriteBatch::new();
         let mut overlay = HashMap::new();
         let mut upserts_changed = 0usize;
@@ -234,7 +277,15 @@ impl Graph {
                 etype: e.etype.clone(),
                 op: EdgeOp::Upsert { merge },
             };
-            if apply_edge_delta(&self.substrate, &self.keyspace, &mut batch, &mut overlay, &d).await? {
+            if apply_edge_delta(
+                &self.substrate,
+                &self.keyspace,
+                &mut batch,
+                &mut overlay,
+                &d,
+            )
+            .await?
+            {
                 upserts_changed += 1;
             }
         }
@@ -247,7 +298,15 @@ impl Graph {
                 etype: e.etype.clone(),
                 op: EdgeOp::Delete,
             };
-            if apply_edge_delta(&self.substrate, &self.keyspace, &mut batch, &mut overlay, &d).await? {
+            if apply_edge_delta(
+                &self.substrate,
+                &self.keyspace,
+                &mut batch,
+                &mut overlay,
+                &d,
+            )
+            .await?
+            {
                 deletes_removed += 1;
             }
         }
@@ -255,7 +314,13 @@ impl Graph {
             return Ok((upserts_changed, deletes_removed));
         }
         writer
-            .write_with_options(batch, &WriteOptions { await_durable: false, ..Default::default() })
+            .write_with_options(
+                batch,
+                &WriteOptions {
+                    await_durable: false,
+                    ..Default::default()
+                },
+            )
             .await
             .map_err(Self::storage_err)?;
         drop(_lease);
@@ -270,7 +335,10 @@ impl Graph {
     /// graph's three tag ranges and deletes each key in a single WriteBatch.
     pub async fn drop_graph(&self, graph: &str) -> Result<usize, EvidenceError> {
         let _lease = self.write_lease.lock().await;
-        let writer = self.substrate.require_writer().map_err(|_| EvidenceError::NotWriter)?;
+        let writer = self
+            .substrate
+            .require_writer()
+            .map_err(|_| EvidenceError::NotWriter)?;
         let mut batch = WriteBatch::new();
         let mut edges = 0usize;
         for tag in [TAG_GRAPH_EDGE, TAG_GRAPH_OUT, TAG_GRAPH_IN] {
@@ -288,7 +356,13 @@ impl Graph {
             return Ok(0); // nothing to drop — SlateDB rejects an empty batch
         }
         writer
-            .write_with_options(batch, &WriteOptions { await_durable: false, ..Default::default() })
+            .write_with_options(
+                batch,
+                &WriteOptions {
+                    await_durable: false,
+                    ..Default::default()
+                },
+            )
             .await
             .map_err(Self::storage_err)?;
         drop(_lease);
@@ -310,7 +384,11 @@ impl Graph {
         floor: i64,
         directed: bool,
     ) -> Result<Vec<String>, EvidenceError> {
-        let view = self.substrate.read_view().await.map_err(Self::storage_err)?;
+        let view = self
+            .substrate
+            .read_view()
+            .await
+            .map_err(Self::storage_err)?;
         crate::traverse::reachable(&view, &self.keyspace, graph, from, floor, directed).await
     }
 
@@ -326,7 +404,11 @@ impl Graph {
         to: &str,
         directed: bool,
     ) -> Result<crate::traverse::WidestPath, EvidenceError> {
-        let view = self.substrate.read_view().await.map_err(Self::storage_err)?;
+        let view = self
+            .substrate
+            .read_view()
+            .await
+            .map_err(Self::storage_err)?;
         crate::traverse::widest_path(&view, &self.keyspace, graph, from, to, directed).await
     }
 }

@@ -18,7 +18,9 @@ use slatedb::object_store::memory::InMemory;
 use slatedb::Db;
 
 async fn make_db(name: &str) -> Database {
-    Database::new(Arc::new(Db::open(name, Arc::new(InMemory::new())).await.unwrap()))
+    Database::new(Arc::new(
+        Db::open(name, Arc::new(InMemory::new())).await.unwrap(),
+    ))
 }
 
 async fn engine(root: &str, db: Database, cdc: CdcConfig) -> LakehouseEngine {
@@ -54,9 +56,24 @@ async fn read_back(engine: &LakehouseEngine, table: &str) -> BTreeMap<(i64, Stri
 
     let mut out = BTreeMap::new();
     for batch in batches {
-        let a = batch.column_by_name("a").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
-        let b = batch.column_by_name("b").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
-        let p = batch.column_by_name("payload").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+        let a = batch
+            .column_by_name("a")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let b = batch
+            .column_by_name("b")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let p = batch
+            .column_by_name("payload")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         for i in 0..batch.num_rows() {
             out.insert((a.value(i), b.value(i).to_string()), p.value(i).to_string());
         }
@@ -76,15 +93,35 @@ async fn composite_table_mirrors_with_full_crud() {
     // CREATE persists the Pk catalog (on a plain connection).
     {
         let mut g = Glue::new(db.connection_serialized());
-        exec(&mut g, "CREATE TABLE t (a INTEGER, b TEXT, payload TEXT, PRIMARY KEY (a, b))").await;
+        exec(
+            &mut g,
+            "CREATE TABLE t (a INTEGER, b TEXT, payload TEXT, PRIMARY KEY (a, b))",
+        )
+        .await;
     }
     // Writes flow through a CDC-tapped connection so the mirror captures them.
     {
         let mut g = Glue::new(db.connection_with_cdc(cdc.clone()));
-        exec(&mut g, "INSERT INTO t (a, b, payload) VALUES (1, 'x', 'p1')").await;
-        exec(&mut g, "INSERT INTO t (a, b, payload) VALUES (1, 'y', 'p2')").await;
-        exec(&mut g, "INSERT INTO t (a, b, payload) VALUES (2, 'x', 'p3')").await;
-        exec(&mut g, "UPDATE t SET payload = 'p1b' WHERE a = 1 AND b = 'x'").await;
+        exec(
+            &mut g,
+            "INSERT INTO t (a, b, payload) VALUES (1, 'x', 'p1')",
+        )
+        .await;
+        exec(
+            &mut g,
+            "INSERT INTO t (a, b, payload) VALUES (1, 'y', 'p2')",
+        )
+        .await;
+        exec(
+            &mut g,
+            "INSERT INTO t (a, b, payload) VALUES (2, 'x', 'p3')",
+        )
+        .await;
+        exec(
+            &mut g,
+            "UPDATE t SET payload = 'p1b' WHERE a = 1 AND b = 'x'",
+        )
+        .await;
         exec(&mut g, "DELETE FROM t WHERE a = 1 AND b = 'y'").await;
     }
 
@@ -92,7 +129,11 @@ async fn composite_table_mirrors_with_full_crud() {
 
     let rows = read_back(&eng, "t").await;
     assert_eq!(rows.len(), 2, "one row deleted, one updated, one untouched");
-    assert_eq!(rows.get(&(1, "x".into())).map(String::as_str), Some("p1b"), "updated");
+    assert_eq!(
+        rows.get(&(1, "x".into())).map(String::as_str),
+        Some("p1b"),
+        "updated"
+    );
     assert_eq!(rows.get(&(2, "x".into())).map(String::as_str), Some("p3"));
     assert_eq!(rows.get(&(1, "y".into())), None, "deleted");
 
@@ -112,5 +153,9 @@ async fn composite_table_mirrors_with_full_crud() {
         .iter()
         .map(|f| f["source-id"].as_i64().unwrap())
         .collect();
-    assert_eq!(source_ids, vec![1, 2], "sort order should be on the (a, b) components");
+    assert_eq!(
+        source_ids,
+        vec![1, 2],
+        "sort order should be on the (a, b) components"
+    );
 }

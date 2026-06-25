@@ -33,9 +33,10 @@ async fn rest_select_translates_and_executes() {
         .unwrap();
 
     // GET /users?select=name&age=gt.28&order=name.asc
-    let payloads = rest_sql::execute_query_str(&mut glue, "users", "select=name&age=gt.28&order=name.asc")
-        .await
-        .expect("rest query");
+    let payloads =
+        rest_sql::execute_query_str(&mut glue, "users", "select=name&age=gt.28&order=name.asc")
+            .await
+            .expect("rest query");
     assert_eq!(
         select_rows(payloads),
         vec![
@@ -49,7 +50,9 @@ async fn rest_select_translates_and_executes() {
 #[tokio::test]
 async fn rest_insert_update_delete_round_trip() {
     let mut glue = new_glue().await;
-    glue.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);").await.unwrap();
+    glue.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);")
+        .await
+        .unwrap();
 
     rest_sql::execute_insert(
         &mut glue,
@@ -86,8 +89,15 @@ async fn rest_insert_update_delete_round_trip() {
     .await
     .expect("delete");
 
-    let rows = select_rows(glue.execute("SELECT id, name FROM t ORDER BY id;").await.unwrap());
-    assert_eq!(rows, vec![vec![Value::I64(1), Value::Str("ALICE".to_owned())]]);
+    let rows = select_rows(
+        glue.execute("SELECT id, name FROM t ORDER BY id;")
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        rows,
+        vec![vec![Value::I64(1), Value::Str("ALICE".to_owned())]]
+    );
 }
 
 #[tokio::test]

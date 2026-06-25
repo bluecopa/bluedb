@@ -3,6 +3,7 @@
 //! bluedb-ledger subsystem shape (native postcard records + atomic WriteBatch
 //! inside the serialized writer).
 
+pub mod chain;
 mod error;
 mod graph;
 mod keyspace;
@@ -12,7 +13,6 @@ mod proof;
 mod sth;
 mod store;
 mod traverse;
-pub mod chain;
 
 pub use chain::{Appended, ConsistencyProof, Digest, EntryInput, Evidence, InclusionProof};
 pub use error::EvidenceError;

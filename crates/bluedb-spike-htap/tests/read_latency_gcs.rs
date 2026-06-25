@@ -63,8 +63,8 @@ use iceberg_datafusion::IcebergStaticTableProvider;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::path::Path as OsPath;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions,
-    PutOptions, PutPayload, PutResult, Result as OsResult,
+    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as OsResult,
 };
 
 use datafusion::prelude::SessionContext;
@@ -210,7 +210,9 @@ impl ObjectStore for MeasuredStore {
             .nanos
             .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
         if let Ok(b) = &res {
-            self.stats.bytes.fetch_add(b.len() as u64, Ordering::Relaxed);
+            self.stats
+                .bytes
+                .fetch_add(b.len() as u64, Ordering::Relaxed);
         }
         res
     }
@@ -495,7 +497,10 @@ async fn build_grid(store: Arc<dyn ObjectStore>, prefix: &str) {
         .await
         .expect("reopen lakehouse engine on gcs"),
     );
-    engine.enable_table("grid").await.expect("enable table grid");
+    engine
+        .enable_table("grid")
+        .await
+        .expect("enable table grid");
     {
         let mut g = Glue::new(db.connection_serialized());
         // We go through `Glue` directly (not the server's `execute_sql`), spelling
@@ -732,7 +737,8 @@ fn report_query(q: &QueryRun) {
     let miss_compute = q.miss.latency.as_secs_f64() * 1e3
         - q.miss.gcs.nanos as f64 / 1e6
         - q.miss.foyer_insert_nanos as f64 / 1e6;
-    println!("    miss breakdown: GCS {:.0}ms + foyer-insert {:.1}ms + compute/plan {:.0}ms",
+    println!(
+        "    miss breakdown: GCS {:.0}ms + foyer-insert {:.1}ms + compute/plan {:.0}ms",
         q.miss.gcs.nanos as f64 / 1e6,
         q.miss.foyer_insert_nanos as f64 / 1e6,
         miss_compute.max(0.0),
@@ -749,8 +755,11 @@ fn report_query(q: &QueryRun) {
         q.hit.foyer_hit_nanos as f64 / 1e6,
         q.hit.cache_misses,
     );
-    println!("  >>> SPEEDUP (miss/hit) = {speedup:.1}x   [hit is local: GCS read-ops dropped {} -> {}]",
-        q.miss.gcs.read_ops(), q.hit.gcs.read_ops());
+    println!(
+        "  >>> SPEEDUP (miss/hit) = {speedup:.1}x   [hit is local: GCS read-ops dropped {} -> {}]",
+        q.miss.gcs.read_ops(),
+        q.hit.gcs.read_ops()
+    );
 }
 
 #[tokio::test]
@@ -768,7 +777,10 @@ async fn read_latency_miss_vs_hit_against_real_gcs() {
     println!("\n--- build phase (excluded from read timing) ---");
     let build_t = Instant::now();
     build_grid(plain.clone(), &prefix).await;
-    println!("  built grid (~{TOTAL_ROWS} rows, {BATCHES} Parquet files) in {:.1}s", build_t.elapsed().as_secs_f64());
+    println!(
+        "  built grid (~{TOTAL_ROWS} rows, {BATCHES} Parquet files) in {:.1}s",
+        build_t.elapsed().as_secs_f64()
+    );
 
     // ---- read store: CachingObjectStore { MeasuredStore { Gcs } } ----
     let op_stats = Arc::new(OpStats::default());
@@ -827,9 +839,33 @@ async fn read_latency_miss_vs_hit_against_real_gcs() {
     let q_point = format!("SELECT * FROM grid WHERE id = {mid_id}");
 
     let runs = vec![
-        measure_query("Q_agg  (full GROUP BY + SUM)", q_agg, &file_io, &lakehouse_root, &op_stats, &cache_stats).await,
-        measure_query("Q_grid (selective filter + top-50)", &q_grid, &file_io, &lakehouse_root, &op_stats, &cache_stats).await,
-        measure_query("Q_point (PK equality)", &q_point, &file_io, &lakehouse_root, &op_stats, &cache_stats).await,
+        measure_query(
+            "Q_agg  (full GROUP BY + SUM)",
+            q_agg,
+            &file_io,
+            &lakehouse_root,
+            &op_stats,
+            &cache_stats,
+        )
+        .await,
+        measure_query(
+            "Q_grid (selective filter + top-50)",
+            &q_grid,
+            &file_io,
+            &lakehouse_root,
+            &op_stats,
+            &cache_stats,
+        )
+        .await,
+        measure_query(
+            "Q_point (PK equality)",
+            &q_point,
+            &file_io,
+            &lakehouse_root,
+            &op_stats,
+            &cache_stats,
+        )
+        .await,
     ];
 
     println!("\n=== RESULTS: MISS (cold, GCS) vs HIT (warm, foyer) ===");
@@ -850,7 +886,9 @@ async fn read_latency_miss_vs_hit_against_real_gcs() {
         "  total GCS read-ops across the 3 HIT passes = {total_hit_gcs_ops} (≈0 ⇒ the warm tier is served ENTIRELY from local foyer — region-independent)"
     );
 
-    println!("\n=== done — DELETE gs://{bucket}/{prefix} (SlateDB + Iceberg both live under it) ===\n");
+    println!(
+        "\n=== done — DELETE gs://{bucket}/{prefix} (SlateDB + Iceberg both live under it) ===\n"
+    );
 }
 
 /// Raw single-op floor: one cold `read` (whole metadata.json) + one cold ranged
@@ -859,12 +897,7 @@ async fn read_latency_miss_vs_hit_against_real_gcs() {
 async fn raw_op_floor(file_io: &iceberg::io::FileIO, lakehouse_root: &str) {
     let table_root = grid_table_root(lakehouse_root);
     let hint_path = format!("{table_root}/metadata/version-hint.text");
-    let raw = file_io
-        .new_input(&hint_path)
-        .unwrap()
-        .read()
-        .await
-        .unwrap();
+    let raw = file_io.new_input(&hint_path).unwrap().read().await.unwrap();
     let version: u64 = String::from_utf8_lossy(&raw).trim().parse().unwrap();
     let md_path = format!("{table_root}/metadata/v{version}.metadata.json");
 

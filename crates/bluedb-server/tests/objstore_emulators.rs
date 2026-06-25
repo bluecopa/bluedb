@@ -95,8 +95,14 @@ async fn azure_azurite_round_trip() {
 #[tokio::test]
 #[ignore = "fake-gcs-server can't service SlateDB's round-trip (hangs); see fn docs"]
 async fn gcs_fake_round_trip() {
-    let sa = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/emulators/gcs-fake-sa.json");
-    let cfg = ObjectStoreConfig::Gcs { bucket: "bluedb".into(), service_account: Some(sa.into()) };
+    let sa = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/emulators/gcs-fake-sa.json"
+    );
+    let cfg = ObjectStoreConfig::Gcs {
+        bucket: "bluedb".into(),
+        service_account: Some(sa.into()),
+    };
     let store = build_object_store(&cfg).expect("build gcs store");
     slatedb_round_trip(store, "emul-roundtrip-gcs").await;
 }
@@ -119,9 +125,14 @@ async fn gcs_fake_round_trip() {
 #[ignore = "real GCS — set BLUEDB_GCS_TEST_{BUCKET,SA,PREFIX}"]
 async fn gcs_real_round_trip() {
     let bucket = std::env::var("BLUEDB_GCS_TEST_BUCKET").expect("set BLUEDB_GCS_TEST_BUCKET");
-    let sa = std::env::var("BLUEDB_GCS_TEST_SA").expect("set BLUEDB_GCS_TEST_SA (service-account JSON path)");
-    let prefix = std::env::var("BLUEDB_GCS_TEST_PREFIX").expect("set BLUEDB_GCS_TEST_PREFIX (unique throwaway prefix)");
-    let cfg = ObjectStoreConfig::Gcs { bucket, service_account: Some(sa) };
+    let sa = std::env::var("BLUEDB_GCS_TEST_SA")
+        .expect("set BLUEDB_GCS_TEST_SA (service-account JSON path)");
+    let prefix = std::env::var("BLUEDB_GCS_TEST_PREFIX")
+        .expect("set BLUEDB_GCS_TEST_PREFIX (unique throwaway prefix)");
+    let cfg = ObjectStoreConfig::Gcs {
+        bucket,
+        service_account: Some(sa),
+    };
     let store = build_object_store(&cfg).expect("build gcs store");
     slatedb_round_trip(store, &prefix).await;
 }

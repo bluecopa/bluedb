@@ -13,7 +13,9 @@ use slatedb::object_store::memory::InMemory;
 use slatedb::Db;
 
 async fn glue() -> Glue<SlateDbStorage> {
-    let db = Db::open("composite-dp", Arc::new(InMemory::new())).await.unwrap();
+    let db = Db::open("composite-dp", Arc::new(InMemory::new()))
+        .await
+        .unwrap();
     let mut g = Glue::new(SlateDbStorage::new(Arc::new(db)));
     rest_sql::execute_sql(
         &mut g,
@@ -40,7 +42,11 @@ async fn parameterized_sql_insert_and_select() {
     rest_sql::execute_sql(
         &mut g,
         "INSERT INTO t (a, b, payload) VALUES ($1, $2, $3)",
-        &[Param::Int(1), Param::Str("x".into()), Param::Str("p1".into())],
+        &[
+            Param::Int(1),
+            Param::Str("x".into()),
+            Param::Str("p1".into()),
+        ],
         false,
     )
     .await
@@ -89,25 +95,48 @@ async fn cross_surface_key_consistency() {
         rows: vec![vec!["1".into(), "x".into(), "dp".into()]],
     };
     rest_sql::execute_insert(&mut g, &req).await.unwrap();
-    let out = rest_sql::execute_sql(&mut g, "SELECT payload FROM t WHERE a = 1 AND b = 'x'", &[], false)
-        .await
-        .unwrap();
-    assert_eq!(rows(out), vec![vec![Value::Str("dp".into())]], "data-plane key not found via inline SQL");
+    let out = rest_sql::execute_sql(
+        &mut g,
+        "SELECT payload FROM t WHERE a = 1 AND b = 'x'",
+        &[],
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rows(out),
+        vec![vec![Value::Str("dp".into())]],
+        "data-plane key not found via inline SQL"
+    );
 
     // And the reverse: insert inline, find it via the data plane.
-    rest_sql::execute_sql(&mut g, "INSERT INTO t (a, b, payload) VALUES (2, 'y', 'sql')", &[], false)
-        .await
-        .unwrap();
+    rest_sql::execute_sql(
+        &mut g,
+        "INSERT INTO t (a, b, payload) VALUES (2, 'y', 'sql')",
+        &[],
+        false,
+    )
+    .await
+    .unwrap();
     let out = rest_sql::execute_query_str(&mut g, "t", "select=payload&a=eq.2&b=eq.y")
         .await
         .unwrap();
-    assert_eq!(rows(out), vec![vec![Value::Str("sql".into())]], "inline key not found via data plane");
+    assert_eq!(
+        rows(out),
+        vec![vec![Value::Str("sql".into())]],
+        "inline key not found via data plane"
+    );
 
     // Numeric-spelling canonicalization on a numeric column: `5` and `5` agree
     // whether inline or a data-plane param (both coerce to the INTEGER column).
-    rest_sql::execute_sql(&mut g, "INSERT INTO t (a, b, payload) VALUES (5, 'k', 'n')", &[], false)
-        .await
-        .unwrap();
+    rest_sql::execute_sql(
+        &mut g,
+        "INSERT INTO t (a, b, payload) VALUES (5, 'k', 'n')",
+        &[],
+        false,
+    )
+    .await
+    .unwrap();
     let out = rest_sql::execute_query_str(&mut g, "t", "select=payload&a=eq.5&b=eq.k")
         .await
         .unwrap();

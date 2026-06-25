@@ -62,7 +62,10 @@ async fn rollback_discards_inserts() {
     exec_one(&mut glue, "BEGIN;").await;
     exec_one(&mut glue, "INSERT INTO users VALUES (1, 'alice');").await;
     // Read-your-own-writes: the buffered insert is visible inside the txn.
-    assert_eq!(select_ids(&mut glue, "SELECT id FROM users;").await, vec![1]);
+    assert_eq!(
+        select_ids(&mut glue, "SELECT id FROM users;").await,
+        vec![1]
+    );
     exec_one(&mut glue, "ROLLBACK;").await;
 
     // After rollback the row never reached storage.
@@ -81,7 +84,10 @@ async fn commit_persists_inserts() {
     exec_one(&mut glue, "INSERT INTO users VALUES (1, 'alice');").await;
     exec_one(&mut glue, "COMMIT;").await;
 
-    assert_eq!(select_ids(&mut glue, "SELECT id FROM users;").await, vec![1]);
+    assert_eq!(
+        select_ids(&mut glue, "SELECT id FROM users;").await,
+        vec![1]
+    );
 }
 
 #[tokio::test]
@@ -126,11 +132,18 @@ async fn rollback_after_update_restores_prior_state() {
 async fn rollback_after_delete_restores_prior_state() {
     let mut glue = new_glue().await;
     seed_users(&mut glue).await;
-    exec_one(&mut glue, "INSERT INTO users VALUES (1, 'alice'), (2, 'bob');").await;
+    exec_one(
+        &mut glue,
+        "INSERT INTO users VALUES (1, 'alice'), (2, 'bob');",
+    )
+    .await;
 
     exec_one(&mut glue, "BEGIN;").await;
     exec_one(&mut glue, "DELETE FROM users WHERE id = 1;").await;
-    assert_eq!(select_ids(&mut glue, "SELECT id FROM users;").await, vec![2]);
+    assert_eq!(
+        select_ids(&mut glue, "SELECT id FROM users;").await,
+        vec![2]
+    );
     exec_one(&mut glue, "ROLLBACK;").await;
 
     // The deleted row is restored.
@@ -148,7 +161,11 @@ async fn multi_statement_txn_commits_atomically() {
 
     // A mix of insert/update/delete across several statements commits as one.
     exec_one(&mut glue, "BEGIN;").await;
-    exec_one(&mut glue, "INSERT INTO users VALUES (2, 'bob'), (3, 'carol');").await;
+    exec_one(
+        &mut glue,
+        "INSERT INTO users VALUES (2, 'bob'), (3, 'carol');",
+    )
+    .await;
     exec_one(&mut glue, "UPDATE users SET name = 'ALICE' WHERE id = 1;").await;
     exec_one(&mut glue, "DELETE FROM users WHERE id = 3;").await;
     exec_one(&mut glue, "COMMIT;").await;

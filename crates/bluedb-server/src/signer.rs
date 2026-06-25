@@ -54,7 +54,10 @@ impl LocalSigner {
     pub(crate) fn ephemeral() -> Self {
         // CSPRNG-seeded; uses the OS RNG.
         let key = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
-        Self { key, key_id: "local-ephemeral".to_string() }
+        Self {
+            key,
+            key_id: "local-ephemeral".to_string(),
+        }
     }
     /// The local fixture has no real versioning — it always reports version `1`.
     fn sign(&self, payload: &[u8]) -> Result<(u64, Vec<u8>), AppError> {
@@ -63,7 +66,10 @@ impl LocalSigner {
     }
     fn public_key(&self) -> (u64, String) {
         let vk: VerifyingKey = *self.key.verifying_key();
-        (1, vk.to_public_key_pem(Default::default()).expect("spki pem"))
+        (
+            1,
+            vk.to_public_key_pem(Default::default()).expect("spki pem"),
+        )
     }
 }
 

@@ -150,14 +150,22 @@ impl Database {
     ///
     /// Returns 0 before any mutation has committed for `tenant` this session.
     pub async fn last_commit_seq(&self, tenant: &str) -> i64 {
-        self.commit_seq.lock().await.get(tenant).copied().unwrap_or(0)
+        self.commit_seq
+            .lock()
+            .await
+            .get(tenant)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Record `tenant`'s `SET default_null_order` choice (`true` = nulls first,
     /// `false` = nulls last). Shared across every connection vended from this
     /// handle, so a subsequent read on any connection honors it.
     pub async fn set_null_order(&self, tenant: &str, nulls_first: bool) {
-        self.null_order.lock().await.insert(tenant.to_string(), nulls_first);
+        self.null_order
+            .lock()
+            .await
+            .insert(tenant.to_string(), nulls_first);
     }
 
     /// `tenant`'s `default_null_order` choice, if `SET` this session. `None`
@@ -214,7 +222,8 @@ impl Database {
     /// so they can't lose an update under concurrency; the append/insert route
     /// should use [`Self::connection`] to keep group-committing.
     pub fn connection_serialized(&self) -> SlateDbStorage {
-        self.connection_for_tenant(DEFAULT_TENANT).serialize_writes()
+        self.connection_for_tenant(DEFAULT_TENANT)
+            .serialize_writes()
     }
 
     /// A new connection that rejects queries requiring a full table scan or an
@@ -232,7 +241,9 @@ impl Database {
     /// read-modify-write (`/sql`, `PATCH`, `DELETE`): they get both the scan/sort
     /// guardrail and serializable RMW.
     pub fn connection_serialized_guarded(&self) -> SlateDbStorage {
-        self.connection_for_tenant(DEFAULT_TENANT).serialize_writes().strict()
+        self.connection_for_tenant(DEFAULT_TENANT)
+            .serialize_writes()
+            .strict()
     }
 
     /// Resolve a table's stable id (name→id), if it exists. For layers that
@@ -269,7 +280,11 @@ impl Database {
 
     /// Read `tenant`'s CDC log entries with sequence `> after`, in sequence
     /// (commit) order, each paired with its sequence.
-    pub async fn scan_cdc(&self, tenant: &str, after: i64) -> Result<Vec<(i64, CdcEntry)>, SqlError> {
+    pub async fn scan_cdc(
+        &self,
+        tenant: &str,
+        after: i64,
+    ) -> Result<Vec<(i64, CdcEntry)>, SqlError> {
         let ks = Keyspace::new(tenant);
         let start = ks.external_key(TAG_CDC, &after.saturating_add(1).to_be_bytes());
         let end = prefix_upper_bound(&ks.external_prefix(TAG_CDC));
@@ -311,7 +326,11 @@ mod tests {
 
     #[tokio::test]
     async fn writer_database_exposes_substrate_and_lease() {
-        let db = Arc::new(Db::open("conn-test", Arc::new(InMemory::new())).await.unwrap());
+        let db = Arc::new(
+            Db::open("conn-test", Arc::new(InMemory::new()))
+                .await
+                .unwrap(),
+        );
         let database = Database::new(db);
         assert!(database.substrate().is_writer());
         // Two clones of the lease are the same underlying mutex (Arc).

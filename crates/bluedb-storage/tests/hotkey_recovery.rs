@@ -69,7 +69,12 @@ async fn distinct_keys_survive_abrupt_reopen() {
         }
     }
     db2.close().await.unwrap();
-    assert_eq!(present, N, "distinct-key inserts lost {} of {N} on abrupt reopen", N - present);
+    assert_eq!(
+        present,
+        N,
+        "distinct-key inserts lost {} of {N} on abrupt reopen",
+        N - present
+    );
 }
 
 /// Sanity: with `await_durable=false` the writes are NOT promised durable, so an
@@ -80,11 +85,19 @@ async fn non_durable_writes_may_be_lost() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     {
         let db = Db::open("t", store.clone()).await.unwrap();
-        let opts = WriteOptions { await_durable: false, ..Default::default() };
+        let opts = WriteOptions {
+            await_durable: false,
+            ..Default::default()
+        };
         for i in 1..=N {
-            db.put_with_options(b"k".as_slice(), &i.to_be_bytes(), &PutOptions::default(), &opts)
-                .await
-                .unwrap();
+            db.put_with_options(
+                b"k".as_slice(),
+                &i.to_be_bytes(),
+                &PutOptions::default(),
+                &opts,
+            )
+            .await
+            .unwrap();
         }
     }
     let db2 = Db::open("t", store.clone()).await.unwrap();

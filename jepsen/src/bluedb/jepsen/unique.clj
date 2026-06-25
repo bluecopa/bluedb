@@ -23,15 +23,14 @@
 
 (defn- insert! [node id]
   (http/post (str (h/base node) "/tables/u")
-             {:body (json/generate-string {:id id})
-              :content-type :json
-              :throw-exceptions false
-              :socket-timeout 8000
-              :connection-timeout 2000}))
+             (h/opts :body (json/generate-string {:id id})
+                     :content-type :json
+                     :socket-timeout 8000
+                     :connection-timeout 2000)))
 
 (defn- delete! [node id]
   (http/delete (str (h/base node) (format "/tables/u?id=eq.%d" id))
-               {:throw-exceptions false :socket-timeout 8000 :connection-timeout 2000}))
+               (h/opts :socket-timeout 8000 :connection-timeout 2000)))
 
 (defn- classify [r]
   ;; 200 = applied; anything else (incl. uniqueness violation 4xx/5xx) = did not.

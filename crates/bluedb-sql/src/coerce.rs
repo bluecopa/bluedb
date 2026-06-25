@@ -151,8 +151,10 @@ fn insert_value_targets(
     if columns.is_empty() {
         defs.iter().map(|c| Some(c.data_type.clone())).collect()
     } else {
-        let by_name: HashMap<&str, &DataType> =
-            defs.iter().map(|c| (c.name.as_str(), &c.data_type)).collect();
+        let by_name: HashMap<&str, &DataType> = defs
+            .iter()
+            .map(|c| (c.name.as_str(), &c.data_type))
+            .collect();
         columns
             .iter()
             .map(|name| by_name.get(name.as_str()).map(|d| (*d).clone()))
@@ -375,12 +377,8 @@ fn coerce_pair(schema_map: &SchemaMap, scope: &Scope, left: Expr, right: Expr) -
         classify(schema_map, scope, &left),
         classify(schema_map, scope, &right),
     ) {
-        (Side::Num(dt), Side::TextLit(s)) if string_castable_to(&s, &dt) => {
-            (left, cast(right, dt))
-        }
-        (Side::TextLit(s), Side::Num(dt)) if string_castable_to(&s, &dt) => {
-            (cast(left, dt), right)
-        }
+        (Side::Num(dt), Side::TextLit(s)) if string_castable_to(&s, &dt) => (left, cast(right, dt)),
+        (Side::TextLit(s), Side::Num(dt)) if string_castable_to(&s, &dt) => (cast(left, dt), right),
         _ => (left, right),
     }
 }
@@ -648,7 +646,10 @@ mod tests {
         let m = map(vec![schema("t", &[("price", DataType::Decimal)])]);
         let out = where_after(&m, "SELECT * FROM t WHERE price = '9.99'");
         assert!(out.contains("CAST"), "expected a CAST, got: {out}");
-        assert!(out.contains("DECIMAL"), "expected DECIMAL target, got: {out}");
+        assert!(
+            out.contains("DECIMAL"),
+            "expected DECIMAL target, got: {out}"
+        );
     }
 
     #[test]
@@ -656,7 +657,10 @@ mod tests {
         // We never reinterpret a stored text column as a number.
         let m = map(vec![schema("t", &[("name", DataType::Text)])]);
         let out = where_after(&m, "SELECT * FROM t WHERE name = 5");
-        assert!(!out.contains("CAST"), "should not cast a text column, got: {out}");
+        assert!(
+            !out.contains("CAST"),
+            "should not cast a text column, got: {out}"
+        );
     }
 
     #[test]
@@ -665,7 +669,10 @@ mod tests {
         // runtime error) rather than inject a CAST that would fail.
         let m = map(vec![schema("t", &[("id", DataType::Int)])]);
         let out = where_after(&m, "SELECT * FROM t WHERE id = 'abc'");
-        assert!(!out.contains("CAST"), "should not cast a non-numeric string, got: {out}");
+        assert!(
+            !out.contains("CAST"),
+            "should not cast a non-numeric string, got: {out}"
+        );
     }
 
     #[test]
@@ -674,12 +681,18 @@ mod tests {
         // error in GlueSQL — skip it.
         let m = map(vec![schema("t", &[("id", DataType::Int)])]);
         let out = where_after(&m, "SELECT * FROM t WHERE id = '9.99'");
-        assert!(!out.contains("CAST"), "should not cast '9.99' to INT, got: {out}");
+        assert!(
+            !out.contains("CAST"),
+            "should not cast '9.99' to INT, got: {out}"
+        );
     }
 
     #[test]
     fn leaves_same_class_comparisons() {
-        let m = map(vec![schema("t", &[("id", DataType::Int), ("name", DataType::Text)])]);
+        let m = map(vec![schema(
+            "t",
+            &[("id", DataType::Int), ("name", DataType::Text)],
+        )]);
         // number vs number, text vs text — nothing to coerce.
         assert!(!where_after(&m, "SELECT * FROM t WHERE id = 5").contains("CAST"));
         assert!(!where_after(&m, "SELECT * FROM t WHERE name = 'x'").contains("CAST"));
@@ -690,7 +703,10 @@ mod tests {
         // bool↔int is intentionally out of scope (engine-specific).
         let m = map(vec![schema("t", &[("flag", DataType::Boolean)])]);
         let out = where_after(&m, "SELECT * FROM t WHERE flag = 1");
-        assert!(!out.contains("CAST"), "bool↔int must stay uncoerced, got: {out}");
+        assert!(
+            !out.contains("CAST"),
+            "bool↔int must stay uncoerced, got: {out}"
+        );
     }
 
     #[test]
@@ -698,21 +714,33 @@ mod tests {
         // Column not in any schema (schemaless / unknown) → left untouched.
         let m = map(vec![schema("t", &[("id", DataType::Int)])]);
         let out = where_after(&m, "SELECT * FROM t WHERE other = '5'");
-        assert!(!out.contains("CAST"), "unknown column must stay uncoerced, got: {out}");
+        assert!(
+            !out.contains("CAST"),
+            "unknown column must stay uncoerced, got: {out}"
+        );
     }
 
     #[test]
     fn coerces_qualified_column() {
         let m = map(vec![schema("t", &[("id", DataType::Int)])]);
         let out = where_after(&m, "SELECT * FROM t WHERE t.id = '5'");
-        assert!(out.contains("CAST"), "expected a CAST for qualified column, got: {out}");
+        assert!(
+            out.contains("CAST"),
+            "expected a CAST for qualified column, got: {out}"
+        );
     }
 
     #[test]
     fn coerces_inside_and_or() {
-        let m = map(vec![schema("t", &[("id", DataType::Int), ("name", DataType::Text)])]);
+        let m = map(vec![schema(
+            "t",
+            &[("id", DataType::Int), ("name", DataType::Text)],
+        )]);
         let out = where_after(&m, "SELECT * FROM t WHERE id = '5' AND name = 'x'");
-        assert!(out.contains("CAST"), "expected nested comparison coerced, got: {out}");
+        assert!(
+            out.contains("CAST"),
+            "expected nested comparison coerced, got: {out}"
+        );
     }
 
     // --- coerce_writes (parameterised INSERT/UPDATE value widening) -----------
@@ -777,7 +805,11 @@ mod tests {
             &m,
             insert_row("t", &["x"], vec![Expr::Value(Value::I64(3))]),
         ));
-        assert!(is_cast_to(&cells[0], &DataType::Float), "x not cast: {:?}", cells[0]);
+        assert!(
+            is_cast_to(&cells[0], &DataType::Float),
+            "x not cast: {:?}",
+            cells[0]
+        );
     }
 
     #[test]
@@ -802,9 +834,21 @@ mod tests {
                 ],
             ),
         ));
-        assert!(!is_cast_to(&cells[0], &DataType::Float), "b wrongly cast: {:?}", cells[0]);
-        assert!(matches!(cells[1], Expr::Value(Value::Str(_))), "c changed: {:?}", cells[1]);
-        assert!(matches!(cells[2], Expr::Value(Value::I64(7))), "d changed: {:?}", cells[2]);
+        assert!(
+            !is_cast_to(&cells[0], &DataType::Float),
+            "b wrongly cast: {:?}",
+            cells[0]
+        );
+        assert!(
+            matches!(cells[1], Expr::Value(Value::Str(_))),
+            "c changed: {:?}",
+            cells[1]
+        );
+        assert!(
+            matches!(cells[2], Expr::Value(Value::I64(7))),
+            "d changed: {:?}",
+            cells[2]
+        );
     }
 
     #[test]

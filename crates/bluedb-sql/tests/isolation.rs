@@ -49,22 +49,35 @@ async fn uncommitted_writes_are_invisible_to_other_connections() {
     let mut a = Glue::new(database.connection());
     let mut b = Glue::new(database.connection());
 
-    a.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);").await.unwrap();
+    a.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);")
+        .await
+        .unwrap();
     a.execute("INSERT INTO t VALUES (1, 10);").await.unwrap();
 
     // A opens a transaction and mutates — buffered in A's overlay, not flushed.
     a.execute("BEGIN;").await.unwrap();
-    a.execute("UPDATE t SET v = 99 WHERE id = 1;").await.unwrap();
+    a.execute("UPDATE t SET v = 99 WHERE id = 1;")
+        .await
+        .unwrap();
 
     // B (a separate connection) must still see the committed value, not A's
     // uncommitted change.
-    assert_eq!(scalar_i64(&mut b, "SELECT v FROM t WHERE id = 1;").await, 10);
+    assert_eq!(
+        scalar_i64(&mut b, "SELECT v FROM t WHERE id = 1;").await,
+        10
+    );
     // A sees its own write (read-your-own-writes).
-    assert_eq!(scalar_i64(&mut a, "SELECT v FROM t WHERE id = 1;").await, 99);
+    assert_eq!(
+        scalar_i64(&mut a, "SELECT v FROM t WHERE id = 1;").await,
+        99
+    );
 
     // After A commits, B sees the new value.
     a.execute("COMMIT;").await.unwrap();
-    assert_eq!(scalar_i64(&mut b, "SELECT v FROM t WHERE id = 1;").await, 99);
+    assert_eq!(
+        scalar_i64(&mut b, "SELECT v FROM t WHERE id = 1;").await,
+        99
+    );
 }
 
 #[tokio::test]
@@ -72,7 +85,9 @@ async fn a_transaction_reads_a_stable_snapshot() {
     let database = open_database("iso-snapshot").await;
     let mut a = Glue::new(database.connection());
 
-    a.execute("CREATE TABLE t (id INTEGER PRIMARY KEY);").await.unwrap();
+    a.execute("CREATE TABLE t (id INTEGER PRIMARY KEY);")
+        .await
+        .unwrap();
     a.execute("INSERT INTO t VALUES (1);").await.unwrap();
 
     a.execute("BEGIN;").await.unwrap();
@@ -101,7 +116,9 @@ async fn concurrent_write_transactions_do_not_lose_updates() {
 
     {
         let mut g = Glue::new(database.connection());
-        g.execute("CREATE TABLE c (id INTEGER PRIMARY KEY, n INTEGER);").await.unwrap();
+        g.execute("CREATE TABLE c (id INTEGER PRIMARY KEY, n INTEGER);")
+            .await
+            .unwrap();
         g.execute("INSERT INTO c VALUES (1, 0);").await.unwrap();
     }
 
@@ -115,7 +132,9 @@ async fn concurrent_write_transactions_do_not_lose_updates() {
         handles.push(tokio::spawn(async move {
             let mut g = Glue::new(database.connection());
             g.execute("BEGIN;").await.unwrap();
-            g.execute("UPDATE c SET n = n + 1 WHERE id = 1;").await.unwrap();
+            g.execute("UPDATE c SET n = n + 1 WHERE id = 1;")
+                .await
+                .unwrap();
             g.execute("COMMIT;").await.unwrap();
         }));
     }
@@ -125,5 +144,8 @@ async fn concurrent_write_transactions_do_not_lose_updates() {
 
     let mut g = Glue::new(database.connection());
     let final_n = scalar_i64(&mut g, "SELECT n FROM c WHERE id = 1;").await;
-    assert_eq!(final_n, N, "every increment landed: {N} serialized RMW transactions");
+    assert_eq!(
+        final_n, N,
+        "every increment landed: {N} serialized RMW transactions"
+    );
 }

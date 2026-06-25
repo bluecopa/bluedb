@@ -38,6 +38,7 @@
     :fill-disk / :free-disk  fill MinIO's (size-bounded tmpfs) data dir so PUTs
                        fail with ENOSPC, then free it."
   (:require [bluedb.jepsen.http :as h]
+            [bluedb.jepsen.kubernetes :as k8s]
             [jepsen.nemesis :as nemesis]
             [clojure.java.shell :as shell]
             [clojure.string :as str]
@@ -49,6 +50,7 @@
 (def ^:private pg-container (h/container "postgres"))
 (def ^:private minio-container (h/container "minio"))
 (def ^:private filler "/data/.jepsen-filler")
+(def ^:private k8s-active-timeout-ms 120000)
 
 (defn- docker [& args]
   (let [{:keys [exit out err]} (apply shell/sh "docker" args)]
@@ -56,7 +58,7 @@
 
 (defn- containers [] (map h/node->container (keys h/ports)))
 
-(defn nemesis
+(defn docker-nemesis
   "A custom nemesis driving docker faults. Tracks the container it isolated so
   :heal/teardown can reliably restore connectivity."
   []
@@ -156,3 +158,89 @@
         (docker "start" pg-container)
         (docker "unpause" minio-container)
         (docker "exec" minio-container "sh" "-c" (str "rm -f " filler "; true"))))))
+
+(defn- node-order []
+  (vec (sort (keys h/ports))))
+
+(defn setup-target!
+  "Prepare the requested target backend before DB/client setup touches HTTP."
+  [opts]
+  (when (= "kubernetes" (:nemesis-backend opts "docker"))
+    (k8s/ensure! (k8s/config opts) (node-order) h/ports)
+    (or (h/wait-active-node k8s-active-timeout-ms)
+        (throw (ex-info "Timed out waiting for an active BlueDB writer"
+                        {:backend :kubernetes
+                         :timeout-ms k8s-active-timeout-ms})))))
+
+(defn- sync-k8s! [cfg]
+  (k8s/sync-port-forwards! cfg (node-order) h/ports))
+
+(defn- wait-k8s-active! []
+  (or (h/wait-active-node k8s-active-timeout-ms)
+      (throw (ex-info "Timed out waiting for an active BlueDB writer"
+                      {:backend :kubernetes
+                       :timeout-ms k8s-active-timeout-ms}))))
+
+(defn k8s-nemesis
+  "A Kubernetes nemesis for live clusters. It targets individual pods via the
+  port-forward registry, so Jepsen can observe leadership movement across pods."
+  [opts]
+  (let [cfg (k8s/config opts)]
+    (reify nemesis/Nemesis
+      (setup! [this _test]
+        (sync-k8s! cfg)
+        (wait-k8s-active!)
+        this)
+
+      (invoke! [_this _test op]
+        (case (:f op)
+          :kill-writer
+          (let [node (h/active-node)
+                pod  (when node (k8s/node->pod node))]
+            (when pod (k8s/delete-pod! cfg pod))
+            (info "k8s nemesis deleted writer pod" pod "node" node)
+            (assoc op :value (str "deleted " pod)))
+
+          :start-all
+          (do (sync-k8s! cfg)
+              (wait-k8s-active!)
+              (assoc op :value :synced))
+
+          :delete-lease
+          (do (k8s/delete-lease! cfg)
+              (info "k8s nemesis deleted Lease" (:lease-name cfg))
+              (assoc op :value :lease-deleted))
+
+          :partition-writer
+          (let [node (h/active-node)
+                pod  (when node (k8s/node->pod node))]
+            (when pod (k8s/partition-pods! cfg [pod]))
+            (info "k8s nemesis isolated writer pod" pod "node" node)
+            (assoc op :value (str "isolated " pod)))
+
+          :isolate-half
+          (let [node   (h/active-node)
+                writer (when node (k8s/node->pod node))
+                buddy  (some->> (node-order)
+                                (remove #{node})
+                                first
+                                k8s/node->pod)
+                pods   (filterv some? [writer buddy])]
+            (when (seq pods) (k8s/partition-pods! cfg pods))
+            (info "k8s nemesis isolated pod minority" pods)
+            (assoc op :value (str "isolated " pods)))
+
+          :heal
+          (do (k8s/heal! cfg)
+              (sync-k8s! cfg)
+              (wait-k8s-active!)
+              (assoc op :value :healed))))
+
+      (teardown! [_this _test]
+        (k8s/heal! cfg)
+        (sync-k8s! cfg)))))
+
+(defn nemesis [opts]
+  (case (:nemesis-backend opts "docker")
+    "kubernetes" (k8s-nemesis opts)
+    (docker-nemesis)))

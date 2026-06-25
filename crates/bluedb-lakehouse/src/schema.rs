@@ -8,9 +8,7 @@
 
 use gluesql_core::ast::DataType;
 use gluesql_core::data::{Schema as GlueSchema, Value};
-use iceberg::spec::{
-    ListType, MapType, NestedField, PrimitiveType, Schema as IcebergSchema, Type,
-};
+use iceberg::spec::{ListType, MapType, NestedField, PrimitiveType, Schema as IcebergSchema, Type};
 
 use crate::{LakehouseError, Result};
 
@@ -88,10 +86,7 @@ pub fn table_to_iceberg(
     let mut fields = Vec::with_capacity(n);
     for (col_idx, col) in columns.iter().enumerate() {
         let field_id = field_id_of(col_idx);
-        let cells: Vec<&Value> = sample_rows
-            .iter()
-            .filter_map(|r| r.get(col_idx))
-            .collect();
+        let cells: Vec<&Value> = sample_rows.iter().filter_map(|r| r.get(col_idx)).collect();
         let ty = iceberg_type(&col.data_type, &cells, &mut next_nested_id)?;
         // The PK column is always required; otherwise honor the column's nullability.
         let field = if col_idx == pk_idx || !col.nullable {
@@ -382,9 +377,18 @@ mod tests {
 
     #[test]
     fn maps_scalar_types() {
-        assert_eq!(iceberg_primitive(&DataType::Int).unwrap(), PrimitiveType::Long);
-        assert_eq!(iceberg_primitive(&DataType::Int32).unwrap(), PrimitiveType::Int);
-        assert_eq!(iceberg_primitive(&DataType::Text).unwrap(), PrimitiveType::String);
+        assert_eq!(
+            iceberg_primitive(&DataType::Int).unwrap(),
+            PrimitiveType::Long
+        );
+        assert_eq!(
+            iceberg_primitive(&DataType::Int32).unwrap(),
+            PrimitiveType::Int
+        );
+        assert_eq!(
+            iceberg_primitive(&DataType::Text).unwrap(),
+            PrimitiveType::String
+        );
         assert_eq!(
             iceberg_primitive(&DataType::Boolean).unwrap(),
             PrimitiveType::Boolean
@@ -425,8 +429,13 @@ mod tests {
         let s1 = Value::List(vec![Value::I64(1), Value::I64(2)]);
         let s2 = Value::List(vec![Value::I64(3)]);
         let t = iceberg_type(&DataType::List, &[&s1, &s2], &mut ids).unwrap();
-        let Type::List(lt) = t else { panic!("expected list") };
-        assert_eq!(prim(lt.element_field.field_type.as_ref()), &PrimitiveType::Long);
+        let Type::List(lt) = t else {
+            panic!("expected list")
+        };
+        assert_eq!(
+            prim(lt.element_field.field_type.as_ref()),
+            &PrimitiveType::Long
+        );
         assert!(ids > 100, "nested field-id should have been allocated");
     }
 
@@ -435,16 +444,26 @@ mod tests {
         let mut ids = 0;
         let s = Value::List(vec![Value::I64(1), Value::Str("x".into())]);
         let t = iceberg_type(&DataType::List, &[&s], &mut ids).unwrap();
-        let Type::List(lt) = t else { panic!("expected list") };
-        assert_eq!(prim(lt.element_field.field_type.as_ref()), &PrimitiveType::String);
+        let Type::List(lt) = t else {
+            panic!("expected list")
+        };
+        assert_eq!(
+            prim(lt.element_field.field_type.as_ref()),
+            &PrimitiveType::String
+        );
     }
 
     #[test]
     fn empty_list_defaults_to_string_element() {
         let mut ids = 0;
         let t = iceberg_type(&DataType::List, &[], &mut ids).unwrap();
-        let Type::List(lt) = t else { panic!("expected list") };
-        assert_eq!(prim(lt.element_field.field_type.as_ref()), &PrimitiveType::String);
+        let Type::List(lt) = t else {
+            panic!("expected list")
+        };
+        assert_eq!(
+            prim(lt.element_field.field_type.as_ref()),
+            &PrimitiveType::String
+        );
     }
 
     #[test]
@@ -455,10 +474,21 @@ mod tests {
         m.insert("b".to_string(), Value::I32(2));
         let s = Value::Map(m);
         let t = iceberg_type(&DataType::Map, &[&s], &mut ids).unwrap();
-        let Type::Map(mt) = t else { panic!("expected map") };
-        assert_eq!(prim(mt.key_field.field_type.as_ref()), &PrimitiveType::String);
-        assert_eq!(prim(mt.value_field.field_type.as_ref()), &PrimitiveType::Int);
-        assert_ne!(mt.key_field.id, mt.value_field.id, "field-ids must be unique");
+        let Type::Map(mt) = t else {
+            panic!("expected map")
+        };
+        assert_eq!(
+            prim(mt.key_field.field_type.as_ref()),
+            &PrimitiveType::String
+        );
+        assert_eq!(
+            prim(mt.value_field.field_type.as_ref()),
+            &PrimitiveType::Int
+        );
+        assert_ne!(
+            mt.key_field.id, mt.value_field.id,
+            "field-ids must be unique"
+        );
     }
 
     #[test]
@@ -466,11 +496,16 @@ mod tests {
         let mut ids = 0;
         let s = Value::List(vec![Value::List(vec![Value::I64(1)])]);
         let t = iceberg_type(&DataType::List, &[&s], &mut ids).unwrap();
-        let Type::List(outer) = t else { panic!("expected outer list") };
+        let Type::List(outer) = t else {
+            panic!("expected outer list")
+        };
         let inner = match outer.element_field.field_type.as_ref() {
             Type::List(inner) => inner,
             other => panic!("expected inner list, got {other:?}"),
         };
-        assert_eq!(prim(inner.element_field.field_type.as_ref()), &PrimitiveType::Long);
+        assert_eq!(
+            prim(inner.element_field.field_type.as_ref()),
+            &PrimitiveType::Long
+        );
     }
 }

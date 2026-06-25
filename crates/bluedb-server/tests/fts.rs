@@ -192,7 +192,11 @@ async fn parameterized_fts_query_works_on_sql() {
     )
     .await;
     assert!(s.is_success(), "parameterized @@ on /sql: {s} {body}");
-    assert_eq!(body, json!([{ "id": 1 }]), "only the matching row id=1: {body}");
+    assert_eq!(
+        body,
+        json!([{ "id": 1 }]),
+        "only the matching row id=1: {body}"
+    );
 
     // to_tsquery($1) with a boolean query string also resolves its param.
     let (s, body) = call(
@@ -205,8 +209,15 @@ async fn parameterized_fts_query_works_on_sql() {
         })),
     )
     .await;
-    assert!(s.is_success(), "parameterized to_tsquery on /sql: {s} {body}");
-    assert_eq!(body, json!([{ "id": 1 }]), "boolean query matches id=1: {body}");
+    assert!(
+        s.is_success(),
+        "parameterized to_tsquery on /sql: {s} {body}"
+    );
+    assert_eq!(
+        body,
+        json!([{ "id": 1 }]),
+        "boolean query matches id=1: {body}"
+    );
 }
 
 /// FTS ranking with `ORDER BY ts_rank(...)` + `LIMIT/OFFSET` on `/sql`. The `@@`
@@ -258,13 +269,21 @@ async fn fts_rank_order_by_works_on_sql() {
     )
     .await;
     assert!(s.is_success(), "ranked FTS page on /sql: {s} {body}");
-    let ids: Vec<i64> = body.as_array().unwrap().iter().map(|r| r["id"].as_i64().unwrap()).collect();
+    let ids: Vec<i64> = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_i64().unwrap())
+        .collect();
     // Both matching docs (id=1, id=2) returned, ranked; id=3 ('weather') excluded.
     // BM25 favors the shorter doc (id=2 'invoice') over the longer one (id=1
     // 'invoice invoice overdue') on tf-density, so the exact order is engine-defined —
     // assert the membership and the page size, not the BM25 tiebreak.
     assert_eq!(ids.len(), 2, "ranked page size 2: {body}");
-    assert!(ids.contains(&1) && ids.contains(&2), "both matching docs: {body}");
+    assert!(
+        ids.contains(&1) && ids.contains(&2),
+        "both matching docs: {body}"
+    );
     assert!(!ids.contains(&3), "non-matching doc excluded: {body}");
 }
 
@@ -329,8 +348,15 @@ async fn fts_rank_with_structured_filter_and_pagination() {
         })),
     )
     .await;
-    assert!(s.is_success(), "FTS rank + structured filter + pagination on /sql: {s} {body}");
-    assert_eq!(body.as_array().unwrap().len(), 1, "one row on page 1: {body}");
+    assert!(
+        s.is_success(),
+        "FTS rank + structured filter + pagination on /sql: {s} {body}"
+    );
+    assert_eq!(
+        body.as_array().unwrap().len(),
+        1,
+        "one row on page 1: {body}"
+    );
     // id=1 (tf=2) ranks above id=2 (tf=1) for DESC rank.
     assert_eq!(body[0]["id"], json!(1), "top-ranked open doc: {body}");
 
@@ -357,8 +383,15 @@ async fn fts_rank_with_structured_filter_and_pagination() {
         })),
     )
     .await;
-    assert!(s.is_success(), "FTS rank query after SET nulls_first must still work: {s} {body}");
-    assert_eq!(body[0]["id"], json!(1), "top-ranked open doc after SET: {body}");
+    assert!(
+        s.is_success(),
+        "FTS rank query after SET nulls_first must still work: {s} {body}"
+    );
+    assert_eq!(
+        body[0]["id"],
+        json!(1),
+        "top-ranked open doc after SET: {body}"
+    );
 }
 
 #[tokio::test]
@@ -396,7 +429,10 @@ async fn durable_engine_serves_a_second_fulltext_index() {
             Some(json!({"column": col, "analyzer": "english"})),
         )
         .await;
-        assert!(s.is_success(), "create fulltext index on {table}: {s} {body}");
+        assert!(
+            s.is_success(),
+            "create fulltext index on {table}: {s} {body}"
+        );
     }
 
     // Insert into both tables on the observed connection (maintains both live indexes).
@@ -432,7 +468,11 @@ async fn durable_engine_serves_a_second_fulltext_index() {
     )
     .await;
     assert!(s.is_success(), "@@ on second index: {s} {body}");
-    assert_eq!(body, json!([{ "id": 10 }]), "second index returns its matching row");
+    assert_eq!(
+        body,
+        json!([{ "id": 10 }]),
+        "second index returns its matching row"
+    );
 
     // And the first index still works (both defs coexist on one bound engine).
     let (s, body) = call(
@@ -499,7 +539,11 @@ async fn trigram_like_over_http_read_your_writes() {
     )
     .await;
     assert!(s.is_success(), "LIKE select: {s} {body}");
-    assert_eq!(body, json!([{ "id": 1 }, { "id": 3 }]), "matching rows 1 and 3");
+    assert_eq!(
+        body,
+        json!([{ "id": 1 }, { "id": 3 }]),
+        "matching rows 1 and 3"
+    );
 
     // 5. a column with NO trigram index: `/sql` (the RYW transactional surface)
     //    rejects the un-indexed scan with `400 NO_INDEX`; the same read on
@@ -536,8 +580,16 @@ async fn trigram_like_over_http_read_your_writes() {
         Some(json!({"sql": "SELECT id FROM notes WHERE memo LIKE '%overdue%'"})),
     )
     .await;
-    assert_eq!(s, StatusCode::BAD_REQUEST, "un-indexed LIKE on /sql is rejected: {body}");
-    assert_eq!(body["code"], json!("NO_INDEX"), "guardrail reject code: {body}");
+    assert_eq!(
+        s,
+        StatusCode::BAD_REQUEST,
+        "un-indexed LIKE on /sql is rejected: {body}"
+    );
+    assert_eq!(
+        body["code"],
+        json!("NO_INDEX"),
+        "guardrail reject code: {body}"
+    );
     // `/query` (analytical) serves the same scan.
     let (s, body) = call(
         &app,
@@ -546,8 +598,15 @@ async fn trigram_like_over_http_read_your_writes() {
         Some(json!({"sql": "SELECT id FROM notes WHERE memo LIKE '%overdue%'"})),
     )
     .await;
-    assert!(s.is_success(), "un-indexed LIKE is served by the analytical engine: {body}");
-    assert_eq!(body, json!([{ "id": 1 }]), "row 1 ('overdue payment') matches '%overdue%'");
+    assert!(
+        s.is_success(),
+        "un-indexed LIKE is served by the analytical engine: {body}"
+    );
+    assert_eq!(
+        body,
+        json!([{ "id": 1 }]),
+        "row 1 ('overdue payment') matches '%overdue%'"
+    );
 }
 
 #[tokio::test]
@@ -612,7 +671,11 @@ async fn sql_search_indexes_see_tables_batch_insert_immediately() {
     )
     .await;
     assert!(s.is_success(), "parameterized FTS select: {s} {body}");
-    assert_eq!(body, json!([{ "id": 1, "title": "Invoice" }]), "FTS sees /tables batch insert");
+    assert_eq!(
+        body,
+        json!([{ "id": 1, "title": "Invoice" }]),
+        "FTS sees /tables batch insert"
+    );
 
     let (s, body) = call(
         &app,
@@ -622,7 +685,11 @@ async fn sql_search_indexes_see_tables_batch_insert_immediately() {
     )
     .await;
     assert!(s.is_success(), "trigram LIKE select: {s} {body}");
-    assert_eq!(body, json!([{ "id": 1 }]), "trigram LIKE sees /tables batch insert");
+    assert_eq!(
+        body,
+        json!([{ "id": 1 }]),
+        "trigram LIKE sees /tables batch insert"
+    );
 }
 
 #[tokio::test]

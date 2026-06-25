@@ -177,7 +177,10 @@ mod tests {
             one_bool(&ctx, r#"SELECT '{"a":1}' @> '{"a":2}'"#).await,
             Some(false)
         );
-        assert_eq!(one_bool(&ctx, r#"SELECT '[1,2,3]' @> '[1,3]'"#).await, Some(true));
+        assert_eq!(
+            one_bool(&ctx, r#"SELECT '[1,2,3]' @> '[1,3]'"#).await,
+            Some(true)
+        );
         // `<@` is the mirror of `@>`.
         assert_eq!(
             one_bool(&ctx, r#"SELECT '{"a":1}' <@ '{"a":1,"b":2}'"#).await,

@@ -5,7 +5,12 @@ use sha2::{Digest as Sha2Digest, Sha256};
 mod harness;
 
 fn entry(t: &str) -> EntryInput {
-    EntryInput { etype: t.into(), payload: t.as_bytes().to_vec(), at: String::new(), edges: vec![] }
+    EntryInput {
+        etype: t.into(),
+        payload: t.as_bytes().to_vec(),
+        at: String::new(),
+        edges: vec![],
+    }
 }
 
 #[tokio::test]
@@ -14,7 +19,9 @@ async fn verified_append_stores_leaf_hash_and_frontier_matches_digest() {
     let ev = Evidence::new(&db, "_");
     // default auto-create is verified
     for i in 0..5 {
-        ev.append("v", vec![entry(&format!("e{i}"))], None).await.unwrap();
+        ev.append("v", vec![entry(&format!("e{i}"))], None)
+            .await
+            .unwrap();
     }
     // Every entry carries a leaf hash on a verified chain.
     let rows = ev.read_range("v", 1, 5).await.unwrap();
@@ -108,7 +115,9 @@ async fn digest_matches_recompute_and_proofs_are_well_formed() {
     let db = harness::memory_db().await;
     let ev = Evidence::new(&db, "_");
     for i in 0..9 {
-        ev.append("v", vec![entry(&format!("e{i}"))], None).await.unwrap();
+        ev.append("v", vec![entry(&format!("e{i}"))], None)
+            .await
+            .unwrap();
     }
     let d = ev.digest("v").await.unwrap();
     assert_eq!(d.size, 9);
@@ -157,7 +166,11 @@ async fn count_merkle_nodes(db: &bluedb_sql::Database, chain: &str) -> usize {
     suffix.extend_from_slice(chain.as_bytes());
     let prefix = ks.external_key(0x1F, &suffix);
     let end = prefix_upper_bound(&prefix);
-    let mut it = db.substrate().scan_range(&prefix, end.as_deref()).await.unwrap();
+    let mut it = db
+        .substrate()
+        .scan_range(&prefix, end.as_deref())
+        .await
+        .unwrap();
     let mut n = 0;
     while it.next().await.unwrap().is_some() {
         n += 1;
@@ -171,9 +184,18 @@ async fn append_persists_complete_subtree_nodes() {
     let ev = Evidence::new(&db, "_");
     // Append 7 single-entry leaves on a verified (default) chain.
     for i in 0..7u8 {
-        ev.append("c", vec![EntryInput { etype: "t".into(), payload: vec![i], at: String::new(), edges: vec![] }], None)
-            .await
-            .unwrap();
+        ev.append(
+            "c",
+            vec![EntryInput {
+                etype: "t".into(),
+                payload: vec![i],
+                at: String::new(),
+                edges: vec![],
+            }],
+            None,
+        )
+        .await
+        .unwrap();
     }
     // Node (level 2, index 0) must be present and 32 bytes — the root over leaves
     // [0,4). Re-derive its key independently via the public Keyspace API.
@@ -183,14 +205,23 @@ async fn append_persists_complete_subtree_nodes() {
     suffix.push(2u8); // level 2
     suffix.extend_from_slice(&0u64.to_be_bytes()); // index 0
     let key = ks.external_key(0x1F, &suffix);
-    let node = db.substrate().get(&key).await.unwrap().expect("node (2,0) present");
+    let node = db
+        .substrate()
+        .get(&key)
+        .await
+        .unwrap()
+        .expect("node (2,0) present");
     assert_eq!(node.len(), 32);
 
     // Total persisted internal nodes after N appends == N − popcount(N): the count
     // of carry-merges across the incremental pushes. For N=7: 7 − 3 = 4.
     let n = 7usize;
     let expected = n - (n as u64).count_ones() as usize;
-    assert_eq!(count_merkle_nodes(&db, "c").await, expected, "node count must equal N - popcount(N)");
+    assert_eq!(
+        count_merkle_nodes(&db, "c").await,
+        expected,
+        "node count must equal N - popcount(N)"
+    );
 }
 
 /// RFC 6962 inclusion-proof length for 0-based `index` in a tree of `size`
@@ -209,7 +240,9 @@ async fn storage_proofs_are_ologn_reconstruct_root_and_survive_redaction() {
     let ev = Evidence::new(&db, "_");
     // 21 separate appends (not a batch) — exercises many incremental carry-merges.
     for i in 0..21 {
-        ev.append("v", vec![entry(&format!("e{i}"))], None).await.unwrap();
+        ev.append("v", vec![entry(&format!("e{i}"))], None)
+            .await
+            .unwrap();
     }
     let d = ev.digest("v").await.unwrap();
     assert_eq!(d.size, 21);

@@ -157,11 +157,7 @@ fn stage_sort(df: DataFrame, body: &Value, ctx: &Ctx<'_>) -> Result<DataFrame, M
 }
 
 /// `$group: {_id: "$field"|null, <out>: {<acc>: "$f"|1}}`.
-fn stage_group(
-    df: DataFrame,
-    body: &Value,
-    ctx: &mut Ctx<'_>,
-) -> Result<DataFrame, MqlError> {
+fn stage_group(df: DataFrame, body: &Value, ctx: &mut Ctx<'_>) -> Result<DataFrame, MqlError> {
     let obj = body
         .as_object()
         .ok_or_else(|| MqlError::Malformed("$group takes an object".into()))?;
@@ -194,7 +190,9 @@ fn stage_group(
             continue;
         }
         let spec_obj = spec.as_object().ok_or_else(|| {
-            MqlError::Malformed(format!("$group field '{out}' must be an accumulator object"))
+            MqlError::Malformed(format!(
+                "$group field '{out}' must be an accumulator object"
+            ))
         })?;
         if spec_obj.len() != 1 {
             return Err(MqlError::Malformed(format!(
@@ -401,7 +399,9 @@ async fn stage_lookup(
         .build()
         .map_err(df_err)?
         .alias(as_name);
-    let out = joined.aggregate(group_expr, vec![agg_expr]).map_err(df_err)?;
+    let out = joined
+        .aggregate(group_expr, vec![agg_expr])
+        .map_err(df_err)?;
 
     // The `as` column is a `List<Utf8>` of foreign JSON texts, re-inflated to an
     // array of objects by the `aggregate` handler — not a materialized scalar
@@ -454,7 +454,10 @@ fn field_expr(field: &str, ctx: &Ctx<'_>) -> Expr {
     } else if ctx.materialized.contains(field) {
         col(field)
     } else {
-        ctx.get_str.as_ref().clone().call(vec![col("doc"), lit(field)])
+        ctx.get_str
+            .as_ref()
+            .clone()
+            .call(vec![col("doc"), lit(field)])
     }
 }
 

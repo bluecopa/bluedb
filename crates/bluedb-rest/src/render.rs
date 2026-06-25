@@ -74,7 +74,10 @@ impl RestQuery {
         let table = validate_ident(&self.table)?;
         let mut params = Vec::new();
         let where_clause = render_where_params(&self.filters, &mut params)?;
-        Ok((format!("SELECT COUNT(*) FROM {table}{where_clause};"), params))
+        Ok((
+            format!("SELECT COUNT(*) FROM {table}{where_clause};"),
+            params,
+        ))
     }
 }
 
@@ -348,7 +351,11 @@ mod params_render {
         let q = RestQuery {
             table: "docs".into(),
             select: vec![],
-            filters: vec![Filter::new("data->>x'; DROP TABLE docs;--", Operator::Eq, "x")],
+            filters: vec![Filter::new(
+                "data->>x'; DROP TABLE docs;--",
+                Operator::Eq,
+                "x",
+            )],
             order: vec![],
             limit: None,
             offset: None,
@@ -362,7 +369,10 @@ mod params_render {
             table: "t".into(),
             select: vec!["id".into()],
             filters: vec![Filter::new("age", Operator::Gt, "20")],
-            order: vec![OrderKey { column: "age".into(), direction: Direction::Desc }],
+            order: vec![OrderKey {
+                column: "age".into(),
+                direction: Direction::Desc,
+            }],
             limit: Some(10),
             offset: Some(5),
         };

@@ -98,7 +98,9 @@ async fn gc_cdc_removes_entries_through_watermark() {
     }
     {
         let mut g = Glue::new(database.connection_with_cdc(cdc.clone()));
-        g.execute("INSERT INTO t VALUES (1),(2),(3);").await.unwrap();
+        g.execute("INSERT INTO t VALUES (1),(2),(3);")
+            .await
+            .unwrap();
     }
     let all = database.scan_cdc(T, 0).await.unwrap();
     assert_eq!(all.len(), 3);

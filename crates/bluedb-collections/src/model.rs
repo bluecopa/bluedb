@@ -1,5 +1,5 @@
-use serde_json::Value;
 use crate::id::new_object_id;
+use serde_json::Value;
 
 /// Ensure `doc` has a string `_id`, generating one if absent. Returns the id.
 /// A non-string existing `_id` is rendered to its text form (v1: text `_id`).

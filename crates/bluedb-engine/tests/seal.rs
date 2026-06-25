@@ -59,13 +59,21 @@ async fn seal_folds_live_into_durable_and_union_keeps_ryw() {
     }
 
     // Pre-seal: union = live; row 1 matches.
-    assert_eq!(query_ids(&fts, &database, sql).await, vec![1], "pre-seal: live");
+    assert_eq!(
+        query_ids(&fts, &database, sql).await,
+        vec![1],
+        "pre-seal: live"
+    );
 
     // Seal: fold the live segment into a durable split, reset the live segment.
     fts.seal().await.unwrap();
 
     // Post-seal: live is empty, so this hit comes from the DURABLE tier.
-    assert_eq!(query_ids(&fts, &database, sql).await, vec![1], "post-seal: durable");
+    assert_eq!(
+        query_ids(&fts, &database, sql).await,
+        vec![1],
+        "post-seal: durable"
+    );
 
     // Update row 1 so it no longer matches, insert row 3 that does → live segment.
     {

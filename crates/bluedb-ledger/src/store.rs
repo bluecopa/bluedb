@@ -62,7 +62,10 @@ pub(crate) async fn get_pending_state(
 pub(crate) async fn get_watermark(substrate: &Substrate, ks: &LedgerKeyspace) -> Result<u64> {
     match substrate.get(&ks.watermark_key()).await? {
         Some(bytes) => {
-            let arr: [u8; 8] = bytes.as_ref().try_into().context("watermark must be 8 bytes")?;
+            let arr: [u8; 8] = bytes
+                .as_ref()
+                .try_into()
+                .context("watermark must be 8 bytes")?;
             Ok(u64::from_be_bytes(arr))
         }
         None => Ok(0),
@@ -71,7 +74,11 @@ pub(crate) async fn get_watermark(substrate: &Substrate, ks: &LedgerKeyspace) ->
 
 /// Whether a transfer id is in the terminal-failure index (burned ⇒ a retry
 /// returns `id_already_failed`).
-pub(crate) async fn is_failed(substrate: &Substrate, ks: &LedgerKeyspace, id: u128) -> Result<bool> {
+pub(crate) async fn is_failed(
+    substrate: &Substrate,
+    ks: &LedgerKeyspace,
+    id: u128,
+) -> Result<bool> {
     Ok(substrate.get(&ks.failed_key(id)).await?.is_some())
 }
 
@@ -161,10 +168,22 @@ mod tests {
         let database = test_harness::writer_database().await;
         let substrate = database.substrate();
         let ks = LedgerKeyspace::new(bluedb_sql::DEFAULT_TENANT);
-        assert!(get_pending_state(&substrate, &ks, 9).await.unwrap().is_none());
+        assert!(get_pending_state(&substrate, &ks, 9)
+            .await
+            .unwrap()
+            .is_none());
         let writer = substrate.require_writer().unwrap();
-        writer.put(&ks.pending_state_key(9), &encode(&PendingStatus::Posted).unwrap()).await.unwrap();
-        assert_eq!(get_pending_state(&substrate, &ks, 9).await.unwrap(), Some(PendingStatus::Posted));
+        writer
+            .put(
+                &ks.pending_state_key(9),
+                &encode(&PendingStatus::Posted).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            get_pending_state(&substrate, &ks, 9).await.unwrap(),
+            Some(PendingStatus::Posted)
+        );
     }
 
     #[tokio::test]
@@ -174,7 +193,10 @@ mod tests {
         let ks = LedgerKeyspace::new(bluedb_sql::DEFAULT_TENANT);
         assert_eq!(get_watermark(&substrate, &ks).await.unwrap(), 0);
         let writer = substrate.require_writer().unwrap();
-        writer.put(&ks.watermark_key(), &1234u64.to_be_bytes()).await.unwrap();
+        writer
+            .put(&ks.watermark_key(), &1234u64.to_be_bytes())
+            .await
+            .unwrap();
         assert_eq!(get_watermark(&substrate, &ks).await.unwrap(), 1234);
     }
 
@@ -187,12 +209,25 @@ mod tests {
         assert!(get_account(&substrate, &ks, 1).await.unwrap().is_none());
 
         let a = Account {
-            id: 1, debits_pending: 0, debits_posted: 10, credits_pending: 0, credits_posted: 0,
-            user_data_128: 0, user_data_64: 0, user_data_32: 0,
-            reserved: 0, ledger: 1, code: 0, flags: AccountFlags::NONE, timestamp: 5,
+            id: 1,
+            debits_pending: 0,
+            debits_posted: 10,
+            credits_pending: 0,
+            credits_posted: 0,
+            user_data_128: 0,
+            user_data_64: 0,
+            user_data_32: 0,
+            reserved: 0,
+            ledger: 1,
+            code: 0,
+            flags: AccountFlags::NONE,
+            timestamp: 5,
         };
         let writer = substrate.require_writer().unwrap();
-        writer.put(&ks.account_key(1), &encode(&a).unwrap()).await.unwrap();
+        writer
+            .put(&ks.account_key(1), &encode(&a).unwrap())
+            .await
+            .unwrap();
 
         let back = get_account(&substrate, &ks, 1).await.unwrap().unwrap();
         assert_eq!(back, a);

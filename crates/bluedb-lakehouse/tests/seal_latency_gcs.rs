@@ -83,9 +83,15 @@ async fn setup(
     let file_io = object_store_file_io(store.clone(), "");
     let cdc = CdcConfig::default();
     let engine = Arc::new(
-        LakehouseEngine::reopen(file_io, format!("{prefix}/lakehouse"), "_", db.clone(), cdc.clone())
-            .await
-            .expect("reopen lakehouse engine on gcs"),
+        LakehouseEngine::reopen(
+            file_io,
+            format!("{prefix}/lakehouse"),
+            "_",
+            db.clone(),
+            cdc.clone(),
+        )
+        .await
+        .expect("reopen lakehouse engine on gcs"),
     );
     engine.enable_table("t").await.expect("enable table t");
     {
@@ -157,7 +163,10 @@ async fn measure_seal_floor(db: &Database, cdc: &CdcConfig, engine: &LakehouseEn
         "\n[scenario 1] SEAL-OP FLOOR (one bare engine.seal(), insert excluded), n={reps}\n  \
          min={mn:.1}ms  median={md:.1}ms  max={mx:.1}ms\n  \
          samples(ms)={:?}",
-        samples.iter().map(|v| (v * 10.0).round() / 10.0).collect::<Vec<_>>()
+        samples
+            .iter()
+            .map(|v| (v * 10.0).round() / 10.0)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -233,7 +242,13 @@ async fn measure_ack_to_seal(
     let last_seq = inserts.iter().map(|(s, _)| *s).max().unwrap_or(0);
     let wait_deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        let sealed_max = events.lock().unwrap().iter().map(|(w, _)| *w).max().unwrap_or(0);
+        let sealed_max = events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(w, _)| *w)
+            .max()
+            .unwrap_or(0);
         if sealed_max >= last_seq || Instant::now() >= wait_deadline {
             break;
         }
@@ -334,7 +349,13 @@ async fn gcs_op_and_seal_phase_breakdown() {
         store.put(&key, payload.clone().into()).await.expect("put");
         put.push(ms(t.elapsed()));
         let t = Instant::now();
-        store.get(&key).await.expect("get").bytes().await.expect("bytes");
+        store
+            .get(&key)
+            .await
+            .expect("get")
+            .bytes()
+            .await
+            .expect("bytes");
         get.push(ms(t.elapsed()));
         let t = Instant::now();
         store.head(&key).await.expect("head");
@@ -354,7 +375,10 @@ async fn gcs_op_and_seal_phase_breakdown() {
     // --- Seal phase breakdown: one warm seal, timed by phase. ---
     let (db, cdc, engine) = setup(store.clone(), &format!("{prefix}/phases")).await;
     insert_one(&db, &cdc, 1).await; // one row to seal
-    engine.seal().await.expect("warm-up seal (table now exists)");
+    engine
+        .seal()
+        .await
+        .expect("warm-up seal (table now exists)");
     insert_one(&db, &cdc, 2).await; // a second row for the timed seal
 
     let t = Instant::now();
@@ -367,7 +391,10 @@ async fn gcs_op_and_seal_phase_breakdown() {
     let t_schema = ms(t.elapsed());
 
     let t = Instant::now();
-    let mut writer = engine.writer_for("t", &schema, &[]).await.expect("writer_for");
+    let mut writer = engine
+        .writer_for("t", &schema, &[])
+        .await
+        .expect("writer_for");
     let t_writer_open = ms(t.elapsed());
 
     let row = (

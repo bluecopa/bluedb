@@ -102,8 +102,8 @@ impl K8sNodeRegistry {
     /// `kubernetes.io/service-name`).
     async fn list_slices(&self) -> Result<Vec<EndpointSlice>> {
         let api: Api<EndpointSlice> = Api::namespaced(self.client.clone(), &self.namespace);
-        let lp = ListParams::default()
-            .labels(&format!("kubernetes.io/service-name={}", self.service));
+        let lp =
+            ListParams::default().labels(&format!("kubernetes.io/service-name={}", self.service));
         let list = api
             .list(&lp)
             .await
@@ -129,11 +129,7 @@ pub(crate) fn endpoints_to_nodes(slices: &[EndpointSlice], port: u16) -> Vec<(St
     for slice in slices {
         for ep in &slice.endpoints {
             // Readiness: explicit false excludes; true or unset includes.
-            let ready = ep
-                .conditions
-                .as_ref()
-                .and_then(|c| c.ready)
-                .unwrap_or(true);
+            let ready = ep.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true);
             if !ready {
                 continue;
             }
@@ -145,7 +141,9 @@ pub(crate) fn endpoints_to_nodes(slices: &[EndpointSlice], port: u16) -> Vec<(St
                 .or_else(|| ep.hostname.clone());
             let Some(node_id) = node_id else { continue };
             // URL from the first address.
-            let Some(addr) = ep.addresses.first() else { continue };
+            let Some(addr) = ep.addresses.first() else {
+                continue;
+            };
             out.push((node_id, format!("http://{addr}:{port}")));
         }
     }
@@ -219,8 +217,18 @@ mod tests {
     fn maps_ready_endpoints_to_node_id_and_url() {
         // targetRef.name (the pod name) becomes node_id; URL = http://ip:port.
         let s = slice(vec![
-            endpoint(Some(true), Some("bluedb-0"), Some("bluedb-0"), &["10.0.0.1"]),
-            endpoint(Some(true), Some("bluedb-1"), Some("bluedb-1"), &["10.0.0.2"]),
+            endpoint(
+                Some(true),
+                Some("bluedb-0"),
+                Some("bluedb-0"),
+                &["10.0.0.1"],
+            ),
+            endpoint(
+                Some(true),
+                Some("bluedb-1"),
+                Some("bluedb-1"),
+                &["10.0.0.2"],
+            ),
         ]);
         let mut nodes = endpoints_to_nodes(&[s], 8080);
         nodes.sort();
@@ -240,7 +248,10 @@ mod tests {
             endpoint(Some(false), Some("bluedb-1"), None, &["10.0.0.2"]), // not Ready
         ]);
         let nodes = endpoints_to_nodes(&[s], 8080);
-        assert_eq!(nodes, vec![("bluedb-0".to_string(), "http://10.0.0.1:8080".to_string())]);
+        assert_eq!(
+            nodes,
+            vec![("bluedb-0".to_string(), "http://10.0.0.1:8080".to_string())]
+        );
     }
 
     #[test]
@@ -248,14 +259,25 @@ mod tests {
         // ready = None (unknown) ⇒ included.
         let s = slice(vec![endpoint(None, Some("bluedb-0"), None, &["10.0.0.1"])]);
         let nodes = endpoints_to_nodes(&[s], 9000);
-        assert_eq!(nodes, vec![("bluedb-0".to_string(), "http://10.0.0.1:9000".to_string())]);
+        assert_eq!(
+            nodes,
+            vec![("bluedb-0".to_string(), "http://10.0.0.1:9000".to_string())]
+        );
     }
 
     #[test]
     fn falls_back_to_hostname_when_no_target_ref() {
-        let s = slice(vec![endpoint(Some(true), None, Some("bluedb-7"), &["10.0.0.7"])]);
+        let s = slice(vec![endpoint(
+            Some(true),
+            None,
+            Some("bluedb-7"),
+            &["10.0.0.7"],
+        )]);
         let nodes = endpoints_to_nodes(&[s], 8080);
-        assert_eq!(nodes, vec![("bluedb-7".to_string(), "http://10.0.0.7:8080".to_string())]);
+        assert_eq!(
+            nodes,
+            vec![("bluedb-7".to_string(), "http://10.0.0.7:8080".to_string())]
+        );
     }
 
     #[test]
@@ -270,8 +292,18 @@ mod tests {
 
     #[test]
     fn flattens_endpoints_across_multiple_slices() {
-        let s1 = slice(vec![endpoint(Some(true), Some("bluedb-0"), None, &["10.0.0.1"])]);
-        let s2 = slice(vec![endpoint(Some(true), Some("bluedb-1"), None, &["10.0.0.2"])]);
+        let s1 = slice(vec![endpoint(
+            Some(true),
+            Some("bluedb-0"),
+            None,
+            &["10.0.0.1"],
+        )]);
+        let s2 = slice(vec![endpoint(
+            Some(true),
+            Some("bluedb-1"),
+            None,
+            &["10.0.0.2"],
+        )]);
         let mut nodes = endpoints_to_nodes(&[s1, s2], 8080);
         nodes.sort();
         assert_eq!(

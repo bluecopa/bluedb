@@ -128,7 +128,9 @@ remaining workloads are ported (see the warning above). The `set`,
 ## Running it yourself
 
 Prerequisites: the cluster up (`docker compose up -d` from the repo root) and
-**Java 21+** on `$PATH`. Leiningen is vendored at `jepsen/bin/lein`.
+**Java 21+** installed. Leiningen is vendored at `jepsen/bin/lein`; that wrapper
+selects Java 21+ from the usual local JDK locations and fails fast if only an
+older JDK is available.
 
 ```bash
 cd jepsen

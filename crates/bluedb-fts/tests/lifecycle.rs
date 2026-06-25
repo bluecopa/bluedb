@@ -106,7 +106,11 @@ async fn tombstone_hides_a_doc_that_is_still_physically_present() {
     let filtered =
         multi_split_search_filtered(&hs, "financial", &fields, 10, IdField(id_f), &tombs)
             .expect("filtered");
-    assert_eq!(filtered.len(), 1, "tombstoned 'a' is hidden, only 'b' lives");
+    assert_eq!(
+        filtered.len(),
+        1,
+        "tombstoned 'a' is hidden, only 'b' lives"
+    );
 }
 
 #[tokio::test]
@@ -130,7 +134,9 @@ async fn filtered_ids_returns_id_score_pairs_deduped_and_tombstone_filtered() {
             ],
         )
         .expect("s1");
-    db.put(s1.blob_key.as_bytes(), &s1.split_bytes[..]).await.expect("put s1");
+    db.put(s1.blob_key.as_bytes(), &s1.split_bytes[..])
+        .await
+        .expect("put s1");
 
     // Update "a" in a strictly newer split (still matches "financial").
     let s2 = writer
@@ -142,7 +148,9 @@ async fn filtered_ids_returns_id_score_pairs_deduped_and_tombstone_filtered() {
             vec![doc(id_f, "a", body_f, "alpha financial updated")],
         )
         .expect("s2");
-    db.put(s2.blob_key.as_bytes(), &s2.split_bytes[..]).await.expect("put s2");
+    db.put(s2.blob_key.as_bytes(), &s2.split_bytes[..])
+        .await
+        .expect("put s2");
 
     // Delete "b" outright at the current max generation.
     tombs.delete_doc_at("b", manifest.max_generation());
@@ -161,8 +169,16 @@ async fn filtered_ids_returns_id_score_pairs_deduped_and_tombstone_filtered() {
     let just_ids: Vec<&str> = ids.iter().map(|(id, _)| id.as_str()).collect();
     let mut sorted = just_ids.clone();
     sorted.sort_unstable();
-    assert_eq!(sorted, vec!["a", "c"], "live, deduped ids only ('b' tombstoned)");
-    assert_eq!(just_ids.len(), 2, "no duplicate 'a' from the same-id update");
+    assert_eq!(
+        sorted,
+        vec!["a", "c"],
+        "live, deduped ids only ('b' tombstoned)"
+    );
+    assert_eq!(
+        just_ids.len(),
+        2,
+        "no duplicate 'a' from the same-id update"
+    );
 
     // Scores are positive and the result is sorted by descending score.
     for (_, score) in &ids {
@@ -183,11 +199,21 @@ async fn incremental_append_is_searchable_across_splits() {
     let mut manifest = Manifest::new(INDEX_ID);
 
     for r in writer
-        .append(&mut manifest, schema.clone(), vec![doc(id_f, "a", body_f, "alpha financial")])
+        .append(
+            &mut manifest,
+            schema.clone(),
+            vec![doc(id_f, "a", body_f, "alpha financial")],
+        )
         .into_iter()
-        .chain(writer.append(&mut manifest, schema.clone(), vec![doc(id_f, "b", body_f, "beta financial")]))
+        .chain(writer.append(
+            &mut manifest,
+            schema.clone(),
+            vec![doc(id_f, "b", body_f, "beta financial")],
+        ))
     {
-        db.put(r.blob_key.as_bytes(), &r.split_bytes[..]).await.expect("put");
+        db.put(r.blob_key.as_bytes(), &r.split_bytes[..])
+            .await
+            .expect("put");
     }
 
     assert_eq!(manifest.splits.len(), 2, "two splits after two appends");
@@ -202,7 +228,11 @@ async fn incremental_append_is_searchable_across_splits() {
     let fields = vec![body_f];
 
     let hits = multi_split_search(&hs, "financial", &fields, 10).expect("search");
-    assert_eq!(hits.len(), 2, "'financial' matches one doc in each appended split");
+    assert_eq!(
+        hits.len(),
+        2,
+        "'financial' matches one doc in each appended split"
+    );
 }
 
 #[tokio::test]
@@ -216,9 +246,15 @@ async fn same_id_update_yields_exactly_one_live_copy_with_new_content() {
 
     // Original: id=x with "oldterm".
     let first = writer
-        .append(&mut manifest, schema.clone(), vec![doc(id_f, "x", body_f, "oldterm shared")])
+        .append(
+            &mut manifest,
+            schema.clone(),
+            vec![doc(id_f, "x", body_f, "oldterm shared")],
+        )
         .expect("append v1");
-    db.put(first.blob_key.as_bytes(), &first.split_bytes[..]).await.expect("put v1");
+    db.put(first.blob_key.as_bytes(), &first.split_bytes[..])
+        .await
+        .expect("put v1");
 
     // Update in place: tombstone old x (at current max gen) + append new x in a
     // strictly newer split.
@@ -231,7 +267,9 @@ async fn same_id_update_yields_exactly_one_live_copy_with_new_content() {
             vec![doc(id_f, "x", body_f, "newterm shared")],
         )
         .expect("update x");
-    db.put(second.blob_key.as_bytes(), &second.split_bytes[..]).await.expect("put v2");
+    db.put(second.blob_key.as_bytes(), &second.split_bytes[..])
+        .await
+        .expect("put v2");
 
     let blob = Arc::new(SlateDbBlobStore::new(db));
     let opened = open_all(&blob, &manifest).await;
@@ -239,20 +277,24 @@ async fn same_id_update_yields_exactly_one_live_copy_with_new_content() {
     let fields = vec![body_f];
 
     // The new content is live...
-    let new_hits =
-        multi_split_search_filtered(&hs, "newterm", &fields, 10, IdField(id_f), &tombs).expect("new");
+    let new_hits = multi_split_search_filtered(&hs, "newterm", &fields, 10, IdField(id_f), &tombs)
+        .expect("new");
     assert_eq!(new_hits.len(), 1, "the updated 'x' is live exactly once");
 
     // ...the old content is gone...
-    let old_hits =
-        multi_split_search_filtered(&hs, "oldterm", &fields, 10, IdField(id_f), &tombs).expect("old");
+    let old_hits = multi_split_search_filtered(&hs, "oldterm", &fields, 10, IdField(id_f), &tombs)
+        .expect("old");
     assert_eq!(old_hits.len(), 0, "the old version of 'x' is hidden");
 
     // ...and a term shared by both versions still yields exactly ONE hit (the
     // new one): generation-scoped delete + last-write-wins dedup, not a double.
-    let shared =
-        multi_split_search_filtered(&hs, "shared", &fields, 10, IdField(id_f), &tombs).expect("shared");
-    assert_eq!(shared.len(), 1, "same-id update collapses to a single live copy");
+    let shared = multi_split_search_filtered(&hs, "shared", &fields, 10, IdField(id_f), &tombs)
+        .expect("shared");
+    assert_eq!(
+        shared.len(),
+        1,
+        "same-id update collapses to a single live copy"
+    );
 }
 
 #[tokio::test]
@@ -269,22 +311,41 @@ async fn compaction_physically_drops_dead_docs_and_keeps_updated_ones() {
         .append(
             &mut manifest,
             schema.clone(),
-            vec![doc(id_f, "a", body_f, "alpha"), doc(id_f, "b", body_f, "beta")],
+            vec![
+                doc(id_f, "a", body_f, "alpha"),
+                doc(id_f, "b", body_f, "beta"),
+            ],
         )
         .expect("s1");
-    db.put(s1.blob_key.as_bytes(), &s1.split_bytes[..]).await.expect("put s1");
+    db.put(s1.blob_key.as_bytes(), &s1.split_bytes[..])
+        .await
+        .expect("put s1");
 
     // split gen2: c("gamma")
     let s2 = writer
-        .append(&mut manifest, schema.clone(), vec![doc(id_f, "c", body_f, "gamma")])
+        .append(
+            &mut manifest,
+            schema.clone(),
+            vec![doc(id_f, "c", body_f, "gamma")],
+        )
         .expect("s2");
-    db.put(s2.blob_key.as_bytes(), &s2.split_bytes[..]).await.expect("put s2");
+    db.put(s2.blob_key.as_bytes(), &s2.split_bytes[..])
+        .await
+        .expect("put s2");
 
     // update a -> "alpha2" (tombstone old a, append split gen3 with new a)
     let s3 = writer
-        .update(&mut manifest, &mut tombs, ["a"], schema.clone(), vec![doc(id_f, "a", body_f, "alpha2")])
+        .update(
+            &mut manifest,
+            &mut tombs,
+            ["a"],
+            schema.clone(),
+            vec![doc(id_f, "a", body_f, "alpha2")],
+        )
         .expect("update a");
-    db.put(s3.blob_key.as_bytes(), &s3.split_bytes[..]).await.expect("put s3");
+    db.put(s3.blob_key.as_bytes(), &s3.split_bytes[..])
+        .await
+        .expect("put s3");
 
     // delete b outright (at the current max generation).
     tombs.delete_doc_at("b", manifest.max_generation());
@@ -294,33 +355,71 @@ async fn compaction_physically_drops_dead_docs_and_keeps_updated_ones() {
     // ---- compact ALL splits into one ----
     let blob = Arc::new(SlateDbBlobStore::new(db.clone()));
     let opened = open_all(&blob, &manifest).await;
-    let inputs: Vec<(String, u64, &tantivy::Index)> =
-        opened.iter().map(|(id, gen, idx)| (id.clone(), *gen, idx)).collect();
+    let inputs: Vec<(String, u64, &tantivy::Index)> = opened
+        .iter()
+        .map(|(id, gen, idx)| (id.clone(), *gen, idx))
+        .collect();
 
     let result = Compactor::new()
         .compact(&manifest, &tombs, &inputs, schema.clone(), IdField(id_f))
         .expect("compact");
 
     // The compacted manifest has a single split; the three inputs are superseded.
-    assert_eq!(result.manifest.splits.len(), 1, "all inputs folded into one split");
+    assert_eq!(
+        result.manifest.splits.len(),
+        1,
+        "all inputs folded into one split"
+    );
     assert_eq!(result.superseded_keys.len(), 3, "three input splits to GC");
-    assert_eq!(result.split_meta.num_docs, 2, "live docs: updated 'a' + 'c'; dead 'a','b' dropped");
+    assert_eq!(
+        result.split_meta.num_docs, 2,
+        "live docs: updated 'a' + 'c'; dead 'a','b' dropped"
+    );
 
     // "b" was fully dropped -> its tombstone is cleared; "a" is kept (live new
     // copy) so its tombstone stays (harmless: the compacted copy is newer).
-    assert!(!result.tombstones.is_deleted("b"), "fully-dropped id's tombstone is cleared");
+    assert!(
+        !result.tombstones.is_deleted("b"),
+        "fully-dropped id's tombstone is cleared"
+    );
 
     // ---- reopen ONLY the compacted split and confirm physical contents ----
-    db.put(result.blob_key.as_bytes(), &result.split_bytes[..]).await.expect("put compacted");
-    let compacted = open_split_lazy(blob.clone(), &result.blob_key).await.expect("open compacted");
-    let opened2 = vec![(result.split_meta.split_id.clone(), result.split_meta.generation, compacted)];
+    db.put(result.blob_key.as_bytes(), &result.split_bytes[..])
+        .await
+        .expect("put compacted");
+    let compacted = open_split_lazy(blob.clone(), &result.blob_key)
+        .await
+        .expect("open compacted");
+    let opened2 = vec![(
+        result.split_meta.split_id.clone(),
+        result.split_meta.generation,
+        compacted,
+    )];
     let hs = handles(&opened2);
     let fields = vec![body_f];
 
     // Plain search over the compacted split (dead docs are physically gone, so
     // no tombstone filtering is needed to exclude them).
-    assert_eq!(multi_split_search(&hs, "alpha2", &fields, 10).unwrap().len(), 1, "updated 'a' present");
-    assert_eq!(multi_split_search(&hs, "gamma", &fields, 10).unwrap().len(), 1, "'c' present");
-    assert_eq!(multi_split_search(&hs, "alpha", &fields, 10).unwrap().len(), 0, "old 'a' physically gone");
-    assert_eq!(multi_split_search(&hs, "beta", &fields, 10).unwrap().len(), 0, "deleted 'b' physically gone");
+    assert_eq!(
+        multi_split_search(&hs, "alpha2", &fields, 10)
+            .unwrap()
+            .len(),
+        1,
+        "updated 'a' present"
+    );
+    assert_eq!(
+        multi_split_search(&hs, "gamma", &fields, 10).unwrap().len(),
+        1,
+        "'c' present"
+    );
+    assert_eq!(
+        multi_split_search(&hs, "alpha", &fields, 10).unwrap().len(),
+        0,
+        "old 'a' physically gone"
+    );
+    assert_eq!(
+        multi_split_search(&hs, "beta", &fields, 10).unwrap().len(),
+        0,
+        "deleted 'b' physically gone"
+    );
 }

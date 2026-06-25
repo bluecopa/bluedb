@@ -3,7 +3,12 @@ use bluedb_evidence::{EntryInput, Evidence};
 mod harness;
 
 fn entry(t: &str) -> EntryInput {
-    EntryInput { etype: t.into(), payload: t.as_bytes().to_vec(), at: "T".into(), edges: vec![] }
+    EntryInput {
+        etype: t.into(),
+        payload: t.as_bytes().to_vec(),
+        at: "T".into(),
+        edges: vec![],
+    }
 }
 
 #[tokio::test]
@@ -11,7 +16,9 @@ async fn redaction_keeps_seq_meta_and_digest_on_verified_chain() {
     let db = harness::memory_db().await;
     let ev = Evidence::new(&db, "_");
     for i in 0..5 {
-        ev.append("v", vec![entry(&format!("e{i}"))], None).await.unwrap();
+        ev.append("v", vec![entry(&format!("e{i}"))], None)
+            .await
+            .unwrap();
     }
     let before = ev.digest("v").await.unwrap();
 
@@ -41,7 +48,9 @@ async fn hard_delete_plain_leaves_gap_but_keeps_head() {
     let ev = Evidence::new(&db, "_");
     ev.create_chain("p", false).await.unwrap();
     for i in 0..3 {
-        ev.append("p", vec![entry(&format!("e{i}"))], None).await.unwrap();
+        ev.append("p", vec![entry(&format!("e{i}"))], None)
+            .await
+            .unwrap();
     }
     ev.hard_delete("p", 2, true).await.unwrap();
     let rows = ev.read_range("p", 1, 3).await.unwrap();
@@ -56,7 +65,10 @@ async fn hard_delete_rejected_on_verified_chain() {
     let ev = Evidence::new(&db, "_");
     ev.append("v", vec![entry("a")], None).await.unwrap(); // verified by default
     let err = ev.hard_delete("v", 1, true).await.unwrap_err();
-    assert!(matches!(err, bluedb_evidence::EvidenceError::VerifiedNoDelete(_)));
+    assert!(matches!(
+        err,
+        bluedb_evidence::EvidenceError::VerifiedNoDelete(_)
+    ));
     // Entry remains.
     assert_eq!(ev.read_range("v", 1, 1).await.unwrap().len(), 1);
 }

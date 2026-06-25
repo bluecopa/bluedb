@@ -99,7 +99,9 @@ fn parse_field(name: &str, spec: &crate::model::FieldSpec) -> Result<FieldKindIn
             };
             Ok(FieldKindInfo::Text(a))
         }
-        Some(other) => Err(SearchError::UnsupportedFieldType(format!("{other} (field {name})"))),
+        Some(other) => Err(SearchError::UnsupportedFieldType(format!(
+            "{other} (field {name})"
+        ))),
     }
 }
 
@@ -131,7 +133,10 @@ pub fn compile(spec: &MappingSpec) -> Result<SearchSchema> {
     let mut fields = HashMap::new();
     fields.insert(
         ID_FIELD.to_string(),
-        ResolvedField { field: id, kind: FieldKindInfo::Keyword },
+        ResolvedField {
+            field: id,
+            kind: FieldKindInfo::Keyword,
+        },
     );
     for (name, kind) in kinds {
         let field = schema
@@ -140,7 +145,11 @@ pub fn compile(spec: &MappingSpec) -> Result<SearchSchema> {
         fields.insert(name, ResolvedField { field, kind });
     }
 
-    Ok(SearchSchema { schema, id_field: IdField(id), fields })
+    Ok(SearchSchema {
+        schema,
+        id_field: IdField(id),
+        fields,
+    })
 }
 
 #[cfg(test)]
@@ -162,9 +171,18 @@ mod tests {
         let ss = compile(&m).unwrap();
         assert!(ss.field("_id").is_some());
         assert_eq!(ss.id_field.0, ss.field("_id").unwrap().field);
-        assert!(matches!(ss.field("title").unwrap().kind, FieldKindInfo::Text(_)));
-        assert!(matches!(ss.field("tag").unwrap().kind, FieldKindInfo::Keyword));
-        assert!(matches!(ss.field("year").unwrap().kind, FieldKindInfo::Integer));
+        assert!(matches!(
+            ss.field("title").unwrap().kind,
+            FieldKindInfo::Text(_)
+        ));
+        assert!(matches!(
+            ss.field("tag").unwrap().kind,
+            FieldKindInfo::Keyword
+        ));
+        assert!(matches!(
+            ss.field("year").unwrap().kind,
+            FieldKindInfo::Integer
+        ));
     }
 
     #[test]
@@ -190,6 +208,9 @@ mod tests {
         assert!(!terms.is_empty());
         // Verify the actual stems produced by the en_stem (Porter) analyzer.
         // "running" → "run"; "QUICKLY" → "quick" after lowercase + Porter stem.
-        assert!(terms.contains(&"run".to_string()), "expected 'run' in {terms:?}");
+        assert!(
+            terms.contains(&"run".to_string()),
+            "expected 'run' in {terms:?}"
+        );
     }
 }

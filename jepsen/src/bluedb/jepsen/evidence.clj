@@ -58,16 +58,16 @@
 
 (defn- append! [node chain v]
   (http/post (str (h/base node) "/evidence/" chain "/entries")
-             {:throw-exceptions false :socket-timeout 8000 :connection-timeout 2000
-              :content-type :json
-              :body (json/generate-string
-                     {:events [{:type "j" :payload_b64 (b64 (str v))}]})}))
+             (h/opts :socket-timeout 8000 :connection-timeout 2000
+                     :content-type :json
+                     :body (json/generate-string
+                            {:events [{:type "j" :payload_b64 (b64 (str v))}]}))))
 
 (defn- read-chain
   "Full chain read → vector of {:seq n :value v}, or nil if the read fails."
   [node chain]
   (let [r (http/get (str (h/base node) "/evidence/" chain "/entries")
-                    {:throw-exceptions false :socket-timeout 10000 :connection-timeout 2000})]
+                    (h/opts :socket-timeout 10000 :connection-timeout 2000))]
     (when (= 200 (:status r))
       (->> (json/parse-string (:body r) true)
            (mapv (fn [e] {:seq (:seq e)

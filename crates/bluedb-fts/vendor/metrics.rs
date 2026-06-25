@@ -61,12 +61,10 @@ impl Gauge {
         let mut current = self.0.load(Ordering::Relaxed);
         loop {
             let next = (f64::from_bits(current) + delta).to_bits();
-            match self.0.compare_exchange_weak(
-                current,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
+            match self
+                .0
+                .compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
                 Ok(_) => return,
                 Err(observed) => current = observed,
             }
@@ -141,6 +139,5 @@ impl CacheMetrics {
 /// directory warmup). Referenced by `CachingDirectory::new_unbounded`.
 pub static SHORTLIVED_CACHE: LazyLock<CacheMetrics> =
     LazyLock::new(|| CacheMetrics::for_component("shortlived"));
-
 
 // Adapted for bluedb: removed the test-only `CACHE_METRICS_FOR_TESTS` static.

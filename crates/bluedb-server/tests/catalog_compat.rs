@@ -52,8 +52,7 @@ async fn rest_catalog_is_iceberg_compatible_and_duckdb_reads_through_it() {
     // Local-fs object store at a tempdir so DuckDB can read the Parquet/metadata.
     let dir = tempfile::tempdir().unwrap();
     let abs = std::fs::canonicalize(dir.path()).unwrap();
-    let store: Arc<dyn ObjectStore> =
-        Arc::new(LocalFileSystem::new_with_prefix(&abs).unwrap());
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new_with_prefix(&abs).unwrap());
     let base = format!("file://{}", abs.display());
 
     let writer = Arc::new(WriterController::new(
@@ -70,7 +69,13 @@ async fn rest_catalog_is_iceberg_compatible_and_duckdb_reads_through_it() {
     let app = build_app(state.clone());
 
     // Mirror on; create + write through /sql; update + delete (equality deletes).
-    call(&app, "POST", "/sql", Some(json!({"sql": "PRAGMA lakehouse_mirror = on"}))).await;
+    call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "PRAGMA lakehouse_mirror = on"})),
+    )
+    .await;
     call(
         &app,
         "POST",
@@ -84,9 +89,27 @@ async fn rest_catalog_is_iceberg_compatible_and_duckdb_reads_through_it() {
         })),
     )
     .await;
-    call(&app, "POST", "/sql", Some(json!({"sql": "INSERT INTO docs VALUES (1,'a'),(2,'b'),(3,'c')"}))).await;
-    call(&app, "POST", "/sql", Some(json!({"sql": "UPDATE docs SET body='x' WHERE id=1"}))).await;
-    call(&app, "POST", "/sql", Some(json!({"sql": "DELETE FROM docs WHERE id=2"}))).await;
+    call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "INSERT INTO docs VALUES (1,'a'),(2,'b'),(3,'c')"})),
+    )
+    .await;
+    call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "UPDATE docs SET body='x' WHERE id=1"})),
+    )
+    .await;
+    call(
+        &app,
+        "POST",
+        "/sql",
+        Some(json!({"sql": "DELETE FROM docs WHERE id=2"})),
+    )
+    .await;
     state.seal_now().await.expect("seal");
 
     // Serve on a real socket so the python client can hit the REST catalog.
@@ -133,7 +156,11 @@ print("CATALOG_COMPAT_OK", rows)
     // Run the blocking python client off the async executor so `axum::serve`
     // keeps making progress.
     let out = tokio::task::spawn_blocking(move || {
-        Command::new("python3").arg("-c").arg(&script).output().expect("python3")
+        Command::new("python3")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .expect("python3")
     })
     .await
     .unwrap();

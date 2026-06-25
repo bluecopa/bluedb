@@ -29,7 +29,13 @@ const TTL: Duration = Duration::from_secs(30);
 const MARGIN: Duration = Duration::from_secs(5);
 
 fn node(node_id: &str, store: Arc<dyn ObjectStore>, lease: Arc<dyn LeaseProvider>) -> AppState {
-    let writer = Arc::new(WriterController::new(node_id, lease, Arc::new(SystemClock), TTL, MARGIN));
+    let writer = Arc::new(WriterController::new(
+        node_id,
+        lease,
+        Arc::new(SystemClock),
+        TTL,
+        MARGIN,
+    ));
     AppState::new(store, "bluedb", writer)
 }
 
@@ -75,7 +81,12 @@ async fn call_tenant(
 }
 
 /// The common, default-tenant case.
-async fn call(app: &Router, method: &str, uri: &str, json_body: Option<Value>) -> (StatusCode, Value) {
+async fn call(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    json_body: Option<Value>,
+) -> (StatusCode, Value) {
     call_tenant(app, method, uri, json_body, None).await
 }
 
@@ -83,24 +94,52 @@ async fn call(app: &Router, method: &str, uri: &str, json_body: Option<Value>) -
 
 /// Declare (or replace) a collection's search mapping. Asserts a 200 ack.
 async fn declare_index(app: &Router, coll: &str, mapping: Value) {
-    let (status, body) =
-        call(app, "POST", &format!("/collections/{coll}/searchIndex"), Some(mapping)).await;
-    assert_eq!(status, StatusCode::OK, "searchIndex [{coll}] failed: {body}");
+    let (status, body) = call(
+        app,
+        "POST",
+        &format!("/collections/{coll}/searchIndex"),
+        Some(mapping),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "searchIndex [{coll}] failed: {body}"
+    );
     assert_eq!(body["acknowledged"], json!(true), "searchIndex ack: {body}");
 }
 
 /// Insert a batch of documents into a collection. Asserts a 200 + the count.
 async fn insert_docs(app: &Router, coll: &str, docs: Value) {
     let n = docs.as_array().map(|a| a.len()).unwrap_or(0);
-    let (status, body) =
-        call(app, "POST", &format!("/collections/{coll}/insert"), Some(json!({ "documents": docs }))).await;
-    assert_eq!(status, StatusCode::OK, "insert into [{coll}] failed: {body}");
-    assert_eq!(body["insertedCount"].as_i64().unwrap() as usize, n, "insertedCount: {body}");
+    let (status, body) = call(
+        app,
+        "POST",
+        &format!("/collections/{coll}/insert"),
+        Some(json!({ "documents": docs })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "insert into [{coll}] failed: {body}"
+    );
+    assert_eq!(
+        body["insertedCount"].as_i64().unwrap() as usize,
+        n,
+        "insertedCount: {body}"
+    );
 }
 
 /// `POST /collections/{coll}/search` with the given ES body → `(status, body)`.
 async fn search(app: &Router, coll: &str, body: Value) -> (StatusCode, Value) {
-    call(app, "POST", &format!("/collections/{coll}/search"), Some(body)).await
+    call(
+        app,
+        "POST",
+        &format!("/collections/{coll}/search"),
+        Some(body),
+    )
+    .await
 }
 
 /// The hit array from a search response.
@@ -110,12 +149,16 @@ fn hits(body: &Value) -> &Vec<Value> {
 
 /// `hits.total.value` as i64.
 fn total(body: &Value) -> i64 {
-    body["hits"]["total"]["value"].as_i64().expect("hits.total.value")
+    body["hits"]["total"]["value"]
+        .as_i64()
+        .expect("hits.total.value")
 }
 
 /// The `_source.<field>` string of a hit.
 fn src_str<'a>(hit: &'a Value, field: &str) -> &'a str {
-    hit["_source"][field].as_str().unwrap_or_else(|| panic!("hit._source.{field} not a string: {hit}"))
+    hit["_source"][field]
+        .as_str()
+        .unwrap_or_else(|| panic!("hit._source.{field} not a string: {hit}"))
 }
 
 /// A standard mapping used by several tests: english title/body, keyword tag,
@@ -152,7 +195,12 @@ async fn declare_index_then_search_match() {
     .await;
 
     // Read-your-writes: search immediately, no seal.
-    let (status, body) = search(&app, "articles", json!({ "query": { "match": { "body": "dogs" } } })).await;
+    let (status, body) = search(
+        &app,
+        "articles",
+        json!({ "query": { "match": { "body": "dogs" } } }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "search failed: {body}");
 
     assert_eq!(total(&body), 1, "exactly the dogs doc: {body}");
@@ -161,11 +209,25 @@ async fn declare_index_then_search_match() {
 
     let id = hs[0]["_id"].as_str().expect("hit._id");
     assert_eq!(id.len(), 24, "_id should be a 24-char hex, got '{id}'");
-    assert!(id.chars().all(|c| c.is_ascii_hexdigit()), "_id should be hex: '{id}'");
+    assert!(
+        id.chars().all(|c| c.is_ascii_hexdigit()),
+        "_id should be hex: '{id}'"
+    );
 
-    assert_eq!(src_str(&hs[0], "title"), "Dogs", "the dogs doc's title: {body}");
-    assert_eq!(hs[0]["_index"], json!("articles"), "_index is the collection: {body}");
-    assert!(hs[0]["_score"].as_f64().unwrap_or(0.0) > 0.0, "scored hit: {body}");
+    assert_eq!(
+        src_str(&hs[0], "title"),
+        "Dogs",
+        "the dogs doc's title: {body}"
+    );
+    assert_eq!(
+        hs[0]["_index"],
+        json!("articles"),
+        "_index is the collection: {body}"
+    );
+    assert!(
+        hs[0]["_score"].as_f64().unwrap_or(0.0) > 0.0,
+        "scored hit: {body}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -203,7 +265,11 @@ async fn bool_must_should_must_not() {
     assert_eq!(total(&body), 1, "only the non-animals cats doc: {body}");
     let hs = hits(&body);
     assert_eq!(hs.len(), 1);
-    assert_eq!(src_str(&hs[0], "title"), "Home", "the surviving doc: {body}");
+    assert_eq!(
+        src_str(&hs[0], "title"),
+        "Home",
+        "the surviving doc: {body}"
+    );
     assert_eq!(src_str(&hs[0], "tag"), "pets");
 }
 
@@ -227,13 +293,20 @@ async fn range_on_integer() {
     )
     .await;
 
-    let (status, body) =
-        search(&app, "years", json!({ "query": { "range": { "year": { "gte": 2020 } } } })).await;
+    let (status, body) = search(
+        &app,
+        "years",
+        json!({ "query": { "range": { "year": { "gte": 2020 } } } }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "search failed: {body}");
 
     assert_eq!(total(&body), 2, "two docs with year >= 2020: {body}");
     let titles: Vec<&str> = hits(&body).iter().map(|h| src_str(h, "title")).collect();
-    assert!(titles.contains(&"edge"), "2020 (gte boundary) included: {titles:?}");
+    assert!(
+        titles.contains(&"edge"),
+        "2020 (gte boundary) included: {titles:?}"
+    );
     assert!(titles.contains(&"new"), "2023 included: {titles:?}");
     assert!(!titles.contains(&"old"), "2018 excluded: {titles:?}");
 }
@@ -255,17 +328,28 @@ async fn match_phrase() {
     .await;
 
     // In-order phrase → matches.
-    let (status, body) =
-        search(&app, "phrases", json!({ "query": { "match_phrase": { "body": "quick brown" } } })).await;
+    let (status, body) = search(
+        &app,
+        "phrases",
+        json!({ "query": { "match_phrase": { "body": "quick brown" } } }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "search failed: {body}");
     assert_eq!(total(&body), 1, "in-order phrase matches: {body}");
 
     // Reversed phrase → no match (the words exist but not adjacent in order).
-    let (status, body) =
-        search(&app, "phrases", json!({ "query": { "match_phrase": { "body": "brown quick" } } })).await;
+    let (status, body) = search(
+        &app,
+        "phrases",
+        json!({ "query": { "match_phrase": { "body": "brown quick" } } }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "search failed: {body}");
     assert_eq!(total(&body), 0, "reversed phrase does NOT match: {body}");
-    assert!(hits(&body).is_empty(), "no hits for reversed phrase: {body}");
+    assert!(
+        hits(&body).is_empty(),
+        "no hits for reversed phrase: {body}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -288,12 +372,19 @@ async fn term_keyword_exact() {
     )
     .await;
 
-    let (status, body) =
-        search(&app, "kw", json!({ "query": { "term": { "tag": "pets" } }, "size": 10 })).await;
+    let (status, body) = search(
+        &app,
+        "kw",
+        json!({ "query": { "term": { "tag": "pets" } }, "size": 10 }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "search failed: {body}");
 
     assert_eq!(total(&body), 2, "two pets docs: {body}");
-    assert!(hits(&body).iter().all(|h| src_str(h, "tag") == "pets"), "all hits are pets: {body}");
+    assert!(
+        hits(&body).iter().all(|h| src_str(h, "tag") == "pets"),
+        "all hits are pets: {body}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -316,14 +407,22 @@ async fn exists_query() {
     )
     .await;
 
-    let (status, body) =
-        search(&app, "maybe_year", json!({ "query": { "exists": { "field": "year" } } })).await;
+    let (status, body) = search(
+        &app,
+        "maybe_year",
+        json!({ "query": { "exists": { "field": "year" } } }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "search failed: {body}");
 
     assert_eq!(total(&body), 1, "only the doc that has `year`: {body}");
     let hs = hits(&body);
     assert_eq!(hs.len(), 1);
-    assert_eq!(src_str(&hs[0], "title"), "has", "the doc with a year: {body}");
+    assert_eq!(
+        src_str(&hs[0], "title"),
+        "has",
+        "the doc with a year: {body}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -356,8 +455,16 @@ async fn from_size_pagination() {
     .await;
     assert_eq!(status, StatusCode::OK, "search failed: {body}");
 
-    assert_eq!(total(&body), 5, "total reflects ALL matches, not the page: {body}");
-    assert_eq!(hits(&body).len(), 2, "the page holds exactly `size` hits: {body}");
+    assert_eq!(
+        total(&body),
+        5,
+        "total reflects ALL matches, not the page: {body}"
+    );
+    assert_eq!(
+        hits(&body).len(),
+        2,
+        "the page holds exactly `size` hits: {body}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -377,12 +484,19 @@ async fn source_false_and_field_list() {
     .await;
 
     // _source: false → the hit carries NO _source at all.
-    let (status, body) =
-        search(&app, "src", json!({ "query": { "match": { "body": "dogs" } }, "_source": false })).await;
+    let (status, body) = search(
+        &app,
+        "src",
+        json!({ "query": { "match": { "body": "dogs" } }, "_source": false }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "search failed: {body}");
     let hs = hits(&body);
     assert_eq!(hs.len(), 1, "{body}");
-    assert!(hs[0].get("_source").is_none(), "_source:false → no _source key: {body}");
+    assert!(
+        hs[0].get("_source").is_none(),
+        "_source:false → no _source key: {body}"
+    );
 
     // _source: ["title"] → _source is present but has only `title`.
     let (status, body) = search(
@@ -396,7 +510,11 @@ async fn source_false_and_field_list() {
     assert_eq!(hs.len(), 1, "{body}");
     let source = hs[0]["_source"].as_object().expect("_source object");
     assert_eq!(source.len(), 1, "_source trimmed to one field: {body}");
-    assert_eq!(source.get("title"), Some(&json!("Hello")), "kept title: {body}");
+    assert_eq!(
+        source.get("title"),
+        Some(&json!("Hello")),
+        "kept title: {body}"
+    );
     assert!(source.get("body").is_none(), "dropped body: {body}");
     assert!(source.get("tag").is_none(), "dropped tag: {body}");
 }
@@ -417,7 +535,12 @@ async fn highlight_wraps_terms() {
     )
     .await;
 
-    insert_docs(&app, "hl", json!([{ "body": "the dogs ran fast", "tag": "a" }])).await;
+    insert_docs(
+        &app,
+        "hl",
+        json!([{ "body": "the dogs ran fast", "tag": "a" }]),
+    )
+    .await;
 
     let (status, body) = search(
         &app,
@@ -435,8 +558,14 @@ async fn highlight_wraps_terms() {
     let snippet = hs[0]["highlight"]["body"][0]
         .as_str()
         .unwrap_or_else(|| panic!("highlight.body[0] missing: {body}"));
-    assert!(snippet.contains("<em>"), "snippet should wrap a term: '{snippet}'");
-    assert!(snippet.contains("<em>dogs</em>"), "the matched term is wrapped: '{snippet}'");
+    assert!(
+        snippet.contains("<em>"),
+        "snippet should wrap a term: '{snippet}'"
+    );
+    assert!(
+        snippet.contains("<em>dogs</em>"),
+        "the matched term is wrapped: '{snippet}'"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -456,7 +585,12 @@ async fn update_reflected_in_search() {
     insert_docs(&app, "mut", json!([{ "body": "alpha" }])).await;
 
     // The id we just inserted, fetched back via a find on `_id`-less filter.
-    let (status, body) = search(&app, "mut", json!({ "query": { "match": { "body": "alpha" } } })).await;
+    let (status, body) = search(
+        &app,
+        "mut",
+        json!({ "query": { "match": { "body": "alpha" } } }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(total(&body), 1, "alpha hits before update: {body}");
     let id = hits(&body)[0]["_id"].as_str().expect("hit _id").to_string();
@@ -470,13 +604,31 @@ async fn update_reflected_in_search() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "update failed: {body}");
-    assert_eq!(body["modifiedCount"].as_i64().unwrap(), 1, "one doc modified: {body}");
+    assert_eq!(
+        body["modifiedCount"].as_i64().unwrap(),
+        1,
+        "one doc modified: {body}"
+    );
 
     // "alpha" no longer matches; "beta" now matches.
-    let (_, body) = search(&app, "mut", json!({ "query": { "match": { "body": "alpha" } } })).await;
-    assert_eq!(total(&body), 0, "alpha no longer matches after update: {body}");
+    let (_, body) = search(
+        &app,
+        "mut",
+        json!({ "query": { "match": { "body": "alpha" } } }),
+    )
+    .await;
+    assert_eq!(
+        total(&body),
+        0,
+        "alpha no longer matches after update: {body}"
+    );
 
-    let (_, body) = search(&app, "mut", json!({ "query": { "match": { "body": "beta" } } })).await;
+    let (_, body) = search(
+        &app,
+        "mut",
+        json!({ "query": { "match": { "body": "beta" } } }),
+    )
+    .await;
     assert_eq!(total(&body), 1, "beta matches after update: {body}");
 }
 
@@ -496,7 +648,12 @@ async fn delete_reflected_in_search() {
 
     insert_docs(&app, "del", json!([{ "body": "ephemeral" }])).await;
 
-    let (_, body) = search(&app, "del", json!({ "query": { "match": { "body": "ephemeral" } } })).await;
+    let (_, body) = search(
+        &app,
+        "del",
+        json!({ "query": { "match": { "body": "ephemeral" } } }),
+    )
+    .await;
     assert_eq!(total(&body), 1, "hits before delete: {body}");
     let id = hits(&body)[0]["_id"].as_str().expect("hit _id").to_string();
 
@@ -508,9 +665,18 @@ async fn delete_reflected_in_search() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "delete failed: {body}");
-    assert_eq!(body["deletedCount"].as_i64().unwrap(), 1, "one doc deleted: {body}");
+    assert_eq!(
+        body["deletedCount"].as_i64().unwrap(),
+        1,
+        "one doc deleted: {body}"
+    );
 
-    let (_, body) = search(&app, "del", json!({ "query": { "match": { "body": "ephemeral" } } })).await;
+    let (_, body) = search(
+        &app,
+        "del",
+        json!({ "query": { "match": { "body": "ephemeral" } } }),
+    )
+    .await;
     assert_eq!(total(&body), 0, "no hits after delete: {body}");
     assert!(hits(&body).is_empty(), "{body}");
 }
@@ -545,9 +711,16 @@ async fn numeric_sort() {
 
     let hs = hits(&body);
     assert_eq!(hs.len(), 3, "all three docs: {body}");
-    let years: Vec<i64> = hs.iter().map(|h| h["_source"]["year"].as_i64().unwrap()).collect();
+    let years: Vec<i64> = hs
+        .iter()
+        .map(|h| h["_source"]["year"].as_i64().unwrap())
+        .collect();
     assert_eq!(years, vec![2019, 2021, 2024], "ascending by year: {body}");
-    assert_eq!(src_str(&hs[0], "title"), "first", "smallest year first: {body}");
+    assert_eq!(
+        src_str(&hs[0], "title"),
+        "first",
+        "smallest year first: {body}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -558,10 +731,24 @@ async fn numeric_sort() {
 async fn unmapped_field_errors() {
     let app = app().await;
     declare_index(&app, "strict", standard_mapping()).await;
-    insert_docs(&app, "strict", json!([{ "title": "a", "body": "x", "tag": "t", "year": 2020 }])).await;
+    insert_docs(
+        &app,
+        "strict",
+        json!([{ "title": "a", "body": "x", "tag": "t", "year": 2020 }]),
+    )
+    .await;
 
-    let (status, body) = search(&app, "strict", json!({ "query": { "match": { "nope": "x" } } })).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "unmapped field → 400: {body}");
+    let (status, body) = search(
+        &app,
+        "strict",
+        json!({ "query": { "match": { "nope": "x" } } }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "unmapped field → 400: {body}"
+    );
     // bluedb's STANDARD error body (an object with an `error` field) — NOT the ES
     // error envelope (documented v1 limitation).
     assert!(body.get("error").is_some(), "error body present: {body}");
@@ -617,8 +804,15 @@ async fn tenant_isolation() {
         Some("t2"),
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "t2 has no mapping → 404: {body}");
-    assert!(body.get("error").is_some() || body.get("code").is_some(), "error body: {body}");
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "t2 has no mapping → 404: {body}"
+    );
+    assert!(
+        body.get("error").is_some() || body.get("code").is_some(),
+        "error body: {body}"
+    );
 
     // Even after t2 declares its OWN mapping, it sees zero of t1's docs.
     let (status, body) = call_tenant(
@@ -630,7 +824,11 @@ async fn tenant_isolation() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "t2 searchIndex: {body}");
-    assert_eq!(body["backfilled"], json!(0), "t2 has no docs to backfill: {body}");
+    assert_eq!(
+        body["backfilled"],
+        json!(0),
+        "t2 has no docs to backfill: {body}"
+    );
 
     let (status, body) = call_tenant(
         &app,
@@ -640,7 +838,11 @@ async fn tenant_isolation() {
         Some("t2"),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "t2 search after own mapping: {body}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "t2 search after own mapping: {body}"
+    );
     assert_eq!(total(&body), 0, "t2 never sees t1's docs: {body}");
 }
 
@@ -654,14 +856,20 @@ async fn search_without_mapping_404() {
     // A collection that exists (has docs) but was never declared for search.
     insert_docs(&app, "unindexed", json!([{ "body": "hello" }])).await;
 
-    let (status, body) =
-        search(&app, "unindexed", json!({ "query": { "match_all": {} } })).await;
+    let (status, body) = search(&app, "unindexed", json!({ "query": { "match_all": {} } })).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "no mapping → 404: {body}");
-    assert!(body.get("error").is_some() || body.get("code").is_some(), "error body: {body}");
+    assert!(
+        body.get("error").is_some() || body.get("code").is_some(),
+        "error body: {body}"
+    );
 
     // A collection that doesn't exist at all is also a 404.
     let (status, body) = search(&app, "ghost", json!({ "query": { "match_all": {} } })).await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "missing collection → 404: {body}");
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "missing collection → 404: {body}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -674,9 +882,12 @@ async fn rejects_invalid_collection_name() {
     // `1bad` starts with a digit → rejected by `ident` (^[A-Za-z_][A-Za-z0-9_]*$),
     // but is URL-safe so it reaches the handler (where the validation lives).
     // Must be a 400 — NOT a 200, and NOT a 500 from interpolating it into SQL.
-    let (status, body) =
-        search(&app, "1bad", json!({ "query": { "match_all": {} } })).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "search bad name → 400: {body}");
+    let (status, body) = search(&app, "1bad", json!({ "query": { "match_all": {} } })).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "search bad name → 400: {body}"
+    );
 
     let (status, body) = call(
         &app,
@@ -685,7 +896,11 @@ async fn rejects_invalid_collection_name() {
         Some(standard_mapping()),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "searchIndex bad name → 400: {body}");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "searchIndex bad name → 400: {body}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -709,7 +924,11 @@ async fn rejects_oversized_window() {
         json!({ "query": { "match_all": {} }, "size": 20000 }),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "size beyond max window → 400: {body}");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "size beyond max window → 400: {body}"
+    );
 }
 
 // ---------------------------------------------------------------------------

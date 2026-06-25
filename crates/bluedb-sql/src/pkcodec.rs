@@ -83,7 +83,10 @@ mod tests {
         // makes "a" < "ab" decide it, so ("a", _) always sorts before ("ab", _).
         let a_z = enc(&[Key::Str("a".into()), Key::Str("z".into())]);
         let ab_a = enc(&[Key::Str("ab".into()), Key::Str("a".into())]);
-        assert!(a_z < ab_a, "shorter leading string sorts first regardless of trailing");
+        assert!(
+            a_z < ab_a,
+            "shorter leading string sorts first regardless of trailing"
+        );
     }
 
     #[test]

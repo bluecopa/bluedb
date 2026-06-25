@@ -83,7 +83,10 @@ async fn registry_survives_reopen() {
     let cdc2 = CdcConfig::default();
     let eng2 = engine(root, db.clone(), cdc2.clone()).await;
     assert_eq!(eng2.mirrored_tables(), vec!["docs".to_string()]);
-    assert!(cdc2.is_enabled("_", "docs"), "registry applied to the fresh CDC control");
+    assert!(
+        cdc2.is_enabled("_", "docs"),
+        "registry applied to the fresh CDC control"
+    );
 }
 
 #[tokio::test]
@@ -121,7 +124,11 @@ async fn seal_publishes_final_state_then_gcs() {
     // The log is GC'd through the sealed watermark; sealing again is a no-op.
     assert!(db.scan_cdc("_", 0).await.unwrap().is_empty());
     eng.seal().await.unwrap();
-    assert_eq!(read_table(&eng, "docs").await.len(), 1, "no-op seal changes nothing");
+    assert_eq!(
+        read_table(&eng, "docs").await.len(),
+        1,
+        "no-op seal changes nothing"
+    );
 }
 
 /// Does the Iceberg table exist yet (version-hint present)?
@@ -147,7 +154,9 @@ async fn seal_loop_fires_on_commit_and_skips_idle() {
             .unwrap();
     }
 
-    let handle = eng.clone().spawn_seal_loop(Duration::from_millis(50), Duration::from_millis(500));
+    let handle = eng
+        .clone()
+        .spawn_seal_loop(Duration::from_millis(50), Duration::from_millis(500));
 
     // Idle (no mirror-enabled commits): the loop blocks, no snapshot appears.
     tokio::time::sleep(Duration::from_millis(250)).await;
@@ -160,7 +169,8 @@ async fn seal_loop_fires_on_commit_and_skips_idle() {
     }
     let mut sealed = false;
     for _ in 0..60 {
-        if table_exists(&root).await && read_table(&eng, "docs").await.get(&1).map(String::as_str) == Some("a")
+        if table_exists(&root).await
+            && read_table(&eng, "docs").await.get(&1).map(String::as_str) == Some("a")
         {
             sealed = true;
             break;
@@ -168,7 +178,10 @@ async fn seal_loop_fires_on_commit_and_skips_idle() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     handle.abort();
-    assert!(sealed, "seal loop should publish the row shortly after commit");
+    assert!(
+        sealed,
+        "seal loop should publish the row shortly after commit"
+    );
 }
 
 #[tokio::test]
@@ -238,7 +251,10 @@ async fn compaction_reduces_files_and_preserves_state() {
     eng.compact("docs").await.unwrap();
 
     let after = eng.data_file_count("docs").await.unwrap();
-    assert!(after < before, "compaction should reduce file count ({after} < {before})");
+    assert!(
+        after < before,
+        "compaction should reduce file count ({after} < {before})"
+    );
 
     // Correctness vs the expected final state: id=2 deleted, id=1 updated.
     let rows = read_table(&eng, "docs").await;
@@ -257,20 +273,28 @@ async fn pragma_controls_default_and_per_table_and_persists() {
     let eng = engine(root, db.clone(), cdc.clone()).await;
 
     // Opt-in default (off): an arbitrary table is not mirrored.
-    eng.apply_pragma(LhPragma::GlobalDefault(false)).await.unwrap();
+    eng.apply_pragma(LhPragma::GlobalDefault(false))
+        .await
+        .unwrap();
     assert!(!eng.is_mirrored("docs"));
 
     // Per-table override on.
-    eng.apply_pragma(LhPragma::Table("docs".into(), true)).await.unwrap();
+    eng.apply_pragma(LhPragma::Table("docs".into(), true))
+        .await
+        .unwrap();
     assert!(eng.is_mirrored("docs"));
 
     // Opt-out default (on): a different, un-overridden table is mirrored.
-    eng.apply_pragma(LhPragma::GlobalDefault(true)).await.unwrap();
+    eng.apply_pragma(LhPragma::GlobalDefault(true))
+        .await
+        .unwrap();
     assert!(eng.is_mirrored("anything_else"));
     assert!(eng.is_mirrored("docs")); // still on
 
     // Per-table override off under opt-out default.
-    eng.apply_pragma(LhPragma::Table("secret".into(), false)).await.unwrap();
+    eng.apply_pragma(LhPragma::Table("secret".into(), false))
+        .await
+        .unwrap();
     assert!(!eng.is_mirrored("secret"));
 
     // All of it survives a reopen with a fresh CDC control.
@@ -320,8 +344,15 @@ async fn seals_into_the_same_object_store_as_slatedb() {
         .map(|m| m.unwrap().location.to_string())
         .collect()
         .await;
-    assert!(keys.iter().any(|k| k.ends_with(".metadata.json")), "metadata present: {keys:?}");
-    assert!(keys.iter().any(|k| k.contains("/data/") && k.ends_with(".parquet")), "data present");
+    assert!(
+        keys.iter().any(|k| k.ends_with(".metadata.json")),
+        "metadata present: {keys:?}"
+    );
+    assert!(
+        keys.iter()
+            .any(|k| k.contains("/data/") && k.ends_with(".parquet")),
+        "data present"
+    );
 }
 
 #[tokio::test]
@@ -349,7 +380,9 @@ async fn failover_resumes_mirror_exactly_once() {
     }
     {
         let mut g = Glue::new(db_a.connection_with_cdc(cdc_a.clone()));
-        g.execute("INSERT INTO docs VALUES (1,'a'),(2,'b');").await.unwrap();
+        g.execute("INSERT INTO docs VALUES (1,'a'),(2,'b');")
+            .await
+            .unwrap();
     }
     eng_a.seal().await.unwrap();
     db_a.flush().await.unwrap(); // make A's state durable before handoff
@@ -372,7 +405,9 @@ async fn failover_resumes_mirror_exactly_once() {
     // Replay more writes on B, then seal.
     {
         let mut g = Glue::new(db_b.connection_with_cdc(cdc_b.clone()));
-        g.execute("UPDATE docs SET body='x' WHERE id=1;").await.unwrap();
+        g.execute("UPDATE docs SET body='x' WHERE id=1;")
+            .await
+            .unwrap();
         g.execute("INSERT INTO docs VALUES (3,'c');").await.unwrap();
     }
     eng_b.seal().await.unwrap();
@@ -401,11 +436,9 @@ async fn seal_decimal_column_round_trips() {
     {
         let mut g = Glue::new(db.connection_serialized());
         // gluesql only supports bare DECIMAL (no precision/scale args).
-        g.execute(
-            "CREATE TABLE orders (id INTEGER PRIMARY KEY, amount DECIMAL);",
-        )
-        .await
-        .unwrap();
+        g.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, amount DECIMAL);")
+            .await
+            .unwrap();
     }
     {
         let mut g = Glue::new(db.connection_with_cdc(cdc.clone()));
@@ -455,8 +488,16 @@ async fn seal_decimal_column_round_trips() {
 
     // 12.34 at scale 18 → mantissa 12_340_000_000_000_000_000;
     // -99.99 at scale 18 → mantissa -99_990_000_000_000_000_000.
-    assert_eq!(arr.value(0), 12_340_000_000_000_000_000_i128, "12.34 at scale 18");
-    assert_eq!(arr.value(1), -99_990_000_000_000_000_000_i128, "-99.99 at scale 18");
+    assert_eq!(
+        arr.value(0),
+        12_340_000_000_000_000_000_i128,
+        "12.34 at scale 18"
+    );
+    assert_eq!(
+        arr.value(1),
+        -99_990_000_000_000_000_000_i128,
+        "-99.99 at scale 18"
+    );
 }
 
 /// Seal a table that has a TIMESTAMP column and verify the mirror returns
@@ -527,7 +568,11 @@ async fn seal_timestamp_column_round_trips() {
     // epoch = 0 μs; 2024-03-15 12:34:56 UTC.
     assert_eq!(arr.value(0), 0_i64, "epoch microseconds");
     // 19797 days * 86400s + 12*3600 + 34*60 + 56 = 1_710_506_096 s → ×1_000_000
-    assert_eq!(arr.value(1), 1_710_506_096_000_000_i64, "2024-03-15 12:34:56 in microseconds");
+    assert_eq!(
+        arr.value(1),
+        1_710_506_096_000_000_i64,
+        "2024-03-15 12:34:56 in microseconds"
+    );
 }
 
 /// Seal a table that has a TIME column and verify the mirror returns
@@ -676,7 +721,9 @@ async fn target_file_bytes_pragma_is_durable() {
         let eng = engine(root, db.clone(), cdc.clone()).await;
         // Unset → engine default (128 MiB, no env override in tests).
         assert_eq!(eng.target_file_bytes(), 128 * 1024 * 1024);
-        eng.apply_pragma(LhPragma::TargetFileBytes(1_048_576)).await.unwrap();
+        eng.apply_pragma(LhPragma::TargetFileBytes(1_048_576))
+            .await
+            .unwrap();
         assert_eq!(eng.target_file_bytes(), 1_048_576);
     }
 

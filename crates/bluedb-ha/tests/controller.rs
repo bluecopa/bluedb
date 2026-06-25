@@ -13,8 +13,20 @@ const MARGIN: Duration = Duration::from_millis(2_000);
 fn two_nodes() -> (Arc<WriterController>, Arc<WriterController>, TestClock) {
     let provider: Arc<dyn LeaseProvider> = Arc::new(LocalLeaseProvider::new());
     let clock = TestClock::new(0);
-    let a = Arc::new(WriterController::new("a", provider.clone(), Arc::new(clock.clone()), TTL, MARGIN));
-    let b = Arc::new(WriterController::new("b", provider.clone(), Arc::new(clock.clone()), TTL, MARGIN));
+    let a = Arc::new(WriterController::new(
+        "a",
+        provider.clone(),
+        Arc::new(clock.clone()),
+        TTL,
+        MARGIN,
+    ));
+    let b = Arc::new(WriterController::new(
+        "b",
+        provider.clone(),
+        Arc::new(clock.clone()),
+        TTL,
+        MARGIN,
+    ));
     (a, b, clock)
 }
 
@@ -28,7 +40,10 @@ async fn only_one_node_can_be_active() {
     assert!(!b.is_active());
 
     // b cannot promote while a holds a live lease.
-    assert!(matches!(b.promote().await, Err(HaError::LeaseHeldByAnother)));
+    assert!(matches!(
+        b.promote().await,
+        Err(HaError::LeaseHeldByAnother)
+    ));
     assert!(!b.is_active());
 
     // After a steps down, b can take over — with a higher fencing epoch.
@@ -80,7 +95,10 @@ async fn losing_the_lease_self_fences_on_renew() {
     assert_eq!(lease_b.epoch, 2);
 
     // a, none the wiser, tries to renew → discovers it lost the lease → Passive.
-    assert!(!a.renew_once().await.unwrap(), "renew fails: lease was taken");
+    assert!(
+        !a.renew_once().await.unwrap(),
+        "renew fails: lease was taken"
+    );
     assert!(!a.is_active(), "a self-fenced");
     assert_eq!(a.epoch(), None);
     assert!(b.is_active());

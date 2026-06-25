@@ -1,10 +1,21 @@
-use std::collections::HashMap;
-use serde_json::Value;
 use crate::error::MqlError;
 use crate::index::{derived_col, IndexType};
+use serde_json::Value;
+use std::collections::HashMap;
 
 #[derive(Debug, PartialEq)]
-pub enum Cmp { Eq, Ne, Gt, Gte, Lt, Lte, In, Nin, Exists, Regex }
+pub enum Cmp {
+    Eq,
+    Ne,
+    Gt,
+    Gte,
+    Lt,
+    Lte,
+    In,
+    Nin,
+    Exists,
+    Regex,
+}
 
 #[derive(Debug, PartialEq)]
 pub enum Filter {
@@ -16,25 +27,37 @@ pub enum Filter {
 }
 
 pub fn parse_filter(v: &Value) -> Result<Filter, MqlError> {
-    let obj = v.as_object().ok_or_else(|| MqlError::Malformed("filter must be an object".into()))?;
-    if obj.is_empty() { return Ok(Filter::True); }
+    let obj = v
+        .as_object()
+        .ok_or_else(|| MqlError::Malformed("filter must be an object".into()))?;
+    if obj.is_empty() {
+        return Ok(Filter::True);
+    }
     let mut clauses = Vec::new();
     for (k, val) in obj {
         match k.as_str() {
             "$and" => clauses.push(Filter::And(parse_array(val)?)),
-            "$or"  => clauses.push(Filter::Or(parse_array(val)?)),
+            "$or" => clauses.push(Filter::Or(parse_array(val)?)),
             "$not" => clauses.push(Filter::Not(Box::new(parse_filter(val)?))),
-            field if field.starts_with('$') =>
-                return Err(MqlError::UnsupportedOperator(field.to_string())),
+            field if field.starts_with('$') => {
+                return Err(MqlError::UnsupportedOperator(field.to_string()))
+            }
             field => clauses.push(parse_field(field, val)?),
         }
     }
-    Ok(if clauses.len() == 1 { clauses.pop().unwrap() } else { Filter::And(clauses) })
+    Ok(if clauses.len() == 1 {
+        clauses.pop().unwrap()
+    } else {
+        Filter::And(clauses)
+    })
 }
 
 fn parse_array(v: &Value) -> Result<Vec<Filter>, MqlError> {
-    v.as_array().ok_or_else(|| MqlError::Malformed("$and/$or take an array".into()))?
-        .iter().map(parse_filter).collect()
+    v.as_array()
+        .ok_or_else(|| MqlError::Malformed("$and/$or take an array".into()))?
+        .iter()
+        .map(parse_filter)
+        .collect()
 }
 
 fn parse_field(path: &str, val: &Value) -> Result<Filter, MqlError> {
@@ -43,17 +66,36 @@ fn parse_field(path: &str, val: &Value) -> Result<Filter, MqlError> {
             let mut out = Vec::new();
             for (op, v) in ops {
                 let cmp = match op.as_str() {
-                    "$eq" => Cmp::Eq, "$ne" => Cmp::Ne, "$gt" => Cmp::Gt, "$gte" => Cmp::Gte,
-                    "$lt" => Cmp::Lt, "$lte" => Cmp::Lte, "$in" => Cmp::In, "$nin" => Cmp::Nin,
-                    "$exists" => Cmp::Exists, "$regex" => Cmp::Regex,
+                    "$eq" => Cmp::Eq,
+                    "$ne" => Cmp::Ne,
+                    "$gt" => Cmp::Gt,
+                    "$gte" => Cmp::Gte,
+                    "$lt" => Cmp::Lt,
+                    "$lte" => Cmp::Lte,
+                    "$in" => Cmp::In,
+                    "$nin" => Cmp::Nin,
+                    "$exists" => Cmp::Exists,
+                    "$regex" => Cmp::Regex,
                     other => return Err(MqlError::UnsupportedOperator(other.to_string())),
                 };
-                out.push(Filter::Cmp { path: path.into(), op: cmp, value: v.clone() });
+                out.push(Filter::Cmp {
+                    path: path.into(),
+                    op: cmp,
+                    value: v.clone(),
+                });
             }
-            return Ok(if out.len() == 1 { out.pop().unwrap() } else { Filter::And(out) });
+            return Ok(if out.len() == 1 {
+                out.pop().unwrap()
+            } else {
+                Filter::And(out)
+            });
         }
     }
-    Ok(Filter::Cmp { path: path.into(), op: Cmp::Eq, value: val.clone() })
+    Ok(Filter::Cmp {
+        path: path.into(),
+        op: Cmp::Eq,
+        value: val.clone(),
+    })
 }
 
 impl Filter {
@@ -66,7 +108,11 @@ impl Filter {
     pub fn eq_map(&self) -> Option<HashMap<String, Value>> {
         match self {
             Filter::True => Some(HashMap::new()),
-            Filter::Cmp { path, op: Cmp::Eq, value } => {
+            Filter::Cmp {
+                path,
+                op: Cmp::Eq,
+                value,
+            } => {
                 let mut m = HashMap::new();
                 m.insert(path.clone(), value.clone());
                 Some(m)
@@ -75,7 +121,11 @@ impl Filter {
                 let mut m = HashMap::new();
                 for f in v {
                     match f {
-                        Filter::Cmp { path, op: Cmp::Eq, value } => {
+                        Filter::Cmp {
+                            path,
+                            op: Cmp::Eq,
+                            value,
+                        } => {
                             m.insert(path.clone(), value.clone());
                         }
                         // Any non-eq child → can't use compound key.
@@ -95,7 +145,7 @@ impl Filter {
         match self {
             Filter::True => "TRUE".into(),
             Filter::And(v) => join(v, " AND ", params),
-            Filter::Or(v)  => join(v, " OR ", params),
+            Filter::Or(v) => join(v, " OR ", params),
             Filter::Not(f) => format!("NOT ({})", f.to_sql(params)),
             Filter::Cmp { path, op, value } => cmp_sql(path, op, value, params),
         }
@@ -117,11 +167,15 @@ impl Filter {
     ///
     /// `$exists` always uses the derived column (it is a NULL check, type-agnostic).
     /// Type-mismatched comparisons fall through to the JSON accessor path.
-    pub fn to_sql_indexed(&self, params: &mut Vec<Value>, indexed: &HashMap<String, IndexType>) -> String {
+    pub fn to_sql_indexed(
+        &self,
+        params: &mut Vec<Value>,
+        indexed: &HashMap<String, IndexType>,
+    ) -> String {
         match self {
             Filter::True => "TRUE".into(),
             Filter::And(v) => join_indexed(v, " AND ", params, indexed),
-            Filter::Or(v)  => join_indexed(v, " OR ", params, indexed),
+            Filter::Or(v) => join_indexed(v, " OR ", params, indexed),
             Filter::Not(f) => format!("NOT ({})", f.to_sql_indexed(params, indexed)),
             Filter::Cmp { path, op, value } => {
                 let col = derived_col(path);
@@ -131,11 +185,13 @@ impl Filter {
                         // value's JSON type matches the column's stored type.
                         let use_index = match op {
                             Cmp::Exists => true,
-                            Cmp::In | Cmp::Nin => {
-                                value.as_array()
-                                    .map(|arr| !arr.is_empty() && arr.iter().all(|v| value_matches_type(v, idx_type)))
-                                    .unwrap_or(false)
-                            }
+                            Cmp::In | Cmp::Nin => value
+                                .as_array()
+                                .map(|arr| {
+                                    !arr.is_empty()
+                                        && arr.iter().all(|v| value_matches_type(v, idx_type))
+                                })
+                                .unwrap_or(false),
                             _ => value_matches_type(value, idx_type),
                         };
                         if use_index {
@@ -165,12 +221,23 @@ impl Filter {
 }
 
 fn join(v: &[Filter], sep: &str, params: &mut Vec<Value>) -> String {
-    let parts: Vec<String> = v.iter().map(|f| format!("({})", f.to_sql(params))).collect();
+    let parts: Vec<String> = v
+        .iter()
+        .map(|f| format!("({})", f.to_sql(params)))
+        .collect();
     parts.join(sep)
 }
 
-fn join_indexed(v: &[Filter], sep: &str, params: &mut Vec<Value>, indexed: &HashMap<String, IndexType>) -> String {
-    let parts: Vec<String> = v.iter().map(|f| format!("({})", f.to_sql_indexed(params, indexed))).collect();
+fn join_indexed(
+    v: &[Filter],
+    sep: &str,
+    params: &mut Vec<Value>,
+    indexed: &HashMap<String, IndexType>,
+) -> String {
+    let parts: Vec<String> = v
+        .iter()
+        .map(|f| format!("({})", f.to_sql_indexed(params, indexed)))
+        .collect();
     parts.join(sep)
 }
 
@@ -181,8 +248,11 @@ fn join_indexed(v: &[Filter], sep: &str, params: &mut Vec<Value>, indexed: &Hash
 fn canonicalize_number_for_index(op: &Cmp, value: &Value) -> Value {
     fn as_int(v: &Value) -> Value {
         if let Some(f) = v.as_f64() {
-            if !v.is_i64() && !v.is_u64() && f.fract() == 0.0
-                && f >= i64::MIN as f64 && f <= i64::MAX as f64
+            if !v.is_i64()
+                && !v.is_u64()
+                && f.fract() == 0.0
+                && f >= i64::MIN as f64
+                && f <= i64::MAX as f64
             {
                 return serde_json::json!(f as i64);
             }
@@ -218,20 +288,24 @@ fn value_matches_type(v: &Value, t: IndexType) -> bool {
 /// Like `cmp_sql` but uses a pre-computed plain column reference (no JSON accessor).
 fn cmp_sql_col(col: &str, op: &Cmp, value: &Value, params: &mut Vec<Value>) -> String {
     match op {
-        Cmp::Eq  => format!("{col} = {}", bind(params, value)),
-        Cmp::Ne  => {
+        Cmp::Eq => format!("{col} = {}", bind(params, value)),
+        Cmp::Ne => {
             let b = bind(params, value);
             format!("({col} <> {b} OR {col} IS NULL)")
         }
-        Cmp::Gt  => format!("{col} > {}", bind(params, value)),
+        Cmp::Gt => format!("{col} > {}", bind(params, value)),
         Cmp::Gte => format!("{col} >= {}", bind(params, value)),
-        Cmp::Lt  => format!("{col} < {}", bind(params, value)),
+        Cmp::Lt => format!("{col} < {}", bind(params, value)),
         Cmp::Lte => format!("{col} <= {}", bind(params, value)),
-        Cmp::In  => in_sql(col, value, params),
+        Cmp::In => in_sql(col, value, params),
         Cmp::Nin => in_sql_nin(col, value, params),
         Cmp::Exists => {
             let want = value.as_bool().unwrap_or(true);
-            if want { format!("{col} IS NOT NULL") } else { format!("{col} IS NULL") }
+            if want {
+                format!("{col} IS NOT NULL")
+            } else {
+                format!("{col} IS NULL")
+            }
         }
         Cmp::Regex => format!("{col} ~ {}", bind(params, value)),
     }
@@ -254,7 +328,9 @@ fn col_ref(path: &str) -> String {
 /// Used by both the filter SQL lowering (`col_ref`) and the `find` sort builder in
 /// `bluedb-server` so the two paths use identical accessors.
 pub fn sort_accessor(path: &str) -> String {
-    if path == "_id" { return "_id".into(); }
+    if path == "_id" {
+        return "_id".into();
+    }
     let parts: Vec<&str> = path.split('.').collect();
     let mut expr = "doc".to_string();
     for (i, p) in parts.iter().enumerate() {
@@ -284,23 +360,27 @@ fn cmp_sql(path: &str, op: &Cmp, value: &Value, params: &mut Vec<Value>) -> Stri
         }
     };
     match op {
-        Cmp::Eq  => format!("{col} = {}", bind(params, value)),
+        Cmp::Eq => format!("{col} = {}", bind(params, value)),
         // MongoDB $ne/$nin match documents where the field is missing/null in
         // addition to documents where it holds a different value. Emit an OR
         // clause so GlueSQL/DataFusion include those rows too.
-        Cmp::Ne  => {
+        Cmp::Ne => {
             let b = bind(params, value);
             format!("({col} <> {b} OR {col} IS NULL)")
         }
-        Cmp::Gt  => format!("{col} > {}", bind(params, value)),
+        Cmp::Gt => format!("{col} > {}", bind(params, value)),
         Cmp::Gte => format!("{col} >= {}", bind(params, value)),
-        Cmp::Lt  => format!("{col} < {}", bind(params, value)),
+        Cmp::Lt => format!("{col} < {}", bind(params, value)),
         Cmp::Lte => format!("{col} <= {}", bind(params, value)),
-        Cmp::In  => in_sql(&col, value, params),
+        Cmp::In => in_sql(&col, value, params),
         Cmp::Nin => in_sql_nin(&col, value, params),
         Cmp::Exists => {
             let want = value.as_bool().unwrap_or(true);
-            if want { format!("{col} IS NOT NULL") } else { format!("{col} IS NULL") }
+            if want {
+                format!("{col} IS NOT NULL")
+            } else {
+                format!("{col} IS NULL")
+            }
         }
         Cmp::Regex => format!("{col} ~ {}", bind(params, value)),
     }
@@ -317,7 +397,10 @@ fn in_sql(col: &str, value: &Value, params: &mut Vec<Value>) -> String {
 fn in_sql_nin(col: &str, value: &Value, params: &mut Vec<Value>) -> String {
     let items = value.as_array().cloned().unwrap_or_default();
     let placeholders: Vec<String> = items.iter().map(|v| bind(params, v)).collect();
-    format!("({col} NOT IN ({}) OR {col} IS NULL)", placeholders.join(", "))
+    format!(
+        "({col} NOT IN ({}) OR {col} IS NULL)",
+        placeholders.join(", ")
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -392,7 +475,9 @@ impl Filter {
                     Some(f) => f.to_df_expr(get_str, materialized)?,
                     None => return Ok(lit(true)),
                 };
-                it.try_fold(first, |acc, f| Ok(acc.and(f.to_df_expr(get_str, materialized)?)))
+                it.try_fold(first, |acc, f| {
+                    Ok(acc.and(f.to_df_expr(get_str, materialized)?))
+                })
             }
             Filter::Or(v) => {
                 let mut it = v.iter();
@@ -400,7 +485,9 @@ impl Filter {
                     Some(f) => f.to_df_expr(get_str, materialized)?,
                     None => return Ok(lit(true)),
                 };
-                it.try_fold(first, |acc, f| Ok(acc.or(f.to_df_expr(get_str, materialized)?)))
+                it.try_fold(first, |acc, f| {
+                    Ok(acc.or(f.to_df_expr(get_str, materialized)?))
+                })
             }
             Filter::Not(f) => Ok(!f.to_df_expr(get_str, materialized)?),
             Filter::Cmp { path, op, value } => cmp_df_expr(path, op, value, get_str, materialized),
@@ -465,7 +552,11 @@ fn cmp_df_expr(
         Cmp::Exists => {
             let want = value.as_bool().unwrap_or(true);
             let base = path_expr(path, get_str, materialized);
-            if want { base.is_not_null() } else { base.is_null() }
+            if want {
+                base.is_not_null()
+            } else {
+                base.is_null()
+            }
         }
         // `$regex` in the DataFusion expr path is out of scope (the SQL `find`
         // path handles `~`); reject cleanly here.
@@ -481,9 +572,23 @@ mod tests {
     #[test]
     fn parses_implicit_eq_and_operators() {
         let f = parse_filter(&json!({"status": "active"})).unwrap();
-        assert_eq!(f, Filter::Cmp { path: "status".into(), op: Cmp::Eq, value: json!("active") });
+        assert_eq!(
+            f,
+            Filter::Cmp {
+                path: "status".into(),
+                op: Cmp::Eq,
+                value: json!("active")
+            }
+        );
         let f = parse_filter(&json!({"age": {"$gte": 18}})).unwrap();
-        assert_eq!(f, Filter::Cmp { path: "age".into(), op: Cmp::Gte, value: json!(18) });
+        assert_eq!(
+            f,
+            Filter::Cmp {
+                path: "age".into(),
+                op: Cmp::Gte,
+                value: json!(18)
+            }
+        );
         let f = parse_filter(&json!({"$and": [{"a": 1}, {"b": 2}]})).unwrap();
         assert!(matches!(f, Filter::And(v) if v.len() == 2));
     }
@@ -851,7 +956,10 @@ mod tests {
             let f = parse_filter(&json!({"_id": "x"})).unwrap();
             let e = f.to_df_expr(&udf(), &mat()).unwrap();
             let s = format!("{e}");
-            assert!(!s.contains("json_get_str"), "_id must be a bare column: {s}");
+            assert!(
+                !s.contains("json_get_str"),
+                "_id must be a bare column: {s}"
+            );
         }
 
         /// A field that an earlier stage materialized resolves to a bare column,

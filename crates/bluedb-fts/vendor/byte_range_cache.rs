@@ -404,6 +404,5 @@ impl ByteRangeCache {
     }
 }
 
-
 // Adapted for bluedb: upstream `#[cfg(test)] mod tests` removed (proptest-based;
 // bluedb has its own tests in crates/bluedb-fts/tests/).

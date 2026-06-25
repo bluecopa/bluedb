@@ -41,6 +41,117 @@ function command_not_found {
     exit 1
 }
 
+function executable_path {
+    if [ -z "$1" ]; then
+        return 1
+    elif [ -x "$1" ]; then
+        echo "$1"
+    elif command -v "$1" >/dev/null 2>&1; then
+        command -v "$1"
+    else
+        return 1
+    fi
+}
+
+function java_major_version {
+    local java_cmd="$1"
+    local version
+    local major
+
+    version="$("$java_cmd" -version 2>&1 | sed -n '1s/.*version "\([^"]*\)".*/\1/p')"
+    if [ -z "$version" ]; then
+        return 1
+    fi
+
+    major="${version%%.*}"
+    if [ "$major" = "1" ]; then
+        major="$(echo "$version" | cut -d. -f2)"
+    fi
+
+    case "$major" in
+        ''|*[!0-9]*) return 1 ;;
+        *) echo "$major" ;;
+    esac
+}
+
+function java_21_or_newer {
+    local java_cmd="$1"
+    local major
+
+    major="$(java_major_version "$java_cmd")" || return 1
+    [ "$major" -ge 21 ]
+}
+
+function maybe_java_21 {
+    local candidate="$1"
+    local resolved
+
+    resolved="$(executable_path "$candidate")" || return 1
+    java_21_or_newer "$resolved" || return 1
+    echo "$resolved"
+}
+
+function require_java_21 {
+    local source_name="$1"
+    local candidate="$2"
+    local resolved
+    local major
+
+    resolved="$(executable_path "$candidate")" || {
+        msg "bluedb Jepsen requires Java 21+, but $source_name='$candidate' is not executable."
+        msg "Install JDK 21 and set LEIN_JAVA_CMD, JAVA_CMD, JAVA_HOME, or put java 21+ on PATH."
+        exit 1
+    }
+
+    major="$(java_major_version "$resolved")" || {
+        msg "bluedb Jepsen requires Java 21+, but $source_name='$resolved' did not report a parseable version."
+        exit 1
+    }
+
+    if [ "$major" -lt 21 ]; then
+        msg "bluedb Jepsen requires Java 21+, but $source_name='$resolved' is Java $major."
+        msg "Install JDK 21 and set LEIN_JAVA_CMD, JAVA_CMD, JAVA_HOME, or put java 21+ on PATH."
+        exit 1
+    fi
+
+    echo "$resolved"
+}
+
+function select_jepsen_java {
+    local java_home
+
+    if [ -n "$LEIN_JAVA_CMD" ]; then
+        require_java_21 LEIN_JAVA_CMD "$LEIN_JAVA_CMD"
+        return
+    fi
+
+    if [ -n "$JAVA_CMD" ]; then
+        require_java_21 JAVA_CMD "$JAVA_CMD"
+        return
+    fi
+
+    if [ -n "$JAVA_HOME" ]; then
+        maybe_java_21 "$JAVA_HOME/bin/java" && return
+    fi
+
+    maybe_java_21 java && return
+
+    if [ -x /usr/libexec/java_home ]; then
+        java_home="$(/usr/libexec/java_home -v 21 2>/dev/null || true)"
+        if [ -n "$java_home" ]; then
+            maybe_java_21 "$java_home/bin/java" && return
+        fi
+    fi
+
+    maybe_java_21 /opt/homebrew/opt/openjdk@21/bin/java && return
+    maybe_java_21 /usr/local/opt/openjdk@21/bin/java && return
+
+    msg "bluedb Jepsen requires Java 21+."
+    msg "Install JDK 21 and set LEIN_JAVA_CMD, JAVA_CMD, JAVA_HOME, or put java 21+ on PATH."
+    msg "On macOS with Homebrew: brew install openjdk@21"
+    exit 1
+}
+
 function make_native_path {
     # ensure we have native paths
     if $cygwin && [[ "$1"  == /* ]]; then
@@ -415,14 +526,14 @@ else
     fi
 fi
 
-if [ ! -x "$JAVA_CMD" ] && ! type -f java >/dev/null
-then
-    msg "Leiningen couldn't find 'java' executable, which is required."
-    msg "Please either set JAVA_CMD or put java (>=1.6) in your \$PATH ($PATH)."
-    exit 1
+SELECTED_JAVA_CMD="$(select_jepsen_java)"
+SELECTED_JAVA_STATUS=$?
+if [ "$SELECTED_JAVA_STATUS" -ne 0 ]; then
+    exit "$SELECTED_JAVA_STATUS"
 fi
-
-export LEIN_JAVA_CMD="${LEIN_JAVA_CMD:-${JAVA_CMD:-java}}"
+export LEIN_JAVA_CMD="$SELECTED_JAVA_CMD"
+export JAVA_CMD="$LEIN_JAVA_CMD"
+export PATH="$(dirname "$LEIN_JAVA_CMD"):$PATH"
 
 if [[ -z "${DRIP_INIT+x}" && "$(basename "$LEIN_JAVA_CMD")" == *drip* ]]; then
     export DRIP_INIT="$(printf -- '-e\n(require (quote leiningen.repl))')"
