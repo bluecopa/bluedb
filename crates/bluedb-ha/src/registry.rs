@@ -1,16 +1,18 @@
 //! The **node registry** — discovery of live coordinator nodes and their
-//! externally-reachable URLs, keyed by `node_id`.
+//! peer-reachable URLs, keyed by `node_id`.
 //!
 //! This is the *discovery* half of HA, complementary to (and independent of) the
 //! [`LeaseProvider`](crate::LeaseProvider) election. The lease answers *which*
 //! `node_id` is the writer (a fencing-token grant); the registry answers *where*
-//! a `node_id` can be reached on the network, and *which* nodes are live at all.
+//! a `node_id` can be reached on the peer network, and *which* nodes are live at
+//! all.
 //! Compose them and a follower can resolve the writer's address —
-//! `registry.url_for(lease.holder)` — to redirect a write (HA-302), and
+//! `registry.url_for(lease.holder)` — to forward a write to the active writer, and
 //! `live_nodes()` feeds affinity routing across the cluster.
 //!
-//! Those consumers (the 302 redirect, the affinity hash ring) are **not** built
-//! here; this is just the seam plus its deployment backends.
+//! The server-side write forwarder consumes the writer lookup; the future
+//! affinity hash ring will consume `live_nodes()`. This crate remains just the
+//! discovery seam plus its deployment backends.
 //!
 //! [`NodeRegistry`] is the trait. Three backends pick up where the lease's
 //! [`LeaseProvider`] backends leave off, one per deployment model:
@@ -38,7 +40,7 @@ use std::time::Duration;
 use anyhow::Result;
 use async_trait::async_trait;
 
-/// Discovery of live coordinator nodes and their externally-reachable URLs.
+/// Discovery of live coordinator nodes and their peer-reachable URLs.
 ///
 /// All three methods key on `node_id` — the SAME id the
 /// [`LeaseProvider`](crate::LeaseProvider) elects on — so a caller that knows the
@@ -50,7 +52,7 @@ pub trait NodeRegistry: Send + Sync + 'static {
     /// the Kubernetes API (K8s). Order is unspecified.
     async fn live_nodes(&self) -> Result<Vec<(String, String)>>;
 
-    /// The externally-reachable URL of `node_id`, or `None` if it is not
+    /// The peer-reachable URL of `node_id`, or `None` if it is not
     /// currently live. Equivalent to looking `node_id` up in [`Self::live_nodes`].
     async fn url_for(&self, node_id: &str) -> Result<Option<String>>;
 

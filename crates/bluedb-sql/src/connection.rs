@@ -55,7 +55,7 @@ use tokio::sync::Mutex;
 use crate::cdc::{cdc_seq_from_key, next_cdc_seq, CdcConfig, CdcEntry, CdcSeq};
 use crate::error::SqlError;
 use crate::keyspace::{prefix_upper_bound, Keyspace, DEFAULT_TENANT, TAG_CDC};
-use crate::storage::{SeqAllocator, SlateDbStorage, WriteLease};
+use crate::storage::{SeqAllocator, SlateDbStorage, UniqueLocks, WriteLease};
 
 /// A per-tenant commit-sequence counter shared by every connection vended from a
 /// [`Database`]. Advanced once per durable committed mutation regardless of
@@ -79,7 +79,7 @@ pub(crate) type NullOrder = Arc<Mutex<HashMap<String, bool>>>;
 pub struct Database {
     substrate: Substrate,
     write_lease: WriteLease,
-    insert_lock: WriteLease,
+    unique_locks: UniqueLocks,
     seq: SeqAllocator,
     /// Lazily-seeded **per-tenant** CDC sequence counters, shared by every
     /// connection vended from this handle so each tenant's lakehouse CDC log
@@ -113,7 +113,7 @@ impl Database {
         Self {
             substrate,
             write_lease: Arc::new(Mutex::new(())),
-            insert_lock: Arc::new(Mutex::new(())),
+            unique_locks: Arc::new(Mutex::new(HashMap::new())),
             seq: Arc::new(Mutex::new(HashMap::new())),
             cdc_seq: Arc::new(Mutex::new(HashMap::new())),
             commit_seq: Arc::new(Mutex::new(HashMap::new())),
@@ -190,11 +190,12 @@ impl Database {
     /// takes this lease for the duration of a read-modify-write serializes against
     /// this database's explicit SQL transactions on the same node.
     ///
-    /// Note this is *not* the `insert_lock` that the SQL store holds briefly at
-    /// commit to re-validate keyed-insert uniqueness — that lock is internal and
-    /// covers only the SQL `insert_data` path. A layered writer that performs its
-    /// own keyed inserts must do its own idempotency check under this lease (the
-    /// ledger does), or route keyed inserts through a [`Database`] connection.
+    /// Note this is *not* the uniqueness-lock table that the SQL store holds at
+    /// commit to re-validate keyed-insert / UNIQUE-index uniqueness — those locks
+    /// are internal and cover only the SQL `insert_data` path. A layered writer
+    /// that performs its own keyed inserts must do its own idempotency check
+    /// under this lease (the ledger does), or route keyed inserts through a
+    /// [`Database`] connection.
     pub fn write_lease(&self) -> WriteLease {
         self.write_lease.clone()
     }
@@ -262,7 +263,7 @@ impl Database {
             self.substrate.clone(),
             tenant,
             self.write_lease.clone(),
-            self.insert_lock.clone(),
+            self.unique_locks.clone(),
             self.seq.clone(),
             self.cdc_seq.clone(),
             self.commit_seq.clone(),

@@ -30,8 +30,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use axum::body::{to_bytes, Body};
 use axum::extract::{Path, RawQuery, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderName, HeaderValue, Method, Request, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
@@ -71,6 +73,8 @@ use slatedb::{Db, DbReader, Settings};
 /// bluedb's default WAL flush interval (overrides SlateDB's 100 ms) — chosen for
 /// the latency-sensitive HTTP profile. Override with `BLUEDB_FLUSH_INTERVAL_MS`.
 const DEFAULT_FLUSH_INTERVAL_MS: u64 = 25;
+const FORWARDED_BY_HEADER: &str = "x-bluedb-forwarded-by";
+const MAX_FORWARDED_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 /// The node-level default FTS seal/compaction interval. Deliberately moderate
 /// (30 s): foreground writes stay lookup-latency, while the background seal still
@@ -297,11 +301,11 @@ struct Inner {
     /// key never lives here in production — the `Vault` backend holds only a token.
     signer: Option<Arc<signer::EvidenceSigner>>,
     /// Node registry: cross-node discovery of live coordinators and their
-    /// externally-reachable URLs, keyed by `node_id`. `None` until set at startup
-    /// via [`AppState::with_node_registry`] (`main` picks the backend). Foundation
-    /// for the later cross-node redirect (resolving the writer's URL via
-    /// `url_for(lease.holder)`) and affinity routing — neither built yet. Kept as
-    /// the deployment-selected backend (in-memory / Postgres / Kubernetes).
+    /// peer-reachable URLs, keyed by `node_id`. `None` until set at startup
+    /// via [`AppState::with_node_registry`] (`main` picks the backend). Used by
+    /// the server-side write forwarder to resolve the active writer's URL via
+    /// `url_for(lease.holder)`, and later by affinity routing. Kept as the
+    /// deployment-selected backend (in-memory / Postgres / Kubernetes).
     node_registry: Option<Arc<dyn NodeRegistry>>,
 }
 
@@ -383,11 +387,41 @@ impl AppState {
     }
 
     /// The node registry, if one was installed. Discovery of live coordinators
-    /// and their URLs (`live_nodes` / `url_for`). The later cross-node redirect
-    /// will resolve the writer's URL via `url_for(self.writer().node_id())` once
-    /// the lease holder is known; that consumer is not built yet.
+    /// and their URLs (`live_nodes` / `url_for`). The write forwarder resolves
+    /// the lease holder through this registry; future affinity routing can use
+    /// `live_nodes()`.
     pub fn node_registry(&self) -> Option<&Arc<dyn NodeRegistry>> {
         self.inner.node_registry.as_ref()
+    }
+
+    /// Resolve the active writer's URL using the live lease holder and node
+    /// registry. Returns `None` when discovery is unavailable or the holder is
+    /// this node but the writer Db is not yet bound, so the local write guard can
+    /// fail closed instead of forwarding to itself.
+    async fn active_writer_url(&self) -> Result<Option<String>, AppError> {
+        let Some(registry) = self.inner.node_registry.as_ref() else {
+            return Ok(None);
+        };
+        let lease =
+            self.inner.writer.current_lease().await.map_err(|e| {
+                AppError::service_unavailable(format!("resolve active writer: {e}"))
+            })?;
+        let Some(lease) = lease else {
+            return Ok(None);
+        };
+        if lease.holder == self.inner.writer.node_id() {
+            return if self.is_writer() {
+                registry
+                    .url_for(&lease.holder)
+                    .await
+                    .map_err(|e| AppError::service_unavailable(format!("resolve writer URL: {e}")))
+            } else {
+                Ok(None)
+            };
+        }
+        registry.url_for(&lease.holder).await.map_err(|e| {
+            AppError::service_unavailable(format!("resolve writer URL for '{}': {e}", lease.holder))
+        })
     }
 
     /// Override the object store handed to the lakehouse/Iceberg mirror with a
@@ -1090,6 +1124,7 @@ impl AppState {
 
 /// Build the HTTP router over `state`.
 pub fn build_app(state: AppState) -> Router {
+    let forward_state = state.clone();
     Router::new()
         .route("/health", get(health))
         .route("/sql", post(exec_sql))
@@ -1191,6 +1226,167 @@ pub fn build_app(state: AppState) -> Router {
         )
         .route("/collections/{coll}/search", post(search::search))
         .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            forward_state,
+            writer_forward_middleware,
+        ))
+}
+
+async fn writer_forward_middleware(
+    State(state): State<AppState>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    if state.is_writer()
+        || req.headers().contains_key(FORWARDED_BY_HEADER)
+        || !is_writer_routed_request(req.method(), req.uri().path())
+    {
+        return next.run(req).await;
+    }
+
+    let writer_url = match state.active_writer_url().await {
+        Ok(Some(url)) => url,
+        Ok(None) => return next.run(req).await,
+        Err(err) => return err.into_response(),
+    };
+
+    match forward_to_writer(&state, req, &writer_url).await {
+        Ok(response) => response,
+        Err(err) => err.into_response(),
+    }
+}
+
+fn is_writer_routed_request(method: &Method, path: &str) -> bool {
+    match (method, path) {
+        (&Method::POST, "/sql") | (&Method::POST, "/admin/sql") => true,
+        (&Method::POST, "/schema/tables") => true,
+        (&Method::POST, path) | (&Method::DELETE, path) if path.starts_with("/schema/tables/") => {
+            true
+        }
+        (&Method::POST, "/ledger/accounts") | (&Method::POST, "/ledger/transfers") => true,
+        (&Method::PUT, path) | (&Method::POST, path) | (&Method::DELETE, path)
+            if path.starts_with("/evidence/") =>
+        {
+            true
+        }
+        (&Method::PUT, path) | (&Method::DELETE, path) if path.starts_with("/graph/") => true,
+        (&Method::POST, path)
+            if path.starts_with("/graph/")
+                && !path.ends_with("/reachable")
+                && !path.ends_with("/widest-path") =>
+        {
+            true
+        }
+        (&Method::POST, path) if path.starts_with("/collections/") => {
+            path.ends_with("/insert")
+                || path.ends_with("/createIndex")
+                || path.ends_with("/update")
+                || path.ends_with("/delete")
+                || path.ends_with("/searchIndex")
+        }
+        (&Method::POST, path) | (&Method::PATCH, path) | (&Method::DELETE, path)
+            if path.starts_with("/tables/") =>
+        {
+            true
+        }
+        _ => false,
+    }
+}
+
+async fn forward_to_writer(
+    state: &AppState,
+    req: Request<Body>,
+    writer_url: &str,
+) -> Result<Response, AppError> {
+    let (parts, body) = req.into_parts();
+    let body = to_bytes(body, MAX_FORWARDED_BODY_BYTES)
+        .await
+        .map_err(|e| AppError::plain(StatusCode::PAYLOAD_TOO_LARGE, format!("body: {e}")))?;
+    let path_and_query = parts
+        .uri
+        .path_and_query()
+        .map(|p| p.as_str())
+        .unwrap_or("/");
+    let target = format!("{}{}", writer_url.trim_end_matches('/'), path_and_query);
+    let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
+        .map_err(|e| AppError::internal(format!("forward method: {e}")))?;
+
+    let client = forward_client();
+    let mut request = client.request(method, target).body(body);
+    for (name, value) in &parts.headers {
+        if is_forwardable_request_header(name.as_str()) {
+            request = request.header(
+                reqwest::header::HeaderName::from_bytes(name.as_str().as_bytes())
+                    .map_err(|e| AppError::internal(format!("forward header name: {e}")))?,
+                reqwest::header::HeaderValue::from_bytes(value.as_bytes())
+                    .map_err(|e| AppError::internal(format!("forward header value: {e}")))?,
+            );
+        }
+    }
+    request = request.header(FORWARDED_BY_HEADER, state.inner.writer.node_id());
+
+    let response = request
+        .send()
+        .await
+        .map_err(|e| AppError::service_unavailable(format!("forward to active writer: {e}")))?;
+    response_from_reqwest(response).await
+}
+
+fn forward_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
+}
+
+async fn response_from_reqwest(response: reqwest::Response) -> Result<Response, AppError> {
+    let status = StatusCode::from_u16(response.status().as_u16())
+        .map_err(|e| AppError::internal(format!("forward response status: {e}")))?;
+    let headers = response.headers().clone();
+    let body = response
+        .bytes()
+        .await
+        .map_err(|e| AppError::service_unavailable(format!("read forwarded response: {e}")))?;
+
+    let mut builder = Response::builder().status(status);
+    {
+        let out = builder
+            .headers_mut()
+            .ok_or_else(|| AppError::internal("build forwarded response headers"))?;
+        for (name, value) in &headers {
+            if !is_hop_by_hop_header(name.as_str()) && name.as_str() != "content-length" {
+                let name = HeaderName::from_bytes(name.as_str().as_bytes()).map_err(|e| {
+                    AppError::internal(format!("forward response header name: {e}"))
+                })?;
+                let value = HeaderValue::from_bytes(value.as_bytes()).map_err(|e| {
+                    AppError::internal(format!("forward response header value: {e}"))
+                })?;
+                out.insert(name, value);
+            }
+        }
+    }
+    builder
+        .body(Body::from(body.to_vec()))
+        .map_err(|e| AppError::internal(format!("build forwarded response: {e}")))
+}
+
+fn is_forwardable_request_header(name: &str) -> bool {
+    !is_hop_by_hop_header(name)
+        && name != "host"
+        && name != "content-length"
+        && name != FORWARDED_BY_HEADER
+}
+
+fn is_hop_by_hop_header(name: &str) -> bool {
+    matches!(
+        name,
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
 }
 
 // --- SQL request type -------------------------------------------------------
@@ -1540,8 +1736,8 @@ async fn health() -> Json<Value> {
 /// is checked against the sealed Iceberg watermark. If `min > sealed`, the
 /// sealed snapshot can't satisfy the read, so [`serve_fresh_analytical`] decides:
 /// the active writer serves the **fresh, unsealed** rows via the writer-local
-/// read; a non-writer node would 302-redirect to the writer (deferred — no
-/// resolvable writer URL today) and meanwhile fails fast with `503` (never
+/// read; passive nodes forward `/sql` to the active writer before this handler
+/// when writer discovery is available, and otherwise fail fast with `503` (never
 /// hangs). The `bluedb_read_wait_seal_n` PRAGMA tunes the tolerance.
 async fn exec_sql(
     State(state): State<AppState>,

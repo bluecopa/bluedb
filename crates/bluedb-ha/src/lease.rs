@@ -38,6 +38,11 @@ pub struct Lease {
 /// holder has an unexpired lease at any wall-clock instant.
 #[async_trait]
 pub trait LeaseProvider: Send + Sync + 'static {
+    /// Return the currently-live lease at `now_millis`, or `None` if no holder
+    /// has an unexpired grant. This is a read-only observation used by routers
+    /// to locate the writer without attempting promotion.
+    async fn current(&self, now_millis: i64) -> Result<Option<Lease>>;
+
     /// Acquire (or re-acquire) the lease for `holder`, valid for `ttl` from
     /// `now_millis`. Returns the granted [`Lease`] (epoch bumped on a genuine
     /// change of holder; preserved when `holder` already holds a live lease), or
@@ -94,6 +99,15 @@ impl LocalLeaseProvider {
 
 #[async_trait]
 impl LeaseProvider for LocalLeaseProvider {
+    async fn current(&self, now_millis: i64) -> Result<Option<Lease>> {
+        let inner = self.inner.lock().expect("lease mutex poisoned");
+        Ok(inner
+            .lease
+            .as_ref()
+            .filter(|lease| lease.expires_at_millis > now_millis)
+            .cloned())
+    }
+
     async fn try_acquire(
         &self,
         holder: &str,

@@ -86,10 +86,14 @@
 //!   statements do *not* take it — their durable commits run concurrently so
 //!   SlateDB's WAL coalesces them into one object-store flush (group commit),
 //!   which is the throughput path. Read replicas take no lease either.
+//! * **Uniqueness locks** ([`UniqueLocks`]). Fresh keyed inserts and UNIQUE index
+//!   writes lock only the exact row keys / unique-value prefixes they must
+//!   re-check at commit. Conflicting keys serialize; unrelated keyed inserts
+//!   still reach SlateDB concurrently and can group-commit.
 
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
 use futures::stream;
@@ -119,6 +123,45 @@ use crate::keyspace::{prefix_upper_bound, Keyspace, DEFAULT_TENANT, TAG_CDC};
 /// same [`crate::Database`] share one of these; a standalone
 /// [`SlateDbStorage::new`] gets its own (it is the sole writer).
 pub type WriteLease = Arc<Mutex<()>>;
+
+/// Shared per-uniqueness-key locks used while commit revalidates fresh primary
+/// key / UNIQUE-index inserts and submits the durable batch. This is deliberately
+/// keyed: two inserts for different primary keys should not queue behind one
+/// global lock, but two inserts for the same primary key or UNIQUE value must
+/// still serialize so the loser can observe the winner's committed row.
+pub(crate) type UniqueLocks = Arc<Mutex<HashMap<Vec<u8>, Weak<Mutex<()>>>>>;
+
+const UNIQUE_LOCK_PRUNE_AT: usize = 8192;
+
+struct UniqueLockGuards {
+    _guards: Vec<OwnedMutexGuard<()>>,
+}
+
+async fn acquire_unique_locks(lock_set: &UniqueLocks, mut keys: Vec<Vec<u8>>) -> UniqueLockGuards {
+    keys.sort();
+    keys.dedup();
+
+    let mut guards = Vec::with_capacity(keys.len());
+    for key in keys {
+        let lock = {
+            let mut map = lock_set.lock().await;
+            if map.len() > UNIQUE_LOCK_PRUNE_AT {
+                map.retain(|_, weak| weak.strong_count() > 0);
+            }
+            match map.get(&key).and_then(Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(Mutex::new(()));
+                    map.insert(key, Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        guards.push(lock.lock_owned().await);
+    }
+
+    UniqueLockGuards { _guards: guards }
+}
 
 /// Shared per-table auto-increment row-key counters (keyed by the table's data
 /// keyspace prefix, so tenants don't collide). Holds the *next* key already
@@ -198,9 +241,10 @@ struct TxnState {
     /// read-your-writes keys on data writes, not DDL.
     had_data_write: bool,
     /// Fresh `UNIQUE` index entries staged by this txn (each a value-prefix
-    /// range to re-scan + the owning pk). Re-validated under `insert_lock` at
-    /// `commit` against live committed state, mirroring `unique_checks`, so two
-    /// concurrent autocommit inserts of the same unique value can't both commit.
+    /// range to re-scan + the owning pk). Re-validated under the matching
+    /// uniqueness lock at `commit` against live committed state, mirroring
+    /// `unique_checks`, so two concurrent autocommit inserts of the same unique
+    /// value can't both commit.
     unique_index_checks: Vec<UniqueIndexCheck>,
 }
 
@@ -231,11 +275,12 @@ pub struct SlateDbStorage {
     tenant: String,
     /// Shared write lease serializing explicit write transactions over this `Db`.
     write_lease: WriteLease,
-    /// Shared lock held *briefly* at commit while a fresh keyed insert
-    /// re-validates uniqueness and writes — separate from `write_lease` so an
-    /// autocommit insert doesn't block on a long-held explicit-transaction lease
-    /// (it serializes only against other inserters). See `commit`.
-    insert_lock: WriteLease,
+    /// Shared keyed locks held at commit while a fresh keyed insert /
+    /// UNIQUE-index write re-validates uniqueness and writes. Separate from
+    /// `write_lease` so an autocommit insert doesn't block on a long-held
+    /// explicit-transaction lease, and keyed so unrelated inserts can still
+    /// group-commit. See `commit`.
+    unique_locks: UniqueLocks,
     /// Shared per-table auto-increment counters (see [`SeqAllocator`]).
     seq: SeqAllocator,
     /// When set, autocommit statements on this connection also take the write
@@ -292,7 +337,7 @@ impl SlateDbStorage {
             Substrate::writer(db),
             tenant,
             Arc::new(Mutex::new(())),
-            Arc::new(Mutex::new(())),
+            Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(HashMap::new())),
@@ -300,14 +345,14 @@ impl SlateDbStorage {
     }
 
     /// Construct over any [`Substrate`] (writer or read replica), sharing the
-    /// `write_lease`, `insert_lock`, `seq` allocator and `cdc_seq` counter. A
+    /// `write_lease`, `unique_locks`, `seq` allocator and `cdc_seq` counter. A
     /// reader substrate yields a **read-only** connection: reads work, but writes
     /// and `BEGIN` error (`require_writer`).
     pub(crate) fn with_substrate(
         substrate: Substrate,
         tenant: &str,
         write_lease: WriteLease,
-        insert_lock: WriteLease,
+        unique_locks: UniqueLocks,
         seq: SeqAllocator,
         cdc_seq: CdcSeq,
         commit_seq: CommitSeq,
@@ -317,7 +362,7 @@ impl SlateDbStorage {
             keyspace: Keyspace::new(tenant),
             tenant: tenant.to_string(),
             write_lease,
-            insert_lock,
+            unique_locks,
             seq,
             serialize_writes: false,
             strict: false,
@@ -1325,20 +1370,28 @@ impl Transaction for SlateDbStorage {
         if let Some(txn) = self.txn.take() {
             if !txn.overlay.is_empty() {
                 // If this txn made fresh keyed inserts, validate uniqueness while
-                // holding `insert_lock` across the re-check AND the batch write,
-                // so the check is atomic against other inserters. This is a
-                // distinct, briefly-held lock — NOT `write_lease` — so an
-                // autocommit insert doesn't stall behind a long-held explicit
-                // transaction (and a read-only explicit txn never blocks it).
-                // Pure appends/updates have no checks and stay lock-free (group
-                // commit). Acquired regardless of whether `write_lease` is already
-                // held, so explicit-transaction inserts serialize here too. UNIQUE
-                // secondary indexes need the same atomic re-check, so the lock is
-                // taken whenever either check set is non-empty.
-                let _ilock = if txn.unique_checks.is_empty() && txn.unique_index_checks.is_empty() {
+                // holding locks for the exact row keys / UNIQUE-index value
+                // prefixes being re-checked across the re-check AND the batch
+                // write. This keeps the check atomic against conflicting
+                // inserters without forcing unrelated primary keys through one
+                // global mutex, so their durable writes can still group-commit.
+                // Acquired regardless of whether `write_lease` is already held,
+                // so explicit-transaction inserts preserve the same uniqueness
+                // guarantee.
+                let _unique_locks = if txn.unique_checks.is_empty()
+                    && txn.unique_index_checks.is_empty()
+                {
                     None
                 } else {
-                    Some(self.insert_lock.clone().lock_owned().await)
+                    let mut lock_keys =
+                        Vec::with_capacity(txn.unique_checks.len() + txn.unique_index_checks.len());
+                    lock_keys.extend(txn.unique_checks.iter().cloned());
+                    lock_keys.extend(
+                        txn.unique_index_checks
+                            .iter()
+                            .map(|check| check.value_prefix.clone()),
+                    );
+                    Some(acquire_unique_locks(&self.unique_locks, lock_keys).await)
                 };
                 for key in &txn.unique_checks {
                     if self

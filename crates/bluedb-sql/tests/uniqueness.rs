@@ -12,8 +12,8 @@
 
 use std::sync::Arc;
 
-use bluedb_sql::SlateDbStorage;
-use gluesql_core::prelude::Glue;
+use bluedb_sql::{Database, SlateDbStorage};
+use gluesql_core::prelude::{Glue, Payload};
 use slatedb::object_store::memory::InMemory;
 use slatedb::Db;
 
@@ -58,6 +58,57 @@ async fn primary_key_uniqueness_is_enforced() {
         p => panic!("{p:?}"),
     };
     assert_eq!(rows, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_primary_key_inserts_allow_only_one_winner() {
+    let object_store = Arc::new(InMemory::new());
+    let db = Arc::new(
+        Db::open("bluedb-sql-concurrent-primary-key-unique", object_store)
+            .await
+            .expect("open slatedb"),
+    );
+    let database = Database::new(db);
+
+    {
+        let mut glue = Glue::new(database.connection());
+        glue.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);")
+            .await
+            .unwrap();
+    }
+
+    const N: usize = 16;
+    let mut handles = Vec::new();
+    for i in 0..N {
+        let database = database.clone();
+        handles.push(tokio::spawn(async move {
+            let mut glue = Glue::new(database.connection());
+            glue.execute(&format!("INSERT INTO t VALUES (1, 'name-{i}');"))
+                .await
+                .is_ok()
+        }));
+    }
+
+    let mut winners = 0;
+    for handle in handles {
+        if handle.await.expect("insert task") {
+            winners += 1;
+        }
+    }
+    assert_eq!(winners, 1, "exactly one duplicate-key insert should win");
+
+    let mut glue = Glue::new(database.connection());
+    let rows = match glue
+        .execute("SELECT id FROM t WHERE id = 1;")
+        .await
+        .unwrap()
+        .pop()
+        .unwrap()
+    {
+        Payload::Select { rows, .. } => rows,
+        p => panic!("{p:?}"),
+    };
+    assert_eq!(rows.len(), 1);
 }
 
 #[tokio::test]

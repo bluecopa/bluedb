@@ -27,11 +27,12 @@
 //!     for the namespace (default `default`).
 //! - `BLUEDB_NODE_ID` (default `node-0`), `BLUEDB_LEASE_TTL_SECS` (15),
 //!   `BLUEDB_LEASE_MARGIN_SECS` (5).
-//! - `BLUEDB_ADVERTISE_ADDR` — this node's externally-reachable base URL (e.g.
+//! - `BLUEDB_ADVERTISE_ADDR` — this node's peer-reachable base URL (e.g.
 //!   `http://bluedb-0.bluedb.default.svc:8080`), published to the node registry so
-//!   other nodes can resolve `node_id → URL`. Defaults to `http://<BLUEDB_ADDR>`
-//!   when unset (fine for a single host / local dev; set explicitly behind a
-//!   Service/LB). Foundation for the later cross-node redirect + affinity routing.
+//!   other nodes can resolve `node_id → URL`. This should be a per-node address,
+//!   not the shared public load balancer. Defaults to `http://<BLUEDB_ADDR>` when
+//!   unset (fine for a single host / local dev). Used for passive-node write
+//!   forwarding; future affinity routing can use the same registry.
 //! - Node registry backend (cross-node discovery). `BLUEDB_NODE_REGISTRY_TTL_SECS`
 //!   (default 3× the lease TTL) bounds liveness for the in-memory + Postgres
 //!   backends. The backend is selected with this precedence:
@@ -164,11 +165,12 @@ fn select_lease_backend(
     }
 }
 
-/// This node's externally-reachable base URL, published to the node registry.
+/// This node's peer-reachable base URL, published to the node registry.
 ///
 /// `BLUEDB_ADVERTISE_ADDR` when set; otherwise `http://<BLUEDB_ADDR>` (the bind
 /// address). The fallback is correct for a single host / local dev — behind a
-/// Service or load balancer set `BLUEDB_ADVERTISE_ADDR` to the routable address.
+/// Service or load balancer set `BLUEDB_ADVERTISE_ADDR` to the per-node routable
+/// address, not the shared public endpoint.
 fn advertise_url(bind_addr: &str) -> String {
     std::env::var("BLUEDB_ADVERTISE_ADDR")
         .ok()
@@ -329,11 +331,11 @@ async fn main() -> anyhow::Result<()> {
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
-    // This node's externally-reachable URL + the node-registry backend. The URL
-    // is published to the registry so other nodes can later resolve `node_id → URL`
-    // (cross-node redirect / affinity routing — neither built yet). The registry
-    // ttl defaults to 3× the lease ttl (≈ a few missed heartbeats before a node is
-    // dropped). Built before the state's `Arc` is shared so `with_node_registry`'s
+    // This node's peer-reachable URL + the node-registry backend. The URL is
+    // published to the registry so passive nodes can resolve the active
+    // writer for server-side forwarding. The registry ttl defaults to 3× the
+    // lease ttl (≈ a few missed heartbeats before a node is dropped). Built
+    // before the state's `Arc` is shared so `with_node_registry`'s
     // `Arc::get_mut` succeeds.
     let bind_addr = std::env::var("BLUEDB_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let advertise = advertise_url(&bind_addr);
