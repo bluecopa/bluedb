@@ -111,10 +111,11 @@ the writes/sec that implies.
 *Method and caveat:* single node, local-disk (SSD) backend, `flush_interval=25 ms`,
 strong durability. Read these as a local engine upper bound, not a customer sizing
 number. The current Civo UAT baseline through the public API and object-store
-backend is roughly linear to **~128 concurrent write clients**, with an observed
-ceiling of **~312 writes/sec** and p99 moving into seconds past the knee; an
-Iceberg-mirror-on sanity sweep in one tenant landed in the same range but
-saturated CPU at high concurrency. See
+backend is roughly linear to **~128 concurrent write clients**, with the last
+good run reaching **~400 writes/sec** at 256 clients and p99 around **1.5 s**;
+use **~350 writes/sec** at 128 clients for the current sub-second p99 sizing
+point. An Iceberg-mirror-on sanity sweep in one tenant landed in the same range
+but saturated CPU at high concurrency. See
 **[Sizing & capacity](operations/sizing.md#current-civo-write-slo)** before using
 these numbers for deployment sizing. Reproduce the local lab benchmark with
 `cargo test --release -p bluedb-sql --test throughput_bench -- --ignored`.

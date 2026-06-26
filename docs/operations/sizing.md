@@ -35,32 +35,37 @@ Use this as the current customer-facing baseline until you benchmark your own
 cluster. It is intentionally conservative and measured through the public API,
 not inside the process.
 
-**Measured 2026-06-25** on the Civo UAT deployment: 3-pod Kubernetes HA cluster,
-Kubernetes lease, public `LoadBalancer`, server-side forwarding enabled, Civo
-object-store backend, default `flush_interval = 25 ms`, primary-key `/tables`
-single-row inserts, Iceberg mirror off, 15s measured windows with 2s warmup.
+**Last good run: 2026-06-26T01:25:52Z** on the Civo UAT deployment: 3-pod
+Kubernetes HA cluster, Kubernetes lease, public `LoadBalancer`, server-side
+forwarding enabled, Civo object-store backend, default
+`flush_interval = 25 ms`, primary-key `/tables` single-row inserts, Iceberg
+mirror off, 15s measured windows with 2s warmup.
 
 | Concurrent clients | Writes/sec | p50 | p99 | Interpretation |
 |--:|--:|--:|--:|---|
-| 1 | 14.9 | 55.9 ms | 154 ms | serial-client floor |
-| 8 | 99.3 | 73.9 ms | 184 ms | still comfortably linear |
-| 16 | 163.3 | 88.8 ms | 205 ms | still comfortably linear |
-| 32 | 222.2 | 139 ms | 372 ms | below the knee |
-| 64 | 264.3 | 236 ms | 494 ms | below the knee |
-| 128 | 287.3 | 432 ms | 855 ms | knee begins |
-| 256 | 312.1 | 748 ms | 2,056 ms | ceiling/tail blowout |
+| 1 | 8.7 | 103 ms | 206 ms | serial-client floor |
+| 8 | 70.6 | 103 ms | 207 ms | still comfortably linear |
+| 16 | 127.7 | 107 ms | 247 ms | still comfortably linear |
+| 32 | 210.6 | 142 ms | 265 ms | below the knee |
+| 64 | 294.9 | 213 ms | 469 ms | below the knee |
+| 128 | 353.3 | 350 ms | 635 ms | knee begins |
+| 256 | 399.9 | 608 ms | 1,471 ms | ceiling/tail rising |
 
 For sizing conversations today, treat this deployment as **roughly linear to
 about 128 concurrent write clients**, with an observed ceiling of **about
-312 writes/sec**. Past the knee, p99 moves into seconds; do not sell or size the
-current Civo profile above that point without admission control, batching, larger
-writer resources, or log-path work that beats this baseline.
+400 writes/sec**. Past the knee, p99 starts moving toward seconds; do not sell
+or size the current Civo profile above that point without admission control,
+batching, larger writer resources, or log-path work that beats this baseline.
+
+A same-shape run three minutes earlier reached **365.6 writes/sec** at 256
+concurrent clients with p99 **1,468 ms**, so treat the high-concurrency ceiling
+as a **365-400 writes/sec** range rather than a precise single-run value.
 
 If you need a practical bound from this exact environment:
 
-- p99 under ~500 ms: stay at or below ~64 concurrent writers, about 260 writes/s.
-- p99 under ~1 s: stay at or below ~128 concurrent writers, about 285 writes/s.
-- Absolute observed ceiling: about 312 writes/s, but p99 was already ~2 s.
+- p99 around ~500 ms: stay at or below ~64 concurrent writers, about 275-295 writes/s.
+- p99 under ~1 s: stay at or below ~128 concurrent writers, about 350 writes/s.
+- Absolute observed ceiling: about 365-400 writes/s, but p99 was already ~1.5 s.
 
 The local-SSD benchmark later on this page shows the engine's group-commit
 ceiling, not the current Civo/customer sizing number.
